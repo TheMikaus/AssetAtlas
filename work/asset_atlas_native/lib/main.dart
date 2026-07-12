@@ -627,7 +627,6 @@ class _CatalogScreenState extends State<CatalogScreen> {
             canGoBack: canGoBackInHistory,
             canGoForward: canGoForwardInHistory,
             onScan: chooseAndScan,
-            onScanJuryRigs: scanJuryRigs,
             onSaveProject: saveProjectSnapshot,
             onLoadProject: loadProjectSnapshot,
             onCopySelected: copySelected,
@@ -759,7 +758,6 @@ class HeaderBar extends StatelessWidget {
     required this.canGoBack,
     required this.canGoForward,
     required this.onScan,
-    required this.onScanJuryRigs,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
@@ -774,7 +772,6 @@ class HeaderBar extends StatelessWidget {
   final bool canGoBack;
   final bool canGoForward;
   final VoidCallback onScan;
-  final VoidCallback onScanJuryRigs;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
@@ -802,7 +799,6 @@ class HeaderBar extends StatelessWidget {
             canGoForward: canGoForward,
             selectedCount: selectedCount,
             onScan: onScan,
-            onScanJuryRigs: onScanJuryRigs,
             onSaveProject: onSaveProject,
             onLoadProject: onLoadProject,
             onCopySelected: onCopySelected,
@@ -901,7 +897,6 @@ class _HeaderActions extends StatelessWidget {
     required this.canGoForward,
     required this.selectedCount,
     required this.onScan,
-    required this.onScanJuryRigs,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
@@ -914,7 +909,6 @@ class _HeaderActions extends StatelessWidget {
   final bool canGoForward;
   final int selectedCount;
   final VoidCallback onScan;
-  final VoidCallback onScanJuryRigs;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
@@ -936,11 +930,6 @@ class _HeaderActions extends StatelessWidget {
           tooltip: 'Next asset',
           onPressed: canGoForward ? onGoForward : null,
           icon: const Icon(Icons.arrow_forward),
-        ),
-        OutlinedButton.icon(
-          onPressed: scanning ? null : onScanJuryRigs,
-          icon: const Icon(Icons.bolt_outlined),
-          label: const Text('Scan Jury_Rigs'),
         ),
         FilledButton.icon(
           onPressed: scanning ? null : onScan,
@@ -1703,10 +1692,11 @@ class MeshPainter extends CustomPainter {
           face.materialIndex,
           textured: false,
         );
+        final materialOpacity = mesh.opacityForMaterial(face.materialIndex);
         if (vertexTint != null) {
           baseColor = _multiplyColor(baseColor, vertexTint);
         }
-        facePaint.color = baseColor;
+        facePaint.color = baseColor.withValues(alpha: materialOpacity);
         canvas.drawPath(texturedBase, facePaint);
 
         _drawTexturedTriangle(
@@ -1718,6 +1708,7 @@ class MeshPainter extends CustomPainter {
           uvA: face.uvs[0],
           uvB: face.uvs[1],
           uvC: face.uvs[2],
+          alpha: materialOpacity,
         );
         if (vertexTint != null && !_isApproximatelyWhite(vertexTint)) {
           canvas.drawPath(
@@ -1752,13 +1743,15 @@ class MeshPainter extends CustomPainter {
           face.materialIndex,
           textured: renderMode == RenderMode.textured,
         );
+        final materialOpacity = mesh.opacityForMaterial(face.materialIndex);
         final vertexTint = mesh.averageFaceVertexColor(face);
         if (vertexTint != null) {
           faceColor = _multiplyColor(faceColor, vertexTint);
         }
-        facePaint.color = faceColor.withValues(
-          alpha: renderMode == RenderMode.textured ? .92 : 1.0,
-        );
+        final fillAlpha = renderMode == RenderMode.solid
+            ? 1.0
+            : (renderMode == RenderMode.textured ? .92 : 1.0) * materialOpacity;
+        facePaint.color = faceColor.withValues(alpha: fillAlpha);
         canvas.drawPath(path, facePaint);
       }
       if (drawEdges) {
@@ -1799,6 +1792,7 @@ class MeshPainter extends CustomPainter {
     required Vec2 uvA,
     required Vec2 uvB,
     required Vec2 uvC,
+    double alpha = 1.0,
   }) {
     final w = image.width.toDouble();
     final h = image.height.toDouble();
@@ -1854,7 +1848,18 @@ class MeshPainter extends CustomPainter {
         1,
       ]),
     );
-    canvas.drawImage(image, Offset.zero, Paint());
+    canvas.drawImage(
+      image,
+      Offset.zero,
+      Paint()
+        ..color = Color.fromARGB(
+          (alpha.clamp(0.0, 1.0) * 255).round(),
+          255,
+          255,
+          255,
+        )
+        ..blendMode = BlendMode.modulate,
+    );
     canvas.restore();
   }
 
@@ -2866,6 +2871,32 @@ Future<MeshModel> meshModelFromImporterJson(
     final material = item as Map<String, dynamic>;
     final color =
         (material['color'] as List<dynamic>?) ?? const [0.56, 0.72, 0.85];
+    final opacity = ((material['opacity'] as num?)?.toDouble() ?? 1.0).clamp(
+      0.0,
+      1.0,
+    );
+    final roughness = ((material['roughness'] as num?)?.toDouble() ?? 0.7)
+        .clamp(0.0, 1.0);
+    final metalness = ((material['metalness'] as num?)?.toDouble() ?? 0.0)
+        .clamp(0.0, 1.0);
+    final specularFactor =
+        ((material['specularFactor'] as num?)?.toDouble() ?? 0.2).clamp(
+          0.0,
+          2.0,
+        );
+    final emissiveFactor =
+        ((material['emissiveFactor'] as num?)?.toDouble() ?? 0.0).clamp(
+          0.0,
+          8.0,
+        );
+    final emissiveValues =
+        (material['emissiveColor'] as List<dynamic>?) ?? const [0.0, 0.0, 0.0];
+    final emissiveColor = Color.fromARGB(
+      255,
+      (((emissiveValues[0] as num).toDouble()).clamp(0, 1) * 255).round(),
+      (((emissiveValues[1] as num).toDouble()).clamp(0, 1) * 255).round(),
+      (((emissiveValues[2] as num).toDouble()).clamp(0, 1) * 255).round(),
+    );
     final textureRefs = ((material['textures'] as List<dynamic>?) ?? const [])
         .cast<String>();
     final resolvedTextures = textureRefs
@@ -2897,6 +2928,14 @@ Future<MeshModel> meshModelFromImporterJson(
         resolvedTextures: resolvedTextures,
         textureColor: textureColor,
         textureImage: textureImage,
+        opacity: opacity,
+        roughness: roughness,
+        metalness: metalness,
+        specularFactor: specularFactor,
+        emissiveFactor: emissiveFactor,
+        emissiveColor: emissiveColor,
+        shaderType: (material['shaderType'] as num?)?.toInt() ?? -1,
+        shadingModel: (material['shadingModel'] as String?) ?? '',
       ),
     );
   }
@@ -2959,6 +2998,14 @@ Future<MeshModel> meshModelFromImporterJson(
           resolvedTextures: resolvedList,
           textureColor: declaredColor,
           textureImage: declaredImage,
+          opacity: 1.0,
+          roughness: 0.7,
+          metalness: 0.0,
+          specularFactor: 0.2,
+          emissiveFactor: 0.0,
+          emissiveColor: const Color(0xff000000),
+          shaderType: -1,
+          shadingModel: 'declared',
         ),
       );
       fbxLog('Applied declared FBX texture reference: ${resolvedList.first}');
@@ -2983,6 +3030,14 @@ Future<MeshModel> meshModelFromImporterJson(
         resolvedTextures: const [],
         textureColor: const Color(0xffcbd5e1),
         textureImage: checkerImage,
+        opacity: 1.0,
+        roughness: 0.7,
+        metalness: 0.0,
+        specularFactor: 0.2,
+        emissiveFactor: 0.0,
+        emissiveColor: const Color(0xff000000),
+        shaderType: -1,
+        shadingModel: 'checker',
       ),
     );
     fbxLog(
@@ -3540,12 +3595,60 @@ class MeshModel {
   Color colorForMaterial(int materialIndex, {bool textured = false}) {
     if (materialIndex >= 0 && materialIndex < materials.length) {
       final material = materials[materialIndex];
-      if (textured && material.textureColor != null) {
-        return material.textureColor!;
-      }
-      return material.color;
+      final base = textured && material.textureColor != null
+          ? material.textureColor!
+          : material.color;
+
+      final baseRed = (base.r * 255).round().clamp(0, 255);
+      final baseGreen = (base.g * 255).round().clamp(0, 255);
+      final baseBlue = (base.b * 255).round().clamp(0, 255);
+      final emissiveRed = (material.emissiveColor.r * 255).round().clamp(
+        0,
+        255,
+      );
+      final emissiveGreen = (material.emissiveColor.g * 255).round().clamp(
+        0,
+        255,
+      );
+      final emissiveBlue = (material.emissiveColor.b * 255).round().clamp(
+        0,
+        255,
+      );
+
+      var brightness = 0.88 + material.specularFactor.clamp(0.0, 1.0) * 0.22;
+      brightness *= 1.0 - material.metalness.clamp(0.0, 1.0) * 0.08;
+      brightness *= 0.82 + (1.0 - material.roughness.clamp(0.0, 1.0)) * 0.18;
+      final emissiveWeight = material.emissiveFactor.clamp(0.0, 8.0) * 0.3;
+
+      final red = (baseRed * brightness + emissiveRed * emissiveWeight)
+          .round()
+          .clamp(0, 255);
+      final green = (baseGreen * brightness + emissiveGreen * emissiveWeight)
+          .round()
+          .clamp(0, 255);
+      final blue = (baseBlue * brightness + emissiveBlue * emissiveWeight)
+          .round()
+          .clamp(0, 255);
+
+      return Color.fromARGB(
+        (base.a * 255).round().clamp(0, 255),
+        red,
+        green,
+        blue,
+      );
     }
     return const Color(0xff8fb8d8);
+  }
+
+  double opacityForMaterial(int materialIndex) {
+    if (materialIndex >= 0 && materialIndex < materials.length) {
+      final opacity = materials[materialIndex].opacity.clamp(0.0, 1.0);
+      // Some FBX exports still encode transparency in a way that collapses
+      // to near-zero; avoid disappearing meshes.
+      if (opacity <= 0.03) return 1.0;
+      return opacity;
+    }
+    return 1.0;
   }
 
   List<String> get allTexturePaths {
@@ -3592,6 +3695,14 @@ class MeshMaterial {
     this.resolvedTextures = const [],
     this.textureColor,
     this.textureImage,
+    this.opacity = 1.0,
+    this.roughness = 0.7,
+    this.metalness = 0.0,
+    this.specularFactor = 0.2,
+    this.emissiveFactor = 0.0,
+    this.emissiveColor = const Color(0xff000000),
+    this.shaderType = -1,
+    this.shadingModel = '',
   });
 
   final String name;
@@ -3600,6 +3711,14 @@ class MeshMaterial {
   final List<String> resolvedTextures;
   final Color? textureColor;
   final ui.Image? textureImage;
+  final double opacity;
+  final double roughness;
+  final double metalness;
+  final double specularFactor;
+  final double emissiveFactor;
+  final Color emissiveColor;
+  final int shaderType;
+  final String shadingModel;
 }
 
 class MeshFace {

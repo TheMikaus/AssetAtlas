@@ -43,6 +43,74 @@ flutter test
 flutter analyze
 ```
 
+## Package Windows Executable
+
+Use the packaging script to build and stage a distributable Windows folder, and
+optionally a zip archive.
+
+```powershell
+pwsh -File .\scripts\package_windows.ps1
+```
+
+Useful options:
+
+```powershell
+# Build Debug package instead of Release
+pwsh -File .\scripts\package_windows.ps1 -Configuration Debug
+
+# Skip zip creation
+pwsh -File .\scripts\package_windows.ps1 -NoZip
+
+# Skip flutter pub get (faster when dependencies are unchanged)
+pwsh -File .\scripts\package_windows.ps1 -SkipPubGet
+```
+
+Outputs are written under `dist/` with timestamped folder names.
+
+## Create Windows Installer
+
+To build the app and create an installer (Inno Setup):
+
+```powershell
+pwsh -File .\scripts\create_windows_installer.ps1
+```
+
+Notes:
+
+- Requires Inno Setup 6 (`ISCC.exe`) installed.
+- Installer output is written to `dist/installers/`.
+- A staged app folder is also generated under `dist/`.
+- Installer filename includes version, configuration, and timestamp.
+
+Useful options:
+
+```powershell
+# Build debug installer
+pwsh -File .\scripts\create_windows_installer.ps1 -Configuration Debug
+
+# Skip flutter pub get for faster iteration
+pwsh -File .\scripts\create_windows_installer.ps1 -SkipPubGet
+```
+
+## Version Bumping
+
+Use the version script whenever code changes are made:
+
+```powershell
+pwsh -File .\scripts\bump_version.ps1
+```
+
+Options:
+
+```powershell
+# Bump minor or major instead of patch
+pwsh -File .\scripts\bump_version.ps1 -Part minor
+pwsh -File .\scripts\bump_version.ps1 -Part major
+
+# Preview without changing files
+pwsh -File .\scripts\bump_version.ps1 -DryRun
+```
+
 Scan regression is covered by fixture-based tests in [test/scan_fixture_test.dart](test/scan_fixture_test.dart) using [test/fixtures/corpus](test/fixtures/corpus).
 
 Copy flow regression is covered in [test/copy_fixture_test.dart](test/copy_fixture_test.dart).

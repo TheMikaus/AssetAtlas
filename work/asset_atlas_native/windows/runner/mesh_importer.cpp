@@ -39,6 +39,16 @@ struct MaterialInfo {
   double r;
   double g;
   double b;
+  double opacity;
+  double roughness;
+  double metalness;
+  double specular_factor;
+  double emissive_factor;
+  double emissive_r;
+  double emissive_g;
+  double emissive_b;
+  int shader_type;
+  std::string shading_model;
   std::vector<std::string> textures;
 };
 
@@ -79,6 +89,18 @@ static void add_texture_path(std::vector<std::string>& paths, ufbx_texture* text
   }
 }
 
+static double clamp01(double value) {
+  return std::clamp(value, 0.0, 1.0);
+}
+
+static double normalize_unit_value(double value) {
+  // Some exporters write percentage-like values (0..100) into scalar slots.
+  if (value > 1.0 && value <= 100.0) {
+    return value / 100.0;
+  }
+  return value;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     fprintf(stderr, "Usage: asset_atlas_mesh_importer <model.fbx>\n");
@@ -110,6 +132,17 @@ int main(int argc, char** argv) {
     material_indices[material] = static_cast<int>(material_index);
     MaterialInfo info;
     info.name = string_from_ufbx(material->name);
+    info.opacity = 1.0;
+    info.roughness = 0.7;
+    info.metalness = 0.0;
+    info.specular_factor = 0.2;
+    info.emissive_factor = 0.0;
+    info.emissive_r = 0.0;
+    info.emissive_g = 0.0;
+    info.emissive_b = 0.0;
+    info.shader_type = static_cast<int>(material->shader_type);
+    info.shading_model = string_from_ufbx(material->shading_model_name);
+
     ufbx_vec3 color = material->pbr.base_color.value_vec3;
     if (!material->pbr.base_color.has_value && material->fbx.diffuse_color.has_value) {
       color = material->fbx.diffuse_color.value_vec3;
@@ -117,10 +150,57 @@ int main(int argc, char** argv) {
     info.r = color.x;
     info.g = color.y;
     info.b = color.z;
+
+    if (material->pbr.opacity.has_value) {
+      info.opacity = clamp01(normalize_unit_value(material->pbr.opacity.value_real));
+    } else if (material->fbx.transparency_factor.has_value) {
+      const double transparency = clamp01(
+        normalize_unit_value(material->fbx.transparency_factor.value_real)
+      );
+      info.opacity = clamp01(1.0 - transparency);
+    }
+
+    if (material->pbr.roughness.has_value) {
+      info.roughness = clamp01(normalize_unit_value(material->pbr.roughness.value_real));
+    } else if (material->fbx.specular_exponent.has_value) {
+      const double exponent = std::max(1.0, material->fbx.specular_exponent.value_real);
+      const double normalized = std::clamp(exponent / 100.0, 0.0, 1.0);
+      info.roughness = clamp01(1.0 - normalized);
+    }
+
+    if (material->pbr.metalness.has_value) {
+      info.metalness = clamp01(normalize_unit_value(material->pbr.metalness.value_real));
+    }
+
+    if (material->pbr.specular_factor.has_value) {
+      info.specular_factor = clamp01(normalize_unit_value(material->pbr.specular_factor.value_real));
+    } else if (material->fbx.specular_factor.has_value) {
+      info.specular_factor = clamp01(normalize_unit_value(material->fbx.specular_factor.value_real));
+    }
+
+    if (material->pbr.emission_factor.has_value) {
+      info.emissive_factor = std::max(0.0, material->pbr.emission_factor.value_real);
+    } else if (material->fbx.emission_factor.has_value) {
+      info.emissive_factor = std::max(0.0, material->fbx.emission_factor.value_real);
+    }
+
+    ufbx_vec3 emissive = {0.0, 0.0, 0.0};
+    if (material->pbr.emission_color.has_value) {
+      emissive = material->pbr.emission_color.value_vec3;
+    } else if (material->fbx.emission_color.has_value) {
+      emissive = material->fbx.emission_color.value_vec3;
+    }
+    info.emissive_r = clamp01(emissive.x);
+    info.emissive_g = clamp01(emissive.y);
+    info.emissive_b = clamp01(emissive.z);
+
     add_texture_path(info.textures, material->pbr.base_color.texture);
     add_texture_path(info.textures, material->fbx.diffuse_color.texture);
     add_texture_path(info.textures, material->pbr.normal_map.texture);
     add_texture_path(info.textures, material->fbx.normal_map.texture);
+    add_texture_path(info.textures, material->pbr.emission_color.texture);
+    add_texture_path(info.textures, material->fbx.emission_color.texture);
+    add_texture_path(info.textures, material->pbr.opacity.texture);
     for (size_t texture_index = 0; texture_index < material->textures.count; ++texture_index) {
       add_texture_path(info.textures, material->textures.data[texture_index].texture);
     }
@@ -242,7 +322,17 @@ int main(int argc, char** argv) {
     if (i) putchar(',');
     printf("{\"name\":");
     print_json_string(material.name.c_str());
-    printf(",\"color\":[%.6g,%.6g,%.6g],\"textures\":[", material.r, material.g, material.b);
+    printf(",\"color\":[%.6g,%.6g,%.6g]", material.r, material.g, material.b);
+    printf(",\"opacity\":%.6g", material.opacity);
+    printf(",\"roughness\":%.6g", material.roughness);
+    printf(",\"metalness\":%.6g", material.metalness);
+    printf(",\"specularFactor\":%.6g", material.specular_factor);
+    printf(",\"emissiveFactor\":%.6g", material.emissive_factor);
+    printf(",\"emissiveColor\":[%.6g,%.6g,%.6g]", material.emissive_r, material.emissive_g, material.emissive_b);
+    printf(",\"shaderType\":%d", material.shader_type);
+    printf(",\"shadingModel\":");
+    print_json_string(material.shading_model.c_str());
+    printf(",\"textures\":[");
     for (size_t texture_index = 0; texture_index < material.textures.size(); ++texture_index) {
       if (texture_index) putchar(',');
       print_json_string(material.textures[texture_index].c_str());
