@@ -2,14 +2,12 @@
 
 AssetAtlas is a desktop-first asset catalog and preview tool focused on local game/content pipelines.
 
-This repository currently contains multiple prototype tracks (web, Electron, Flutter desktop), with active development centered on the Flutter Windows desktop app.
+This repository is now focused on the Flutter Windows desktop app.
 
 ## Repository Layout
 
 - `work/asset_atlas_native/` - Primary active app (Flutter desktop, Windows-focused)
-- `work/asset-atlas/` - Web prototype
-- `work/asset-atlas-desktop/` - Electron prototype
-- `outputs/` - Built/exported artifacts from prior runs
+- `outputs/` - Build/export artifacts
 
 ## Recommended Starting Point
 
