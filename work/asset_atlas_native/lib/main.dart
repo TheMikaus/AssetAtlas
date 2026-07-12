@@ -154,6 +154,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
   final _modelValidationInFlight = <String>{};
   final Queue<AssetItem> _modelValidationQueue = Queue<AssetItem>();
   bool _processingModelValidationQueue = false;
+  final List<String> _assetHistory = <String>[];
+  int _assetHistoryIndex = -1;
+
+  bool get canGoBackInHistory => _assetHistoryIndex > 0;
+  bool get canGoForwardInHistory =>
+      _assetHistoryIndex >= 0 && _assetHistoryIndex < _assetHistory.length - 1;
 
   @override
   void initState() {
@@ -167,6 +173,103 @@ class _CatalogScreenState extends State<CatalogScreen> {
     } else {
       loadingPersisted = false;
     }
+  }
+
+  AssetItem? _assetById(String id) {
+    for (final asset in assets) {
+      if (asset.id == id) return asset;
+    }
+    return null;
+  }
+
+  void _seedHistoryWithActive() {
+    _assetHistory.clear();
+    if (active == null) {
+      _assetHistoryIndex = -1;
+      return;
+    }
+    _assetHistory.add(active!.id);
+    _assetHistoryIndex = 0;
+  }
+
+  void _pruneHistoryToVisibleAssets() {
+    if (_assetHistory.isEmpty) {
+      _assetHistoryIndex = -1;
+      return;
+    }
+
+    final activeHistoryId =
+        _assetHistoryIndex >= 0 && _assetHistoryIndex < _assetHistory.length
+        ? _assetHistory[_assetHistoryIndex]
+        : null;
+    final validAssetIds = assets.map((asset) => asset.id).toSet();
+    _assetHistory.removeWhere((id) => !validAssetIds.contains(id));
+
+    if (_assetHistory.isEmpty) {
+      _assetHistoryIndex = -1;
+      active = assets.isEmpty ? null : assets.first;
+      if (active != null) {
+        _assetHistory.add(active!.id);
+        _assetHistoryIndex = 0;
+      }
+      return;
+    }
+
+    if (activeHistoryId != null) {
+      final nextIndex = _assetHistory.indexOf(activeHistoryId);
+      if (nextIndex >= 0) {
+        _assetHistoryIndex = nextIndex;
+      } else {
+        _assetHistoryIndex = _assetHistory.length - 1;
+      }
+    } else {
+      _assetHistoryIndex = _assetHistory.length - 1;
+    }
+
+    final historyAsset = _assetById(_assetHistory[_assetHistoryIndex]);
+    if (historyAsset != null) {
+      active = historyAsset;
+    }
+  }
+
+  void _activateAsset(AssetItem asset, {bool addToHistory = true}) {
+    setState(() {
+      active = asset;
+      if (!addToHistory) return;
+
+      if (_assetHistoryIndex >= 0 &&
+          _assetHistoryIndex < _assetHistory.length - 1) {
+        _assetHistory.removeRange(_assetHistoryIndex + 1, _assetHistory.length);
+      }
+      if (_assetHistory.isNotEmpty && _assetHistory.last == asset.id) {
+        _assetHistoryIndex = _assetHistory.length - 1;
+        return;
+      }
+      _assetHistory.add(asset.id);
+      _assetHistoryIndex = _assetHistory.length - 1;
+    });
+  }
+
+  void _goBackHistory() {
+    if (!canGoBackInHistory) return;
+    final nextIndex = _assetHistoryIndex - 1;
+    final next = _assetById(_assetHistory[nextIndex]);
+    if (next == null) return;
+    setState(() {
+      _assetHistoryIndex = nextIndex;
+      active = next;
+    });
+  }
+
+  void _goForwardHistory() {
+    if (!canGoForwardInHistory) return;
+    final nextIndex = _assetHistoryIndex + 1;
+    final next = _assetById(_assetHistory[nextIndex]);
+    if (next == null) return;
+    setState(() {
+      _assetHistoryIndex = nextIndex;
+      active = next;
+    });
   }
 
   List<AssetItem> get filteredAssets {
@@ -254,6 +357,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ..addAll(snapshot.assets);
         modelHasValidTextures.clear();
         active = assets.isNotEmpty ? assets.first : null;
+        _seedHistoryWithActive();
         loadingPersisted = false;
         if (assets.isNotEmpty) {
           status = ScanStatus(
@@ -430,6 +534,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         (asset) => !assets.any((existing) => existing.id == asset.id),
       );
       active = result.assets.isNotEmpty ? result.assets.first : active;
+      _pruneHistoryToVisibleAssets();
       scanning = false;
       status = ScanStatus(
         'Scan complete',
@@ -459,6 +564,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       if (active?.sourceRoot == rootPath) {
         active = assets.isEmpty ? null : assets.first;
       }
+      _pruneHistoryToVisibleAssets();
     });
     unawaited(_persistCatalog());
   }
@@ -518,11 +624,15 @@ class _CatalogScreenState extends State<CatalogScreen> {
           HeaderBar(
             scanning: scanning,
             status: status,
+            canGoBack: canGoBackInHistory,
+            canGoForward: canGoForwardInHistory,
             onScan: chooseAndScan,
             onScanJuryRigs: scanJuryRigs,
             onSaveProject: saveProjectSnapshot,
             onLoadProject: loadProjectSnapshot,
             onCopySelected: copySelected,
+            onGoBack: _goBackHistory,
+            onGoForward: _goForwardHistory,
             selectedCount: selectedIds.length,
           ),
           Expanded(
@@ -567,6 +677,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                               child: PreviewPanel(
                                 asset: active,
                                 allAssets: assets,
+                                onActivateAsset: _activateAsset,
                               ),
                             ),
                             ListResizeHandle(
@@ -584,8 +695,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                 assets: visible,
                                 active: active,
                                 selectedIds: selectedIds,
-                                onActivate: (asset) =>
-                                    setState(() => active = asset),
+                                onActivate: _activateAsset,
                                 onSelect: toggleSelected,
                                 onIgnoredChanged: setIgnored,
                               ),
@@ -646,22 +756,30 @@ class HeaderBar extends StatelessWidget {
   const HeaderBar({
     required this.scanning,
     required this.status,
+    required this.canGoBack,
+    required this.canGoForward,
     required this.onScan,
     required this.onScanJuryRigs,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
+    required this.onGoBack,
+    required this.onGoForward,
     required this.selectedCount,
     super.key,
   });
 
   final bool scanning;
   final ScanStatus status;
+  final bool canGoBack;
+  final bool canGoForward;
   final VoidCallback onScan;
   final VoidCallback onScanJuryRigs;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
+  final VoidCallback onGoBack;
+  final VoidCallback onGoForward;
   final int selectedCount;
 
   @override
@@ -680,12 +798,16 @@ class HeaderBar extends StatelessWidget {
           final statusView = _StatusView(status: status, scanning: scanning);
           final actions = _HeaderActions(
             scanning: scanning,
+            canGoBack: canGoBack,
+            canGoForward: canGoForward,
             selectedCount: selectedCount,
             onScan: onScan,
             onScanJuryRigs: onScanJuryRigs,
             onSaveProject: onSaveProject,
             onLoadProject: onLoadProject,
             onCopySelected: onCopySelected,
+            onGoBack: onGoBack,
+            onGoForward: onGoForward,
           );
 
           if (constraints.maxWidth < 1080) {
@@ -775,21 +897,29 @@ class _StatusView extends StatelessWidget {
 class _HeaderActions extends StatelessWidget {
   const _HeaderActions({
     required this.scanning,
+    required this.canGoBack,
+    required this.canGoForward,
     required this.selectedCount,
     required this.onScan,
     required this.onScanJuryRigs,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
+    required this.onGoBack,
+    required this.onGoForward,
   });
 
   final bool scanning;
+  final bool canGoBack;
+  final bool canGoForward;
   final int selectedCount;
   final VoidCallback onScan;
   final VoidCallback onScanJuryRigs;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
+  final VoidCallback onGoBack;
+  final VoidCallback onGoForward;
 
   @override
   Widget build(BuildContext context) {
@@ -797,6 +927,16 @@ class _HeaderActions extends StatelessWidget {
       spacing: 8,
       runSpacing: 8,
       children: [
+        IconButton(
+          tooltip: 'Previous asset',
+          onPressed: canGoBack ? onGoBack : null,
+          icon: const Icon(Icons.arrow_back),
+        ),
+        IconButton(
+          tooltip: 'Next asset',
+          onPressed: canGoForward ? onGoForward : null,
+          icon: const Icon(Icons.arrow_forward),
+        ),
         OutlinedButton.icon(
           onPressed: scanning ? null : onScanJuryRigs,
           icon: const Icon(Icons.bolt_outlined),
@@ -1054,10 +1194,16 @@ class AssetList extends StatelessWidget {
 }
 
 class PreviewPanel extends StatefulWidget {
-  const PreviewPanel({required this.asset, required this.allAssets, super.key});
+  const PreviewPanel({
+    required this.asset,
+    required this.allAssets,
+    required this.onActivateAsset,
+    super.key,
+  });
 
   final AssetItem? asset;
   final List<AssetItem> allAssets;
+  final ValueChanged<AssetItem> onActivateAsset;
 
   @override
   State<PreviewPanel> createState() => _PreviewPanelState();
@@ -1105,6 +1251,7 @@ class _PreviewPanelState extends State<PreviewPanel> {
                 child: AssetDetailsPanel(
                   item: item,
                   allAssets: widget.allAssets,
+                  onActivateAsset: widget.onActivateAsset,
                 ),
               ),
             ],
@@ -1543,6 +1690,7 @@ class MeshPainter extends CustomPainter {
         final p0 = projected[face.indices[0]];
         final p1 = projected[face.indices[1]];
         final p2 = projected[face.indices[2]];
+        final vertexTint = mesh.averageFaceVertexColor(face);
         final texturedBase = Path()
           ..moveTo(p0.x, p0.y)
           ..lineTo(p1.x, p1.y)
@@ -1551,10 +1699,14 @@ class MeshPainter extends CustomPainter {
 
         // Lay down an opaque base first so transparent texels don't punch
         // through to the clear background.
-        facePaint.color = mesh.colorForMaterial(
+        var baseColor = mesh.colorForMaterial(
           face.materialIndex,
           textured: false,
         );
+        if (vertexTint != null) {
+          baseColor = _multiplyColor(baseColor, vertexTint);
+        }
+        facePaint.color = baseColor;
         canvas.drawPath(texturedBase, facePaint);
 
         _drawTexturedTriangle(
@@ -1567,6 +1719,14 @@ class MeshPainter extends CustomPainter {
           uvB: face.uvs[1],
           uvC: face.uvs[2],
         );
+        if (vertexTint != null && !_isApproximatelyWhite(vertexTint)) {
+          canvas.drawPath(
+            texturedBase,
+            Paint()
+              ..color = vertexTint
+              ..blendMode = BlendMode.modulate,
+          );
+        }
         if (drawEdges) {
           canvas.drawPath(
             Path()
@@ -1588,18 +1748,46 @@ class MeshPainter extends CustomPainter {
       }
       path.close();
       if (renderMode != RenderMode.wireframe) {
-        facePaint.color = mesh
-            .colorForMaterial(
-              face.materialIndex,
-              textured: renderMode == RenderMode.textured,
-            )
-            .withValues(alpha: renderMode == RenderMode.textured ? .92 : 1.0);
+        var faceColor = mesh.colorForMaterial(
+          face.materialIndex,
+          textured: renderMode == RenderMode.textured,
+        );
+        final vertexTint = mesh.averageFaceVertexColor(face);
+        if (vertexTint != null) {
+          faceColor = _multiplyColor(faceColor, vertexTint);
+        }
+        facePaint.color = faceColor.withValues(
+          alpha: renderMode == RenderMode.textured ? .92 : 1.0,
+        );
         canvas.drawPath(path, facePaint);
       }
       if (drawEdges) {
         canvas.drawPath(path, edgePaint);
       }
     }
+  }
+
+  static bool _isApproximatelyWhite(Color color) {
+    final red = (color.r * 255).round().clamp(0, 255);
+    final green = (color.g * 255).round().clamp(0, 255);
+    final blue = (color.b * 255).round().clamp(0, 255);
+    return red >= 250 && green >= 250 && blue >= 250;
+  }
+
+  static Color _multiplyColor(Color a, Color b) {
+    final aAlpha = (a.a * 255).round().clamp(0, 255);
+    final aRed = (a.r * 255).round().clamp(0, 255);
+    final aGreen = (a.g * 255).round().clamp(0, 255);
+    final aBlue = (a.b * 255).round().clamp(0, 255);
+    final bAlpha = (b.a * 255).round().clamp(0, 255);
+    final bRed = (b.r * 255).round().clamp(0, 255);
+    final bGreen = (b.g * 255).round().clamp(0, 255);
+    final bBlue = (b.b * 255).round().clamp(0, 255);
+    final alpha = (aAlpha * bAlpha / 255).round();
+    final red = (aRed * bRed / 255).round();
+    final green = (aGreen * bGreen / 255).round();
+    final blue = (aBlue * bBlue / 255).round();
+    return Color.fromARGB(alpha, red, green, blue);
   }
 
   static void _drawTexturedTriangle(
@@ -1738,11 +1926,13 @@ class AssetDetailsPanel extends StatelessWidget {
   const AssetDetailsPanel({
     required this.item,
     required this.allAssets,
+    required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem item;
   final List<AssetItem> allAssets;
+  final ValueChanged<AssetItem> onActivateAsset;
 
   @override
   Widget build(BuildContext context) {
@@ -1802,7 +1992,11 @@ class AssetDetailsPanel extends StatelessWidget {
             ),
             if (item.type == 'model') ...[
               const SizedBox(height: 14),
-              ModelTextureDiagnostics(asset: item, allAssets: allAssets),
+              ModelTextureDiagnostics(
+                asset: item,
+                allAssets: allAssets,
+                onActivateAsset: onActivateAsset,
+              ),
             ],
           ],
         ),
@@ -1845,24 +2039,39 @@ class ModelTextureDiagnostics extends StatelessWidget {
   const ModelTextureDiagnostics({
     required this.asset,
     required this.allAssets,
+    required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+  final ValueChanged<AssetItem> onActivateAsset;
 
   @override
   Widget build(BuildContext context) {
     final nearby = findNearbyTextures(asset, allAssets);
     if (asset.ext == 'fbx') {
-      return FutureBuilder<List<String>>(
-        future: loadModelTextureReferences(asset, allAssets),
+      return FutureBuilder<List<TextureDiscoveryEntry>>(
+        future: loadModelTextureReferenceEntries(asset, allAssets),
         builder: (context, snapshot) {
-          final referenced = snapshot.data ?? const <String>[];
-          final combined = <String>{
-            ...referenced,
-            ...nearby.map((asset) => asset.relativePath),
-          }.toList();
+          final referenced = snapshot.data ?? const <TextureDiscoveryEntry>[];
+          final pathKeys = referenced
+              .where((entry) => entry.copyPath.isNotEmpty)
+              .map((entry) => normalizePathKey(entry.copyPath))
+              .toSet();
+          final nearbyEntries = nearby
+              .where(
+                (texture) => !pathKeys.contains(normalizePathKey(texture.path)),
+              )
+              .map(
+                (texture) => TextureDiscoveryEntry(
+                  label: texture.relativePath,
+                  copyPath: texture.path,
+                  jumpAsset: texture,
+                ),
+              )
+              .toList();
+          final combined = [...referenced, ...nearbyEntries];
           return TextureDiscoveryBox(
             title: snapshot.connectionState == ConnectionState.done
                 ? 'Texture discovery'
@@ -1870,7 +2079,8 @@ class ModelTextureDiagnostics extends StatelessWidget {
             message: combined.isEmpty
                 ? 'No FBX texture references or nearby scanned textures found. The material may be embedded, procedural, or untextured.'
                 : '${referenced.length} FBX references · ${nearby.length} nearby scanned candidates.',
-            paths: combined,
+            entries: combined,
+            onActivateAsset: onActivateAsset,
           );
         },
       );
@@ -1880,22 +2090,45 @@ class ModelTextureDiagnostics extends StatelessWidget {
       message: nearby.isEmpty
           ? 'No scanned nearby textures found. For FBX this usually means textures are embedded, missing, or in a folder not scanned yet.'
           : '${nearby.length} nearby texture candidates found.',
-      paths: nearby.map((texture) => texture.relativePath).toList(),
+      entries: nearby
+          .map(
+            (texture) => TextureDiscoveryEntry(
+              label: texture.relativePath,
+              copyPath: texture.path,
+              jumpAsset: texture,
+            ),
+          )
+          .toList(),
+      onActivateAsset: onActivateAsset,
     );
   }
+}
+
+class TextureDiscoveryEntry {
+  const TextureDiscoveryEntry({
+    required this.label,
+    required this.copyPath,
+    this.jumpAsset,
+  });
+
+  final String label;
+  final String copyPath;
+  final AssetItem? jumpAsset;
 }
 
 class TextureDiscoveryBox extends StatelessWidget {
   const TextureDiscoveryBox({
     required this.title,
     required this.message,
-    required this.paths,
+    required this.entries,
+    required this.onActivateAsset,
     super.key,
   });
 
   final String title;
   final String message;
-  final List<String> paths;
+  final List<TextureDiscoveryEntry> entries;
+  final ValueChanged<AssetItem> onActivateAsset;
 
   String _copyablePath(String value) {
     var path = value;
@@ -1926,21 +2159,45 @@ class TextureDiscoveryBox extends StatelessWidget {
             const SizedBox(height: 6),
             Text(message, style: const TextStyle(color: Colors.black54)),
             const SizedBox(height: 8),
-            for (final path in paths.take(10))
+            for (final entry in entries.take(10))
               Row(
                 children: [
                   Expanded(
-                    child: Text(
-                      path,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                    child: InkWell(
+                      onTap: entry.jumpAsset == null
+                          ? null
+                          : () => onActivateAsset(entry.jumpAsset!),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Text(
+                          entry.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: entry.jumpAsset == null
+                                ? Colors.black87
+                                : Theme.of(context).colorScheme.primary,
+                            decoration: entry.jumpAsset == null
+                                ? TextDecoration.none
+                                : TextDecoration.underline,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
+                  if (entry.jumpAsset != null)
+                    IconButton(
+                      tooltip: 'Open texture asset',
+                      icon: const Icon(Icons.open_in_new, size: 16),
+                      onPressed: () => onActivateAsset(entry.jumpAsset!),
+                    ),
                   IconButton(
                     tooltip: 'Copy texture path',
                     icon: const Icon(Icons.content_copy, size: 16),
                     onPressed: () async {
-                      final copyPath = _copyablePath(path);
+                      final copyPath = entry.copyPath.isEmpty
+                          ? _copyablePath(entry.label)
+                          : entry.copyPath;
                       if (copyPath.isEmpty) return;
                       await Clipboard.setData(ClipboardData(text: copyPath));
                       if (!context.mounted) return;
@@ -1962,6 +2219,14 @@ Future<List<String>> loadModelTextureReferences(
   AssetItem asset,
   List<AssetItem> allAssets,
 ) async {
+  final entries = await loadModelTextureReferenceEntries(asset, allAssets);
+  return entries.map((entry) => entry.label).toList();
+}
+
+Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
+  AssetItem asset,
+  List<AssetItem> allAssets,
+) async {
   if (asset.ext != 'fbx') return const [];
   final mesh = await importFbxWithUfbx(
     asset.path,
@@ -1975,12 +2240,34 @@ Future<List<String>> loadModelTextureReferences(
       allAssets: allAssets,
       allowFallbackLookup: false,
     );
-    final exists = resolved != null && File(resolved).existsSync();
-    if (resolved == null || resolved == path) {
-      return '$path ${exists ? "(found)" : "(missing)"}';
+    final existingPath = resolved ?? path;
+    final exists = File(existingPath).existsSync();
+    AssetItem? jumpAsset;
+    if (exists) {
+      final key = normalizePathKey(existingPath);
+      for (final candidate in allAssets) {
+        if (normalizePathKey(candidate.path) == key) {
+          jumpAsset = candidate;
+          break;
+        }
+      }
     }
-    return '$path -> $resolved ${exists ? "(found)" : "(missing)"}';
+    late final String label;
+    if (resolved == null || resolved == path) {
+      label = '$path ${exists ? "(found)" : "(missing)"}';
+    } else {
+      label = '$path -> $resolved ${exists ? "(found)" : "(missing)"}';
+    }
+    return TextureDiscoveryEntry(
+      label: label,
+      copyPath: existingPath,
+      jumpAsset: jumpAsset,
+    );
   }).toList();
+}
+
+String normalizePathKey(String value) {
+  return value.trim().toLowerCase().replaceAll('/', '\\');
 }
 
 String? resolveTextureReference(
@@ -2498,7 +2785,7 @@ Future<MeshModel> importFbxWithUfbx(
 
   final json = jsonDecode(result.stdout as String) as Map<String, dynamic>;
   fbxLog(
-    'Importer JSON counts: vertices=${(json['vertices'] as List<dynamic>?)?.length ?? 0}, faces=${(json['faces'] as List<dynamic>?)?.length ?? 0}, materials=${(json['materials'] as List<dynamic>?)?.length ?? 0}, textureFiles=${(json['textureFiles'] as List<dynamic>?)?.length ?? 0}, sceneTextures=${(json['sceneTextures'] as List<dynamic>?)?.length ?? 0}',
+    'Importer JSON counts: vertices=${(json['vertices'] as List<dynamic>?)?.length ?? 0}, vertexColors=${(json['vertexColors'] as List<dynamic>?)?.length ?? 0}, faces=${(json['faces'] as List<dynamic>?)?.length ?? 0}, materials=${(json['materials'] as List<dynamic>?)?.length ?? 0}, textureFiles=${(json['textureFiles'] as List<dynamic>?)?.length ?? 0}, sceneTextures=${(json['sceneTextures'] as List<dynamic>?)?.length ?? 0}',
   );
   return meshModelFromImporterJson(
     json,
@@ -2551,6 +2838,29 @@ Future<MeshModel> meshModelFromImporterJson(
           : const [],
     );
   }).toList();
+  final vertexColors = ((json['vertexColors'] as List<dynamic>?) ?? const [])
+      .map((item) {
+        final values = item as List<dynamic>;
+        final r = (((values[0] as num).toDouble()).clamp(0, 1) * 255).round();
+        final g = (((values[1] as num).toDouble()).clamp(0, 1) * 255).round();
+        final b = (((values[2] as num).toDouble()).clamp(0, 1) * 255).round();
+        final a = values.length > 3
+            ? (((values[3] as num).toDouble()).clamp(0, 1) * 255).round()
+            : 255;
+        return Color.fromARGB(a, r, g, b);
+      })
+      .toList();
+  final nonWhiteVertexColors = vertexColors.where((color) {
+    final r = (color.r * 255).round().clamp(0, 255);
+    final g = (color.g * 255).round().clamp(0, 255);
+    final b = (color.b * 255).round().clamp(0, 255);
+    return r < 250 || g < 250 || b < 250;
+  }).length;
+  if (vertexColors.isNotEmpty) {
+    fbxLog(
+      'Vertex color stats for $name: total=${vertexColors.length}, nonWhite=$nonWhiteVertexColors',
+    );
+  }
   final materials = <MeshMaterial>[];
   for (final item in ((json['materials'] as List<dynamic>?) ?? const [])) {
     final material = item as Map<String, dynamic>;
@@ -2688,7 +2998,7 @@ Future<MeshModel> meshModelFromImporterJson(
       .where((material) => material.textureImage != null)
       .length;
   fbxLog(
-    'Mesh summary for $name: vertices=${vertices.length}, faces=${faces.length}, uvFaces=$uvFaces, materials=${materials.length}, texturedMaterials=$texturedMaterials',
+    'Mesh summary for $name: vertices=${vertices.length}, faces=${faces.length}, uvFaces=$uvFaces, materials=${materials.length}, texturedMaterials=$texturedMaterials, vertexColors=${vertexColors.length}, nonWhiteVertexColors=$nonWhiteVertexColors',
   );
   return MeshModel(
     name: name,
@@ -2696,6 +3006,7 @@ Future<MeshModel> meshModelFromImporterJson(
     faces: faces,
     materials: materials,
     textureFiles: textureFiles,
+    vertexColors: vertexColors,
   );
 }
 
@@ -3169,12 +3480,14 @@ class MeshModel {
     required this.faces,
     this.materials = const [],
     this.textureFiles = const [],
+    this.vertexColors = const [],
   });
 
   factory MeshModel.normalized({
     required String name,
     required List<Vec3> vertices,
     required List<MeshFace> faces,
+    List<Color> vertexColors = const [],
   }) {
     var minX = double.infinity;
     var minY = double.infinity;
@@ -3213,6 +3526,7 @@ class MeshModel {
           )
           .toList(),
       faces: faces,
+      vertexColors: vertexColors,
     );
   }
 
@@ -3221,6 +3535,7 @@ class MeshModel {
   final List<MeshFace> faces;
   final List<MeshMaterial> materials;
   final List<String> textureFiles;
+  final List<Color> vertexColors;
 
   Color colorForMaterial(int materialIndex, {bool textured = false}) {
     if (materialIndex >= 0 && materialIndex < materials.length) {
@@ -3240,6 +3555,32 @@ class MeshModel {
       paths.addAll(material.resolvedTextures);
     }
     return paths.where((path) => path.trim().isNotEmpty).toList();
+  }
+
+  Color? averageFaceVertexColor(MeshFace face) {
+    if (vertexColors.length != vertices.length) return null;
+    if (face.indices.isEmpty) return null;
+    var red = 0;
+    var green = 0;
+    var blue = 0;
+    var alpha = 0;
+    var count = 0;
+    for (final index in face.indices) {
+      if (index < 0 || index >= vertexColors.length) continue;
+      final color = vertexColors[index];
+      red += (color.r * 255).round().clamp(0, 255);
+      green += (color.g * 255).round().clamp(0, 255);
+      blue += (color.b * 255).round().clamp(0, 255);
+      alpha += (color.a * 255).round().clamp(0, 255);
+      count += 1;
+    }
+    if (count == 0) return null;
+    return Color.fromARGB(
+      (alpha / count).round(),
+      (red / count).round(),
+      (green / count).round(),
+      (blue / count).round(),
+    );
   }
 }
 

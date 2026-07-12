@@ -14,6 +14,13 @@ struct Vec3 {
   double z;
 };
 
+struct Vec4 {
+  double x;
+  double y;
+  double z;
+  double w;
+};
+
 struct Face {
   int a;
   int b;
@@ -92,6 +99,7 @@ int main(int argc, char** argv) {
   }
 
   std::vector<Vec3> vertices;
+  std::vector<Vec4> vertex_colors;
   std::vector<Face> faces;
   std::vector<MaterialInfo> materials;
   std::vector<SceneTextureInfo> scene_textures;
@@ -155,6 +163,12 @@ int main(int argc, char** argv) {
           unsigned int vertex_index = tri_indices[tri * 3 + corner];
           ufbx_vec3 p = ufbx_get_vertex_vec3(&mesh->vertex_position, vertex_index);
           vertices.push_back({p.x, p.y, p.z});
+          Vec4 color = {1.0, 1.0, 1.0, 1.0};
+          if (mesh->vertex_color.exists) {
+            ufbx_vec4 c = ufbx_get_vertex_vec4(&mesh->vertex_color, vertex_index);
+            color = {c.x, c.y, c.z, c.w};
+          }
+          vertex_colors.push_back(color);
           if (mesh->vertex_uv.exists) {
             ufbx_vec2 uv = ufbx_get_vertex_vec2(&mesh->vertex_uv, vertex_index);
             tri_uvs[corner * 2 + 0] = uv.x;
@@ -209,6 +223,12 @@ int main(int argc, char** argv) {
     const Vec3& v = vertices[i];
     if (i) putchar(',');
     printf("[%.9g,%.9g,%.9g]", v.x, v.y, v.z);
+  }
+  printf("],\"vertexColors\":[");
+  for (size_t i = 0; i < vertex_colors.size(); ++i) {
+    const Vec4& c = vertex_colors[i];
+    if (i) putchar(',');
+    printf("[%.9g,%.9g,%.9g,%.9g]", c.x, c.y, c.z, c.w);
   }
   printf("],\"faces\":[");
   for (size_t i = 0; i < faces.size(); ++i) {
