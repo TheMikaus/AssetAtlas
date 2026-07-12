@@ -130,16 +130,9 @@ Note: Model rendering currently focuses on mesh visualization and diagnostics, n
 - Project management is minimal (no rename/delete/history UI yet).
 - Textured preview uses triangle-affine UV mapping, so perspective-heavy assets may still show minor distortion at extreme camera angles.
 - Large-folder indexing can block UI responsiveness during heavy scans.
-- Desktop package/build pipeline has not been formalized for this Flutter track.
 
 ## Immediate Next Priorities
 
 1. Add project rename/delete/history UI and guards around duplicate names.
 2. Move folder scanning and mesh parsing into background isolates for responsiveness.
 3. Expand regression tests to include project save/load flows.
-4. Formalize desktop packaging/release steps for this Flutter track.
-
-## Related Tracks
-
-- Web prototype: [../asset-atlas/README.md](../asset-atlas/README.md)
-- Electron desktop prototype: [../../outputs/asset-atlas-desktop/README.md](../../outputs/asset-atlas-desktop/README.md)
