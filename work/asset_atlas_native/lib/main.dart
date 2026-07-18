@@ -8,6 +8,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:audioplayers/audioplayers.dart';
+import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -45,6 +46,11 @@ const textureExts = {
 };
 const audioExts = {'wav', 'mp3', 'flac', 'ogg', 'midi', 'mid'};
 const modelExts = {'obj', 'fbx', 'gltf', 'glb', 'blend', 'dae', 'stl'};
+const archiveExts = {'zip'};
+const maxZipIntrospectionBytes = 128 * 1024 * 1024;
+const maxZipEntriesToInspect = 25000;
+const maxZipArchiveCacheEntries = 8;
+const appVersion = '1.1.0';
 const enableFbxLogs = true;
 String fbxLogFilePath =
     '${Directory.systemTemp.path}${Platform.pathSeparator}asset_atlas_fbx.log';
@@ -141,12 +147,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
   final searchController = TextEditingController();
 
   AssetItem? active;
+  String? activeProjectId;
   String? activeProjectName;
   bool loadingPersisted = true;
   String query = '';
   String typeFilter = 'all';
   String modelTextureFilter = 'all';
   bool hideIgnored = true;
+  bool hideZipAssets = false;
   bool scanning = false;
   double assetListHeight = 280;
   ScanStatus status = const ScanStatus('Ready', 'Choose a folder to catalog.');
@@ -276,6 +284,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final lower = query.trim().toLowerCase();
     return assets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
+      if (hideZipAssets && isZipVirtualPath(asset.path)) return false;
       if (typeFilter != 'all' && asset.type != typeFilter) return false;
       if (asset.type == 'model' && modelTextureFilter != 'all') {
         final hasValid = modelHasValidTextures[asset.id];
@@ -297,7 +306,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   void _scheduleModelTextureValidation([Iterable<AssetItem>? subset]) {
     if (modelTextureFilter == 'all') return;
-    final models = (subset ?? assets).where((asset) => asset.type == 'model');
+    final models = (subset ?? assets).where(
+      (asset) =>
+          asset.type == 'model' &&
+          !(hideZipAssets && isZipVirtualPath(asset.path)),
+    );
     for (final asset in models) {
       if (modelHasValidTextures.containsKey(asset.id)) continue;
       if (_modelValidationInFlight.contains(asset.id)) continue;
@@ -421,17 +434,51 @@ class _CatalogScreenState extends State<CatalogScreen> {
     controller.dispose();
 
     if (!mounted || projectName == null || projectName.isEmpty) return;
-    final projectId = await db.saveProject(
-      name: projectName,
-      rootPath: sourceRoots.isEmpty ? null : sourceRoots.first,
+
+    final existing = await db.findProjectByName(projectName);
+    if (!mounted) return;
+
+    final canRenameActiveProject =
+        activeProjectId != null && existing?.id == activeProjectId;
+    if (existing != null && !canRenameActiveProject) {
+      setState(() {
+        status = const ScanStatus(
+          'Project name already exists',
+          'Use a different name or load/update the existing project.',
+        );
+      });
+      return;
+    }
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final rootPath = sourceRoots.isEmpty ? null : sourceRoots.first;
+    final shouldUpdate = activeProjectId != null;
+    final projectId = shouldUpdate
+        ? activeProjectId!
+        : await db.saveProject(
+            name: projectName,
+            rootPath: rootPath,
+            createdMs: now,
+          );
+    if (shouldUpdate) {
+      await db.updateProject(
+        projectId: projectId,
+        name: projectName,
+        rootPath: rootPath,
+      );
+    }
+    await db.replaceProjectAssetIds(
+      projectId: projectId,
       assetIds: selectedIds.toList(),
     );
+
     if (!mounted) return;
     setState(() {
+      activeProjectId = projectId;
       activeProjectName = projectName;
       status = ScanStatus(
-        'Project saved',
-        '$projectName (${selectedIds.length} selected assets, id $projectId)',
+        shouldUpdate ? 'Project updated' : 'Project saved',
+        '$projectName (${selectedIds.length} selected assets)',
       );
     });
   }
@@ -447,41 +494,206 @@ class _CatalogScreenState extends State<CatalogScreen> {
       return;
     }
 
-    final projects = await db.listProjects();
-    if (!mounted) return;
-    if (projects.isEmpty) {
+    while (mounted) {
+      final projects = await db.listProjects();
+      if (!mounted) return;
+      if (projects.isEmpty) {
+        setState(() {
+          status = const ScanStatus('No projects', 'Save a project first.');
+          activeProjectId = null;
+          activeProjectName = null;
+        });
+        return;
+      }
+
+      final result = await showDialog<_ProjectDialogResult>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Load Project Snapshot'),
+          content: SizedBox(
+            width: 560,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: projects.length,
+              itemBuilder: (context, index) {
+                final project = projects[index];
+                final isActive = project.id == activeProjectId;
+                return ListTile(
+                  title: Text(project.name),
+                  subtitle: Text(
+                    project.rootPath == null
+                        ? 'No root path'
+                        : 'Root: ${project.rootPath}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  leading: isActive
+                      ? const Icon(Icons.radio_button_checked)
+                      : const Icon(Icons.bookmark_border),
+                  onTap: () {
+                    Navigator.of(context).pop(
+                      _ProjectDialogResult(
+                        action: _ProjectDialogAction.load,
+                        project: project,
+                      ),
+                    );
+                  },
+                  trailing: Wrap(
+                    spacing: 2,
+                    children: [
+                      IconButton(
+                        tooltip: 'Rename project',
+                        onPressed: () {
+                          Navigator.of(context).pop(
+                            _ProjectDialogResult(
+                              action: _ProjectDialogAction.rename,
+                              project: project,
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.drive_file_rename_outline),
+                      ),
+                      IconButton(
+                        tooltip: 'Delete project',
+                        onPressed: () {
+                          Navigator.of(context).pop(
+                            _ProjectDialogResult(
+                              action: _ProjectDialogAction.delete,
+                              project: project,
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+
+      if (!mounted || result == null) return;
+      if (result.action == _ProjectDialogAction.rename) {
+        await _renameProject(result.project);
+        continue;
+      }
+      if (result.action == _ProjectDialogAction.delete) {
+        await _deleteProject(result.project);
+        continue;
+      }
+
+      final loadedAssetIds = await db.loadProjectAssetIds(result.project.id);
+      if (!mounted) return;
       setState(() {
-        status = const ScanStatus('No projects', 'Save a project first.');
+        selectedIds
+          ..clear()
+          ..addAll(
+            loadedAssetIds.where((id) => assets.any((asset) => asset.id == id)),
+          );
+        activeProjectId = result.project.id;
+        activeProjectName = result.project.name;
+        status = ScanStatus(
+          'Project loaded',
+          '${result.project.name} (${selectedIds.length} selected assets)',
+        );
+      });
+      return;
+    }
+  }
+
+  Future<void> _renameProject(PersistedProject project) async {
+    final controller = TextEditingController(text: project.name);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rename Project'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: 'Project name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('Rename'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (!mounted ||
+        newName == null ||
+        newName.isEmpty ||
+        newName == project.name) {
+      return;
+    }
+
+    final duplicate = await db.findProjectByName(newName);
+    if (!mounted) return;
+    if (duplicate != null && duplicate.id != project.id) {
+      setState(() {
+        status = const ScanStatus(
+          'Project name already exists',
+          'Use a unique name before renaming.',
+        );
       });
       return;
     }
 
-    final chosen = await showDialog<PersistedProject>(
+    await db.updateProject(
+      projectId: project.id,
+      name: newName,
+      rootPath: project.rootPath,
+    );
+    if (!mounted) return;
+    setState(() {
+      if (activeProjectId == project.id) {
+        activeProjectName = newName;
+      }
+      status = ScanStatus('Project renamed', '$newName updated successfully.');
+    });
+  }
+
+  Future<void> _deleteProject(PersistedProject project) async {
+    final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => SimpleDialog(
-        title: const Text('Load Project Snapshot'),
-        children: [
-          for (final project in projects)
-            SimpleDialogOption(
-              onPressed: () => Navigator.of(context).pop(project),
-              child: Text(project.name),
-            ),
+      builder: (context) => AlertDialog(
+        title: const Text('Delete Project'),
+        content: Text('Delete ${project.name}? This removes saved membership.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
         ],
       ),
     );
-    if (!mounted || chosen == null) return;
+    if (!mounted || confirmed != true) return;
 
-    final loadedAssetIds = await db.loadProjectAssetIds(chosen.id);
+    await db.deleteProject(project.id);
     if (!mounted) return;
     setState(() {
-      selectedIds
-        ..clear()
-        ..addAll(loadedAssetIds.where((id) => assets.any((a) => a.id == id)));
-      activeProjectName = chosen.name;
-      status = ScanStatus(
-        'Project loaded',
-        '${chosen.name} (${selectedIds.length} selected assets)',
-      );
+      if (activeProjectId == project.id) {
+        activeProjectId = null;
+        activeProjectName = null;
+      }
+      status = ScanStatus('Project deleted', '${project.name} removed.');
     });
   }
 
@@ -642,6 +854,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   typeFilter: typeFilter,
                   modelTextureFilter: modelTextureFilter,
                   hideIgnored: hideIgnored,
+                  hideZipAssets: hideZipAssets,
                   sourceRoots: sourceRoots.toList()..sort(),
                   onTypeChanged: (value) => setState(() => typeFilter = value),
                   onModelTextureFilterChanged: (value) {
@@ -658,6 +871,24 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   },
                   onHideIgnoredChanged: (value) =>
                       setState(() => hideIgnored = value),
+                  onHideZipAssetsChanged: (value) {
+                    setState(() {
+                      hideZipAssets = value;
+                      if (value &&
+                          active != null &&
+                          isZipVirtualPath(active!.path)) {
+                        active = assets
+                            .where((asset) => !isZipVirtualPath(asset.path))
+                            .firstOrNull;
+                        _seedHistoryWithActive();
+                      }
+                      if (value) {
+                        _modelValidationQueue.removeWhere(
+                          (asset) => isZipVirtualPath(asset.path),
+                        );
+                      }
+                    });
+                  },
                   onRemoveSource: removeSource,
                 ),
                 Expanded(
@@ -850,7 +1081,7 @@ class _HeaderTitle extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Asset Atlas Native',
+              'Asset Atlas Native · v$appVersion',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
             ),
             Text(
@@ -962,10 +1193,12 @@ class FilterPanel extends StatelessWidget {
     required this.typeFilter,
     required this.modelTextureFilter,
     required this.hideIgnored,
+    required this.hideZipAssets,
     required this.sourceRoots,
     required this.onTypeChanged,
     required this.onModelTextureFilterChanged,
     required this.onHideIgnoredChanged,
+    required this.onHideZipAssetsChanged,
     required this.onRemoveSource,
     super.key,
   });
@@ -974,10 +1207,12 @@ class FilterPanel extends StatelessWidget {
   final String typeFilter;
   final String modelTextureFilter;
   final bool hideIgnored;
+  final bool hideZipAssets;
   final List<String> sourceRoots;
   final ValueChanged<String> onTypeChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
   final ValueChanged<bool> onHideIgnoredChanged;
+  final ValueChanged<bool> onHideZipAssetsChanged;
   final ValueChanged<String> onRemoveSource;
 
   @override
@@ -1028,6 +1263,14 @@ class FilterPanel extends StatelessWidget {
               contentPadding: EdgeInsets.zero,
               title: const Text('Hide ignored'),
               onChanged: (value) => onHideIgnoredChanged(value ?? true),
+            ),
+            CheckboxListTile(
+              dense: true,
+              value: hideZipAssets,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Hide ZIP contents'),
+              subtitle: const Text('Exclude assets indexed inside archives'),
+              onChanged: (value) => onHideZipAssetsChanged(value ?? true),
             ),
             const Divider(height: 28),
             const Text(
@@ -1252,6 +1495,39 @@ class _PreviewPanelState extends State<PreviewPanel> {
 
   Widget _previewFor(AssetItem item) {
     if (item.type == 'image') {
+      if (isZipVirtualPath(item.path)) {
+        return FutureBuilder<Uint8List?>(
+          future: readZipVirtualAssetBytesByPath(item.path),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final bytes = snapshot.data;
+            if (bytes == null || bytes.isEmpty) {
+              return const Center(
+                child: Text('Could not read image bytes from ZIP entry.'),
+              );
+            }
+            return ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: ColoredBox(
+                color: const Color(0xffe9edf3),
+                child: Center(
+                  child: InteractiveViewer(
+                    child: Image.memory(
+                      bytes,
+                      fit: BoxFit.contain,
+                      errorBuilder: (_, error, _) =>
+                          Text('Image failed to load: $error'),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      }
+
       return ClipRRect(
         borderRadius: BorderRadius.circular(8),
         child: ColoredBox(
@@ -1271,6 +1547,11 @@ class _PreviewPanelState extends State<PreviewPanel> {
     }
 
     if (item.type == 'model') {
+      if (isZipVirtualPath(item.path) &&
+          item.ext != 'obj' &&
+          item.ext != 'fbx') {
+        return _unsupportedZipModelPreview(item);
+      }
       return ModelPreview(asset: item, allAssets: widget.allAssets);
     }
 
@@ -1281,6 +1562,28 @@ class _PreviewPanelState extends State<PreviewPanel> {
         color: const Color(0xfff2f5f9),
       ),
       child: AudioPreview(asset: item),
+    );
+  }
+
+  Widget _unsupportedZipModelPreview(AssetItem item) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(8),
+        color: const Color(0xfff2f5f9),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Text(
+            'Preview for ${item.ext.toUpperCase()} inside ZIP is not available yet.\n'
+            'Images, audio, and OBJ entries preview in-memory.\n'
+            'Use Copy to extract this asset if you need external-tool preview.',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.black54),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -1346,6 +1649,14 @@ class _AudioPreviewState extends State<AudioPreview> {
   Future<void> playPause() async {
     if (state == PlayerState.playing) {
       await player.pause();
+      return;
+    }
+    if (isZipVirtualPath(widget.asset.path)) {
+      final bytes = await readZipVirtualAssetBytesByPath(widget.asset.path);
+      if (bytes == null || bytes.isEmpty) {
+        return;
+      }
+      await player.play(BytesSource(bytes));
       return;
     }
     await player.play(DeviceFileSource(widget.asset.path));
@@ -1428,6 +1739,8 @@ class _ModelPreviewState extends State<ModelPreview> {
   double zoom = 1;
   RenderMode renderMode = RenderMode.textured;
   int checkerSquareSize = 16;
+  String? uvSetOverride;
+  LightingMode lightingMode = LightingMode.corner;
 
   Future<MeshModel> _loadCurrentMesh() {
     return loadMesh(
@@ -1452,6 +1765,7 @@ class _ModelPreviewState extends State<ModelPreview> {
       yaw = -0.6;
       pitch = 0.35;
       zoom = 1;
+      uvSetOverride = null;
     }
   }
 
@@ -1509,6 +1823,8 @@ class _ModelPreviewState extends State<ModelPreview> {
                         pitch: pitch,
                         zoom: zoom,
                         renderMode: renderMode,
+                        uvSetOverride: uvSetOverride,
+                        lightingMode: lightingMode,
                       ),
                       child: Align(
                         alignment: Alignment.bottomLeft,
@@ -1571,6 +1887,96 @@ class _ModelPreviewState extends State<ModelPreview> {
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            const Text('Light'),
+                            const SizedBox(width: 8),
+                            DropdownButtonHideUnderline(
+                              child: DropdownButton<LightingMode>(
+                                value: lightingMode,
+                                isDense: true,
+                                items: const [
+                                  DropdownMenuItem(
+                                    value: LightingMode.corner,
+                                    child: Text('Corner'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: LightingMode.top,
+                                    child: Text('Top'),
+                                  ),
+                                  DropdownMenuItem(
+                                    value: LightingMode.unlit,
+                                    child: Text('Unlit'),
+                                  ),
+                                ],
+                                onChanged: (next) {
+                                  if (next == null) return;
+                                  setState(() => lightingMode = next);
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      if (mesh.availableUvSets.length > 1) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: .9),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.black12),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text('UV set'),
+                              const SizedBox(width: 8),
+                              DropdownButtonHideUnderline(
+                                child: DropdownButton<String>(
+                                  value: uvSetOverride ?? '',
+                                  isDense: true,
+                                  items: [
+                                    const DropdownMenuItem(
+                                      value: '',
+                                      child: Text('Material default'),
+                                    ),
+                                    ...mesh.availableUvSets.map(
+                                      (name) => DropdownMenuItem(
+                                        value: name,
+                                        child: Text(name),
+                                      ),
+                                    ),
+                                  ],
+                                  onChanged: (next) {
+                                    setState(() {
+                                      uvSetOverride = switch (next) {
+                                        null || '' => null,
+                                        _ => next,
+                                      };
+                                    });
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: .9),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.black12),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
                             const Text('Fallback'),
                             const SizedBox(width: 8),
                             DropdownButtonHideUnderline(
@@ -1619,6 +2025,8 @@ class MeshPainter extends CustomPainter {
     required this.pitch,
     required this.zoom,
     required this.renderMode,
+    required this.lightingMode,
+    this.uvSetOverride,
   });
 
   final MeshModel mesh;
@@ -1626,6 +2034,8 @@ class MeshPainter extends CustomPainter {
   final double pitch;
   final double zoom;
   final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final String? uvSetOverride;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1636,6 +2046,7 @@ class MeshPainter extends CustomPainter {
     final sx = math.sin(pitch);
     final cx = math.cos(pitch);
     final projected = <_Projected>[];
+    final viewVertices = <Vec3>[];
 
     for (final vertex in mesh.vertices) {
       final x1 = vertex.x * cy + vertex.z * sy;
@@ -1643,6 +2054,7 @@ class MeshPainter extends CustomPainter {
       final y1 = vertex.y * cx - z1 * sx;
       final z2 = vertex.y * sx + z1 * cx;
       final perspective = 2.8 / (2.8 + z2);
+      viewVertices.add(Vec3(x1, y1, z2));
       projected.add(
         _Projected(
           center.dx + x1 * scale * perspective,
@@ -1673,9 +2085,11 @@ class MeshPainter extends CustomPainter {
               face.materialIndex < mesh.materials.length)
           ? mesh.materials[face.materialIndex]
           : null;
+      final textureUvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
+      final light = _faceLight(viewVertices, face, lightingMode);
       if (renderMode == RenderMode.textured &&
           material?.textureImage != null &&
-          face.uvs.length == 3) {
+          textureUvs.length == 3) {
         final p0 = projected[face.indices[0]];
         final p1 = projected[face.indices[1]];
         final p2 = projected[face.indices[2]];
@@ -1705,9 +2119,9 @@ class MeshPainter extends CustomPainter {
           a: Offset(p0.x, p0.y),
           b: Offset(p1.x, p1.y),
           c: Offset(p2.x, p2.y),
-          uvA: face.uvs[0],
-          uvB: face.uvs[1],
-          uvC: face.uvs[2],
+          uvA: textureUvs[0],
+          uvB: textureUvs[1],
+          uvC: textureUvs[2],
           alpha: materialOpacity,
         );
         if (vertexTint != null && !_isApproximatelyWhite(vertexTint)) {
@@ -1716,6 +2130,12 @@ class MeshPainter extends CustomPainter {
             Paint()
               ..color = vertexTint
               ..blendMode = BlendMode.modulate,
+          );
+        }
+        if (light < 0.999) {
+          canvas.drawPath(
+            texturedBase,
+            Paint()..color = Colors.black.withValues(alpha: (1 - light) * .7),
           );
         }
         if (drawEdges) {
@@ -1748,6 +2168,7 @@ class MeshPainter extends CustomPainter {
         if (vertexTint != null) {
           faceColor = _multiplyColor(faceColor, vertexTint);
         }
+        faceColor = _shadeColor(faceColor, light);
         final fillAlpha = renderMode == RenderMode.solid
             ? 1.0
             : (renderMode == RenderMode.textured ? .92 : 1.0) * materialOpacity;
@@ -1781,6 +2202,46 @@ class MeshPainter extends CustomPainter {
     final green = (aGreen * bGreen / 255).round();
     final blue = (aBlue * bBlue / 255).round();
     return Color.fromARGB(alpha, red, green, blue);
+  }
+
+  static Color _shadeColor(Color color, double light) {
+    final factor = light.clamp(0.0, 1.0);
+    return Color.fromARGB(
+      (color.a * 255).round().clamp(0, 255),
+      ((color.r * 255) * factor).round().clamp(0, 255),
+      ((color.g * 255) * factor).round().clamp(0, 255),
+      ((color.b * 255) * factor).round().clamp(0, 255),
+    );
+  }
+
+  static double _faceLight(
+    List<Vec3> vertices,
+    MeshFace face,
+    LightingMode mode,
+  ) {
+    if (mode == LightingMode.unlit || face.indices.length < 3) return 1;
+    final a = vertices[face.indices[0]];
+    final b = vertices[face.indices[1]];
+    final c = vertices[face.indices[2]];
+    final ux = b.x - a.x;
+    final uy = b.y - a.y;
+    final uz = b.z - a.z;
+    final vx = c.x - a.x;
+    final vy = c.y - a.y;
+    final vz = c.z - a.z;
+    final nx = uy * vz - uz * vy;
+    final ny = uz * vx - ux * vz;
+    final nz = ux * vy - uy * vx;
+    final normalLength = math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (normalLength < 1e-9) return 1;
+
+    final (lx, ly, lz) = mode == LightingMode.top
+        ? (0.0, 1.0, 0.0)
+        : (-0.45, 0.75, -0.5);
+    final lightLength = math.sqrt(lx * lx + ly * ly + lz * lz);
+    final diffuse =
+        ((nx * lx + ny * ly + nz * lz) / (normalLength * lightLength)).abs();
+    return 0.42 + diffuse * 0.58;
   }
 
   static void _drawTexturedTriangle(
@@ -1877,11 +2338,15 @@ class MeshPainter extends CustomPainter {
         oldDelegate.yaw != yaw ||
         oldDelegate.pitch != pitch ||
         oldDelegate.zoom != zoom ||
-        oldDelegate.renderMode != renderMode;
+        oldDelegate.renderMode != renderMode ||
+        oldDelegate.lightingMode != lightingMode ||
+        oldDelegate.uvSetOverride != uvSetOverride;
   }
 }
 
 enum RenderMode { textured, solid, wireframe }
+
+enum LightingMode { corner, top, unlit }
 
 class _Projected {
   const _Projected(this.x, this.y, this.z);
@@ -2236,6 +2701,9 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   final mesh = await importFbxWithUfbx(
     asset.path,
     asset.name,
+    inputBytes: isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : null,
     allAssets: allAssets,
   );
   return mesh.allTexturePaths.map((path) {
@@ -2246,7 +2714,13 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
       allowFallbackLookup: false,
     );
     final existingPath = resolved ?? path;
-    final exists = File(existingPath).existsSync();
+    final exists = isZipVirtualPath(existingPath)
+        ? allAssets.any(
+            (candidate) =>
+                normalizePathKey(candidate.path) ==
+                normalizePathKey(existingPath),
+          )
+        : File(existingPath).existsSync();
     AssetItem? jumpAsset;
     if (exists) {
       final key = normalizePathKey(existingPath);
@@ -2289,6 +2763,29 @@ String? resolveTextureReference(
     fbxLog('Resolved absolute texture path: $trimmed');
     return trimmed;
   }
+
+  final zipModel = parseZipVirtualPath(modelPath);
+  if (zipModel != null && !isAbsolute) {
+    final zipRelativeEntry = resolveZipRelativeEntryPath(
+      zipModel.entryPath,
+      trimmed,
+    );
+    final zipVirtualCandidate = buildZipVirtualPath(
+      zipModel.zipPath,
+      zipRelativeEntry,
+    );
+    final hasZipCandidate = allAssets.any(
+      (asset) =>
+          normalizePathKey(asset.path) == normalizePathKey(zipVirtualCandidate),
+    );
+    if (hasZipCandidate) {
+      fbxLog(
+        'Resolved ZIP-relative texture path: $trimmed -> $zipVirtualCandidate',
+      );
+      return zipVirtualCandidate;
+    }
+  }
+
   final relativeCandidate = isAbsolute
       ? trimmed
       : '${parentPath(modelPath)}${Platform.pathSeparator}${trimmed.replaceAll('/', Platform.pathSeparator)}';
@@ -2327,8 +2824,16 @@ String? findDeterministicTextureRelink(
 ) {
   if (allAssets.isEmpty) return null;
   final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
   final sourceCandidates = allAssets.where((asset) {
     if (!textureExts.contains(asset.ext)) return false;
+    if (zipModel != null) {
+      final zipCandidate = parseZipVirtualPath(asset.path);
+      return zipCandidate != null &&
+          normalizePathKey(zipCandidate.zipPath) ==
+              normalizePathKey(zipModel.zipPath);
+    }
+    if (isZipVirtualPath(asset.path)) return false;
     final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
     return modelPathLower.startsWith(sourceLower);
   }).toList();
@@ -2350,6 +2855,14 @@ String? findDeterministicTextureRelink(
       ? requestedBase.substring(0, requestedBase.lastIndexOf('_'))
       : requestedBase;
 
+  String paletteTail(String value) {
+    final match = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*').firstMatch(value);
+    if (match == null) return '';
+    return normalize(value.substring(match.start));
+  }
+
+  final requestedPaletteTail = paletteTail(requestedBase);
+
   int score(AssetItem asset) {
     final base = asset.name.toLowerCase().replaceAll(RegExp(r'\.[^.]+$'), '');
     final normalized = normalize(base);
@@ -2359,6 +2872,18 @@ String? findDeterministicTextureRelink(
 
     // Many source FBX files keep author-variant suffixes (eg. _Mike).
     if (strippedSuffix.isNotEmpty && base == strippedSuffix) value += 90;
+
+    // Synty palette/source textures commonly replace author suffixes with
+    // exported variants, eg. Texture_01.psd -> Texture_01_A.png.
+    if (base.startsWith('${requestedBase}_')) value += 75;
+    if (strippedSuffix.isNotEmpty && base.startsWith('${strippedSuffix}_')) {
+      value += 70;
+    }
+    final candidatePaletteTail = paletteTail(base);
+    if (requestedPaletteTail.isNotEmpty &&
+        candidatePaletteTail == requestedPaletteTail) {
+      value += 105;
+    }
 
     // Common singular/plural drift eg. window -> windows.
     if (base == '${requestedBase}s' || '${base}s' == requestedBase) {
@@ -2448,7 +2973,8 @@ Future<ui.Image?> firstTextureImage(List<String> paths) async {
   for (final path in paths) {
     if (!imageExts.contains(extensionOf(path))) continue;
     try {
-      final bytes = await File(path).readAsBytes();
+      final bytes = await readAssetBytes(path);
+      if (bytes == null || bytes.isEmpty) continue;
       final image = await decodeImage(bytes);
       fbxLog('Decoded texture image: $path (${image.width}x${image.height})');
       return image;
@@ -2491,7 +3017,8 @@ Future<ui.Image> createCheckerboardTextureImage({
 
 Future<Color?> averageImageColor(String path) async {
   try {
-    final bytes = await File(path).readAsBytes();
+    final bytes = await readAssetBytes(path);
+    if (bytes == null || bytes.isEmpty) return null;
     final image = await decodeImage(bytes);
     final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
     image.dispose();
@@ -2554,6 +3081,21 @@ Future<ScanResult> scanAssetFolder(
     checked += 1;
 
     final ext = extensionOf(entity.path);
+    if (archiveExts.contains(ext)) {
+      final zipStat = await entity.stat();
+      final zipResult = await scanZipAssetEntries(
+        zipPath: entity.path,
+        rootPath: rootPath,
+        sourceName: sourceName,
+        zipModified: zipStat.modified,
+      );
+      assets.addAll(zipResult.assets);
+      skippedUnsupported += zipResult.skippedUnsupported;
+      skippedBinaryObj += zipResult.skippedBinaryObj;
+      checked += zipResult.entriesInspected;
+      continue;
+    }
+
     final type = typeForExt(ext);
     if (type == 'other') {
       skippedUnsupported += 1;
@@ -2598,6 +3140,211 @@ Future<ScanResult> scanAssetFolder(
     skippedUnsupported: skippedUnsupported,
     skippedBinaryObj: skippedBinaryObj,
   );
+}
+
+Future<ZipAssetScanResult> scanZipAssetEntries({
+  required String zipPath,
+  required String rootPath,
+  required String sourceName,
+  required DateTime zipModified,
+}) async {
+  final zipFile = File(zipPath);
+  if (!zipFile.existsSync()) {
+    return const ZipAssetScanResult(
+      assets: [],
+      skippedUnsupported: 0,
+      skippedBinaryObj: 0,
+      entriesInspected: 0,
+    );
+  }
+
+  final zipSize = await zipFile.length();
+  if (zipSize > maxZipIntrospectionBytes) {
+    fbxLog(
+      'Skipping ZIP introspection for large archive: $zipPath ($zipSize bytes)',
+    );
+    return const ZipAssetScanResult(
+      assets: [],
+      skippedUnsupported: 0,
+      skippedBinaryObj: 0,
+      entriesInspected: 0,
+    );
+  }
+
+  try {
+    final bytes = await zipFile.readAsBytes();
+    final archive = ZipDecoder().decodeBytes(bytes, verify: false);
+    final zipRelative = relativeTo(zipPath, rootPath).replaceAll('\\', '/');
+    final assets = <AssetItem>[];
+    var skippedUnsupported = 0;
+    var skippedBinaryObj = 0;
+    var entriesInspected = 0;
+
+    for (final entry in archive.files) {
+      if (!entry.isFile) continue;
+      if (entriesInspected >= maxZipEntriesToInspect) break;
+      entriesInspected += 1;
+
+      final entryPath = entry.name.replaceAll('\\', '/');
+      if (entryPath.isEmpty) continue;
+      if (hasIgnoredArchiveFolder(entryPath)) continue;
+
+      final ext = extensionOf(entryPath);
+      final type = typeForExt(ext);
+      if (type == 'other') {
+        skippedUnsupported += 1;
+        continue;
+      }
+
+      if (ext == 'obj') {
+        final content = entry.content;
+        if (isLikelyBinaryObjBytes(content)) {
+          skippedBinaryObj += 1;
+          continue;
+        }
+      }
+
+      final name = entryPath.split('/').last;
+      final relativePath = '$sourceName/$zipRelative!/$entryPath';
+      assets.add(
+        AssetItem(
+          id: 'zip:${normalizePathKey(zipPath)}::$entryPath:${entry.size}:${zipModified.millisecondsSinceEpoch}',
+          name: name,
+          path: buildZipVirtualPath(zipPath, entryPath),
+          relativePath: relativePath,
+          sourceRoot: rootPath,
+          sourceName: sourceName,
+          ext: ext,
+          type: type,
+          size: entry.size,
+          modified: zipModified,
+          tags: inferTags(name, relativePath, type, ext),
+        ),
+      );
+    }
+
+    return ZipAssetScanResult(
+      assets: assets,
+      skippedUnsupported: skippedUnsupported,
+      skippedBinaryObj: skippedBinaryObj,
+      entriesInspected: entriesInspected,
+    );
+  } catch (error) {
+    fbxLog('ZIP introspection failed for $zipPath: $error');
+    return const ZipAssetScanResult(
+      assets: [],
+      skippedUnsupported: 0,
+      skippedBinaryObj: 0,
+      entriesInspected: 0,
+    );
+  }
+}
+
+bool hasIgnoredArchiveFolder(String archiveEntryPath) {
+  final parts = archiveEntryPath.replaceAll('\\', '/').split('/');
+  return parts.any((part) => ignoredFolderNames.contains(part.toLowerCase()));
+}
+
+String buildZipVirtualPath(String zipPath, String entryPath) {
+  return 'zip:$zipPath::${entryPath.replaceAll('\\', '/')}';
+}
+
+bool isZipVirtualPath(String path) {
+  return path.startsWith('zip:') && path.contains('::');
+}
+
+String resolveZipRelativeEntryPath(String modelEntryPath, String textureRef) {
+  final normalizedTexture = textureRef.replaceAll('\\', '/').trim();
+  final baseDirParts = modelEntryPath
+      .replaceAll('\\', '/')
+      .split('/')
+      .where((part) => part.isNotEmpty)
+      .toList();
+  if (baseDirParts.isNotEmpty) {
+    baseDirParts.removeLast();
+  }
+  final resolved = <String>[...baseDirParts];
+  for (final segment in normalizedTexture.split('/')) {
+    if (segment.isEmpty || segment == '.') continue;
+    if (segment == '..') {
+      if (resolved.isNotEmpty) {
+        resolved.removeLast();
+      }
+      continue;
+    }
+    resolved.add(segment);
+  }
+  return resolved.join('/');
+}
+
+class ZipVirtualPath {
+  const ZipVirtualPath({required this.zipPath, required this.entryPath});
+
+  final String zipPath;
+  final String entryPath;
+}
+
+final _zipArchiveCache = <String, Archive>{};
+
+ZipVirtualPath? parseZipVirtualPath(String value) {
+  if (!isZipVirtualPath(value)) return null;
+  final separator = value.indexOf('::');
+  if (separator < 4 || separator >= value.length - 2) return null;
+  final zipPath = value.substring(4, separator);
+  final entryPath = value.substring(separator + 2).replaceAll('\\', '/');
+  if (zipPath.isEmpty || entryPath.isEmpty) return null;
+  return ZipVirtualPath(zipPath: zipPath, entryPath: entryPath);
+}
+
+Future<Archive?> _readArchiveFromDisk(String zipPath) async {
+  final file = File(zipPath);
+  if (!file.existsSync()) return null;
+  final length = await file.length();
+  if (length > maxZipIntrospectionBytes) return null;
+  final bytes = await file.readAsBytes();
+  return ZipDecoder().decodeBytes(bytes, verify: false);
+}
+
+Future<Archive?> _loadCachedArchive(String zipPath) async {
+  final cacheKey = normalizePathKey(zipPath);
+  final cached = _zipArchiveCache[cacheKey];
+  if (cached != null) {
+    // Promote recently-used entries to the end for LRU eviction.
+    _zipArchiveCache.remove(cacheKey);
+    _zipArchiveCache[cacheKey] = cached;
+    return cached;
+  }
+  final archive = await _readArchiveFromDisk(zipPath);
+  if (archive != null) {
+    _zipArchiveCache[cacheKey] = archive;
+    while (_zipArchiveCache.length > maxZipArchiveCacheEntries) {
+      _zipArchiveCache.remove(_zipArchiveCache.keys.first);
+    }
+  }
+  return archive;
+}
+
+Uint8List? _archiveEntryToBytes(ArchiveFile entry) {
+  return entry.content;
+}
+
+Future<Uint8List?> readZipVirtualAssetBytesByPath(String virtualPath) async {
+  final parsed = parseZipVirtualPath(virtualPath);
+  if (parsed == null) return null;
+  final archive = await _loadCachedArchive(parsed.zipPath);
+  if (archive == null) return null;
+  final entry = archive.findFile(parsed.entryPath);
+  if (entry == null || !entry.isFile) return null;
+  return _archiveEntryToBytes(entry);
+}
+
+Future<Uint8List?> readAssetBytes(String path) async {
+  if (isZipVirtualPath(path)) {
+    return readZipVirtualAssetBytesByPath(path);
+  }
+  final file = File(path);
+  if (!file.existsSync()) return null;
+  return file.readAsBytes();
 }
 
 bool hasIgnoredFolder(String filePath, String rootPath) {
@@ -2663,6 +3410,24 @@ Future<bool> isLikelyBinaryObj(File file) async {
   return suspicious / total > .08;
 }
 
+bool isLikelyBinaryObjBytes(List<int> bytes) {
+  var total = 0;
+  var suspicious = 0;
+  for (final byte in bytes.take(4096)) {
+    total += 1;
+    if (byte == 0) return true;
+    final textByte =
+        byte == 9 ||
+        byte == 10 ||
+        byte == 13 ||
+        (byte >= 32 && byte <= 126) ||
+        byte >= 128;
+    if (!textByte) suspicious += 1;
+  }
+  if (total == 0) return false;
+  return suspicious / total > .08;
+}
+
 Future<int> copyAssetsToTarget(List<AssetItem> selected, String target) async {
   var copied = 0;
   final destinationRoot = Directory(target);
@@ -2671,11 +3436,81 @@ Future<int> copyAssetsToTarget(List<AssetItem> selected, String target) async {
   }
 
   for (final asset in selected) {
+    if (isZipVirtualPath(asset.path)) {
+      final bytes = await readZipVirtualAssetBytesByPath(asset.path);
+      if (bytes == null || bytes.isEmpty) {
+        continue;
+      }
+      final zipParts = parseZipVirtualPath(asset.path);
+      final relativeOutput = safeZipEntryRelativePath(
+        zipParts?.entryPath ?? asset.name,
+        fallbackName: asset.name,
+      );
+      final destination = File(
+        '$target${Platform.pathSeparator}${relativeOutput.replaceAll('/', Platform.pathSeparator)}',
+      );
+      destination.parent.createSync(recursive: true);
+      await destination.writeAsBytes(bytes, flush: true);
+      copied += 1;
+      continue;
+    }
     final destination = File('$target${Platform.pathSeparator}${asset.name}');
+    if (!File(asset.path).existsSync()) {
+      continue;
+    }
     await File(asset.path).copy(destination.path);
     copied += 1;
   }
   return copied;
+}
+
+String safeZipEntryRelativePath(
+  String entryPath, {
+  required String fallbackName,
+}) {
+  String cleanSegment(String segment) {
+    final sanitized = segment.replaceAll(RegExp(r'[<>:"|?*]'), '_').trim();
+    if (sanitized.isEmpty || sanitized == '.' || sanitized == '..') {
+      return '';
+    }
+    return sanitized;
+  }
+
+  final normalized = entryPath.replaceAll('\\', '/').trim();
+  final parts = <String>[];
+  for (final raw in normalized.split('/')) {
+    if (raw.isEmpty || raw == '.') continue;
+    if (raw == '..') {
+      if (parts.isNotEmpty) {
+        parts.removeLast();
+      }
+      continue;
+    }
+    final cleaned = cleanSegment(raw);
+    if (cleaned.isNotEmpty) {
+      parts.add(cleaned);
+    }
+  }
+
+  if (parts.isEmpty) {
+    final fallback = cleanSegment(fallbackName);
+    return fallback.isEmpty ? 'asset.bin' : fallback;
+  }
+  return parts.join('/');
+}
+
+class ZipAssetScanResult {
+  const ZipAssetScanResult({
+    required this.assets,
+    required this.skippedUnsupported,
+    required this.skippedBinaryObj,
+    required this.entriesInspected,
+  });
+
+  final List<AssetItem> assets;
+  final int skippedUnsupported;
+  final int skippedBinaryObj;
+  final int entriesInspected;
 }
 
 List<String> inferTags(
@@ -2751,13 +3586,29 @@ Future<MeshModel> loadMesh(
   int fallbackCheckerSquareSize = 16,
 }) async {
   if (asset.ext == 'obj') {
+    if (isZipVirtualPath(asset.path)) {
+      final bytes = await readZipVirtualAssetBytesByPath(asset.path);
+      if (bytes == null || bytes.isEmpty) {
+        throw const FormatException('Could not read OBJ bytes from ZIP entry.');
+      }
+      final objText = utf8.decode(bytes, allowMalformed: true);
+      return parseObjMesh(objText, asset.name);
+    }
     return parseObjMesh(await File(asset.path).readAsString(), asset.name);
   }
   if (asset.ext == 'fbx') {
     fbxLog('Loading FBX mesh: ${asset.path}');
+    final zipBytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : null;
+    if (isZipVirtualPath(asset.path) &&
+        (zipBytes == null || zipBytes.isEmpty)) {
+      throw const FormatException('Could not read FBX bytes from ZIP entry.');
+    }
     return importFbxWithUfbx(
       asset.path,
       asset.name,
+      inputBytes: zipBytes,
       allAssets: allAssets,
       fallbackCheckerSquareSize: fallbackCheckerSquareSize,
     );
@@ -2770,6 +3621,7 @@ Future<MeshModel> loadMesh(
 Future<MeshModel> importFbxWithUfbx(
   String path,
   String name, {
+  Uint8List? inputBytes,
   List<AssetItem> allAssets = const [],
   int fallbackCheckerSquareSize = 16,
 }) async {
@@ -2780,15 +3632,15 @@ Future<MeshModel> importFbxWithUfbx(
     throw FormatException('FBX importer helper was not found at $helper.');
   }
   fbxLog('Launching importer for: $path');
-  final result = await Process.run(helper, [path]);
+  final result = await runMeshImporter(helper, path, inputBytes: inputBytes);
   if (result.exitCode != 0) {
-    final error = (result.stderr as String).trim();
+    final error = result.stderr.trim();
     fbxLog('Importer failed (${result.exitCode}): $error');
     throw FormatException(error.isEmpty ? 'ufbx importer failed.' : error);
   }
   fbxLog('Importer completed for: $path');
 
-  final json = jsonDecode(result.stdout as String) as Map<String, dynamic>;
+  final json = jsonDecode(result.stdout) as Map<String, dynamic>;
   fbxLog(
     'Importer JSON counts: vertices=${(json['vertices'] as List<dynamic>?)?.length ?? 0}, vertexColors=${(json['vertexColors'] as List<dynamic>?)?.length ?? 0}, faces=${(json['faces'] as List<dynamic>?)?.length ?? 0}, materials=${(json['materials'] as List<dynamic>?)?.length ?? 0}, textureFiles=${(json['textureFiles'] as List<dynamic>?)?.length ?? 0}, sceneTextures=${(json['sceneTextures'] as List<dynamic>?)?.length ?? 0}',
   );
@@ -2798,6 +3650,45 @@ Future<MeshModel> importFbxWithUfbx(
     name: name,
     allAssets: allAssets,
     fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+  );
+}
+
+class MeshImporterResult {
+  const MeshImporterResult({
+    required this.exitCode,
+    required this.stdout,
+    required this.stderr,
+  });
+
+  final int exitCode;
+  final String stdout;
+  final String stderr;
+}
+
+Future<MeshImporterResult> runMeshImporter(
+  String helper,
+  String sourcePath, {
+  Uint8List? inputBytes,
+}) async {
+  if (inputBytes == null) {
+    final processResult = await Process.run(helper, [sourcePath]);
+    return MeshImporterResult(
+      exitCode: processResult.exitCode,
+      stdout: processResult.stdout as String? ?? '',
+      stderr: processResult.stderr as String? ?? '',
+    );
+  }
+
+  final process = await Process.start(helper, ['--stdin', sourcePath]);
+  process.stdin.add(inputBytes);
+  await process.stdin.close();
+  final stdoutBytes = await process.stdout.expand((chunk) => chunk).toList();
+  final stderrBytes = await process.stderr.expand((chunk) => chunk).toList();
+  final exitCode = await process.exitCode;
+  return MeshImporterResult(
+    exitCode: exitCode,
+    stdout: utf8.decode(stdoutBytes, allowMalformed: true),
+    stderr: utf8.decode(stderrBytes, allowMalformed: true),
   );
 }
 
@@ -2816,7 +3707,33 @@ Future<MeshModel> meshModelFromImporterJson(
       (values[2] as num).toDouble(),
     );
   }).toList();
-  final faces = (json['faces'] as List<dynamic>).map((item) {
+  final importedFaces = json['faces'] as List<dynamic>;
+  final namedUvsByFace = List.generate(
+    importedFaces.length,
+    (_) => <String, List<Vec2>>{},
+  );
+  for (final item in ((json['uvSets'] as List<dynamic>?) ?? const [])) {
+    final uvSet = item as Map<String, dynamic>;
+    final name = (uvSet['name'] as String?)?.trim() ?? '';
+    if (name.isEmpty) continue;
+    final uvFaces = (uvSet['faces'] as List<dynamic>?) ?? const [];
+    for (
+      var faceIndex = 0;
+      faceIndex < uvFaces.length && faceIndex < namedUvsByFace.length;
+      faceIndex += 1
+    ) {
+      final values = uvFaces[faceIndex] as List<dynamic>;
+      if (values.length < 6) continue;
+      namedUvsByFace[faceIndex][name] = [
+        Vec2((values[0] as num).toDouble(), (values[1] as num).toDouble()),
+        Vec2((values[2] as num).toDouble(), (values[3] as num).toDouble()),
+        Vec2((values[4] as num).toDouble(), (values[5] as num).toDouble()),
+      ];
+    }
+  }
+  final faces = importedFaces.indexed.map((entry) {
+    final faceIndex = entry.$1;
+    final item = entry.$2;
     final values = item as List<dynamic>;
     return MeshFace(
       [
@@ -2841,6 +3758,7 @@ Future<MeshModel> meshModelFromImporterJson(
               ),
             ]
           : const [],
+      namedUvsByFace[faceIndex],
     );
   }).toList();
   final vertexColors = ((json['vertexColors'] as List<dynamic>?) ?? const [])
@@ -2899,6 +3817,9 @@ Future<MeshModel> meshModelFromImporterJson(
     );
     final textureRefs = ((material['textures'] as List<dynamic>?) ?? const [])
         .cast<String>();
+    final uvSet = (material['uvSet'] as String?)?.trim() ?? '';
+    final embeddedTextureBase64 =
+        (material['embeddedTextureBase64'] as String?) ?? '';
     final resolvedTextures = textureRefs
         .map(
           (texture) => resolveTextureReference(
@@ -2914,7 +3835,19 @@ Future<MeshModel> meshModelFromImporterJson(
       'Material ${(material['name'] as String?) ?? 'Material'} refs=${textureRefs.length} resolved=${resolvedTextures.length}',
     );
     final textureColor = await firstTextureAverageColor(resolvedTextures);
-    final textureImage = await firstTextureImage(resolvedTextures);
+    ui.Image? textureImage;
+    if (embeddedTextureBase64.isNotEmpty) {
+      try {
+        textureImage = await decodeImage(base64Decode(embeddedTextureBase64));
+        fbxLog(
+          'Decoded embedded texture for ${(material['name'] as String?) ?? 'Material'} '
+          '(${textureImage.width}x${textureImage.height})',
+        );
+      } catch (error) {
+        fbxLog('Embedded texture decode failed: $error');
+      }
+    }
+    textureImage ??= await firstTextureImage(resolvedTextures);
     materials.add(
       MeshMaterial(
         name: (material['name'] as String?) ?? 'Material',
@@ -2936,6 +3869,8 @@ Future<MeshModel> meshModelFromImporterJson(
         emissiveColor: emissiveColor,
         shaderType: (material['shaderType'] as num?)?.toInt() ?? -1,
         shadingModel: (material['shadingModel'] as String?) ?? '',
+        uvSet: uvSet,
+        hasEmbeddedTexture: embeddedTextureBase64.isNotEmpty,
       ),
     );
   }
@@ -2972,7 +3907,7 @@ Future<MeshModel> meshModelFromImporterJson(
     );
   }
 
-  if (materials.isEmpty && faces.any((face) => face.uvs.length == 3)) {
+  if (materials.isEmpty && faces.any((face) => face.uvsFor(null).length == 3)) {
     final declaredResolved = <String>{};
     for (final texture in [...textureFiles, ...sceneTextureRefs]) {
       final resolved = resolveTextureReference(
@@ -3012,7 +3947,7 @@ Future<MeshModel> meshModelFromImporterJson(
     }
   }
 
-  if (materials.isEmpty && faces.any((face) => face.uvs.length == 3)) {
+  if (materials.isEmpty && faces.any((face) => face.uvsFor(null).length == 3)) {
     const checkerTextureSize = 256;
     final checkerCells = math.max(
       2,
@@ -3048,7 +3983,7 @@ Future<MeshModel> meshModelFromImporterJson(
   if (vertices.isEmpty || faces.isEmpty) {
     throw const FormatException('ufbx returned no renderable geometry.');
   }
-  final uvFaces = faces.where((face) => face.uvs.length == 3).length;
+  final uvFaces = faces.where((face) => face.uvsFor(null).length == 3).length;
   final texturedMaterials = materials
       .where((material) => material.textureImage != null)
       .length;
@@ -3067,7 +4002,19 @@ Future<MeshModel> meshModelFromImporterJson(
 
 String meshImporterPath() {
   final executableDir = File(Platform.resolvedExecutable).parent.path;
-  return '$executableDir${Platform.pathSeparator}asset_atlas_mesh_importer.exe';
+  final packaged =
+      '$executableDir${Platform.pathSeparator}asset_atlas_mesh_importer.exe';
+  if (File(packaged).existsSync()) return packaged;
+
+  // flutter_test runs from the project but uses flutter_tester.exe from the SDK,
+  // so the packaged sibling lookup cannot find a locally-built native helper.
+  final developmentBuild = File(
+    'build${Platform.pathSeparator}windows${Platform.pathSeparator}x64'
+    '${Platform.pathSeparator}runner${Platform.pathSeparator}Release'
+    '${Platform.pathSeparator}asset_atlas_mesh_importer.exe',
+  ).absolute.path;
+  if (File(developmentBuild).existsSync()) return developmentBuild;
+  return packaged;
 }
 
 String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
@@ -3242,289 +4189,11 @@ MeshModel parseObjMesh(String text, String name) {
   return MeshModel.normalized(name: name, vertices: vertices, faces: faces);
 }
 
-MeshModel parseFbxMesh(Uint8List bytes, String name) {
-  final header = String.fromCharCodes(bytes.take(21));
-  if (header.startsWith('Kaydara FBX Binary')) {
-    return _parseBinaryFbx(bytes, name);
-  }
-  return _parseAsciiFbx(String.fromCharCodes(bytes), name);
-}
-
-MeshModel _parseAsciiFbx(String text, String name) {
-  final vertexMatch = RegExp(
-    r'Vertices:\s*\*\d+\s*\{[^}]*?a:\s*([^}]*)\}',
-    dotAll: true,
-  ).firstMatch(text);
-  final indexMatch = RegExp(
-    r'PolygonVertexIndex:\s*\*\d+\s*\{[^}]*?a:\s*([^}]*)\}',
-    dotAll: true,
-  ).firstMatch(text);
-  if (vertexMatch == null || indexMatch == null) {
-    throw const FormatException('No ASCII FBX mesh geometry found.');
-  }
-
-  final vertexNumbers = _parseNumberList(vertexMatch.group(1)!);
-  final indexNumbers = _parseNumberList(
-    indexMatch.group(1)!,
-  ).map((value) => value.toInt()).toList();
-  return _meshFromFbxArrays(name, vertexNumbers, indexNumbers);
-}
-
-List<double> _parseNumberList(String text) {
-  return RegExp(
-    r'-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
-  ).allMatches(text).map((match) => double.parse(match.group(0)!)).toList();
-}
-
-MeshModel _parseBinaryFbx(Uint8List bytes, String name) {
-  final reader = _FbxReader(bytes);
-  reader.offset = 23;
-  final version = reader.readUint32();
-  final root = _FbxNode('Root', const [], []);
-  while (reader.offset < bytes.length) {
-    final node = reader.readNode(version);
-    if (node == null) break;
-    root.children.add(node);
-  }
-
-  for (final geometry in root.descendants('Geometry')) {
-    final verticesNode = geometry.child('Vertices');
-    final indicesNode = geometry.child('PolygonVertexIndex');
-    if (verticesNode == null || indicesNode == null) continue;
-    final vertices = verticesNode.firstDoubleArray;
-    final indices = indicesNode.firstIntArray;
-    if (vertices.isNotEmpty && indices.isNotEmpty) {
-      return _meshFromFbxArrays(name, vertices, indices);
-    }
-  }
-  throw const FormatException('No binary FBX mesh geometry found.');
-}
-
-MeshModel _meshFromFbxArrays(
-  String name,
-  List<double> vertexNumbers,
-  List<int> indexNumbers,
-) {
-  final vertices = <Vec3>[];
-  for (var i = 0; i + 2 < vertexNumbers.length; i += 3) {
-    vertices.add(
-      Vec3(vertexNumbers[i], vertexNumbers[i + 1], vertexNumbers[i + 2]),
-    );
-  }
-
-  final faces = <MeshFace>[];
-  var polygon = <int>[];
-  for (final raw in indexNumbers) {
-    if (raw < 0) {
-      polygon.add(-raw - 1);
-      _addTriangulatedFace(polygon, faces);
-      polygon = <int>[];
-    } else {
-      polygon.add(raw);
-    }
-  }
-
-  if (vertices.isEmpty || faces.isEmpty) {
-    throw const FormatException('No FBX polygon mesh found.');
-  }
-  return MeshModel.normalized(name: name, vertices: vertices, faces: faces);
-}
-
 void _addTriangulatedFace(List<int> indices, List<MeshFace> faces) {
   final clean = indices.where((index) => index >= 0).toList();
   if (clean.length < 3) return;
   for (var i = 1; i < clean.length - 1; i += 1) {
     faces.add(MeshFace([clean[0], clean[i], clean[i + 1]]));
-  }
-}
-
-class _FbxReader {
-  _FbxReader(this.bytes) : data = ByteData.sublistView(bytes);
-
-  final Uint8List bytes;
-  final ByteData data;
-  int offset = 0;
-
-  int readUint8() => bytes[offset++];
-  int readUint32() {
-    final value = data.getUint32(offset, Endian.little);
-    offset += 4;
-    return value;
-  }
-
-  int readUint64() {
-    final value = data.getUint64(offset, Endian.little);
-    offset += 8;
-    return value;
-  }
-
-  int readInt16() {
-    final value = data.getInt16(offset, Endian.little);
-    offset += 2;
-    return value;
-  }
-
-  int readInt32() {
-    final value = data.getInt32(offset, Endian.little);
-    offset += 4;
-    return value;
-  }
-
-  double readFloat32() {
-    final value = data.getFloat32(offset, Endian.little);
-    offset += 4;
-    return value;
-  }
-
-  double readFloat64() {
-    final value = data.getFloat64(offset, Endian.little);
-    offset += 8;
-    return value;
-  }
-
-  _FbxNode? readNode(int version) {
-    final largeOffsets = version >= 7500;
-    final start = offset;
-    final endOffset = largeOffsets ? readUint64() : readUint32();
-    final propertyCount = largeOffsets ? readUint64() : readUint32();
-    final propertyBytes = largeOffsets ? readUint64() : readUint32();
-    final nameLength = readUint8();
-    if (endOffset == 0 &&
-        propertyCount == 0 &&
-        propertyBytes == 0 &&
-        nameLength == 0) {
-      return null;
-    }
-    if (endOffset <= start || endOffset > bytes.length) {
-      throw const FormatException('Invalid FBX node bounds.');
-    }
-
-    final nodeName = String.fromCharCodes(
-      bytes.sublist(offset, offset + nameLength),
-    );
-    offset += nameLength;
-    final properties = <Object?>[];
-    for (var i = 0; i < propertyCount; i += 1) {
-      properties.add(readProperty());
-    }
-
-    final children = <_FbxNode>[];
-    while (offset < endOffset) {
-      final childStart = offset;
-      final child = readNode(version);
-      if (child == null) break;
-      children.add(child);
-      if (offset == childStart) break;
-    }
-    offset = endOffset;
-    return _FbxNode(nodeName, properties, children);
-  }
-
-  Object? readProperty() {
-    final code = String.fromCharCode(readUint8());
-    switch (code) {
-      case 'Y':
-        return readInt16();
-      case 'C':
-        return readUint8() != 0;
-      case 'I':
-        return readInt32();
-      case 'F':
-        return readFloat32();
-      case 'D':
-        return readFloat64();
-      case 'L':
-        final value = data.getInt64(offset, Endian.little);
-        offset += 8;
-        return value;
-      case 'R':
-      case 'S':
-        final length = readUint32();
-        final value = bytes.sublist(offset, offset + length);
-        offset += length;
-        return code == 'S' ? String.fromCharCodes(value) : value;
-      case 'd':
-        return _readDoubleArray(float64: true);
-      case 'f':
-        return _readDoubleArray(float64: false);
-      case 'i':
-        return _readIntArray(int64: false);
-      case 'l':
-        return _readIntArray(int64: true);
-      case 'b':
-      case 'c':
-        return _readIntArray(int64: false);
-      default:
-        throw FormatException('Unsupported FBX property type $code.');
-    }
-  }
-
-  List<double> _readDoubleArray({required bool float64}) {
-    final length = readUint32();
-    final encoding = readUint32();
-    final byteLength = readUint32();
-    var payload = bytes.sublist(offset, offset + byteLength);
-    offset += byteLength;
-    if (encoding == 1) payload = Uint8List.fromList(zlib.decode(payload));
-    final payloadData = ByteData.sublistView(payload);
-    return List<double>.generate(length, (i) {
-      final byteOffset = i * (float64 ? 8 : 4);
-      return float64
-          ? payloadData.getFloat64(byteOffset, Endian.little)
-          : payloadData.getFloat32(byteOffset, Endian.little);
-    });
-  }
-
-  List<int> _readIntArray({required bool int64}) {
-    final length = readUint32();
-    final encoding = readUint32();
-    final byteLength = readUint32();
-    var payload = bytes.sublist(offset, offset + byteLength);
-    offset += byteLength;
-    if (encoding == 1) payload = Uint8List.fromList(zlib.decode(payload));
-    final payloadData = ByteData.sublistView(payload);
-    return List<int>.generate(length, (i) {
-      final byteOffset = i * (int64 ? 8 : 4);
-      return int64
-          ? payloadData.getInt64(byteOffset, Endian.little)
-          : payloadData.getInt32(byteOffset, Endian.little);
-    });
-  }
-}
-
-class _FbxNode {
-  _FbxNode(this.name, this.properties, this.children);
-
-  final String name;
-  final List<Object?> properties;
-  final List<_FbxNode> children;
-
-  _FbxNode? child(String childName) {
-    for (final child in children) {
-      if (child.name == childName) return child;
-    }
-    return null;
-  }
-
-  Iterable<_FbxNode> descendants(String nodeName) sync* {
-    for (final child in children) {
-      if (child.name == nodeName) yield child;
-      yield* child.descendants(nodeName);
-    }
-  }
-
-  List<double> get firstDoubleArray {
-    for (final property in properties) {
-      if (property is List<double>) return property;
-    }
-    return const [];
-  }
-
-  List<int> get firstIntArray {
-    for (final property in properties) {
-      if (property is List<int>) return property;
-    }
-    return const [];
   }
 }
 
@@ -3591,6 +4260,14 @@ class MeshModel {
   final List<MeshMaterial> materials;
   final List<String> textureFiles;
   final List<Color> vertexColors;
+
+  List<String> get availableUvSets {
+    final names = <String>{};
+    for (final face in faces) {
+      names.addAll(face.uvSets.keys.where((name) => name.trim().isNotEmpty));
+    }
+    return names.toList()..sort();
+  }
 
   Color colorForMaterial(int materialIndex, {bool textured = false}) {
     if (materialIndex >= 0 && materialIndex < materials.length) {
@@ -3703,6 +4380,8 @@ class MeshMaterial {
     this.emissiveColor = const Color(0xff000000),
     this.shaderType = -1,
     this.shadingModel = '',
+    this.uvSet = '',
+    this.hasEmbeddedTexture = false,
   });
 
   final String name;
@@ -3719,13 +4398,34 @@ class MeshMaterial {
   final Color emissiveColor;
   final int shaderType;
   final String shadingModel;
+  final String uvSet;
+  final bool hasEmbeddedTexture;
 }
 
 class MeshFace {
-  const MeshFace(this.indices, [this.materialIndex = 0, this.uvs = const []]);
+  const MeshFace(
+    this.indices, [
+    this.materialIndex = 0,
+    this.uvs = const [],
+    this.uvSets = const {},
+  ]);
   final List<int> indices;
   final int materialIndex;
   final List<Vec2> uvs;
+  final Map<String, List<Vec2>> uvSets;
+
+  List<Vec2> uvsFor(String? requestedSet) {
+    final name = requestedSet?.trim() ?? '';
+    if (name.isNotEmpty) {
+      final selected = uvSets[name];
+      if (selected != null && selected.length == 3) return selected;
+    }
+    if (uvs.length == 3) return uvs;
+    for (final candidate in uvSets.values) {
+      if (candidate.length == 3) return candidate;
+    }
+    return const [];
+  }
 }
 
 class Vec2 {
@@ -3920,26 +4620,37 @@ class AssetAtlasDatabase {
   Future<String> saveProject({
     required String name,
     required String? rootPath,
-    required List<String> assetIds,
+    required int createdMs,
   }) async {
     await initialize();
     final db = _db!;
     final projectId = '${DateTime.now().millisecondsSinceEpoch}-$name';
-    await db.transaction((txn) async {
-      await txn.insert('projects', {
-        'id': projectId,
-        'name': name,
-        'root_path': rootPath,
-        'created_ms': DateTime.now().millisecondsSinceEpoch,
-      });
-      for (final assetId in assetIds) {
-        await txn.insert('project_assets', {
-          'project_id': projectId,
-          'asset_id': assetId,
-        });
-      }
+    await db.insert('projects', {
+      'id': projectId,
+      'name': name,
+      'root_path': rootPath,
+      'created_ms': createdMs,
     });
     return projectId;
+  }
+
+  Future<PersistedProject?> findProjectByName(String name) async {
+    await initialize();
+    final db = _db!;
+    final rows = await db.query(
+      'projects',
+      where: 'LOWER(name) = LOWER(?)',
+      whereArgs: [name],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final row = rows.first;
+    return PersistedProject(
+      id: row['id'] as String,
+      name: row['name'] as String,
+      rootPath: row['root_path'] as String?,
+      createdMs: row['created_ms'] as int,
+    );
   }
 
   Future<List<PersistedProject>> listProjects() async {
@@ -3969,6 +4680,64 @@ class AssetAtlasDatabase {
     );
     return rows.map((row) => row['asset_id'] as String).toSet();
   }
+
+  Future<void> replaceProjectAssetIds({
+    required String projectId,
+    required List<String> assetIds,
+  }) async {
+    await initialize();
+    final db = _db!;
+    await db.transaction((txn) async {
+      await txn.delete(
+        'project_assets',
+        where: 'project_id = ?',
+        whereArgs: [projectId],
+      );
+      for (final assetId in assetIds.toSet()) {
+        await txn.insert('project_assets', {
+          'project_id': projectId,
+          'asset_id': assetId,
+        });
+      }
+    });
+  }
+
+  Future<void> updateProject({
+    required String projectId,
+    required String name,
+    required String? rootPath,
+  }) async {
+    await initialize();
+    final db = _db!;
+    await db.update(
+      'projects',
+      {'name': name, 'root_path': rootPath},
+      where: 'id = ?',
+      whereArgs: [projectId],
+    );
+  }
+
+  Future<void> deleteProject(String projectId) async {
+    await initialize();
+    final db = _db!;
+    await db.transaction((txn) async {
+      await txn.delete(
+        'project_assets',
+        where: 'project_id = ?',
+        whereArgs: [projectId],
+      );
+      await txn.delete('projects', where: 'id = ?', whereArgs: [projectId]);
+    });
+  }
+}
+
+enum _ProjectDialogAction { load, rename, delete }
+
+class _ProjectDialogResult {
+  const _ProjectDialogResult({required this.action, required this.project});
+
+  final _ProjectDialogAction action;
+  final PersistedProject project;
 }
 
 class PersistedProject {

@@ -20,9 +20,13 @@ function Resolve-ProjectRoot {
 
 $projectRoot = Resolve-ProjectRoot
 $pubspecPath = Join-Path $projectRoot "pubspec.yaml"
+$mainDartPath = Join-Path $projectRoot "lib\main.dart"
 
 if (-not (Test-Path $pubspecPath)) {
     throw "pubspec.yaml not found at: $pubspecPath"
+}
+if (-not (Test-Path $mainDartPath)) {
+    throw "lib/main.dart not found at: $mainDartPath"
 }
 
 $content = Get-Content -Path $pubspecPath -Raw
@@ -71,3 +75,18 @@ $updated = [regex]::Replace($content, $pattern, $newLine)
 Set-Content -Path $pubspecPath -Value $updated -Encoding UTF8
 
 Write-Step "Updated $pubspecPath"
+
+$mainContent = Get-Content -Path $mainDartPath -Raw
+$appVersionPattern = "(?m)^const appVersion = '[0-9]+\.[0-9]+\.[0-9]+';\s*$"
+if (-not [regex]::IsMatch($mainContent, $appVersionPattern)) {
+    throw "Could not find appVersion constant in: $mainDartPath"
+}
+$visibleVersion = "$major.$minor.$patch"
+$updatedMain = [regex]::Replace(
+    $mainContent,
+    $appVersionPattern,
+    "const appVersion = '$visibleVersion';"
+)
+Set-Content -Path $mainDartPath -Value $updatedMain -Encoding UTF8
+
+Write-Step "Updated visible app version in $mainDartPath"
