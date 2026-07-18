@@ -4,6 +4,8 @@ AssetAtlas is a desktop-first asset catalog and preview tool focused on local ga
 
 This repository is now focused on the Flutter Windows desktop app.
 
+New users should start with the [User Manual](USER_MANUAL.md).
+
 ## Repository Layout
 
 - `work/asset_atlas_native/` - Primary active app (Flutter desktop, Windows-focused)
