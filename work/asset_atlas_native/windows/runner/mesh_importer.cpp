@@ -1,9 +1,13 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
+#include <io.h>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "third_party/ufbx/ufbx.h"
@@ -32,6 +36,7 @@ struct Face {
   double v2;
   double u3;
   double v3;
+  std::vector<std::array<double, 6>> uv_sets;
 };
 
 struct MaterialInfo {
@@ -50,6 +55,8 @@ struct MaterialInfo {
   int shader_type;
   std::string shading_model;
   std::vector<std::string> textures;
+  std::string uv_set;
+  std::vector<uint8_t> embedded_texture;
 };
 
 struct SceneTextureInfo {
@@ -79,11 +86,44 @@ static std::string string_from_ufbx(ufbx_string value) {
   return std::string(value.data, value.length);
 }
 
-static void add_texture_path(std::vector<std::string>& paths, ufbx_texture* texture) {
-  if (!texture) return;
+static std::string texture_path(ufbx_texture* texture) {
+  if (!texture) return std::string();
   std::string path = string_from_ufbx(texture->filename);
   if (path.empty()) path = string_from_ufbx(texture->relative_filename);
   if (path.empty()) path = string_from_ufbx(texture->absolute_filename);
+  if (path.empty()) path = string_from_ufbx(texture->name);
+  return path;
+}
+
+static ufbx_blob texture_content(ufbx_scene* scene, ufbx_texture* texture) {
+  if (!texture) return {};
+  if (texture->content.data && texture->content.size > 0) return texture->content;
+  if (texture->has_file && texture->file_index < scene->texture_files.count) {
+    return scene->texture_files.data[texture->file_index].content;
+  }
+  return {};
+}
+
+static void print_base64(const uint8_t* data, size_t size) {
+  static const char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  putchar('"');
+  for (size_t i = 0; i < size; i += 3) {
+    const uint32_t a = data[i];
+    const uint32_t b = i + 1 < size ? data[i + 1] : 0;
+    const uint32_t c = i + 2 < size ? data[i + 2] : 0;
+    const uint32_t value = (a << 16) | (b << 8) | c;
+    putchar(alphabet[(value >> 18) & 63]);
+    putchar(alphabet[(value >> 12) & 63]);
+    putchar(i + 1 < size ? alphabet[(value >> 6) & 63] : '=');
+    putchar(i + 2 < size ? alphabet[value & 63] : '=');
+  }
+  putchar('"');
+}
+
+static void add_texture_path(std::vector<std::string>& paths, ufbx_texture* texture) {
+  if (!texture) return;
+  std::string path = texture_path(texture);
   if (!path.empty() && std::find(paths.begin(), paths.end(), path) == paths.end()) {
     paths.push_back(path);
   }
@@ -103,8 +143,17 @@ static double normalize_unit_value(double value) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: asset_atlas_mesh_importer <model.fbx>\n");
+    fprintf(stderr, "Usage: asset_atlas_mesh_importer <model.fbx> | --stdin <label>\n");
     return 2;
+  }
+
+  bool read_from_stdin = false;
+  std::string input_label;
+  if (std::string(argv[1]) == "--stdin") {
+    read_from_stdin = true;
+    input_label = argc >= 3 ? argv[2] : "<stdin>";
+  } else {
+    input_label = argv[1];
   }
 
   ufbx_load_opts opts = {};
@@ -114,7 +163,33 @@ int main(int argc, char** argv) {
   opts.target_unit_meters = 1.0f;
 
   ufbx_error error;
-  ufbx_scene* scene = ufbx_load_file(argv[1], &opts, &error);
+  ufbx_scene* scene = nullptr;
+  std::vector<uint8_t> input_bytes;
+  if (read_from_stdin) {
+    _setmode(_fileno(stdin), _O_BINARY);
+    constexpr size_t kChunkSize = 64 * 1024;
+    std::vector<char> chunk(kChunkSize);
+    for (;;) {
+      const size_t n = fread(chunk.data(), 1, chunk.size(), stdin);
+      if (n > 0) {
+        input_bytes.insert(input_bytes.end(), chunk.begin(), chunk.begin() + n);
+      }
+      if (n < chunk.size()) {
+        if (feof(stdin)) break;
+        if (ferror(stdin)) {
+          fprintf(stderr, "Failed reading FBX bytes from stdin.\n");
+          return 1;
+        }
+      }
+    }
+    if (input_bytes.empty()) {
+      fprintf(stderr, "No FBX bytes received on stdin.\n");
+      return 1;
+    }
+    scene = ufbx_load_memory(input_bytes.data(), input_bytes.size(), &opts, &error);
+  } else {
+    scene = ufbx_load_file(argv[1], &opts, &error);
+  }
   if (!scene) {
     fprintf(stderr, "ufbx failed: %s\n", error.description.data ? error.description.data : "unknown error");
     return 1;
@@ -142,6 +217,17 @@ int main(int argc, char** argv) {
     info.emissive_b = 0.0;
     info.shader_type = static_cast<int>(material->shader_type);
     info.shading_model = string_from_ufbx(material->shading_model_name);
+
+    ufbx_texture* primary_texture = material->pbr.base_color.texture;
+    if (!primary_texture) primary_texture = material->fbx.diffuse_color.texture;
+    if (primary_texture) {
+      info.uv_set = string_from_ufbx(primary_texture->uv_set);
+      const ufbx_blob embedded = texture_content(scene, primary_texture);
+      if (embedded.data && embedded.size > 0) {
+        const uint8_t* begin = static_cast<const uint8_t*>(embedded.data);
+        info.embedded_texture.assign(begin, begin + embedded.size);
+      }
+    }
 
     ufbx_vec3 color = material->pbr.base_color.value_vec3;
     if (!material->pbr.base_color.has_value && material->fbx.diffuse_color.has_value) {
@@ -218,9 +304,21 @@ int main(int argc, char** argv) {
     scene_textures.push_back(info);
   }
 
+  std::vector<std::string> uv_set_names;
   for (size_t mesh_index = 0; mesh_index < scene->meshes.count; ++mesh_index) {
     ufbx_mesh* mesh = scene->meshes.data[mesh_index];
-    if (!mesh || mesh->num_faces == 0) continue;
+    if (!mesh) continue;
+    for (size_t uv_index = 0; uv_index < mesh->uv_sets.count; ++uv_index) {
+      std::string name = string_from_ufbx(mesh->uv_sets.data[uv_index].name);
+      if (name.empty()) name = "UVSet" + std::to_string(uv_index);
+      if (std::find(uv_set_names.begin(), uv_set_names.end(), name) == uv_set_names.end()) {
+        uv_set_names.push_back(name);
+      }
+    }
+  }
+
+  auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world) {
+    if (!mesh || mesh->num_faces == 0) return;
 
     std::vector<unsigned int> tri_indices(mesh->max_face_triangles * 3);
     for (size_t face_index = 0; face_index < mesh->num_faces; ++face_index) {
@@ -239,9 +337,13 @@ int main(int argc, char** argv) {
       for (size_t tri = 0; tri < num_triangles; ++tri) {
         int base = static_cast<int>(vertices.size());
         double tri_uvs[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        std::vector<std::array<double, 6>> tri_uv_sets(uv_set_names.size());
         for (size_t corner = 0; corner < 3; ++corner) {
           unsigned int vertex_index = tri_indices[tri * 3 + corner];
           ufbx_vec3 p = ufbx_get_vertex_vec3(&mesh->vertex_position, vertex_index);
+          if (geometry_to_world) {
+            p = ufbx_transform_position(geometry_to_world, p);
+          }
           vertices.push_back({p.x, p.y, p.z});
           Vec4 color = {1.0, 1.0, 1.0, 1.0};
           if (mesh->vertex_color.exists) {
@@ -253,6 +355,18 @@ int main(int argc, char** argv) {
             ufbx_vec2 uv = ufbx_get_vertex_vec2(&mesh->vertex_uv, vertex_index);
             tri_uvs[corner * 2 + 0] = uv.x;
             tri_uvs[corner * 2 + 1] = 1.0 - uv.y;
+          }
+          for (size_t uv_index = 0; uv_index < mesh->uv_sets.count; ++uv_index) {
+            const ufbx_uv_set& uv_set = mesh->uv_sets.data[uv_index];
+            if (!uv_set.vertex_uv.exists) continue;
+            std::string uv_name = string_from_ufbx(uv_set.name);
+            if (uv_name.empty()) uv_name = "UVSet" + std::to_string(uv_index);
+            auto name_it = std::find(uv_set_names.begin(), uv_set_names.end(), uv_name);
+            if (name_it == uv_set_names.end()) continue;
+            const size_t output_index = static_cast<size_t>(name_it - uv_set_names.begin());
+            ufbx_vec2 uv = ufbx_get_vertex_vec2(&uv_set.vertex_uv, vertex_index);
+            tri_uv_sets[output_index][corner * 2 + 0] = uv.x;
+            tri_uv_sets[output_index][corner * 2 + 1] = 1.0 - uv.y;
           }
         }
         faces.push_back({
@@ -266,13 +380,38 @@ int main(int argc, char** argv) {
           tri_uvs[3],
           tri_uvs[4],
           tri_uvs[5],
+          std::move(tri_uv_sets),
         });
       }
     }
+  };
+
+  // Iterate mesh instances through scene nodes so every mesh receives its full
+  // inherited node + geometric transform. Iterating scene->meshes directly
+  // loses instance transforms and also collapses repeated instances to one.
+  for (size_t node_index = 0; node_index < scene->nodes.count; ++node_index) {
+    ufbx_node* node = scene->nodes.data[node_index];
+    if (!node || !node->mesh) continue;
+    append_mesh(node->mesh, &node->geometry_to_world);
+  }
+
+  // Defensive fallback for unusual scenes that contain an unattached mesh.
+  for (size_t mesh_index = 0; mesh_index < scene->meshes.count; ++mesh_index) {
+    ufbx_mesh* mesh = scene->meshes.data[mesh_index];
+    if (!mesh || mesh->instances.count != 0) continue;
+    append_mesh(mesh, nullptr);
   }
 
   if (vertices.empty() || faces.empty()) {
-    fprintf(stderr, "No renderable mesh geometry found.\n");
+    if (scene->anim_stacks.count > 0 || scene->bones.count > 0) {
+      fprintf(
+        stderr,
+        "FBX contains animation or skeleton data but no renderable mesh geometry. "
+        "Animation-only preview is not implemented yet.\n"
+      );
+    } else {
+      fprintf(stderr, "No renderable mesh geometry found.\n");
+    }
     ufbx_free_scene(scene);
     return 1;
   }
@@ -297,7 +436,7 @@ int main(int argc, char** argv) {
   }
 
   printf("{\"name\":");
-  print_json_string(argv[1]);
+  print_json_string(input_label.c_str());
   printf(",\"vertices\":[");
   for (size_t i = 0; i < vertices.size(); ++i) {
     const Vec3& v = vertices[i];
@@ -332,10 +471,27 @@ int main(int argc, char** argv) {
     printf(",\"shaderType\":%d", material.shader_type);
     printf(",\"shadingModel\":");
     print_json_string(material.shading_model.c_str());
+    printf(",\"uvSet\":");
+    print_json_string(material.uv_set.c_str());
+    printf(",\"embeddedTextureBase64\":");
+    print_base64(material.embedded_texture.data(), material.embedded_texture.size());
     printf(",\"textures\":[");
     for (size_t texture_index = 0; texture_index < material.textures.size(); ++texture_index) {
       if (texture_index) putchar(',');
       print_json_string(material.textures[texture_index].c_str());
+    }
+    printf("]}");
+  }
+  printf("],\"uvSets\":[");
+  for (size_t uv_set_index = 0; uv_set_index < uv_set_names.size(); ++uv_set_index) {
+    if (uv_set_index) putchar(',');
+    printf("{\"name\":");
+    print_json_string(uv_set_names[uv_set_index].c_str());
+    printf(",\"faces\":[");
+    for (size_t face_index = 0; face_index < faces.size(); ++face_index) {
+      if (face_index) putchar(',');
+      const auto& uv = faces[face_index].uv_sets[uv_set_index];
+      printf("[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]", uv[0], uv[1], uv[2], uv[3], uv[4], uv[5]);
     }
     printf("]}");
   }

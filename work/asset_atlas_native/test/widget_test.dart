@@ -6,6 +6,7 @@
 // tree, read text, and verify that the values of widget properties are correct.
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
 
 import 'package:asset_atlas_native/main.dart';
 
@@ -14,7 +15,13 @@ void main() {
     await tester.pumpWidget(const AssetAtlasApp(enablePersistence: false));
     await tester.pumpAndSettle();
 
-    expect(find.text('Asset Atlas Native'), findsOneWidget);
+    expect(find.text('Asset Atlas Native · v1.1.0'), findsOneWidget);
     expect(find.text('Scan folder'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('Hide ZIP contents'),
+      180,
+      scrollable: find.byType(Scrollable).first,
+    );
+    expect(find.text('Hide ZIP contents'), findsOneWidget);
   });
 }

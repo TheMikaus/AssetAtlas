@@ -19,6 +19,23 @@ This is no longer a template app. It is an active native prototype that can:
 - Preview 3D models with a software renderer (textured, solid, wireframe modes).
 - Render FBX textures in textured mode using imported UV coordinates.
 - Show model texture discovery diagnostics for FBX content.
+- Parse FBX exclusively through the bundled `ufbx` native importer; Dart consumes
+  the importer's normalized mesh/material output and does not parse FBX directly.
+- Apply inherited FBX node and geometric transforms, including separate placement
+  of repeated mesh instances, before normalizing the scene for preview.
+- Decode embedded FBX base-color images directly from the file when no external
+  texture is available.
+- Import every named FBX UV set and render each material with its requested set,
+  with deterministic fallback to the default or first available coordinates.
+- Preview FBX models directly from ZIP entries through the native stdin importer;
+  embedded images and ZIP-relative external textures both render without extracting
+  the archive to a temporary directory.
+- Relink stale FBX author-machine texture paths within the same ZIP by deterministic
+  filename and Synty-style variant matching, without crossing into another pack.
+- Shade solid and textured previews with selectable corner, top-down, or unlit
+  directional lighting so low-poly surface forms remain readable.
+- Optionally hide all assets indexed inside ZIP archives from the catalog, which
+  also keeps hidden ZIP models out of background texture validation.
 
 Main implementation is in [lib/main.dart](lib/main.dart).
 
@@ -116,6 +133,9 @@ Scan regression is covered by fixture-based tests in [test/scan_fixture_test.dar
 Copy flow regression is covered in [test/copy_fixture_test.dart](test/copy_fixture_test.dart).
 
 FBX textured pipeline regression is covered in [test/fbx_texture_pipeline_test.dart](test/fbx_texture_pipeline_test.dart).
+Native ufbx regression coverage is in [test/native_fbx_importer_test.dart](test/native_fbx_importer_test.dart)
+and uses an ASCII FBX fixture with embedded PNG content, transformed instances,
+and two named UV sets. Build Windows first so the native helper is available.
 
 ## Supported File Types (Current)
 

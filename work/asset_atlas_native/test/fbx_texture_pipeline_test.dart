@@ -38,11 +38,21 @@ void main() {
         'faces': [
           [0, 1, 2, 0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
         ],
+        'uvSets': [
+          {
+            'name': 'LightmapUV',
+            'faces': [
+              [0.25, 0.25, 0.75, 0.25, 0.25, 0.75],
+            ],
+          },
+        ],
         'materials': [
           {
             'name': 'Mat',
             'color': [1.0, 1.0, 1.0],
             'textures': ['albedo.png'],
+            'uvSet': 'LightmapUV',
+            'embeddedTextureBase64': base64Encode(onePixelPng),
           },
         ],
         'textureFiles': ['albedo.png'],
@@ -56,6 +66,10 @@ void main() {
     expect(mesh.faces.first.uvs.length, 3);
     expect(mesh.faces.first.uvs.first.x, 0.0);
     expect(mesh.faces.first.uvs.first.y, 0.0);
+    expect(mesh.faces.first.uvSets.keys, contains('LightmapUV'));
+    expect(mesh.faces.first.uvsFor('LightmapUV').first.x, 0.25);
+    expect(mesh.materials.first.uvSet, 'LightmapUV');
+    expect(mesh.materials.first.hasEmbeddedTexture, isTrue);
     expect(mesh.materials.first.resolvedTextures, contains(textureFile.path));
     expect(mesh.materials.first.textures, contains('albedo.png'));
     expect(mesh.allTexturePaths, contains('albedo.png'));
