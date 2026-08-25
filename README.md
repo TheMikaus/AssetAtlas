@@ -35,3 +35,8 @@ See the `docs/` folder for implementation-level technical specs:
 - [Architecture](docs/TECH_SPEC_ARCHITECTURE.md) - app structure, data flow, and module boundaries.
 - [Rendering and FBX](docs/TECH_SPEC_RENDERING_FBX.md) - importer pipeline, texture resolution, and renderer behavior.
 - [Build and Release](docs/TECH_SPEC_BUILD_RELEASE.md) - versioning, packaging scripts, and installer workflow.
+
+## Current Engineering Work
+
+- [Engineering Assessment](docs/ENGINEERING_ASSESSMENT.md) - known defects, ranked, with the reasoning behind the plan.
+- [Task Specs](docs/tasks/README.md) - self-contained work items derived from the assessment.
