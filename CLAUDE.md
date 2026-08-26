@@ -95,6 +95,20 @@ Tests are fixture-driven, under `test/`:
 
 Tests import app code as `package:asset_atlas_native/main.dart`, so anything they exercise must be a top-level (non-private) declaration in `main.dart`.
 
+## Windows platform gotchas
+
+**Never put a `Tooltip` directly inside `ToggleButtons`.** It corrupts the
+Windows accessibility tree (`Failed to update ui::AXTree` on stderr at startup)
+and the app then hard-crashes inside `flutter_windows.dll` — exception
+`0xC000041D` — the next time the window is resized or maximised. Bisected and
+confirmed against this exact combination; `ToggleButtons` alone and
+`DropdownButton` alone are both fine, and `IconButton(tooltip: ...)` is safe and
+is what the toolbar uses instead.
+
+More generally: AX errors on stderr are not cosmetic here. A clean run prints
+none, so treat any `accessibility_bridge.cc` line as a crash waiting for a
+resize, and bisect the widget tree until it is silent.
+
 ## Diagnostics
 
 FBX pipeline logging is on via `const enableFbxLogs = true` and writes to `work/asset_atlas_native/logs/asset_atlas_fbx.log` — importer launch/exit, JSON field counts, texture relink decisions, mesh/vertex-color summary. Read this log first when a model previews blank or untextured.

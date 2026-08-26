@@ -50,7 +50,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.4.1';
+const appVersion = '1.4.2';
 const _maxConcurrentModelValidations = 3;
 const enableFbxLogs = true;
 String fbxLogFilePath =
@@ -1093,6 +1093,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
   @override
   Widget build(BuildContext context) {
     final visible = filteredAssets;
+    // FBX files nothing has read yet, so the animation count is a lower bound.
+    final unclassifiedFbxCount = assets
+        .where((asset) => asset.ext == 'fbx' && asset.modelKind == null)
+        .length;
     final counts = {
       'all': assets.length,
       'image': assets.where((asset) => asset.effectiveType == 'image').length,
@@ -1133,6 +1137,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                   children: [
                     FilterPanel(
                       counts: counts,
+                      unclassifiedFbxCount: unclassifiedFbxCount,
                       typeFilter: typeFilter,
                       modelTextureFilter: modelTextureFilter,
                       hideIgnored: hideIgnored,
@@ -1706,6 +1711,7 @@ class _FolderRow extends StatelessWidget {
 class FilterPanel extends StatelessWidget {
   const FilterPanel({
     required this.counts,
+    required this.unclassifiedFbxCount,
     required this.typeFilter,
     required this.modelTextureFilter,
     required this.hideIgnored,
@@ -1725,6 +1731,7 @@ class FilterPanel extends StatelessWidget {
   });
 
   final Map<String, int> counts;
+  final int unclassifiedFbxCount;
   final String typeFilter;
   final String modelTextureFilter;
   final bool hideIgnored;
@@ -1755,10 +1762,22 @@ class FilterPanel extends StatelessWidget {
             for (final type in ['all', 'image', 'model', 'animation', 'audio'])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
-                child: ChoiceChip(
-                  selected: typeFilter == type,
-                  label: Text('${type.toUpperCase()} (${counts[type] ?? 0})'),
-                  onSelected: (_) => onTypeChanged(type),
+                child: Tooltip(
+                  message: type == 'animation' && unclassifiedFbxCount > 0
+                      ? '$unclassifiedFbxCount FBX files have not been read '
+                            'yet. Pick this filter to classify them.'
+                      : '',
+                  child: ChoiceChip(
+                    selected: typeFilter == type,
+                    // "(0)" would claim there are no animation clips when in
+                    // fact nothing has looked yet.
+                    label: Text(
+                      type == 'animation' && unclassifiedFbxCount > 0
+                          ? 'ANIMATION (${counts[type] ?? 0}+)'
+                          : '${type.toUpperCase()} (${counts[type] ?? 0})',
+                    ),
+                    onSelected: (_) => onTypeChanged(type),
+                  ),
                 ),
               ),
             const SizedBox(height: 10),
@@ -1850,6 +1869,36 @@ class FilterPanel extends StatelessWidget {
   }
 }
 
+class _ViewModeButton extends StatelessWidget {
+  const _ViewModeButton({
+    required this.icon,
+    required this.tooltip,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final bool selected;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+      style: IconButton.styleFrom(
+        backgroundColor: selected ? scheme.primaryContainer : null,
+        foregroundColor: selected ? scheme.onPrimaryContainer : Colors.black54,
+      ),
+      icon: Icon(icon, size: 20),
+    );
+  }
+}
+
 class SearchAndSummary extends StatelessWidget {
   const SearchAndSummary({
     required this.controller,
@@ -1912,18 +1961,22 @@ class SearchAndSummary extends StatelessWidget {
               const SizedBox(width: 6),
               // List and grid answer different questions: "which file is this"
               // versus "which one looks right".
-              ToggleButtons(
-                isSelected: [!gridMode, gridMode],
-                constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-                borderRadius: BorderRadius.circular(6),
-                onPressed: (index) => onGridModeChanged(index == 1),
-                children: const [
-                  Tooltip(message: 'List view', child: Icon(Icons.view_list)),
-                  Tooltip(
-                    message: 'Thumbnail grid',
-                    child: Icon(Icons.grid_view),
-                  ),
-                ],
+              // Two IconButtons rather than ToggleButtons: a Tooltip placed
+              // as a direct child of ToggleButtons corrupts the Windows
+              // accessibility tree, and the app then hard-crashes inside
+              // flutter_windows.dll on the next window resize. IconButton's
+              // own tooltip is safe and is what the rest of the app uses.
+              _ViewModeButton(
+                icon: Icons.view_list,
+                tooltip: 'List view',
+                selected: !gridMode,
+                onPressed: () => onGridModeChanged(false),
+              ),
+              _ViewModeButton(
+                icon: Icons.grid_view,
+                tooltip: 'Thumbnail grid',
+                selected: gridMode,
+                onPressed: () => onGridModeChanged(true),
               ),
             ],
           ),
@@ -3691,8 +3744,57 @@ class CopyablePathText extends StatelessWidget {
   final int maxLines;
   final TextStyle? style;
 
+  /// Trims from the *front* until the text fits.
+  ///
+  /// Two long paths under the same root differ at the end, so cutting the tail
+  /// renders them identical on screen -- which is exactly what the source
+  /// folder list used to do.
+  String fitPathToWidth(String value, double width, TextStyle? textStyle) {
+    bool fits(String candidate) {
+      final painter = TextPainter(
+        text: TextSpan(text: candidate, style: textStyle),
+        maxLines: maxLines,
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: width);
+      return !painter.didExceedMaxLines;
+    }
+
+    if (width <= 0 || width.isInfinite || fits(value)) return value;
+    // A path tail has no spaces, so without a break opportunity it cannot wrap
+    // and only one line's worth survives however many lines are allowed.
+
+    // Binary search for the shortest head that has to go.
+    var low = 0;
+    var high = value.length;
+    while (low < high) {
+      final mid = (low + high) ~/ 2;
+      if (fits(breakableAtSeparators('...${value.substring(mid)}'))) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    // Prefer cutting at a folder boundary: "...\FBX\wall.fbx" reads better
+    // than "...BX\wall.fbx".
+    final separator = value.indexOf(RegExp(r'[\\/]'), low);
+    if (separator >= 0 &&
+        fits(breakableAtSeparators('...${value.substring(separator)}'))) {
+      return '...${value.substring(separator)}';
+    }
+    return '...${value.substring(low)}';
+  }
+
+  /// Inserts zero-width spaces after path separators so a long path can wrap
+  /// at folder boundaries instead of being stuck on one line.
+  static String breakableAtSeparators(String value) =>
+      value.replaceAllMapped(
+        RegExp(r'[\\/]'),
+        (match) => '${match[0]}\u200b',
+      );
+
   @override
   Widget build(BuildContext context) {
+    final effectiveStyle = style ?? DefaultTextStyle.of(context).style;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -3700,11 +3802,15 @@ class CopyablePathText extends StatelessWidget {
           child: Tooltip(
             message: path,
             waitDuration: const Duration(milliseconds: 400),
-            child: Text(
-              path,
-              maxLines: maxLines,
-              overflow: TextOverflow.ellipsis,
-              style: style,
+            child: LayoutBuilder(
+              builder: (context, constraints) => Text(
+                breakableAtSeparators(
+                  fitPathToWidth(path, constraints.maxWidth, effectiveStyle),
+                ),
+                maxLines: maxLines,
+                overflow: TextOverflow.ellipsis,
+                style: style,
+              ),
             ),
           ),
         ),
@@ -6611,5 +6717,6 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
