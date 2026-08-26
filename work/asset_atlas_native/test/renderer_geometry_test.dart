@@ -1,6 +1,3 @@
-import 'dart:io';
-import 'dart:math' as math;
-
 import 'package:asset_atlas_native/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -64,63 +61,132 @@ void main() {
       expect(isBackFacingTriangle(0, 0, 5, 5, 10, 10), isFalse);
     });
 
-    test('the two conventions are exact opposites', () {
-      expect(isBackFacingTriangle(0, 0, 10, 0, 10, 10), isTrue);
-      expect(isBackFacingTriangle(0, 0, 10, 10, 10, 0), isFalse);
+    test('the two windings classify oppositely', () {
+      // Which winding is "front" is pinned by the cube tests below, against
+      // outward normals; this only asserts the two are treated as opposites.
+      const a = [0.0, 0.0, 10.0, 0.0, 10.0, 10.0];
+      const b = [0.0, 0.0, 10.0, 10.0, 10.0, 0.0];
+      expect(
+        isBackFacingTriangle(a[0], a[1], a[2], a[3], a[4], a[5]),
+        isNot(isBackFacingTriangle(b[0], b[1], b[2], b[3], b[4], b[5])),
+      );
     });
   });
 
-  test('fixture faces are front facing under the default camera', () async {
-    // Pins the winding convention against real ufbx output. The fixture is
-    // authored to be looked at, so if these were culled the sign would be
-    // inverted and closed models would render inside out.
-    final helper = File(
-      'build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe',
-    );
-    if (!helper.existsSync()) {
-      markTestSkipped('Build the Windows app before running native FBX tests.');
-      return;
-    }
+  group('culling keeps the outside of a solid', () {
+    // A cube face, wound so its right-handed geometric normal points away from
+    // the cube centre. "Outward" is computed here, not assumed, so this test
+    // cannot drift with the renderer's conventions.
+    ({List<double> xs, List<double> ys, List<double> normal}) cubeFace({
+      required double axis,
+      required int axisIndex,
+    }) {
+      // Four corners of the face at `axis` on `axisIndex`.
+      final corners = <List<double>>[];
+      for (final u in [-1.0, 1.0]) {
+        for (final v in [-1.0, 1.0]) {
+          final point = [0.0, 0.0, 0.0];
+          point[axisIndex] = axis;
+          point[(axisIndex + 1) % 3] = u;
+          point[(axisIndex + 2) % 3] = v;
+          corners.add(point);
+        }
+      }
+      // corners is [--, -+, +-, ++]; take a triangle and orient it outward.
+      var a = corners[0];
+      var b = corners[1];
+      var c = corners[3];
+      List<double> normalOf(List<double> p, List<double> q, List<double> r) {
+        final ux = q[0] - p[0], uy = q[1] - p[1], uz = q[2] - p[2];
+        final vx = r[0] - p[0], vy = r[1] - p[1], vz = r[2] - p[2];
+        return [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx];
+      }
 
-    final mesh = await importFbxWithUfbx(
-      File('test/fixtures/fbx/transformed_uv_embedded.fbx').absolute.path,
-      'fixture',
-    );
-
-    // Same projection the painter uses, at ModelPreview's initial camera.
-    const yaw = -0.6;
-    const pitch = 0.35;
-    final sy = math.sin(yaw);
-    final cy = math.cos(yaw);
-    final sx = math.sin(pitch);
-    final cx = math.cos(pitch);
-    final xs = <double>[];
-    final ys = <double>[];
-    for (final vertex in mesh.vertices) {
-      final x1 = vertex.x * cy + vertex.z * sy;
-      final z1 = -vertex.x * sy + vertex.z * cy;
-      final y1 = vertex.y * cx - z1 * sx;
-      final z2 = vertex.y * sx + z1 * cx;
-      final perspective = 2.8 / (2.8 + z2);
-      xs.add(200 + x1 * 100 * perspective);
-      ys.add(200 - y1 * 100 * perspective);
-    }
-
-    expect(mesh.faces, isNotEmpty);
-    for (final face in mesh.faces) {
-      final i = face.indices;
+      var normal = normalOf(a, b, c);
+      // Outward means the normal agrees with the direction from the centre.
+      if (normal[axisIndex] * axis < 0) {
+        final swap = b;
+        b = c;
+        c = swap;
+        normal = normalOf(a, b, c);
+      }
       expect(
-        isBackFacingTriangle(
-          xs[i[0]],
-          ys[i[0]],
-          xs[i[1]],
-          ys[i[1]],
-          xs[i[2]],
-          ys[i[2]],
-        ),
-        isFalse,
-        reason: 'fixture geometry must survive culling at the default camera',
+        normal[axisIndex] * axis,
+        greaterThan(0),
+        reason: 'test setup: face normal must point outward',
+      );
+
+      // The painter's projection at yaw = 0, pitch = 0: x and y pass through,
+      // larger z is farther, screen y is flipped.
+      List<double> project(List<double> p) {
+        final perspective = 2.8 / (2.8 + p[2]);
+        return [250 + p[0] * 100 * perspective, 250 - p[1] * 100 * perspective];
+      }
+
+      final pa = project(a), pb = project(b), pc = project(c);
+      return (
+        xs: [pa[0], pb[0], pc[0]],
+        ys: [pa[1], pb[1], pc[1]],
+        normal: normal,
       );
     }
+
+    test('the near face of a cube is kept', () {
+      // Camera sits at negative z looking toward +z, so the z = -1 face faces
+      // the viewer. If this is ever culled, every closed model renders
+      // inside out -- which is exactly the bug this pins.
+      final face = cubeFace(axis: -1, axisIndex: 2);
+      expect(
+        isBackFacingTriangle(
+          face.xs[0],
+          face.ys[0],
+          face.xs[1],
+          face.ys[1],
+          face.xs[2],
+          face.ys[2],
+        ),
+        isFalse,
+        reason: 'the outside of the near face must survive culling',
+      );
+    });
+
+    test('the far face of a cube is culled', () {
+      final face = cubeFace(axis: 1, axisIndex: 2);
+      expect(
+        isBackFacingTriangle(
+          face.xs[0],
+          face.ys[0],
+          face.xs[1],
+          face.ys[1],
+          face.xs[2],
+          face.ys[2],
+        ),
+        isTrue,
+        reason: 'the far side of a solid is hidden and should be dropped',
+      );
+    });
+
+    test('only the faces turned toward the camera are kept', () {
+      var kept = 0;
+      for (var axisIndex = 0; axisIndex < 3; axisIndex += 1) {
+        for (final axis in [-1.0, 1.0]) {
+          final face = cubeFace(axis: axis, axisIndex: axisIndex);
+          if (!isBackFacingTriangle(
+            face.xs[0],
+            face.ys[0],
+            face.xs[1],
+            face.ys[1],
+            face.xs[2],
+            face.ys[2],
+          )) {
+            kept += 1;
+          }
+        }
+      }
+      // Head-on camera (yaw and pitch both zero), so only the near face is
+      // turned toward the viewer; the four side faces are edge-on and the far
+      // face points away.
+      expect(kept, 1, reason: 'only the near face of a head-on cube is kept');
+    });
   });
 }
