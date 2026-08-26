@@ -246,6 +246,26 @@ void main() {
     expect(await db.loadProjectAssetIds(projectId), isEmpty);
   });
 
+  test('loading drops AppleDouble rows left by older scans', () async {
+    final db = await _openAt(await _freshDbPath('asset_atlas_db_apple_'));
+
+    await db.saveCatalog(
+      assets: [
+        _asset('keep', name: 'track.mp3'),
+        _asset('stub', name: '._track.mp3'),
+      ],
+      sourceRoots: const [],
+    );
+
+    final restored = await db.loadCatalog();
+    expect(restored.assets.map((asset) => asset.name), ['track.mp3']);
+
+    // And it is gone from storage, not merely hidden.
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    final again = await db.loadCatalog();
+    expect(again.assets.map((asset) => asset.id), ['keep']);
+  });
+
   group('migration', () {
     test('a v1 database upgrades, keeping its rows, and gains indexes', () async {
       final path = await _freshDbPath('asset_atlas_db_migrate_');

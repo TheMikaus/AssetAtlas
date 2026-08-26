@@ -74,6 +74,12 @@ FBX files that contain only a skeleton and animation curves are listed as
 is, so a file is classified when you select it, or in the background when you
 choose the ANIMATION filter. The answer is remembered afterwards.
 
+While a background sweep runs, the count reads for example **ANIMATION (783+)**:
+the plus means files are still unread, so the number can only grow. The sweep
+uses several background workers and reads roughly 26,000 files in about three
+minutes; the app stays usable throughout, and progress appears in the status
+area at the top.
+
 ### Selecting assets
 
 - Click the checkbox on a row to select it for copying.
@@ -104,6 +110,13 @@ Select an image to display it in the preview area. Images stored in ZIP archives
 are read directly from the archive.
 
 ### Audio
+
+Some archives contain macOS sidecar files - names beginning with `._`, or
+anything under a `__MACOSX` folder - which carry a real file's extension but
+none of its content. AssetAtlas skips these when scanning and removes any that
+older scans left behind, and it checks that a file really contains audio before
+playing it, reporting a message rather than attempting playback.
+
 
 Select an audio file, then use **Play preview**, pause, seek, and the time display.
 ZIP-contained audio is played from its archived bytes.
