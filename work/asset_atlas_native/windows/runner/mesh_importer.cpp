@@ -75,7 +75,16 @@ static void print_json_string(const char* text) {
       case '\n': printf("\\n"); break;
       case '\r': printf("\\r"); break;
       case '\t': printf("\\t"); break;
-      default: putchar(*p); break;
+      default:
+        // Control bytes are illegal raw in JSON. Bytes >= 0x80 must pass
+        // through untouched: they are UTF-8 continuation bytes and escaping
+        // them individually would corrupt the text.
+        if (static_cast<unsigned char>(*p) < 0x20) {
+          printf("\\u%04x", static_cast<unsigned char>(*p));
+        } else {
+          putchar(*p);
+        }
+        break;
     }
   }
   putchar('"');

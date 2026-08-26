@@ -65,4 +65,31 @@ void main() {
       expect(mesh.faces.first.uvsFor('DetailUV').first.y, closeTo(0.75, 1e-6));
     },
   );
+
+  test(
+    'importer output survives the round trip as UTF-8 and stays valid JSON',
+    () async {
+      final helper = File(
+        'build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe',
+      );
+      if (!helper.existsSync()) {
+        markTestSkipped('Build the Windows app before running native FBX tests.');
+        return;
+      }
+
+      final fixture = File('test/fixtures/fbx/non_ascii_material.fbx').absolute;
+      expect(fixture.existsSync(), isTrue);
+
+      // The on-disk branch is the one that used to decode with systemEncoding.
+      final result = await runMeshImporter(helper.absolute.path, fixture.path);
+      expect(result.exitCode, 0, reason: result.stderr);
+
+      // A raw control byte in the material name must be escaped by the
+      // importer, or this decode throws.
+      final json = jsonDecode(result.stdout) as Map<String, dynamic>;
+      final material = (json['materials'] as List<dynamic>).first
+          as Map<String, dynamic>;
+      expect(material['name'], 'Matériau_Grün\u0001x');
+    },
+  );
 }
