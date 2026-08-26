@@ -157,12 +157,25 @@ int main(int argc, char** argv) {
   }
 
   bool read_from_stdin = false;
+  bool probe_only = false;
   std::string input_label;
-  if (std::string(argv[1]) == "--stdin") {
-    read_from_stdin = true;
-    input_label = argc >= 3 ? argv[2] : "<stdin>";
-  } else {
-    input_label = argv[1];
+  const char* file_argument = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--stdin") {
+      read_from_stdin = true;
+    } else if (arg == "--probe") {
+      // Classification only: skip geometry extraction and the JSON
+      // payload, which dominate cost when sweeping a whole catalog.
+      probe_only = true;
+    } else if (!file_argument) {
+      file_argument = argv[i];
+    }
+  }
+  input_label = file_argument ? file_argument : "<stdin>";
+  if (!read_from_stdin && !file_argument) {
+    fprintf(stderr, "Usage: asset_atlas_mesh_importer [--probe] <model.fbx> | --stdin [--probe] <label>\n");
+    return 2;
   }
 
   ufbx_load_opts opts = {};
@@ -197,11 +210,42 @@ int main(int argc, char** argv) {
     }
     scene = ufbx_load_memory(input_bytes.data(), input_bytes.size(), &opts, &error);
   } else {
-    scene = ufbx_load_file(argv[1], &opts, &error);
+    scene = ufbx_load_file(file_argument, &opts, &error);
   }
   if (!scene) {
     fprintf(stderr, "ufbx failed: %s\n", error.description.data ? error.description.data : "unknown error");
     return 1;
+  }
+
+  if (probe_only) {
+    size_t total_faces = 0;
+    for (size_t i = 0; i < scene->meshes.count; ++i) {
+      const ufbx_mesh* mesh = scene->meshes.data[i];
+      if (mesh) total_faces += mesh->num_faces;
+    }
+    if (total_faces == 0 &&
+        (scene->anim_stacks.count > 0 || scene->bones.count > 0)) {
+      double duration = 0.0;
+      for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+        const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+        if (!stack) continue;
+        const double length = stack->time_end - stack->time_begin;
+        if (length > duration) duration = length;
+      }
+      printf("{\"kind\":\"animation\",\"animationStacks\":%zu", scene->anim_stacks.count);
+      printf(",\"bones\":%zu", scene->bones.count);
+      printf(",\"durationSeconds\":%.6g}", duration);
+      ufbx_free_scene(scene);
+      return 0;
+    }
+    if (total_faces == 0) {
+      fprintf(stderr, "No renderable mesh geometry found.\n");
+      ufbx_free_scene(scene);
+      return 1;
+    }
+    printf("{\"kind\":\"mesh\",\"faces\":%zu}", total_faces);
+    ufbx_free_scene(scene);
+    return 0;
   }
 
   std::vector<Vec3> vertices;
@@ -413,14 +457,32 @@ int main(int argc, char** argv) {
 
   if (vertices.empty() || faces.empty()) {
     if (scene->anim_stacks.count > 0 || scene->bones.count > 0) {
-      fprintf(
-        stderr,
-        "FBX contains animation or skeleton data but no renderable mesh geometry. "
-        "Animation-only preview is not implemented yet.\n"
-      );
-    } else {
-      fprintf(stderr, "No renderable mesh geometry found.\n");
+      // Animation-only content is a legitimate result, not a failure.
+      // Report it as such so the catalog can classify the asset instead
+      // of showing an import error.
+      double duration = 0.0;
+      for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+        const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+        if (!stack) continue;
+        const double length = stack->time_end - stack->time_begin;
+        if (length > duration) duration = length;
+      }
+      printf("{\"kind\":\"animation\",\"name\":");
+      print_json_string(input_label.c_str());
+      printf(",\"animationStacks\":%zu", scene->anim_stacks.count);
+      printf(",\"bones\":%zu", scene->bones.count);
+      printf(",\"durationSeconds\":%.6g", duration);
+      printf(",\"animationNames\":[");
+      for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+        const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+        if (i) putchar(0x2C);
+        print_json_string(stack ? string_from_ufbx(stack->name).c_str() : "");
+      }
+      printf("]}");
+      ufbx_free_scene(scene);
+      return 0;
     }
+    fprintf(stderr, "No renderable mesh geometry found.\n");
     ufbx_free_scene(scene);
     return 1;
   }
@@ -444,7 +506,7 @@ int main(int argc, char** argv) {
     v.z = (v.z - center.z) * scale;
   }
 
-  printf("{\"name\":");
+  printf("{\"kind\":\"mesh\",\"name\":");
   print_json_string(input_label.c_str());
   printf(",\"vertices\":[");
   for (size_t i = 0; i < vertices.size(); ++i) {
