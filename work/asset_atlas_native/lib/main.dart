@@ -415,6 +415,20 @@ class _CatalogScreenState extends State<CatalogScreen> {
     await db.saveCatalog(assets: assets, sourceRoots: sourceRoots.toList());
   }
 
+  /// Runs a persistence call without blocking the caller, but surfaces a
+  /// failure instead of letting it vanish into an unawaited future.
+  void _persistInBackground(Future<void> Function() work) {
+    if (!widget.enablePersistence) return;
+    unawaited(
+      work().catchError((Object error) {
+        if (!mounted) return;
+        setState(() {
+          status = ScanStatus('Save failed', error.toString());
+        });
+      }),
+    );
+  }
+
   Future<void> saveProjectSnapshot() async {
     if (!widget.enablePersistence) {
       setState(() {
@@ -802,7 +816,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       }
       _pruneHistoryToVisibleAssets();
     });
-    unawaited(_persistCatalog());
+    _persistInBackground(() => db.deleteAssetsForSourceRoot(rootPath));
   }
 
   Future<void> copySelected() async {
@@ -843,15 +857,22 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   void setIgnored(AssetItem asset, bool ignored) {
+    final changed = <AssetItem>[];
     setState(() {
       final selected = selectedIds.contains(asset.id)
           ? assets.where((item) => selectedIds.contains(item.id))
           : [asset];
       for (final item in selected) {
         item.ignored = ignored;
+        changed.add(item);
       }
     });
-    unawaited(_persistCatalog());
+    // One UPDATE per changed asset, not a rewrite of the whole catalog.
+    _persistInBackground(() async {
+      for (final item in changed) {
+        await db.updateAssetIgnored(assetId: item.id, ignored: item.ignored);
+      }
+    });
   }
 
   @override
@@ -4938,17 +4959,48 @@ class AssetAtlasDatabase {
   static final instance = AssetAtlasDatabase._();
   Database? _db;
 
-  Future<void> initialize() async {
+  /// Schema history:
+  ///   v1 - initial catalog, sources, projects, membership
+  ///   v2 - indexes on the columns the app filters and joins by
+  static const schemaVersion = 2;
+
+  /// Indexes are created identically by [_createSchema] and by the v2 upgrade
+  /// so a fresh install and an upgraded install converge; see
+  /// test/database_test.dart, which asserts they match.
+  static const _indexStatements = [
+    'CREATE INDEX IF NOT EXISTS idx_catalog_assets_source_root '
+        'ON catalog_assets(source_root)',
+    'CREATE INDEX IF NOT EXISTS idx_catalog_assets_type '
+        'ON catalog_assets(type)',
+    'CREATE INDEX IF NOT EXISTS idx_project_assets_project '
+        'ON project_assets(project_id)',
+  ];
+
+  /// [databasePath] is a test seam; production passes nothing and the database
+  /// lives in the app support directory.
+  Future<void> initialize({String? databasePath}) async {
     if (_db != null) return;
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
-    final supportDir = await getApplicationSupportDirectory();
-    final dbPath =
-        '${supportDir.path}${Platform.pathSeparator}asset_atlas_native.db';
+    final String dbPath;
+    if (databasePath != null) {
+      dbPath = databasePath;
+    } else {
+      final supportDir = await getApplicationSupportDirectory();
+      dbPath =
+          '${supportDir.path}${Platform.pathSeparator}asset_atlas_native.db';
+    }
     _db = await databaseFactory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
-        version: 1,
+        version: schemaVersion,
+        onUpgrade: (db, oldVersion, newVersion) async {
+          if (oldVersion < 2) {
+            for (final statement in _indexStatements) {
+              await db.execute(statement);
+            }
+          }
+        },
         onCreate: (db, _) async {
           await db.execute('''
             CREATE TABLE catalog_assets (
@@ -4986,6 +5038,9 @@ class AssetAtlasDatabase {
               PRIMARY KEY (project_id, asset_id)
             )
           ''');
+          for (final statement in _indexStatements) {
+            await db.execute(statement);
+          }
         },
       ),
     );
@@ -5021,6 +5076,31 @@ class AssetAtlasDatabase {
     return PersistedCatalog(assets: assets, sourceRoots: sourceRoots);
   }
 
+  /// Releases the handle so a later [initialize] can open a different file.
+  /// Used by tests, which each need their own database.
+  Future<void> close() async {
+    final db = _db;
+    _db = null;
+    await db?.close();
+  }
+
+  Map<String, Object?> _rowFor(AssetItem asset) => {
+    'id': asset.id,
+    'name': asset.name,
+    'path': asset.path,
+    'relative_path': asset.relativePath,
+    'source_root': asset.sourceRoot,
+    'source_name': asset.sourceName,
+    'ext': asset.ext,
+    'type': asset.type,
+    'size': asset.size,
+    'modified_ms': asset.modified.millisecondsSinceEpoch,
+    'tags_json': jsonEncode(asset.tags),
+    'ignored': asset.ignored ? 1 : 0,
+  };
+
+  /// Full replace. Only correct after a scan, where the catalog really did
+  /// change wholesale - never for a single-field edit.
   Future<void> saveCatalog({
     required List<AssetItem> assets,
     required List<String> sourceRoots,
@@ -5030,25 +5110,79 @@ class AssetAtlasDatabase {
     await db.transaction((txn) async {
       await txn.delete('catalog_assets');
       await txn.delete('catalog_sources');
+      final batch = txn.batch();
       for (final rootPath in sourceRoots) {
-        await txn.insert('catalog_sources', {'root_path': rootPath});
+        batch.insert('catalog_sources', {'root_path': rootPath});
       }
       for (final asset in assets) {
-        await txn.insert('catalog_assets', {
-          'id': asset.id,
-          'name': asset.name,
-          'path': asset.path,
-          'relative_path': asset.relativePath,
-          'source_root': asset.sourceRoot,
-          'source_name': asset.sourceName,
-          'ext': asset.ext,
-          'type': asset.type,
-          'size': asset.size,
-          'modified_ms': asset.modified.millisecondsSinceEpoch,
-          'tags_json': jsonEncode(asset.tags),
-          'ignored': asset.ignored ? 1 : 0,
-        });
+        batch.insert(
+          'catalog_assets',
+          _rowFor(asset),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
       }
+      // noResult: collecting per-row results for a 100k-row catalog allocates
+      // a list nobody reads.
+      await batch.commit(noResult: true);
+    });
+  }
+
+  /// One row, one statement. Toggling an ignore flag used to delete and
+  /// reinsert the entire catalog.
+  Future<void> updateAssetIgnored({
+    required String assetId,
+    required bool ignored,
+  }) async {
+    await initialize();
+    await _db!.update(
+      'catalog_assets',
+      {'ignored': ignored ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [assetId],
+    );
+  }
+
+  Future<void> upsertAssets(List<AssetItem> assets) async {
+    if (assets.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final asset in assets) {
+        batch.insert(
+          'catalog_assets',
+          _rowFor(asset),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  Future<void> deleteAssetsForSourceRoot(String rootPath) async {
+    await initialize();
+    await _db!.transaction((txn) async {
+      await txn.delete(
+        'catalog_assets',
+        where: 'source_root = ?',
+        whereArgs: [rootPath],
+      );
+      await txn.delete(
+        'catalog_sources',
+        where: 'root_path = ?',
+        whereArgs: [rootPath],
+      );
+    });
+  }
+
+  Future<void> replaceSourceRoots(List<String> rootPaths) async {
+    await initialize();
+    await _db!.transaction((txn) async {
+      await txn.delete('catalog_sources');
+      final batch = txn.batch();
+      for (final rootPath in rootPaths) {
+        batch.insert('catalog_sources', {'root_path': rootPath});
+      }
+      await batch.commit(noResult: true);
     });
   }
 
