@@ -2759,6 +2759,13 @@ String normalizePathKey(String value) {
   return value.trim().toLowerCase().replaceAll('/', '\\');
 }
 
+// Shared by the texture scoring paths, which run per candidate per material.
+// Rebuilding these inside the scorers dominated relink cost.
+final _extensionPattern = RegExp(r'\.[^.]+$');
+final _nonAlphanumericPattern = RegExp(r'[^a-z0-9]+');
+final _pathSeparatorPattern = RegExp(r'[\\/]');
+final _paletteTailPattern = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*');
+
 String? resolveTextureReference(
   String modelPath,
   String texturePath, {
@@ -2850,14 +2857,14 @@ String? findDeterministicTextureRelink(
   if (sourceCandidates.isEmpty) return null;
 
   final requestedBase = texturePath
-      .split(RegExp(r'[\\/]'))
+      .split(_pathSeparatorPattern)
       .last
       .toLowerCase()
-      .replaceAll(RegExp(r'\.[^.]+$'), '');
+      .replaceAll(_extensionPattern, '');
   if (requestedBase.isEmpty) return null;
 
   String normalize(String value) {
-    return value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+    return value.toLowerCase().replaceAll(_nonAlphanumericPattern, '');
   }
 
   final requestedNormalized = normalize(requestedBase);
@@ -2866,7 +2873,7 @@ String? findDeterministicTextureRelink(
       : requestedBase;
 
   String paletteTail(String value) {
-    final match = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*').firstMatch(value);
+    final match = _paletteTailPattern.firstMatch(value);
     if (match == null) return '';
     return normalize(value.substring(match.start));
   }
@@ -2874,7 +2881,7 @@ String? findDeterministicTextureRelink(
   final requestedPaletteTail = paletteTail(requestedBase);
 
   int score(AssetItem asset) {
-    final base = asset.name.toLowerCase().replaceAll(RegExp(r'\.[^.]+$'), '');
+    final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
     final normalized = normalize(base);
     var value = 0;
     if (base == requestedBase) value += 120;
@@ -2910,11 +2917,22 @@ String? findDeterministicTextureRelink(
     return value;
   }
 
-  sourceCandidates.sort((a, b) => score(b).compareTo(score(a)));
-  final best = sourceCandidates.first;
-  final bestScore = score(best);
-  if (bestScore < 80) return null;
-  return best.path;
+  // Score once per candidate, then break ties on the normalized path so the
+  // winner cannot depend on catalog order or on List.sort being stable
+  // (it is not).
+  final scored = [
+    for (final asset in sourceCandidates) (asset: asset, score: score(asset)),
+  ]..sort((a, b) {
+      final byScore = b.score.compareTo(a.score);
+      if (byScore != 0) return byScore;
+      return normalizePathKey(
+        a.asset.path,
+      ).compareTo(normalizePathKey(b.asset.path));
+    });
+
+  final best = scored.first;
+  if (best.score < 80) return null;
+  return best.asset.path;
 }
 
 String? findFallbackTexture(
@@ -2931,6 +2949,12 @@ String? findFallbackTexture(
   final sourceTokens = tokenSet(texturePath);
   if (sourceTokens.isEmpty) return null;
 
+  final textureBase = texturePath
+      .split(_pathSeparatorPattern)
+      .last
+      .toLowerCase()
+      .replaceAll(_extensionPattern, '');
+
   int score(AssetItem asset) {
     final assetTokens = tokenSet(asset.name);
     var value = sourceTokens.intersection(assetTokens).length * 10;
@@ -2941,28 +2965,34 @@ String? findFallbackTexture(
       value += 10;
     }
     if (dir == modelDir) value += 6;
-    final textureBase = texturePath
-        .split(RegExp(r'[\\/]'))
-        .last
-        .toLowerCase()
-        .replaceAll(RegExp(r'\.[^.]+$'), '');
     final assetBase = asset.name.toLowerCase().replaceAll(
-      RegExp(r'\.[^.]+$'),
+      _extensionPattern,
       '',
     );
     if (textureBase == assetBase) value += 25;
     return value;
   }
 
-  supported.sort((a, b) => score(b).compareTo(score(a)));
-  return score(supported.first) > 0 ? supported.first.path : null;
+  // Same decorate-sort-undecorate and tie-break as the deterministic relink.
+  final scored = [
+    for (final asset in supported) (asset: asset, score: score(asset)),
+  ]..sort((a, b) {
+      final byScore = b.score.compareTo(a.score);
+      if (byScore != 0) return byScore;
+      return normalizePathKey(
+        a.asset.path,
+      ).compareTo(normalizePathKey(b.asset.path));
+    });
+
+  final best = scored.first;
+  return best.score > 0 ? best.asset.path : null;
 }
 
 Set<String> tokenSet(String value) {
   return value
       .toLowerCase()
-      .replaceAll(RegExp(r'\.[^.]+$'), '')
-      .split(RegExp(r'[^a-z0-9]+'))
+      .replaceAll(_extensionPattern, '')
+      .split(_nonAlphanumericPattern)
       .where(
         (token) =>
             token.length > 2 && token != 'texture' && token != 'textures',
