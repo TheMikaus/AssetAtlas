@@ -50,7 +50,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.1.0';
+const appVersion = '1.1.1';
 const enableFbxLogs = true;
 String fbxLogFilePath =
     '${Directory.systemTemp.path}${Platform.pathSeparator}asset_atlas_fbx.log';
@@ -791,11 +791,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
     );
     if (target == null) return;
 
-    final copied = await copyAssetsToTarget(selected, target);
-    if (!mounted) return;
-    setState(() {
-      status = ScanStatus('Copied assets', '$copied files copied to $target');
-    });
+    try {
+      final report = await copyAssetsToTarget(selected, target);
+      if (!mounted) return;
+      setState(() {
+        status = ScanStatus(
+          report.failedCount > 0 ? 'Copied with errors' : 'Copied assets',
+          '${report.summaryLine} · target: $target',
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        status = ScanStatus('Copy failed', error.toString());
+      });
+    }
   }
 
   void toggleSelected(AssetItem asset, bool selected) {
@@ -3428,40 +3438,164 @@ bool isLikelyBinaryObjBytes(List<int> bytes) {
   return suspicious / total > .08;
 }
 
-Future<int> copyAssetsToTarget(List<AssetItem> selected, String target) async {
-  var copied = 0;
+enum CopyOutcome { copied, renamed, skippedMissingSource, failed }
+
+class CopyResultEntry {
+  const CopyResultEntry({
+    required this.asset,
+    required this.outcome,
+    this.destinationPath,
+    this.detail,
+  });
+
+  final AssetItem asset;
+  final CopyOutcome outcome;
+  final String? destinationPath;
+
+  /// Reason for a skip, or the error text for a failure.
+  final String? detail;
+}
+
+class CopyReport {
+  const CopyReport(this.entries);
+
+  final List<CopyResultEntry> entries;
+
+  int _countOf(CopyOutcome outcome) =>
+      entries.where((entry) => entry.outcome == outcome).length;
+
+  /// Files actually written, including the ones written under a new name.
+  int get copiedCount =>
+      _countOf(CopyOutcome.copied) + _countOf(CopyOutcome.renamed);
+  int get renamedCount => _countOf(CopyOutcome.renamed);
+  int get skippedCount => _countOf(CopyOutcome.skippedMissingSource);
+  int get failedCount => _countOf(CopyOutcome.failed);
+
+  String get summaryLine {
+    final parts = <String>['$copiedCount copied'];
+    if (renamedCount > 0) {
+      parts.add('$renamedCount renamed to avoid overwrite');
+    }
+    if (skippedCount > 0) {
+      parts.add('$skippedCount skipped (source missing)');
+    }
+    if (failedCount > 0) {
+      parts.add('$failedCount failed');
+    }
+    return parts.join(' · ');
+  }
+}
+
+/// Returns [desiredPath] if it is free, otherwise the same path with an
+/// incrementing ` (n)` suffix inserted before the extension. Mirrors the
+/// Windows Explorer convention so renamed output reads as familiar.
+String resolveNonCollidingPath(String desiredPath) {
+  if (!File(desiredPath).existsSync() &&
+      !Directory(desiredPath).existsSync()) {
+    return desiredPath;
+  }
+
+  final separatorIndex = desiredPath.lastIndexOf(RegExp(r'[\\/]'));
+  final directory = separatorIndex < 0
+      ? ''
+      : desiredPath.substring(0, separatorIndex + 1);
+  final fileName = desiredPath.substring(separatorIndex + 1);
+
+  // A leading dot belongs to the name (.gitignore), not to an extension.
+  final dotIndex = fileName.lastIndexOf('.');
+  final hasExtension = dotIndex > 0;
+  final stem = hasExtension ? fileName.substring(0, dotIndex) : fileName;
+  final extension = hasExtension ? fileName.substring(dotIndex) : '';
+
+  for (var suffix = 2; ; suffix += 1) {
+    final candidate = '$directory$stem ($suffix)$extension';
+    if (!File(candidate).existsSync() && !Directory(candidate).existsSync()) {
+      return candidate;
+    }
+  }
+}
+
+Future<CopyReport> copyAssetsToTarget(
+  List<AssetItem> selected,
+  String target,
+) async {
+  final entries = <CopyResultEntry>[];
   final destinationRoot = Directory(target);
   if (!destinationRoot.existsSync()) {
     destinationRoot.createSync(recursive: true);
   }
 
   for (final asset in selected) {
-    if (isZipVirtualPath(asset.path)) {
-      final bytes = await readZipVirtualAssetBytesByPath(asset.path);
-      if (bytes == null || bytes.isEmpty) {
+    try {
+      if (isZipVirtualPath(asset.path)) {
+        final bytes = await readZipVirtualAssetBytesByPath(asset.path);
+        if (bytes == null || bytes.isEmpty) {
+          entries.add(
+            CopyResultEntry(
+              asset: asset,
+              outcome: CopyOutcome.skippedMissingSource,
+              detail: 'ZIP entry could not be read.',
+            ),
+          );
+          continue;
+        }
+        final zipParts = parseZipVirtualPath(asset.path);
+        final relativeOutput = safeZipEntryRelativePath(
+          zipParts?.entryPath ?? asset.name,
+          fallbackName: asset.name,
+        );
+        final desired =
+            '$target${Platform.pathSeparator}${relativeOutput.replaceAll('/', Platform.pathSeparator)}';
+        File(desired).parent.createSync(recursive: true);
+        final resolved = resolveNonCollidingPath(desired);
+        await File(resolved).writeAsBytes(bytes, flush: true);
+        entries.add(
+          CopyResultEntry(
+            asset: asset,
+            outcome: resolved == desired
+                ? CopyOutcome.copied
+                : CopyOutcome.renamed,
+            destinationPath: resolved,
+          ),
+        );
         continue;
       }
-      final zipParts = parseZipVirtualPath(asset.path);
-      final relativeOutput = safeZipEntryRelativePath(
-        zipParts?.entryPath ?? asset.name,
-        fallbackName: asset.name,
+
+      final source = File(asset.path);
+      if (!source.existsSync()) {
+        entries.add(
+          CopyResultEntry(
+            asset: asset,
+            outcome: CopyOutcome.skippedMissingSource,
+            detail: 'Source file no longer exists.',
+          ),
+        );
+        continue;
+      }
+      final desired = '$target${Platform.pathSeparator}${asset.name}';
+      final resolved = resolveNonCollidingPath(desired);
+      await source.copy(resolved);
+      entries.add(
+        CopyResultEntry(
+          asset: asset,
+          outcome: resolved == desired
+              ? CopyOutcome.copied
+              : CopyOutcome.renamed,
+          destinationPath: resolved,
+        ),
       );
-      final destination = File(
-        '$target${Platform.pathSeparator}${relativeOutput.replaceAll('/', Platform.pathSeparator)}',
+    } catch (error) {
+      // One unwritable file must not end the batch.
+      entries.add(
+        CopyResultEntry(
+          asset: asset,
+          outcome: CopyOutcome.failed,
+          detail: error.toString(),
+        ),
       );
-      destination.parent.createSync(recursive: true);
-      await destination.writeAsBytes(bytes, flush: true);
-      copied += 1;
-      continue;
     }
-    final destination = File('$target${Platform.pathSeparator}${asset.name}');
-    if (!File(asset.path).existsSync()) {
-      continue;
-    }
-    await File(asset.path).copy(destination.path);
-    copied += 1;
   }
-  return copied;
+  return CopyReport(entries);
 }
 
 String safeZipEntryRelativePath(
@@ -3665,22 +3799,21 @@ class MeshImporterResult {
   final String stderr;
 }
 
+/// The helper always emits UTF-8. Both branches below must decode it as such:
+/// `Process.run` would otherwise fall back to `systemEncoding` (the Windows
+/// ANSI codepage), which mangles non-ASCII material names and texture paths.
 Future<MeshImporterResult> runMeshImporter(
   String helper,
   String sourcePath, {
   Uint8List? inputBytes,
 }) async {
-  if (inputBytes == null) {
-    final processResult = await Process.run(helper, [sourcePath]);
-    return MeshImporterResult(
-      exitCode: processResult.exitCode,
-      stdout: processResult.stdout as String? ?? '',
-      stderr: processResult.stderr as String? ?? '',
-    );
+  final arguments = inputBytes == null
+      ? [sourcePath]
+      : ['--stdin', sourcePath];
+  final process = await Process.start(helper, arguments);
+  if (inputBytes != null) {
+    process.stdin.add(inputBytes);
   }
-
-  final process = await Process.start(helper, ['--stdin', sourcePath]);
-  process.stdin.add(inputBytes);
   await process.stdin.close();
   final stdoutBytes = await process.stdout.expand((chunk) => chunk).toList();
   final stderrBytes = await process.stderr.expand((chunk) => chunk).toList();
@@ -4753,3 +4886,4 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
