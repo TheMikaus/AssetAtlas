@@ -31,7 +31,12 @@ time AssetAtlas starts.
 
 ## 3. Browse and Search
 
-Select an asset in the lower list to open its preview and details.
+The window has three columns: filters and folders on the left, the browse list in
+the middle, and the preview with asset details on the right. Drag the divider
+between the list and the preview to trade list width for preview size.
+
+Select an asset in the list to open its preview and details. **Arrow up and arrow
+down** move through the list without touching the mouse.
 
 Use the search box to search by:
 
@@ -39,9 +44,48 @@ Use the search box to search by:
 - Relative path
 - Automatically generated tags
 
-Use the left panel to filter the catalog by image, model, or audio assets. The
+### List and grid views
+
+The toggle beside the search box switches between:
+
+- **List** - one row per asset, with its folder underneath. Best when you know
+  what you are looking for.
+- **Grid** - thumbnails for images and a type icon for everything else. Best when
+  you are looking for the asset that *looks* right.
+
+**Sort** reorders the visible assets by path, name, size, modified date, or type.
+Size and date sort largest and newest first.
+
+### Folders
+
+The **Folders** tree in the left panel mirrors the folder structure of everything
+you have scanned, with a count beside each folder. Click a folder to limit the
+list to it and everything beneath it; click **All folders** to clear that filter.
+This is the fastest way to work through a large pack without knowing file names.
+
+### Types
+
+Filter the catalog by image, model, animation, or audio assets. The
 model-texture filters can show all models, models with valid textures, or models
 whose textures could not be located.
+
+FBX files that contain only a skeleton and animation curves are listed as
+**animation** rather than model. AssetAtlas has to read a file to know which it
+is, so a file is classified when you select it, or in the background when you
+choose the ANIMATION filter. The answer is remembered afterwards.
+
+### Selecting assets
+
+- Click the checkbox on a row to select it for copying.
+- **Shift-click** a checkbox to select every asset between it and your last
+  click.
+- **Select all** selects everything currently visible, so filter or search first
+  and then select.
+- **Clear (n)** drops the whole selection.
+
+The eye icon on each row is separate from selection: it marks an asset as
+ignored. Ignored assets are struck through, and **Hide ignored** removes them
+from the list entirely.
 
 ### ZIP archives
 
@@ -136,8 +180,9 @@ one file failing to copy does not stop the rest.
 
 ## 7. Ignore Assets
 
-Use the checkbox at the right side of an asset row to mark that asset as ignored.
-Selected assets can be ignored together.
+Use the eye icon at the right side of an asset row to mark that asset as ignored.
+If the row is part of the current selection, every selected asset is ignored
+together.
 
 Enable **Hide ignored** in the left panel to remove ignored entries from the
 visible list. Ignore state is saved in the local catalog.
