@@ -50,7 +50,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.2.0';
+const appVersion = '1.3.0';
 const _maxConcurrentModelValidations = 3;
 const enableFbxLogs = true;
 String fbxLogFilePath =
@@ -161,6 +161,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
   ScanStatus status = const ScanStatus('Ready', 'Choose a folder to catalog.');
   final modelHasValidTextures = <String, bool>{};
   final _modelValidationInFlight = <String>{};
+  final _modelKindInFlight = <String>{};
+  final Queue<AssetItem> _modelKindQueue = Queue<AssetItem>();
+  bool _processingModelKindQueue = false;
+  int _modelKindClassified = 0;
   final Queue<AssetItem> _modelValidationQueue = Queue<AssetItem>();
   bool _processingModelValidationQueue = false;
   final List<String> _assetHistory = <String>[];
@@ -247,6 +251,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   void _activateAsset(AssetItem asset, {bool addToHistory = true}) {
+    // The preview is about to import this file regardless, so the
+    // classification is nearly free here.
+    _scheduleModelKindClassification([asset]);
     setState(() {
       active = asset;
       if (!addToHistory) return;
@@ -291,7 +298,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return assets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
       if (hideZipAssets && isZipVirtualPath(asset.path)) return false;
-      if (typeFilter != 'all' && asset.type != typeFilter) return false;
+      if (typeFilter == 'animation') {
+        // Only a parse can tell an animation clip from a mesh, so ask for one
+        // and leave the asset out of the list until the answer arrives.
+        if (asset.type == 'model' && asset.ext == 'fbx') {
+          if (asset.modelKind == null) {
+            _scheduleModelKindClassification([asset]);
+            return false;
+          }
+          if (asset.modelKind != 'animation') return false;
+        } else if (asset.effectiveType != 'animation') {
+          return false;
+        }
+      } else if (typeFilter != 'all' && asset.effectiveType != typeFilter) {
+        return false;
+      }
       if (asset.type == 'model' && modelTextureFilter != 'all') {
         final hasValid = modelHasValidTextures[asset.id];
         if (hasValid == null) {
@@ -324,6 +345,61 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _modelValidationQueue.add(asset);
     }
     unawaited(_processModelValidationQueue());
+  }
+
+  /// Classifying an FBX means running the importer, so this is deliberately
+  /// lazy: assets are classified when something needs the answer, and the
+  /// result is persisted so it is paid for once.
+  void _scheduleModelKindClassification(Iterable<AssetItem> subset) {
+    for (final asset in subset) {
+      if (asset.ext != 'fbx' || asset.modelKind != null) continue;
+      if (!_modelKindInFlight.add(asset.id)) continue;
+      _modelKindQueue.add(asset);
+    }
+    unawaited(_processModelKindQueue());
+  }
+
+  Future<void> _processModelKindQueue() async {
+    if (_processingModelKindQueue) return;
+    _processingModelKindQueue = true;
+    while (_modelKindQueue.isNotEmpty) {
+      final batch = <AssetItem>[];
+      while (batch.length < _maxConcurrentModelValidations &&
+          _modelKindQueue.isNotEmpty) {
+        batch.add(_modelKindQueue.removeFirst());
+      }
+      await Future.wait(batch.map(_classifyModelKind));
+      if (!mounted) break;
+      // One rebuild per batch rather than per asset: a big catalog would
+      // otherwise rebuild the list thousands of times.
+      setState(() {
+        status = ScanStatus(
+          'Classifying FBX content',
+          '$_modelKindClassified classified, '
+          '${_modelKindQueue.length} to go',
+        );
+      });
+    }
+    _processingModelKindQueue = false;
+    if (!mounted) return;
+    setState(() {
+      status = ScanStatus(
+        'Classification complete',
+        '$_modelKindClassified FBX files classified',
+      );
+    });
+  }
+
+  Future<void> _classifyModelKind(AssetItem asset) async {
+    // A file the importer cannot read is recorded too, so the app does not
+    // retry it on every pass.
+    final kind = await probeFbxContentKind(asset);
+    asset.modelKind = kind;
+    _modelKindClassified += 1;
+    _modelKindInFlight.remove(asset.id);
+    _persistInBackground(
+      () => db.updateAssetModelKind(assetId: asset.id, modelKind: kind),
+    );
   }
 
   Future<void> _processModelValidationQueue() async {
@@ -880,9 +956,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final visible = filteredAssets;
     final counts = {
       'all': assets.length,
-      'image': assets.where((asset) => asset.type == 'image').length,
-      'model': assets.where((asset) => asset.type == 'model').length,
-      'audio': assets.where((asset) => asset.type == 'audio').length,
+      'image': assets.where((asset) => asset.effectiveType == 'image').length,
+      'model': assets.where((asset) => asset.effectiveType == 'model').length,
+      'animation': assets
+          .where((asset) => asset.effectiveType == 'animation')
+          .length,
+      'audio': assets.where((asset) => asset.effectiveType == 'audio').length,
     };
 
     return Scaffold(
@@ -1282,7 +1361,7 @@ class FilterPanel extends StatelessWidget {
           children: [
             const Text('Types', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
-            for (final type in ['all', 'image', 'model', 'audio'])
+            for (final type in ['all', 'image', 'model', 'animation', 'audio'])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: ChoiceChip(
@@ -1340,14 +1419,24 @@ class FilterPanel extends StatelessWidget {
                 style: TextStyle(color: Colors.black54),
               ),
             for (final root in sourceRoots)
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text(root, maxLines: 2, overflow: TextOverflow.ellipsis),
-                trailing: IconButton(
-                  tooltip: 'Remove source',
-                  icon: const Icon(Icons.close),
-                  onPressed: () => onRemoveSource(root),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(child: CopyablePathText(path: root)),
+                    IconButton(
+                      tooltip: 'Remove source',
+                      icon: const Icon(Icons.close, size: 18),
+                      visualDensity: VisualDensity.compact,
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      padding: EdgeInsets.zero,
+                      onPressed: () => onRemoveSource(root),
+                    ),
+                  ],
                 ),
               ),
           ],
@@ -1878,6 +1967,9 @@ class _ModelPreviewState extends State<ModelPreview> {
               );
             }
             final mesh = snapshot.data!;
+            if (mesh.isAnimationOnly) {
+              return AnimationClipPreview(mesh: mesh);
+            }
             return Stack(
               children: [
                 Listener(
@@ -2134,6 +2226,87 @@ class _ModelPreviewState extends State<ModelPreview> {
               ],
             );
           },
+        ),
+      ),
+    );
+  }
+}
+
+/// Shown for an FBX that carries a skeleton and curves but no geometry. There
+/// is nothing to draw, so report what the file actually holds instead of
+/// showing an import error.
+class AnimationClipPreview extends StatelessWidget {
+  const AnimationClipPreview({required this.mesh, super.key});
+
+  final MeshModel mesh;
+
+  String get _duration {
+    if (mesh.durationSeconds <= 0) return 'unknown';
+    return '${mesh.durationSeconds.toStringAsFixed(2)}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.directions_run,
+              size: 56,
+              color: Colors.black54,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Animation clip',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'This FBX contains animation and skeleton data, with no mesh to '
+              'draw.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.black.withValues(alpha: .6)),
+            ),
+            const SizedBox(height: 16),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: .8),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.black12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DetailRow(
+                      label: 'Takes',
+                      value: mesh.animationStacks.toString(),
+                    ),
+                    DetailRow(label: 'Bones', value: mesh.boneCount.toString()),
+                    DetailRow(label: 'Length', value: _duration),
+                    if (mesh.animationNames.isNotEmpty)
+                      DetailRow(
+                        label: 'Clip names',
+                        value: mesh.animationNames.join(', '),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Playback is not implemented yet.',
+              style: TextStyle(color: Colors.black.withValues(alpha: .45)),
+            ),
+          ],
         ),
       ),
     );
@@ -2628,32 +2801,23 @@ class AssetDetailsPanel extends StatelessWidget {
               style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 6),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    item.path,
-                    style: const TextStyle(color: Colors.black54),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'Copy asset path',
-                  icon: const Icon(Icons.content_copy, size: 18),
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: item.path));
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Asset path copied.')),
-                    );
-                  },
-                ),
-              ],
+            CopyablePathText(
+              path: item.path,
+              style: const TextStyle(color: Colors.black54),
             ),
             const SizedBox(height: 14),
-            DetailRow(label: 'Type', value: '${item.type} / ${item.ext}'),
+            DetailRow(
+              label: 'Type',
+              value: '${item.effectiveType} / ${item.ext}',
+            ),
             DetailRow(label: 'Source', value: item.sourceName),
+            DetailRow(
+              label: 'Folder',
+              value: isZipVirtualPath(item.path)
+                  ? item.relativePath
+                  : parentPath(item.path),
+              isPath: true,
+            ),
             DetailRow(label: 'Size', value: formatBytes(item.size)),
             DetailRow(
               label: 'Modified',
@@ -2683,11 +2847,73 @@ class AssetDetailsPanel extends StatelessWidget {
   }
 }
 
+/// A path that may not fit its column: shows the full value on hover and
+/// offers a one-click copy, so a truncated path is still usable.
+class CopyablePathText extends StatelessWidget {
+  const CopyablePathText({
+    required this.path,
+    this.maxLines = 2,
+    this.style,
+    super.key,
+  });
+
+  final String path;
+  final int maxLines;
+  final TextStyle? style;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: Tooltip(
+            message: path,
+            waitDuration: const Duration(milliseconds: 400),
+            child: Text(
+              path,
+              maxLines: maxLines,
+              overflow: TextOverflow.ellipsis,
+              style: style,
+            ),
+          ),
+        ),
+        const SizedBox(width: 4),
+        IconButton(
+          tooltip: 'Copy full path',
+          icon: const Icon(Icons.content_copy, size: 16),
+          visualDensity: VisualDensity.compact,
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          padding: EdgeInsets.zero,
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: path));
+            if (!context.mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Copied: $path'),
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
 class DetailRow extends StatelessWidget {
-  const DetailRow({required this.label, required this.value, super.key});
+  const DetailRow({
+    required this.label,
+    required this.value,
+    this.isPath = false,
+    super.key,
+  });
 
   final String label;
   final String value;
+
+  /// Render the value as a hoverable, copyable path.
+  final bool isPath;
 
   @override
   Widget build(BuildContext context) {
@@ -2706,7 +2932,11 @@ class DetailRow extends StatelessWidget {
               ),
             ),
           ),
-          Expanded(child: Text(value)),
+          Expanded(
+            child: isPath
+                ? CopyablePathText(path: value)
+                : Text(value),
+          ),
         ],
       ),
     );
@@ -4025,6 +4255,37 @@ String parentPath(String path) {
   return normalized.substring(0, index);
 }
 
+/// Asks the importer only what an FBX contains, skipping geometry extraction
+/// and the JSON payload. Roughly 4x faster than a full import and returns tens
+/// of bytes instead of megabytes, which is what makes classifying a whole
+/// catalog viable.
+///
+/// Returns 'mesh', 'animation', or 'unreadable'.
+Future<String> probeFbxContentKind(AssetItem asset) async {
+  if (asset.ext != 'fbx') return 'mesh';
+  final helper = meshImporterPath();
+  if (!File(helper).existsSync()) return 'unreadable';
+  try {
+    final bytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : null;
+    if (isZipVirtualPath(asset.path) && (bytes == null || bytes.isEmpty)) {
+      return 'unreadable';
+    }
+    final result = await runMeshImporter(
+      helper,
+      asset.path,
+      inputBytes: bytes,
+      probeOnly: true,
+    );
+    if (result.exitCode != 0) return 'unreadable';
+    final json = jsonDecode(result.stdout) as Map<String, dynamic>;
+    return json['kind'] == 'animation' ? 'animation' : 'mesh';
+  } catch (_) {
+    return 'unreadable';
+  }
+}
+
 /// Shares one in-flight mesh import between everything that needs it.
 ///
 /// Both the 3D preview and the texture diagnostics panel want the same parsed
@@ -4177,10 +4438,13 @@ Future<MeshImporterResult> runMeshImporter(
   String helper,
   String sourcePath, {
   Uint8List? inputBytes,
+  bool probeOnly = false,
 }) async {
-  final arguments = inputBytes == null
-      ? [sourcePath]
-      : ['--stdin', sourcePath];
+  final arguments = <String>[
+    if (inputBytes != null) '--stdin',
+    if (probeOnly) '--probe',
+    sourcePath,
+  ];
   final process = await Process.start(helper, arguments);
   if (inputBytes != null) {
     process.stdin.add(inputBytes);
@@ -4203,6 +4467,23 @@ Future<MeshModel> meshModelFromImporterJson(
   List<AssetItem> allAssets = const [],
   int fallbackCheckerSquareSize = 16,
 }) async {
+  if (json['kind'] == 'animation') {
+    final names = ((json['animationNames'] as List<dynamic>?) ?? const [])
+        .map((value) => value.toString())
+        .where((value) => value.trim().isNotEmpty)
+        .toList();
+    return MeshModel(
+      name: name,
+      vertices: const [],
+      faces: const [],
+      kind: FbxContentKind.animation,
+      animationStacks: (json['animationStacks'] as num?)?.toInt() ?? 0,
+      boneCount: (json['bones'] as num?)?.toInt() ?? 0,
+      durationSeconds: (json['durationSeconds'] as num?)?.toDouble() ?? 0,
+      animationNames: names,
+    );
+  }
+
   final vertices = (json['vertices'] as List<dynamic>).map((item) {
     final values = item as List<dynamic>;
     return Vec3(
@@ -4701,6 +4982,10 @@ void _addTriangulatedFace(List<int> indices, List<MeshFace> faces) {
   }
 }
 
+/// What an FBX turned out to contain. A file with a skeleton and curves but no
+/// geometry is a legitimate asset, not an import failure.
+enum FbxContentKind { mesh, animation }
+
 class MeshModel {
   MeshModel({
     required this.name,
@@ -4709,7 +4994,15 @@ class MeshModel {
     this.materials = const [],
     this.textureFiles = const [],
     this.vertexColors = const [],
+    this.kind = FbxContentKind.mesh,
+    this.animationStacks = 0,
+    this.boneCount = 0,
+    this.durationSeconds = 0,
+    this.animationNames = const [],
   });
+
+  /// True when the file carries animation or skeleton data and nothing to draw.
+  bool get isAnimationOnly => kind == FbxContentKind.animation;
 
   factory MeshModel.normalized({
     required String name,
@@ -4763,6 +5056,11 @@ class MeshModel {
   final List<MeshFace> faces;
   final List<MeshMaterial> materials;
   final List<String> textureFiles;
+  final FbxContentKind kind;
+  final int animationStacks;
+  final int boneCount;
+  final double durationSeconds;
+  final List<String> animationNames;
   final List<Color> vertexColors;
 
   List<String> get availableUvSets {
@@ -4959,6 +5257,7 @@ class AssetItem {
     required this.modified,
     required this.tags,
     this.ignored = false,
+    this.modelKind,
   });
 
   final String id;
@@ -4973,6 +5272,16 @@ class AssetItem {
   final DateTime modified;
   final List<String> tags;
   bool ignored;
+
+  /// For model assets: what the file actually turned out to contain, once
+  /// something has looked. Null means not classified yet -- classifying an FBX
+  /// costs an importer run, so it happens lazily and is persisted.
+  String? modelKind;
+
+  /// The type to show and filter by. An FBX holding only a skeleton and curves
+  /// is an animation, not a model, but only a parse can tell you that.
+  String get effectiveType =>
+      modelKind == 'animation' ? 'animation' : type;
 }
 
 class ScanResult {
@@ -5012,7 +5321,8 @@ class AssetAtlasDatabase {
   ///   v2 - indexes on the columns the app filters and joins by
   ///   v3 - asset ids rebuilt from source root + relative path, so editing a
   ///        file no longer orphans it from projects and ignore flags
-  static const schemaVersion = 3;
+  ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
+  static const schemaVersion = 4;
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -5053,6 +5363,11 @@ class AssetAtlasDatabase {
           if (oldVersion < 3) {
             await _migrateAssetIdsToV3(db);
           }
+          if (oldVersion < 4) {
+            await db.execute(
+              'ALTER TABLE catalog_assets ADD COLUMN model_kind TEXT',
+            );
+          }
         },
         onCreate: (db, _) async {
           await db.execute('''
@@ -5068,7 +5383,8 @@ class AssetAtlasDatabase {
               size INTEGER NOT NULL,
               modified_ms INTEGER NOT NULL,
               tags_json TEXT NOT NULL,
-              ignored INTEGER NOT NULL DEFAULT 0
+              ignored INTEGER NOT NULL DEFAULT 0,
+              model_kind TEXT
             )
           ''');
           await db.execute('''
@@ -5121,6 +5437,7 @@ class AssetAtlasDatabase {
         tags: ((jsonDecode(row['tags_json'] as String) as List<dynamic>)
             .cast<String>()),
         ignored: (row['ignored'] as int) == 1,
+        modelKind: row['model_kind'] as String?,
       );
     }).toList();
     final sourceRoots = sourceRows
@@ -5221,6 +5538,7 @@ class AssetAtlasDatabase {
     'modified_ms': asset.modified.millisecondsSinceEpoch,
     'tags_json': jsonEncode(asset.tags),
     'ignored': asset.ignored ? 1 : 0,
+    'model_kind': asset.modelKind,
   };
 
   /// Full replace. Only correct after a scan, where the catalog really did
@@ -5261,6 +5579,19 @@ class AssetAtlasDatabase {
     await _db!.update(
       'catalog_assets',
       {'ignored': ignored ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [assetId],
+    );
+  }
+
+  Future<void> updateAssetModelKind({
+    required String assetId,
+    required String modelKind,
+  }) async {
+    await initialize();
+    await _db!.update(
+      'catalog_assets',
+      {'model_kind': modelKind},
       where: 'id = ?',
       whereArgs: [assetId],
     );
@@ -5446,5 +5777,6 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 

@@ -436,7 +436,55 @@ void main() {
       expect(secondId, firstId);
     });
 
-    test('a fresh v2 schema matches an upgraded v1 schema', () async {
+    test('v4 adds model_kind and it round trips', () async {
+      final path = await _freshDbPath('asset_atlas_db_v4_');
+      final legacy = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 1,
+          onCreate: (db, _) async {
+            for (final statement in _v1Ddl) {
+              await db.execute(statement);
+            }
+          },
+        ),
+      );
+      await legacy.insert('catalog_assets', {
+        'id': 'legacy-anim',
+        'name': 'A_Idle.fbx',
+        'path': r'C:\Packs\A\A_Idle.fbx',
+        'relative_path': 'A/A_Idle.fbx',
+        'source_root': r'C:\Packs\A',
+        'source_name': 'A',
+        'ext': 'fbx',
+        'type': 'model',
+        'size': 5,
+        'modified_ms': 1700000000000,
+        'tags_json': '["model"]',
+        'ignored': 0,
+      });
+      await legacy.close();
+
+      final db = await _openAt(path);
+      final restored = await db.loadCatalog();
+      final asset = restored.assets.single;
+      expect(
+        asset.modelKind,
+        isNull,
+        reason: 'existing rows start unclassified',
+      );
+      expect(asset.effectiveType, 'model');
+
+      await db.updateAssetModelKind(
+        assetId: asset.id,
+        modelKind: 'animation',
+      );
+      final reloaded = (await db.loadCatalog()).assets.single;
+      expect(reloaded.modelKind, 'animation');
+      expect(reloaded.effectiveType, 'animation');
+    });
+
+    test('a fresh schema matches an upgraded one', () async {
       final freshPath = await _freshDbPath('asset_atlas_db_fresh_');
       await (await _openAt(freshPath)).close();
 
