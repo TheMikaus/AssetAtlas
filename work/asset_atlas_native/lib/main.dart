@@ -50,7 +50,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.4.0';
+const appVersion = '1.4.1';
 const _maxConcurrentModelValidations = 3;
 const enableFbxLogs = true;
 String fbxLogFilePath =
@@ -163,6 +163,16 @@ class _CatalogScreenState extends State<CatalogScreen> {
   String? _lastSelectionAnchorId;
   String? folderFilter;
   final expandedFolders = <String>{};
+  Timer? _searchDebounce;
+
+  /// Bumped whenever something that affects filtering changes without the
+  /// catalog itself changing: an ignore toggle, a texture validation result, an
+  /// FBX classification.
+  int _listEpoch = 0;
+  List<AssetItem>? _sortedCache;
+  String? _sortedCacheKey;
+  List<AssetItem>? _filteredCache;
+  String? _filteredCacheKey;
   List<FolderNode>? _folderRootsCache;
   int _folderRootsRevision = -1;
   ScanStatus status = const ScanStatus('Ready', 'Choose a folder to catalog.');
@@ -310,9 +320,36 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return _folderRootsCache!;
   }
 
+  /// The catalog in display order, sorted once per (catalog, sort mode).
+  /// Filtering a sorted list yields a sorted list, so searching no longer has
+  /// to re-sort tens of thousands of assets on every keystroke.
+  List<AssetItem> get sortedAssets {
+    final key = '$catalogRevision|${sortMode.name}|$_listEpoch';
+    if (_sortedCache == null || _sortedCacheKey != key) {
+      _sortedCache = sortAssets(assets, sortMode);
+      _sortedCacheKey = key;
+    }
+    return _sortedCache!;
+  }
+
   List<AssetItem> get filteredAssets {
     final lower = query.trim().toLowerCase();
-    final matches = assets.where((asset) {
+    final cacheKey = [
+      lower,
+      typeFilter,
+      modelTextureFilter,
+      hideIgnored,
+      hideZipAssets,
+      folderFilter ?? '',
+      sortMode.name,
+      catalogRevision,
+      _listEpoch,
+    ].join('|');
+    if (_filteredCache != null && _filteredCacheKey == cacheKey) {
+      return _filteredCache!;
+    }
+
+    final matches = sortedAssets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
       if (folderFilter != null &&
           !isUnderFolder(asset.relativePath, folderFilter!)) {
@@ -346,11 +383,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
       }
       if (lower.isEmpty) return true;
-      return asset.name.toLowerCase().contains(lower) ||
-          asset.relativePath.toLowerCase().contains(lower) ||
-          asset.tags.any((tag) => tag.contains(lower));
+      return asset.searchText.contains(lower);
     }).toList();
-    return sortAssets(matches, sortMode);
+
+    _filteredCache = matches;
+    _filteredCacheKey = cacheKey;
+    return matches;
+  }
+
+  /// Invalidate the memoised list after a change that filtering depends on.
+  void _invalidateAssetViews() {
+    _listEpoch += 1;
   }
 
   void _scheduleModelTextureValidation([Iterable<AssetItem>? subset]) {
@@ -418,6 +461,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final kind = await probeFbxContentKind(asset);
     asset.modelKind = kind;
     _modelKindClassified += 1;
+    _invalidateAssetViews();
     _modelKindInFlight.remove(asset.id);
     _persistInBackground(
       () => db.updateAssetModelKind(assetId: asset.id, modelKind: kind),
@@ -462,6 +506,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     if (mounted) {
       setState(() {
         modelHasValidTextures[asset.id] = hasValidTexture;
+        _invalidateAssetViews();
       });
     }
     _modelValidationInFlight.remove(asset.id);
@@ -469,6 +514,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     searchController.dispose();
     super.dispose();
   }
@@ -959,6 +1005,20 @@ class _CatalogScreenState extends State<CatalogScreen> {
     _activateAsset(visible[nextIndex]);
   }
 
+  /// A scan of 48k assets costs tens of milliseconds, so run it when typing
+  /// pauses rather than on every character.
+  void _onSearchChanged(String value) {
+    _searchDebounce?.cancel();
+    if (value.isEmpty) {
+      setState(() => query = '');
+      return;
+    }
+    _searchDebounce = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      setState(() => query = value);
+    });
+  }
+
   void _selectAll(List<AssetItem> visible) {
     setState(() {
       selectedIds.addAll(visible.map((asset) => asset.id));
@@ -1020,6 +1080,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         item.ignored = ignored;
         changed.add(item);
       }
+      _invalidateAssetViews();
     });
     // One UPDATE per changed asset, not a rewrite of the whole catalog.
     _persistInBackground(() async {
@@ -1138,7 +1199,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                             selectedCount: selectedIds.length,
                             sortMode: sortMode,
                             gridMode: gridMode,
-                            onChanged: (value) => setState(() => query = value),
+                            onChanged: _onSearchChanged,
                             onSortChanged: (value) =>
                                 setState(() => sortMode = value),
                             onGridModeChanged: (value) =>
@@ -6047,6 +6108,14 @@ class AssetItem {
   /// The type to show and filter by. An FBX holding only a skeleton and curves
   /// is an animation, not a model, but only a parse can tell you that.
   String get effectiveType => modelKind == 'animation' ? 'animation' : type;
+
+  String? _searchText;
+
+  /// Name, path and tags folded to lowercase once, on first use. Search
+  /// used to lowercase all three for every asset on every keystroke.
+  String get searchText =>
+      _searchText ??=
+          '$name\u0000$relativePath\u0000${tags.join(' ')}'.toLowerCase();
 }
 
 class ScanResult {
@@ -6542,4 +6611,5 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
