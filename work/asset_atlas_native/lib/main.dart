@@ -2988,6 +2988,45 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   }).toList();
 }
 
+/// The one place asset ids are built.
+///
+/// Identity is *where an asset is*, never what it currently contains. Ids used
+/// to embed size and modified time, so editing a file changed its id and it
+/// silently dropped out of saved projects and lost its ignore flag.
+///
+/// Rules:
+///  - separators normalised to `/`
+///  - lowercased, because the app is Windows-first and its paths are
+///    case-insensitive (a Linux port would need to revisit this)
+///  - [relativePath] is relative to [sourceRoot] and must NOT carry the
+///    `sourceName/` display prefix, which duplicates the source root
+///  - readable, not hashed: these strings show up in the database and in bug
+///    reports, and a debuggable id is worth more than a short one
+///
+/// ZIP entries pass a relative path of the form `pack.zip!/Textures/wall.png`.
+String buildAssetId({
+  required String sourceRoot,
+  required String relativePath,
+}) {
+  String normalize(String value) =>
+      value.trim().replaceAll('\\', '/').toLowerCase();
+  return 'asset:v2:${normalize(sourceRoot)}|${normalize(relativePath)}';
+}
+
+/// Strips the `sourceName/` display prefix that [AssetItem.relativePath]
+/// carries, so stored rows can be mapped back to an id.
+String assetIdRelativePathFromStored({
+  required String relativePath,
+  required String sourceName,
+}) {
+  final prefix = '$sourceName/';
+  final normalized = relativePath.replaceAll('\\', '/');
+  if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
+    return normalized.substring(prefix.length);
+  }
+  return normalized;
+}
+
 String normalizePathKey(String value) {
   return value.trim().toLowerCase().replaceAll('/', '\\');
 }
@@ -3383,7 +3422,7 @@ Future<ScanResult> scanAssetFolder(
     final relativePath = relativeTo(entity.path, rootPath);
     assets.add(
       AssetItem(
-        id: '${entity.path}:${stat.size}:${stat.modified.millisecondsSinceEpoch}',
+        id: buildAssetId(sourceRoot: rootPath, relativePath: relativePath),
         name: entity.uri.pathSegments.last,
         path: entity.path,
         relativePath: '$sourceName/$relativePath',
@@ -3481,7 +3520,10 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       final relativePath = '$sourceName/$zipRelative!/$entryPath';
       assets.add(
         AssetItem(
-          id: 'zip:${normalizePathKey(zipPath)}::$entryPath:${entry.size}:${zipModified.millisecondsSinceEpoch}',
+          id: buildAssetId(
+            sourceRoot: rootPath,
+            relativePath: '$zipRelative!/$entryPath',
+          ),
           name: name,
           path: buildZipVirtualPath(zipPath, entryPath),
           relativePath: relativePath,
@@ -4962,7 +5004,9 @@ class AssetAtlasDatabase {
   /// Schema history:
   ///   v1 - initial catalog, sources, projects, membership
   ///   v2 - indexes on the columns the app filters and joins by
-  static const schemaVersion = 2;
+  ///   v3 - asset ids rebuilt from source root + relative path, so editing a
+  ///        file no longer orphans it from projects and ignore flags
+  static const schemaVersion = 3;
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -4999,6 +5043,9 @@ class AssetAtlasDatabase {
             for (final statement in _indexStatements) {
               await db.execute(statement);
             }
+          }
+          if (oldVersion < 3) {
+            await _migrateAssetIdsToV3(db);
           }
         },
         onCreate: (db, _) async {
@@ -5074,6 +5121,71 @@ class AssetAtlasDatabase {
         .map((row) => row['root_path'] as String)
         .toSet();
     return PersistedCatalog(assets: assets, sourceRoots: sourceRoots);
+  }
+
+  /// Rebuilds every asset id in the content-independent v2 format and
+  /// remaps project membership onto the new ids.
+  ///
+  /// Runs inside sqflite's upgrade transaction, so catalog_assets and
+  /// project_assets cannot end up disagreeing: either both are rewritten or
+  /// neither is. Membership rows whose asset is already gone are dropped and
+  /// counted rather than left dangling.
+  static Future<void> _migrateAssetIdsToV3(Database db) async {
+    final rows = await db.query(
+      'catalog_assets',
+      columns: ['id', 'source_root', 'source_name', 'relative_path'],
+    );
+
+    final newIdByOldId = <String, String>{};
+    final claimedNewIds = <String>{};
+    var droppedDuplicates = 0;
+
+    for (final row in rows) {
+      final oldId = row['id'] as String;
+      final newId = buildAssetId(
+        sourceRoot: row['source_root'] as String,
+        relativePath: assetIdRelativePathFromStored(
+          relativePath: row['relative_path'] as String,
+          sourceName: row['source_name'] as String,
+        ),
+      );
+      if (!claimedNewIds.add(newId)) {
+        // Two rows describing the same place: keep the first, drop the rest.
+        await db.delete('catalog_assets', where: 'id = ?', whereArgs: [oldId]);
+        droppedDuplicates += 1;
+        continue;
+      }
+      newIdByOldId[oldId] = newId;
+    }
+
+    for (final entry in newIdByOldId.entries) {
+      if (entry.key == entry.value) continue;
+      await db.rawUpdate('UPDATE catalog_assets SET id = ? WHERE id = ?', [
+        entry.value,
+        entry.key,
+      ]);
+    }
+
+    final membership = await db.query('project_assets');
+    await db.delete('project_assets');
+    var droppedMembership = 0;
+    for (final row in membership) {
+      final mapped = newIdByOldId[row['asset_id'] as String];
+      if (mapped == null) {
+        droppedMembership += 1;
+        continue;
+      }
+      await db.insert('project_assets', {
+        'project_id': row['project_id'],
+        'asset_id': mapped,
+      }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
+
+    fbxLog(
+      'Migrated ${newIdByOldId.length} asset ids to v3 '
+      '(dropped $droppedDuplicates duplicate assets, '
+      '$droppedMembership orphaned membership rows).',
+    );
   }
 
   /// Releases the handle so a later [initialize] can open a different file.
