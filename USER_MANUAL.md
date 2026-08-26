@@ -79,6 +79,14 @@ In the model preview:
   **Material default** selected.
 - Use **Fallback** to adjust the checkerboard size shown when a UV-mapped model
   has no usable texture.
+- **Hide back faces** (on by default) skips triangles facing away from you, which
+  makes large models noticeably smoother. Turn it off for single-sided geometry
+  such as foliage cards or planes, where those triangles are meant to be seen.
+
+Very dense models are capped for responsiveness. When that happens the label under
+the model reads "face cap: showing 14000 nearest" — the model is complete, but the
+viewer is drawing only the nearest triangles, so gaps you see in that state are the
+cap and not the asset.
 
 AssetAtlas supports FBX embedded textures, scene transforms, repeated mesh
 instances, and named UV sets. It can also relink many stale texture references,
@@ -86,7 +94,7 @@ including common Synty authoring-path and pack-name variants.
 
 An animation-only FBX may contain a skeleton and animation curves but no mesh to
 draw. AssetAtlas identifies this condition in the preview. Animation playback is
-not implemented in v1.1.0.
+not implemented yet.
 
 ## 5. Texture Diagnostics
 
@@ -118,7 +126,13 @@ AssetAtlas copies selected ordinary files and extracts selected ZIP entries to
 the destination. Archive entry paths are sanitized to prevent files from being
 written outside the chosen destination.
 
-The copy operation does not delete or move the source assets.
+The copy operation does not delete or move the source assets, and it never
+overwrites a file that is already in the destination. Asset libraries often reuse
+names, so if two selected assets are both called `Albedo.png` the second is
+written as `Albedo (2).png`. The status line reports exactly what happened, for
+example `12 copied · 2 renamed to avoid overwrite · 1 skipped (source missing)`.
+Assets whose source file has since been deleted or moved are reported as skipped;
+one file failing to copy does not stop the rest.
 
 ## 7. Ignore Assets
 
