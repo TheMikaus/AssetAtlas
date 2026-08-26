@@ -290,11 +290,15 @@ void main() {
       await legacy.close();
 
       // Open through the app: the upgrade runs.
+      const legacySourceRoot = r'C:\Packs\A';
       final db = await _openAt(path);
       final restored = await db.loadCatalog();
       expect(restored.assets, hasLength(1));
       expect(restored.assets.single.ignored, isTrue);
-      expect(await db.loadProjectAssetIds('p1'), {'legacy-1'});
+      // v3 also runs on this open, so membership is keyed by the rebuilt id.
+      expect(await db.loadProjectAssetIds('p1'), {
+        buildAssetId(sourceRoot: legacySourceRoot, relativePath: 'albedo.png'),
+      });
       await db.close();
 
       final raw = await databaseFactory.openDatabase(path);
@@ -329,6 +333,107 @@ void main() {
       // Second open must not throw on the already-created indexes.
       final db = await _openAt(path);
       expect((await db.loadCatalog()).assets, isEmpty);
+    });
+
+    test('v3 rebuilds asset ids and carries project membership across', () async {
+      final path = await _freshDbPath('asset_atlas_db_v3_');
+
+      // A v1 database whose ids are in the old content-derived format.
+      const oldId = r'C:\Packs\Albedo.png:123:1700000000000';
+      final legacy = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 1,
+          onCreate: (db, _) async {
+            for (final statement in _v1Ddl) {
+              await db.execute(statement);
+            }
+          },
+        ),
+      );
+      await legacy.insert('catalog_assets', {
+        'id': oldId,
+        'name': 'albedo.png',
+        'path': r'C:\Packs\Albedo.png',
+        'relative_path': 'A/albedo.png',
+        'source_root': r'C:\Packs\A',
+        'source_name': 'A',
+        'ext': 'png',
+        'type': 'image',
+        'size': 123,
+        'modified_ms': 1700000000000,
+        'tags_json': '["image"]',
+        'ignored': 1,
+      });
+      await legacy.insert('projects', {
+        'id': 'p1',
+        'name': 'Pass one',
+        'root_path': r'C:\Packs\A',
+        'created_ms': 1700000000000,
+      });
+      await legacy.insert('project_assets', {
+        'project_id': 'p1',
+        'asset_id': oldId,
+      });
+      // A membership row whose asset is already gone.
+      await legacy.insert('project_assets', {
+        'project_id': 'p1',
+        'asset_id': 'vanished:1:2',
+      });
+      await legacy.close();
+
+      final db = await _openAt(path);
+      final restored = await db.loadCatalog();
+
+      final expectedId = buildAssetId(
+        sourceRoot: r'C:\Packs\A',
+        relativePath: 'albedo.png',
+      );
+      expect(restored.assets.single.id, expectedId);
+      expect(restored.assets.single.ignored, isTrue);
+      expect(
+        await db.loadProjectAssetIds('p1'),
+        {expectedId},
+        reason: 'membership must follow the id, and orphans must be dropped',
+      );
+    });
+
+    test('the v3 id migration is idempotent', () async {
+      final path = await _freshDbPath('asset_atlas_db_v3_twice_');
+      final legacy = await databaseFactory.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 1,
+          onCreate: (db, _) async {
+            for (final statement in _v1Ddl) {
+              await db.execute(statement);
+            }
+          },
+        ),
+      );
+      await legacy.insert('catalog_assets', {
+        'id': r'C:\Packs\Albedo.png:1:2',
+        'name': 'albedo.png',
+        'path': r'C:\Packs\Albedo.png',
+        'relative_path': 'A/albedo.png',
+        'source_root': r'C:\Packs\A',
+        'source_name': 'A',
+        'ext': 'png',
+        'type': 'image',
+        'size': 1,
+        'modified_ms': 2,
+        'tags_json': '[]',
+        'ignored': 0,
+      });
+      await legacy.close();
+
+      final first = await _openAt(path);
+      final firstId = (await first.loadCatalog()).assets.single.id;
+      await first.close();
+
+      final second = await _openAt(path);
+      final secondId = (await second.loadCatalog()).assets.single.id;
+      expect(secondId, firstId);
     });
 
     test('a fresh v2 schema matches an upgraded v1 schema', () async {
