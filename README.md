@@ -1,5 +1,7 @@
 # AssetAtlas
 
+![CI](https://github.com/TheMikaus/AssetAtlas/actions/workflows/ci.yml/badge.svg)
+
 AssetAtlas is a desktop-first asset catalog and preview tool focused on local game/content pipelines.
 
 This repository is now focused on the Flutter Windows desktop app.
