@@ -50,7 +50,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.1.1';
+const appVersion = '1.2.0';
 const _maxConcurrentModelValidations = 3;
 const enableFbxLogs = true;
 String fbxLogFilePath =
@@ -5158,28 +5158,34 @@ class AssetAtlasDatabase {
       newIdByOldId[oldId] = newId;
     }
 
+    // Batched: a real catalog is tens of thousands of rows, and one statement
+    // per row turned this into a visible freeze on first launch.
+    final updates = db.batch();
     for (final entry in newIdByOldId.entries) {
       if (entry.key == entry.value) continue;
-      await db.rawUpdate('UPDATE catalog_assets SET id = ? WHERE id = ?', [
+      updates.rawUpdate('UPDATE catalog_assets SET id = ? WHERE id = ?', [
         entry.value,
         entry.key,
       ]);
     }
+    await updates.commit(noResult: true);
 
     final membership = await db.query('project_assets');
     await db.delete('project_assets');
     var droppedMembership = 0;
+    final inserts = db.batch();
     for (final row in membership) {
       final mapped = newIdByOldId[row['asset_id'] as String];
       if (mapped == null) {
         droppedMembership += 1;
         continue;
       }
-      await db.insert('project_assets', {
+      inserts.insert('project_assets', {
         'project_id': row['project_id'],
         'asset_id': mapped,
       }, conflictAlgorithm: ConflictAlgorithm.ignore);
     }
+    await inserts.commit(noResult: true);
 
     fbxLog(
       'Migrated ${newIdByOldId.length} asset ids to v3 '
@@ -5434,4 +5440,5 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
