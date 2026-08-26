@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:developer' as developer;
@@ -50,12 +51,28 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.4.2';
+const appVersion = '1.5.0';
 const _maxConcurrentModelValidations = 3;
+
+/// How many chunks are classified at once.
+///
+/// Each worker holds one archive in memory while it works through a chunk, and
+/// the largest here is ~126 MB, so this is capped well below the core count:
+/// the ceiling is memory, not CPU. Two cores are left for the UI isolate and
+/// the importer subprocesses the workers drive.
+final _classificationWorkerCount = math.max(
+  1,
+  math.min(6, Platform.numberOfProcessors - 2),
+);
+
+/// Assets per worker chunk. Bigger amortises opening the archive; smaller
+/// makes progress visible sooner.
+const fbxClassifyChunkSize = 400;
 const enableFbxLogs = true;
 String fbxLogFilePath =
     '${Directory.systemTemp.path}${Platform.pathSeparator}asset_atlas_fbx.log';
 const ignoredFolderNames = {
+  '__macosx',
   '.git',
   '.vs',
   '.vscode',
@@ -182,6 +199,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   final Queue<AssetItem> _modelKindQueue = Queue<AssetItem>();
   bool _processingModelKindQueue = false;
   int _modelKindClassified = 0;
+  int _classificationFailures = 0;
   final Queue<AssetItem> _modelValidationQueue = Queue<AssetItem>();
   bool _processingModelValidationQueue = false;
   final List<String> _assetHistory = <String>[];
@@ -412,60 +430,125 @@ class _CatalogScreenState extends State<CatalogScreen> {
     unawaited(_processModelValidationQueue());
   }
 
-  /// Classifying an FBX means running the importer, so this is deliberately
-  /// lazy: assets are classified when something needs the answer, and the
-  /// result is persisted so it is paid for once.
+  /// Classifying an FBX means reading it, so this is deliberately lazy:
+  /// assets are classified when something needs the answer, and the result is
+  /// persisted so it is paid for once.
   void _scheduleModelKindClassification(Iterable<AssetItem> subset) {
+    final pending = <AssetItem>[];
     for (final asset in subset) {
       if (asset.ext != 'fbx' || asset.modelKind != null) continue;
       if (!_modelKindInFlight.add(asset.id)) continue;
-      _modelKindQueue.add(asset);
+      pending.add(asset);
     }
+    if (pending.isEmpty) return;
+    _modelKindQueue.addAll(pending);
     unawaited(_processModelKindQueue());
   }
 
+  /// Runs classification on worker isolates, several at a time, folding the
+  /// answers back in chunks.
+  ///
+  /// Inflating archive entries is genuine CPU work; doing it inline made the
+  /// UI stutter, and applying one result at a time invalidated the filtered
+  /// list once per file.
   Future<void> _processModelKindQueue() async {
     if (_processingModelKindQueue) return;
     _processingModelKindQueue = true;
-    while (_modelKindQueue.isNotEmpty) {
-      final batch = <AssetItem>[];
-      while (batch.length < _maxConcurrentModelValidations &&
-          _modelKindQueue.isNotEmpty) {
-        batch.add(_modelKindQueue.removeFirst());
-      }
-      await Future.wait(batch.map(_classifyModelKind));
-      if (!mounted) break;
-      // One rebuild per batch rather than per asset: a big catalog would
-      // otherwise rebuild the list thousands of times.
-      setState(() {
-        status = ScanStatus(
-          'Classifying FBX content',
-          '$_modelKindClassified classified, '
-              '${_modelKindQueue.length} to go',
-        );
-      });
+
+    final helper = meshImporterPath();
+    if (!File(helper).existsSync()) {
+      _processingModelKindQueue = false;
+      _modelKindQueue.clear();
+      _modelKindInFlight.clear();
+      return;
     }
+
+    while (_modelKindQueue.isNotEmpty) {
+      final pending = _modelKindQueue.toList();
+      _modelKindQueue.clear();
+
+      final chunks = buildFbxClassifyChunks(
+        assets: pending,
+        helperPath: helper,
+      );
+      final total = pending.length;
+      var completed = 0;
+      var nextChunk = 0;
+      var failedChunks = 0;
+
+      Future<void> worker() async {
+        while (nextChunk < chunks.length) {
+          final chunk = chunks[nextChunk++];
+          Map<String, String> kinds;
+          try {
+            kinds = await runFbxClassifyChunk(chunk);
+          } catch (error, stack) {
+            // A failure here is ours, not the files'. Recording 'unreadable'
+            // would bake a bug into the catalog as a verdict about 400 assets,
+            // which is exactly what happened once already: leave them
+            // unclassified so a later pass retries them, and say so.
+            fbxLog('Classify chunk failed (${chunk.length} assets): $error');
+            fbxLog('$stack');
+            for (final id in chunk.assetIds) {
+              _modelKindInFlight.remove(id);
+            }
+            failedChunks += 1;
+            completed += chunk.length;
+            continue;
+          }
+          completed += chunk.length;
+          if (!mounted) return;
+          _applyModelKinds(kinds, completed: completed, total: total);
+        }
+      }
+
+      await Future.wait([
+        for (var i = 0; i < _classificationWorkerCount; i += 1) worker(),
+      ]);
+      _classificationFailures += failedChunks;
+      if (!mounted) break;
+    }
+
     _processingModelKindQueue = false;
     if (!mounted) return;
     setState(() {
-      status = ScanStatus(
-        'Classification complete',
-        '$_modelKindClassified FBX files classified',
-      );
+      status = _classificationFailures > 0
+          ? ScanStatus(
+              'Classification finished with errors',
+              '$_modelKindClassified read, '
+                  '$_classificationFailures chunks failed - see '
+                  'logs/asset_atlas_fbx.log',
+            )
+          : ScanStatus(
+              'Classification complete',
+              '$_modelKindClassified FBX files read',
+            );
     });
   }
 
-  Future<void> _classifyModelKind(AssetItem asset) async {
-    // A file the importer cannot read is recorded too, so the app does not
-    // retry it on every pass.
-    final kind = await probeFbxContentKind(asset);
-    asset.modelKind = kind;
-    _modelKindClassified += 1;
-    _invalidateAssetViews();
-    _modelKindInFlight.remove(asset.id);
-    _persistInBackground(
-      () => db.updateAssetModelKind(assetId: asset.id, modelKind: kind),
-    );
+  /// One rebuild and one database write per chunk, not per asset.
+  void _applyModelKinds(
+    Map<String, String> kinds, {
+    required int completed,
+    required int total,
+  }) {
+    if (kinds.isEmpty) return;
+    final byId = {for (final asset in assets) asset.id: asset};
+    for (final entry in kinds.entries) {
+      byId[entry.key]?.modelKind = entry.value;
+      _modelKindInFlight.remove(entry.key);
+    }
+    _modelKindClassified += kinds.length;
+
+    setState(() {
+      _invalidateAssetViews();
+      status = ScanStatus(
+        'Classifying FBX content',
+        '$completed of $total read',
+      );
+    });
+
+    _persistInBackground(() => db.updateAssetModelKinds(kinds));
   }
 
   Future<void> _processModelValidationQueue() async {
@@ -2602,6 +2685,44 @@ class _PreviewPanelState extends State<PreviewPanel> {
   }
 }
 
+/// Whether [bytes] actually start like the audio container their extension
+/// claims.
+///
+/// audioplayers_windows dies with an access violation on malformed input --
+/// a native crash Dart cannot catch -- so nothing unverified may reach it.
+/// Confirmed against a 268-byte AppleDouble stub named ".mp3", which took the
+/// whole app down.
+bool looksLikePlayableAudio(List<int> bytes, String ext) {
+  if (bytes.length < 12) return false;
+
+  bool startsWith(List<int> magic, {int offset = 0}) {
+    if (bytes.length < offset + magic.length) return false;
+    for (var i = 0; i < magic.length; i += 1) {
+      if (bytes[offset + i] != magic[i]) return false;
+    }
+    return true;
+  }
+
+  switch (ext) {
+    case 'mp3':
+      // ID3v2 tag, or an MPEG frame sync (11 set bits).
+      if (startsWith([0x49, 0x44, 0x33])) return true;
+      return bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0;
+    case 'wav':
+      return startsWith([0x52, 0x49, 0x46, 0x46]) &&
+          startsWith([0x57, 0x41, 0x56, 0x45], offset: 8);
+    case 'ogg':
+      return startsWith([0x4F, 0x67, 0x67, 0x53]);
+    case 'flac':
+      return startsWith([0x66, 0x4C, 0x61, 0x43]) ||
+          startsWith([0x49, 0x44, 0x33]);
+    case 'mid':
+    case 'midi':
+      return startsWith([0x4D, 0x54, 0x68, 0x64]);
+  }
+  return true;
+}
+
 class AudioPreview extends StatefulWidget {
   const AudioPreview({required this.asset, super.key});
 
@@ -2620,6 +2741,7 @@ class _AudioPreviewState extends State<AudioPreview> {
   Duration position = Duration.zero;
   Duration duration = Duration.zero;
   PlayerState state = PlayerState.stopped;
+  String? unplayableReason;
 
   @override
   void initState() {
@@ -2647,6 +2769,7 @@ class _AudioPreviewState extends State<AudioPreview> {
         position = Duration.zero;
         duration = Duration.zero;
         state = PlayerState.stopped;
+        unplayableReason = null;
       });
     }
   }
@@ -2665,15 +2788,47 @@ class _AudioPreviewState extends State<AudioPreview> {
       await player.pause();
       return;
     }
-    if (isZipVirtualPath(widget.asset.path)) {
-      final bytes = await readZipVirtualAssetBytesByPath(widget.asset.path);
-      if (bytes == null || bytes.isEmpty) {
+
+    try {
+      if (isZipVirtualPath(widget.asset.path)) {
+        final bytes = await readZipVirtualAssetBytesByPath(widget.asset.path);
+        if (bytes == null || bytes.isEmpty) {
+          _reportUnplayable('This archive entry could not be read.');
+          return;
+        }
+        if (!looksLikePlayableAudio(bytes, widget.asset.ext)) {
+          _reportUnplayable(
+            'This file does not contain ${widget.asset.ext.toUpperCase()} '
+            'audio data, so it cannot be played.',
+          );
+          return;
+        }
+        await player.play(BytesSource(bytes));
         return;
       }
-      await player.play(BytesSource(bytes));
-      return;
+
+      final file = File(widget.asset.path);
+      if (!file.existsSync()) {
+        _reportUnplayable('The file is no longer at this path.');
+        return;
+      }
+      final header = await file.openRead(0, 32).expand((c) => c).toList();
+      if (!looksLikePlayableAudio(header, widget.asset.ext)) {
+        _reportUnplayable(
+          'This file does not contain ${widget.asset.ext.toUpperCase()} '
+          'audio data, so it cannot be played.',
+        );
+        return;
+      }
+      await player.play(DeviceFileSource(widget.asset.path));
+    } catch (error) {
+      _reportUnplayable('Playback failed: $error');
     }
-    await player.play(DeviceFileSource(widget.asset.path));
+  }
+
+  void _reportUnplayable(String message) {
+    if (!mounted) return;
+    setState(() => unplayableReason = message);
   }
 
   String asClock(Duration value) {
@@ -2721,6 +2876,15 @@ class _AudioPreviewState extends State<AudioPreview> {
             ),
           ),
           const SizedBox(height: 12),
+          if (unplayableReason != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Text(
+                unplayableReason!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Color(0xffb3261e)),
+              ),
+            ),
           FilledButton.icon(
             onPressed: playPause,
             icon: Icon(
@@ -4583,6 +4747,10 @@ Future<ScanResult> scanAssetFolder(
       skippedUnsupported += 1;
       continue;
     }
+    if (isAppleDoubleName(entity.uri.pathSegments.last)) {
+      skippedUnsupported += 1;
+      continue;
+    }
     if (ext == 'obj' && await isLikelyBinaryObj(entity)) {
       skippedBinaryObj += 1;
       continue;
@@ -4687,6 +4855,10 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       }
 
       final name = entryPath.split('/').last;
+      if (isAppleDoubleName(name)) {
+        skippedUnsupported += 1;
+        continue;
+      }
       final relativePath = '$sourceName/$zipRelative!/$entryPath';
       assets.add(
         AssetItem(
@@ -4724,6 +4896,12 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
     );
   }
 }
+
+/// AppleDouble sidecars: macOS writes a `._name` stub beside the real file
+/// (and a `__MACOSX/` mirror inside archives) holding resource-fork metadata.
+/// They carry the extension of the file they shadow but none of its content,
+/// so a 268-byte "mp3" reaches the audio plugin and takes the process down.
+bool isAppleDoubleName(String fileName) => fileName.startsWith('._');
 
 bool hasIgnoredArchiveFolder(String archiveEntryPath) {
   final parts = archiveEntryPath.replaceAll('\\', '/').split('/');
@@ -5186,6 +5364,133 @@ String parentPath(String path) {
   final index = normalized.lastIndexOf(separator);
   if (index <= 0) return normalized;
   return normalized.substring(0, index);
+}
+
+/// One unit of classification work: FBX assets that all live in the same
+/// container, so a worker isolate opens that archive once for the whole chunk.
+class FbxClassifyChunk {
+  const FbxClassifyChunk({
+    required this.helperPath,
+    required this.containerPath,
+    required this.assetIds,
+    required this.assetPaths,
+  });
+
+  final String helperPath;
+
+  /// The `.zip` these assets live in, or null for loose files on disk.
+  final String? containerPath;
+  final List<String> assetIds;
+  final List<String> assetPaths;
+
+  int get length => assetIds.length;
+}
+
+/// Classifies a chunk of FBX files. Runs in a worker isolate: reading and
+/// inflating archive entries is real CPU work, and doing it on the UI isolate
+/// is what made classification stutter.
+///
+/// Must stay a top-level function taking only sendable data.
+Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
+  final kinds = <String, String>{};
+
+  Archive? archive;
+  if (chunk.containerPath != null) {
+    try {
+      final file = File(chunk.containerPath!);
+      if (file.existsSync() &&
+          await file.length() <= maxZipIntrospectionBytes) {
+        // Opened once for the whole chunk; entries inflate individually.
+        archive = ZipDecoder().decodeBytes(
+          await file.readAsBytes(),
+          verify: false,
+        );
+      }
+    } catch (_) {
+      archive = null;
+    }
+  }
+
+  for (var index = 0; index < chunk.assetIds.length; index += 1) {
+    final assetId = chunk.assetIds[index];
+    final assetPath = chunk.assetPaths[index];
+    try {
+      Uint8List? bytes;
+      if (isZipVirtualPath(assetPath)) {
+        final parsed = parseZipVirtualPath(assetPath);
+        final entry = archive != null && parsed != null
+            ? archive.findFile(parsed.entryPath)
+            : null;
+        if (entry == null || !entry.isFile) {
+          kinds[assetId] = 'unreadable';
+          continue;
+        }
+        bytes = entry.content;
+      }
+
+      final result = await runMeshImporter(
+        chunk.helperPath,
+        assetPath,
+        inputBytes: bytes,
+        probeOnly: true,
+      );
+      if (result.exitCode != 0) {
+        kinds[assetId] = 'unreadable';
+        continue;
+      }
+      final json = jsonDecode(result.stdout) as Map<String, dynamic>;
+      kinds[assetId] = json['kind'] == 'animation' ? 'animation' : 'mesh';
+    } catch (_) {
+      kinds[assetId] = 'unreadable';
+    }
+  }
+  return kinds;
+}
+
+/// Hands a chunk to a worker isolate.
+///
+/// Must stay top-level. Building this closure inside a State method captures
+/// the enclosing `this`, which drags the whole widget tree into the isolate
+/// message and fails with "object is unsendable".
+Future<Map<String, String>> runFbxClassifyChunk(FbxClassifyChunk chunk) {
+  return Isolate.run(() => classifyFbxChunk(chunk));
+}
+
+/// Splits pending work into per-container chunks.
+///
+/// Grouping by container matters: a chunk spanning three archives would make
+/// its worker open all three.
+List<FbxClassifyChunk> buildFbxClassifyChunks({
+  required List<AssetItem> assets,
+  required String helperPath,
+  int chunkSize = fbxClassifyChunkSize,
+}) {
+  final byContainer = <String?, List<AssetItem>>{};
+  for (final asset in assets) {
+    final container = isZipVirtualPath(asset.path)
+        ? parseZipVirtualPath(asset.path)?.zipPath
+        : null;
+    (byContainer[container] ??= <AssetItem>[]).add(asset);
+  }
+
+  final chunks = <FbxClassifyChunk>[];
+  for (final entry in byContainer.entries) {
+    for (var start = 0; start < entry.value.length; start += chunkSize) {
+      final slice = entry.value.sublist(
+        start,
+        math.min(start + chunkSize, entry.value.length),
+      );
+      chunks.add(
+        FbxClassifyChunk(
+          helperPath: helperPath,
+          containerPath: entry.key,
+          assetIds: [for (final asset in slice) asset.id],
+          assetPaths: [for (final asset in slice) asset.path],
+        ),
+      );
+    }
+  }
+  return chunks;
 }
 
 /// Asks the importer only what an FBX contains, skipping geometry extraction
@@ -6383,6 +6688,29 @@ class AssetAtlasDatabase {
     final sourceRoots = sourceRows
         .map((row) => row['root_path'] as String)
         .toSet();
+
+    // Catalogs scanned before AppleDouble filtering existed still hold these
+    // sidecars, and one of them crashed the audio plugin. Drop them here too
+    // rather than waiting for a full re-scan.
+    final stale = assets
+        .where(
+          (asset) =>
+              isAppleDoubleName(asset.name) ||
+              asset.relativePath.toLowerCase().contains('__macosx/'),
+        )
+        .toList();
+    if (stale.isNotEmpty) {
+      assets.removeWhere(stale.contains);
+      unawaited(
+        deleteAssetsByIds([for (final asset in stale) asset.id]).catchError((
+          Object error,
+        ) {
+          fbxLog('Could not drop AppleDouble rows: $error');
+        }),
+      );
+      fbxLog('Dropped ${stale.length} AppleDouble entries from the catalog.');
+    }
+
     return PersistedCatalog(assets: assets, sourceRoots: sourceRoots);
   }
 
@@ -6535,6 +6863,42 @@ class AssetAtlasDatabase {
       where: 'id = ?',
       whereArgs: [assetId],
     );
+  }
+
+  /// Writes a chunk of classifications in one transaction. Doing this per
+  /// asset meant tens of thousands of separate writes.
+  Future<void> updateAssetModelKinds(Map<String, String> kindByAssetId) async {
+    if (kindByAssetId.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final entry in kindByAssetId.entries) {
+        batch.update(
+          'catalog_assets',
+          {'model_kind': entry.value},
+          where: 'id = ?',
+          whereArgs: [entry.key],
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  Future<void> deleteAssetsByIds(List<String> assetIds) async {
+    if (assetIds.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in assetIds) {
+        batch.delete('catalog_assets', where: 'id = ?', whereArgs: [id]);
+        batch.delete(
+          'project_assets',
+          where: 'asset_id = ?',
+          whereArgs: [id],
+        );
+      }
+      await batch.commit(noResult: true);
+    });
   }
 
   Future<void> upsertAssets(List<AssetItem> assets) async {
@@ -6717,6 +7081,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
