@@ -1803,6 +1803,7 @@ class _ModelPreviewState extends State<ModelPreview> {
   int checkerSquareSize = 16;
   String? uvSetOverride;
   LightingMode lightingMode = LightingMode.corner;
+  bool cullBackFaces = true;
 
   Future<MeshModel> _loadCurrentMesh() {
     return MeshLoadCache.load(
@@ -1887,6 +1888,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                         renderMode: renderMode,
                         uvSetOverride: uvSetOverride,
                         lightingMode: lightingMode,
+                        cullBackFaces: cullBackFaces,
                       ),
                       child: Align(
                         alignment: Alignment.bottomLeft,
@@ -1900,8 +1902,22 @@ class _ModelPreviewState extends State<ModelPreview> {
                             color: Colors.white.withValues(alpha: .86),
                             borderRadius: BorderRadius.circular(6),
                           ),
-                          child: Text(
-                            '${mesh.name} · ${mesh.vertices.length} verts · ${mesh.faces.length} faces',
+                          child: Builder(
+                            builder: (context) {
+                              final total = mesh.faces.length;
+                              final capped = total > maxRenderedFaces;
+                              final summary =
+                                  '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
+                              if (!capped) return Text(summary);
+                              return Text(
+                                '$summary · face cap: showing '
+                                '$maxRenderedFaces nearest',
+                                style: const TextStyle(
+                                  color: Color(0xffb3540a),
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              );
+                            },
                           ),
                         ),
                       ),
@@ -1974,6 +1990,29 @@ class _ModelPreviewState extends State<ModelPreview> {
                                   setState(() => lightingMode = next);
                                 },
                               ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: .9),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.black12),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text('Hide back faces'),
+                            Switch(
+                              value: cullBackFaces,
+                              onChanged: (next) =>
+                                  setState(() => cullBackFaces = next),
                             ),
                           ],
                         ),
@@ -2088,6 +2127,7 @@ class MeshPainter extends CustomPainter {
     required this.zoom,
     required this.renderMode,
     required this.lightingMode,
+    required this.cullBackFaces,
     this.uvSetOverride,
   });
 
@@ -2098,6 +2138,7 @@ class MeshPainter extends CustomPainter {
   final RenderMode renderMode;
   final LightingMode lightingMode;
   final String? uvSetOverride;
+  final bool cullBackFaces;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -2134,14 +2175,34 @@ class MeshPainter extends CustomPainter {
     final drawEdges =
         renderMode == RenderMode.wireframe || renderMode == RenderMode.solid;
 
-    final faces = mesh.faces.toList()
-      ..sort(
-        (a, b) => _faceDepth(projected, b).compareTo(_faceDepth(projected, a)),
-      );
-    final step = math.max(1, (faces.length / 14000).ceil());
-    for (var index = 0; index < faces.length; index += step) {
+    // Depth once per face, not once per comparison: the old comparator
+    // recomputed both sides on every compare.
+    final faces = mesh.faces;
+    final depths = List<double>.filled(faces.length, 0);
+    final visible = List<bool>.filled(faces.length, false);
+    for (var index = 0; index < faces.length; index += 1) {
       final face = faces[index];
       if (face.indices.any((i) => i < 0 || i >= projected.length)) continue;
+      depths[index] = _faceDepth(projected, face);
+      if (cullBackFaces && face.indices.length >= 3) {
+        final p0 = projected[face.indices[0]];
+        final p1 = projected[face.indices[1]];
+        final p2 = projected[face.indices[2]];
+        if (isBackFacingTriangle(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y)) {
+          continue;
+        }
+      }
+      visible[index] = true;
+    }
+
+    final order = selectRenderedFaceOrder(
+      depths: depths,
+      visible: visible,
+      budget: maxRenderedFaces,
+    );
+
+    for (final faceIndex in order) {
+      final face = faces[faceIndex];
       final material =
           (face.materialIndex >= 0 &&
               face.materialIndex < mesh.materials.length)
@@ -2402,8 +2463,63 @@ class MeshPainter extends CustomPainter {
         oldDelegate.zoom != zoom ||
         oldDelegate.renderMode != renderMode ||
         oldDelegate.lightingMode != lightingMode ||
+        oldDelegate.cullBackFaces != cullBackFaces ||
         oldDelegate.uvSetOverride != uvSetOverride;
   }
+}
+
+/// Upper bound on triangles drawn per frame. When a mesh exceeds it the
+/// viewer draws the nearest [maxRenderedFaces] and says so in the overlay --
+/// it must never quietly drop geometry in an inspection tool.
+const maxRenderedFaces = 14000;
+
+/// Screen-space signed area of a projected triangle.
+///
+/// The projection flips Y, so front-facing triangles come out *negative*.
+/// Measured against test/fixtures/fbx/transformed_uv_embedded.fbx under the
+/// default camera rather than assumed; test/renderer_geometry_test.dart pins
+/// the convention.
+double triangleSignedArea(
+  double ax,
+  double ay,
+  double bx,
+  double by,
+  double cx,
+  double cy,
+) {
+  return (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+}
+
+bool isBackFacingTriangle(
+  double ax,
+  double ay,
+  double bx,
+  double by,
+  double cx,
+  double cy,
+) {
+  return triangleSignedArea(ax, ay, bx, by, cx, cy) > 0;
+}
+
+/// Chooses which faces to draw and in what order: back-to-front over the
+/// visible set, capped to [budget] by dropping the farthest faces. Depth-
+/// priority beats the index stride this replaced, which sampled the mesh
+/// uniformly and left holes everywhere.
+List<int> selectRenderedFaceOrder({
+  required List<double> depths,
+  required List<bool> visible,
+  required int budget,
+}) {
+  final order = <int>[];
+  for (var index = 0; index < depths.length; index += 1) {
+    if (visible[index]) order.add(index);
+  }
+  // Larger depth is farther from the camera, so descending is back-to-front.
+  order.sort((a, b) => depths[b].compareTo(depths[a]));
+  if (budget >= 0 && order.length > budget) {
+    return order.sublist(order.length - budget);
+  }
+  return order;
 }
 
 enum RenderMode { textured, solid, wireframe }
