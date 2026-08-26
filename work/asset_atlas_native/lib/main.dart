@@ -2313,9 +2313,10 @@ class MeshPainter extends CustomPainter {
           faceColor = _multiplyColor(faceColor, vertexTint);
         }
         faceColor = _shadeColor(faceColor, light);
-        final fillAlpha = renderMode == RenderMode.solid
-            ? 1.0
-            : (renderMode == RenderMode.textured ? .92 : 1.0) * materialOpacity;
+        // Opaque unless the material itself asks for transparency. The old
+        // blanket .92 in textured mode let interior geometry bleed through
+        // solid walls, which reads as a broken asset.
+        final fillAlpha = renderMode == RenderMode.solid ? 1.0 : materialOpacity;
         facePaint.color = faceColor.withValues(alpha: fillAlpha);
         canvas.drawPath(path, facePaint);
       }
@@ -2496,10 +2497,15 @@ const maxRenderedFaces = 14000;
 
 /// Screen-space signed area of a projected triangle.
 ///
-/// The projection flips Y, so front-facing triangles come out *negative*.
-/// Measured against test/fixtures/fbx/transformed_uv_embedded.fbx under the
-/// default camera rather than assumed; test/renderer_geometry_test.dart pins
-/// the convention.
+/// Convention: an outward-facing surface of a solid projects to a *positive*
+/// signed area under this renderer's Y-flipping projection, so a negative area
+/// means the triangle is turned away from the camera.
+///
+/// Do not re-derive this from a single plane fixture: a lone two-sided triangle
+/// tells you nothing about which side is "out", and getting this backwards
+/// culls the outside of every closed model and shows you its interior.
+/// test/renderer_geometry_test.dart pins it against a cube whose winding is
+/// derived from outward geometric normals.
 double triangleSignedArea(
   double ax,
   double ay,
@@ -2519,7 +2525,7 @@ bool isBackFacingTriangle(
   double cx,
   double cy,
 ) {
-  return triangleSignedArea(ax, ay, bx, by, cx, cy) > 0;
+  return triangleSignedArea(ax, ay, bx, by, cx, cy) < 0;
 }
 
 /// Chooses which faces to draw and in what order: back-to-front over the
