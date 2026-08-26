@@ -50,7 +50,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.3.0';
+const appVersion = '1.4.0';
 const _maxConcurrentModelValidations = 3;
 const enableFbxLogs = true;
 String fbxLogFilePath =
@@ -157,7 +157,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool hideIgnored = true;
   bool hideZipAssets = false;
   bool scanning = false;
-  double assetListHeight = 280;
+  double assetListWidth = 420;
+  bool gridMode = false;
+  AssetSortMode sortMode = AssetSortMode.path;
+  String? _lastSelectionAnchorId;
+  String? folderFilter;
+  final expandedFolders = <String>{};
+  List<FolderNode>? _folderRootsCache;
+  int _folderRootsRevision = -1;
   ScanStatus status = const ScanStatus('Ready', 'Choose a folder to catalog.');
   final modelHasValidTextures = <String, bool>{};
   final _modelValidationInFlight = <String>{};
@@ -293,10 +300,24 @@ class _CatalogScreenState extends State<CatalogScreen> {
     });
   }
 
+  /// Rebuilt only when the catalog changes: walking 48k paths on every
+  /// rebuild would be pure waste.
+  List<FolderNode> get folderRoots {
+    if (_folderRootsCache == null || _folderRootsRevision != catalogRevision) {
+      _folderRootsCache = buildFolderTree(assets);
+      _folderRootsRevision = catalogRevision;
+    }
+    return _folderRootsCache!;
+  }
+
   List<AssetItem> get filteredAssets {
     final lower = query.trim().toLowerCase();
-    return assets.where((asset) {
+    final matches = assets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
+      if (folderFilter != null &&
+          !isUnderFolder(asset.relativePath, folderFilter!)) {
+        return false;
+      }
       if (hideZipAssets && isZipVirtualPath(asset.path)) return false;
       if (typeFilter == 'animation') {
         // Only a parse can tell an animation clip from a mesh, so ask for one
@@ -328,7 +349,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
       return asset.name.toLowerCase().contains(lower) ||
           asset.relativePath.toLowerCase().contains(lower) ||
           asset.tags.any((tag) => tag.contains(lower));
-    }).toList()..sort((a, b) => a.relativePath.compareTo(b.relativePath));
+    }).toList();
+    return sortAssets(matches, sortMode);
   }
 
   void _scheduleModelTextureValidation([Iterable<AssetItem>? subset]) {
@@ -376,7 +398,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         status = ScanStatus(
           'Classifying FBX content',
           '$_modelKindClassified classified, '
-          '${_modelKindQueue.length} to go',
+              '${_modelKindQueue.length} to go',
         );
       });
     }
@@ -922,6 +944,62 @@ class _CatalogScreenState extends State<CatalogScreen> {
     }
   }
 
+  /// Arrow keys walk the visible list, so you can flick through candidates
+  /// without moving the mouse back to the list for every one.
+  void _stepActiveAsset(int delta) {
+    final visible = filteredAssets;
+    if (visible.isEmpty) return;
+    final currentIndex = active == null
+        ? -1
+        : visible.indexWhere((asset) => asset.id == active!.id);
+    final nextIndex = currentIndex < 0
+        ? (delta > 0 ? 0 : visible.length - 1)
+        : (currentIndex + delta).clamp(0, visible.length - 1);
+    if (nextIndex == currentIndex) return;
+    _activateAsset(visible[nextIndex]);
+  }
+
+  void _selectAll(List<AssetItem> visible) {
+    setState(() {
+      selectedIds.addAll(visible.map((asset) => asset.id));
+    });
+  }
+
+  void _clearSelection() {
+    setState(() {
+      selectedIds.clear();
+      _lastSelectionAnchorId = null;
+    });
+  }
+
+  /// Shift-click extends from the last clicked row, the way every file browser
+  /// behaves. Without it, selecting a run of assets means one click each.
+  void _selectWithRange(AssetItem asset, bool selected, {bool range = false}) {
+    final visible = filteredAssets;
+    if (range && _lastSelectionAnchorId != null) {
+      final anchorIndex = visible.indexWhere(
+        (item) => item.id == _lastSelectionAnchorId,
+      );
+      final targetIndex = visible.indexWhere((item) => item.id == asset.id);
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        final start = math.min(anchorIndex, targetIndex);
+        final end = math.max(anchorIndex, targetIndex);
+        setState(() {
+          for (var i = start; i <= end; i += 1) {
+            if (selected) {
+              selectedIds.add(visible[i].id);
+            } else {
+              selectedIds.remove(visible[i].id);
+            }
+          }
+        });
+        return;
+      }
+    }
+    _lastSelectionAnchorId = asset.id;
+    toggleSelected(asset, selected);
+  }
+
   void toggleSelected(AssetItem asset, bool selected) {
     setState(() {
       if (selected) {
@@ -965,116 +1043,153 @@ class _CatalogScreenState extends State<CatalogScreen> {
     };
 
     return Scaffold(
-      body: Column(
-        children: [
-          HeaderBar(
-            scanning: scanning,
-            status: status,
-            canGoBack: canGoBackInHistory,
-            canGoForward: canGoForwardInHistory,
-            onScan: chooseAndScan,
-            onSaveProject: saveProjectSnapshot,
-            onLoadProject: loadProjectSnapshot,
-            onCopySelected: copySelected,
-            onGoBack: _goBackHistory,
-            onGoForward: _goForwardHistory,
-            selectedCount: selectedIds.length,
-          ),
-          Expanded(
-            child: Row(
-              children: [
-                FilterPanel(
-                  counts: counts,
-                  typeFilter: typeFilter,
-                  modelTextureFilter: modelTextureFilter,
-                  hideIgnored: hideIgnored,
-                  hideZipAssets: hideZipAssets,
-                  sourceRoots: sourceRoots.toList()..sort(),
-                  onTypeChanged: (value) => setState(() => typeFilter = value),
-                  onModelTextureFilterChanged: (value) {
-                    setState(() {
-                      modelTextureFilter = value;
-                      if (value == 'all') {
-                        _modelValidationQueue.clear();
-                        _modelValidationInFlight.clear();
-                      }
-                    });
-                    if (value != 'all') {
-                      _scheduleModelTextureValidation();
-                    }
-                  },
-                  onHideIgnoredChanged: (value) =>
-                      setState(() => hideIgnored = value),
-                  onHideZipAssetsChanged: (value) {
-                    setState(() {
-                      hideZipAssets = value;
-                      if (value &&
-                          active != null &&
-                          isZipVirtualPath(active!.path)) {
-                        active = assets
-                            .where((asset) => !isZipVirtualPath(asset.path))
-                            .firstOrNull;
-                        _seedHistoryWithActive();
-                      }
-                      if (value) {
-                        _modelValidationQueue.removeWhere(
-                          (asset) => isZipVirtualPath(asset.path),
-                        );
-                      }
-                    });
-                  },
-                  onRemoveSource: removeSource,
-                ),
-                Expanded(
-                  child: Column(
-                    children: [
-                      SearchAndSummary(
-                        controller: searchController,
-                        visibleCount: visible.length,
-                        totalCount: assets.length,
-                        onChanged: (value) => setState(() => query = value),
+      body: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
+              _stepActiveAsset(1),
+          const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
+              _stepActiveAsset(-1),
+        },
+        child: Focus(
+          autofocus: true,
+          child: Column(
+            children: [
+              HeaderBar(
+                scanning: scanning,
+                status: status,
+                canGoBack: canGoBackInHistory,
+                canGoForward: canGoForwardInHistory,
+                onScan: chooseAndScan,
+                onSaveProject: saveProjectSnapshot,
+                onLoadProject: loadProjectSnapshot,
+                onCopySelected: copySelected,
+                onGoBack: _goBackHistory,
+                onGoForward: _goForwardHistory,
+                selectedCount: selectedIds.length,
+              ),
+              Expanded(
+                child: Row(
+                  children: [
+                    FilterPanel(
+                      counts: counts,
+                      typeFilter: typeFilter,
+                      modelTextureFilter: modelTextureFilter,
+                      hideIgnored: hideIgnored,
+                      hideZipAssets: hideZipAssets,
+                      sourceRoots: sourceRoots.toList()..sort(),
+                      folderRoots: folderRoots,
+                      selectedFolder: folderFilter,
+                      expandedFolders: expandedFolders,
+                      onFolderSelected: (value) =>
+                          setState(() => folderFilter = value),
+                      onFolderExpandToggled: (path) {
+                        setState(() {
+                          if (!expandedFolders.remove(path)) {
+                            expandedFolders.add(path);
+                          }
+                        });
+                      },
+                      onTypeChanged: (value) =>
+                          setState(() => typeFilter = value),
+                      onModelTextureFilterChanged: (value) {
+                        setState(() {
+                          modelTextureFilter = value;
+                          if (value == 'all') {
+                            _modelValidationQueue.clear();
+                            _modelValidationInFlight.clear();
+                          }
+                        });
+                        if (value != 'all') {
+                          _scheduleModelTextureValidation();
+                        }
+                      },
+                      onHideIgnoredChanged: (value) =>
+                          setState(() => hideIgnored = value),
+                      onHideZipAssetsChanged: (value) {
+                        setState(() {
+                          hideZipAssets = value;
+                          if (value &&
+                              active != null &&
+                              isZipVirtualPath(active!.path)) {
+                            active = assets
+                                .where((asset) => !isZipVirtualPath(asset.path))
+                                .firstOrNull;
+                            _seedHistoryWithActive();
+                          }
+                          if (value) {
+                            _modelValidationQueue.removeWhere(
+                              (asset) => isZipVirtualPath(asset.path),
+                            );
+                          }
+                        });
+                      },
+                      onRemoveSource: removeSource,
+                    ),
+                    // The browse list gets its own full-height column: as a bottom
+                    // strip it showed a handful of rows out of tens of thousands.
+                    SizedBox(
+                      width: assetListWidth,
+                      child: Column(
+                        children: [
+                          SearchAndSummary(
+                            controller: searchController,
+                            visibleCount: visible.length,
+                            totalCount: assets.length,
+                            selectedCount: selectedIds.length,
+                            sortMode: sortMode,
+                            gridMode: gridMode,
+                            onChanged: (value) => setState(() => query = value),
+                            onSortChanged: (value) =>
+                                setState(() => sortMode = value),
+                            onGridModeChanged: (value) =>
+                                setState(() => gridMode = value),
+                            onSelectAllVisible: () => _selectAll(visible),
+                            onClearSelection: _clearSelection,
+                          ),
+                          Expanded(
+                            child: gridMode
+                                ? AssetGrid(
+                                    assets: visible,
+                                    active: active,
+                                    selectedIds: selectedIds,
+                                    onActivate: _activateAsset,
+                                    onSelect: _selectWithRange,
+                                  )
+                                : AssetList(
+                                    assets: visible,
+                                    active: active,
+                                    selectedIds: selectedIds,
+                                    onActivate: _activateAsset,
+                                    onSelect: _selectWithRange,
+                                    onIgnoredChanged: setIgnored,
+                                  ),
+                          ),
+                        ],
                       ),
-                      Expanded(
-                        child: Column(
-                          children: [
-                            Expanded(
-                              child: PreviewPanel(
-                                asset: active,
-                                allAssets: assets,
-                                catalogRevision: catalogRevision,
-                                onActivateAsset: _activateAsset,
-                              ),
-                            ),
-                            ListResizeHandle(
-                              onDrag: (delta) {
-                                setState(() {
-                                  assetListHeight = (assetListHeight - delta)
-                                      .clamp(180, 520)
-                                      .toDouble();
-                                });
-                              },
-                            ),
-                            SizedBox(
-                              height: assetListHeight,
-                              child: AssetList(
-                                assets: visible,
-                                active: active,
-                                selectedIds: selectedIds,
-                                onActivate: _activateAsset,
-                                onSelect: toggleSelected,
-                                onIgnoredChanged: setIgnored,
-                              ),
-                            ),
-                          ],
-                        ),
+                    ),
+                    VerticalResizeHandle(
+                      onDrag: (delta) {
+                        setState(() {
+                          assetListWidth = (assetListWidth - delta)
+                              .clamp(280.0, 900.0)
+                              .toDouble();
+                        });
+                      },
+                    ),
+                    Expanded(
+                      child: PreviewPanel(
+                        asset: active,
+                        allAssets: assets,
+                        catalogRevision: catalogRevision,
+                        onActivateAsset: _activateAsset,
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -1322,6 +1437,211 @@ class _HeaderActions extends StatelessWidget {
   }
 }
 
+/// One folder in the browse tree, with the number of assets at or below it.
+class FolderNode {
+  FolderNode({required this.name, required this.path});
+
+  final String name;
+
+  /// Full prefix as it appears in [AssetItem.relativePath], with no trailing
+  /// separator. Filtering is a prefix match on this.
+  final String path;
+
+  int assetCount = 0;
+  final Map<String, FolderNode> childrenByName = <String, FolderNode>{};
+
+  List<FolderNode> get sortedChildren {
+    final children = childrenByName.values.toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return children;
+  }
+}
+
+/// Builds the folder hierarchy from asset relative paths.
+///
+/// A flat list of tens of thousands of assets cannot be browsed by location,
+/// and search only helps when you already know the name.
+List<FolderNode> buildFolderTree(List<AssetItem> assets) {
+  final roots = <String, FolderNode>{};
+  for (final asset in assets) {
+    final segments = asset.relativePath
+        .replaceAll('\\', '/')
+        .split('/')
+        .where((segment) => segment.isNotEmpty)
+        .toList();
+    if (segments.length < 2) continue; // file sitting directly at the root
+    segments.removeLast(); // drop the file name
+
+    var levelMap = roots;
+    final walked = <String>[];
+    for (final segment in segments) {
+      walked.add(segment);
+      final node = levelMap.putIfAbsent(
+        segment,
+        () => FolderNode(name: segment, path: walked.join('/')),
+      );
+      node.assetCount += 1;
+      levelMap = node.childrenByName;
+    }
+  }
+  final sorted = roots.values.toList()
+    ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  return sorted;
+}
+
+/// True when [relativePath] sits at or below [folderPath].
+bool isUnderFolder(String relativePath, String folderPath) {
+  if (folderPath.isEmpty) return true;
+  final normalized = relativePath.replaceAll('\\', '/');
+  return normalized == folderPath || normalized.startsWith('$folderPath/');
+}
+
+class FolderTreeView extends StatelessWidget {
+  const FolderTreeView({
+    required this.roots,
+    required this.selectedFolder,
+    required this.expandedFolders,
+    required this.onSelect,
+    required this.onToggleExpanded,
+    super.key,
+  });
+
+  final List<FolderNode> roots;
+  final String? selectedFolder;
+  final Set<String> expandedFolders;
+  final ValueChanged<String?> onSelect;
+  final ValueChanged<String> onToggleExpanded;
+
+  @override
+  Widget build(BuildContext context) {
+    if (roots.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 6),
+        child: Text('No folders yet.', style: TextStyle(color: Colors.black54)),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _FolderRow(
+          label: 'All folders',
+          count: null,
+          depth: 0,
+          selected: selectedFolder == null,
+          expandable: false,
+          expanded: false,
+          onTap: () => onSelect(null),
+          onToggleExpanded: () {},
+        ),
+        for (final root in roots) ..._buildNode(root, 0),
+      ],
+    );
+  }
+
+  List<Widget> _buildNode(FolderNode node, int depth) {
+    final expanded = expandedFolders.contains(node.path);
+    return [
+      _FolderRow(
+        label: node.name,
+        count: node.assetCount,
+        depth: depth,
+        selected: selectedFolder == node.path,
+        expandable: node.childrenByName.isNotEmpty,
+        expanded: expanded,
+        onTap: () => onSelect(node.path),
+        onToggleExpanded: () => onToggleExpanded(node.path),
+      ),
+      if (expanded)
+        for (final child in node.sortedChildren)
+          ..._buildNode(child, depth + 1),
+    ];
+  }
+}
+
+class _FolderRow extends StatelessWidget {
+  const _FolderRow({
+    required this.label,
+    required this.count,
+    required this.depth,
+    required this.selected,
+    required this.expandable,
+    required this.expanded,
+    required this.onTap,
+    required this.onToggleExpanded,
+  });
+
+  final String label;
+  final int? count;
+  final int depth;
+  final bool selected;
+  final bool expandable;
+  final bool expanded;
+  final VoidCallback onTap;
+  final VoidCallback onToggleExpanded;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: selected
+          ? scheme.primaryContainer.withValues(alpha: .55)
+          : Colors.transparent,
+      borderRadius: BorderRadius.circular(4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(4),
+        onTap: onTap,
+        child: Padding(
+          padding: EdgeInsets.only(left: depth * 12.0, top: 1, bottom: 1),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 20,
+                child: expandable
+                    ? InkWell(
+                        onTap: onToggleExpanded,
+                        child: Icon(
+                          expanded
+                              ? Icons.keyboard_arrow_down
+                              : Icons.keyboard_arrow_right,
+                          size: 16,
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+              Expanded(
+                child: Tooltip(
+                  message: label,
+                  waitDuration: const Duration(milliseconds: 700),
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: selected
+                          ? FontWeight.w600
+                          : FontWeight.normal,
+                    ),
+                  ),
+                ),
+              ),
+              if (count != null)
+                Padding(
+                  padding: const EdgeInsets.only(left: 4, right: 2),
+                  child: Text(
+                    '$count',
+                    style: const TextStyle(fontSize: 11, color: Colors.black45),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class FilterPanel extends StatelessWidget {
   const FilterPanel({
     required this.counts,
@@ -1330,6 +1650,11 @@ class FilterPanel extends StatelessWidget {
     required this.hideIgnored,
     required this.hideZipAssets,
     required this.sourceRoots,
+    required this.folderRoots,
+    required this.selectedFolder,
+    required this.expandedFolders,
+    required this.onFolderSelected,
+    required this.onFolderExpandToggled,
     required this.onTypeChanged,
     required this.onModelTextureFilterChanged,
     required this.onHideIgnoredChanged,
@@ -1344,6 +1669,11 @@ class FilterPanel extends StatelessWidget {
   final bool hideIgnored;
   final bool hideZipAssets;
   final List<String> sourceRoots;
+  final List<FolderNode> folderRoots;
+  final String? selectedFolder;
+  final Set<String> expandedFolders;
+  final ValueChanged<String?> onFolderSelected;
+  final ValueChanged<String> onFolderExpandToggled;
   final ValueChanged<String> onTypeChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
   final ValueChanged<bool> onHideIgnoredChanged;
@@ -1409,6 +1739,19 @@ class FilterPanel extends StatelessWidget {
             ),
             const Divider(height: 28),
             const Text(
+              'Folders',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            FolderTreeView(
+              roots: folderRoots,
+              selectedFolder: selectedFolder,
+              expandedFolders: expandedFolders,
+              onSelect: onFolderSelected,
+              onToggleExpanded: onFolderExpandToggled,
+            ),
+            const Divider(height: 28),
+            const Text(
               'Source Folders',
               style: TextStyle(fontWeight: FontWeight.w700),
             ),
@@ -1451,40 +1794,142 @@ class SearchAndSummary extends StatelessWidget {
     required this.controller,
     required this.visibleCount,
     required this.totalCount,
+    required this.selectedCount,
+    required this.sortMode,
+    required this.gridMode,
     required this.onChanged,
+    required this.onSortChanged,
+    required this.onGridModeChanged,
+    required this.onSelectAllVisible,
+    required this.onClearSelection,
     super.key,
   });
 
   final TextEditingController controller;
   final int visibleCount;
   final int totalCount;
+  final int selectedCount;
+  final AssetSortMode sortMode;
+  final bool gridMode;
   final ValueChanged<String> onChanged;
+  final ValueChanged<AssetSortMode> onSortChanged;
+  final ValueChanged<bool> onGridModeChanged;
+  final VoidCallback onSelectAllVisible;
+  final VoidCallback onClearSelection;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-      child: Row(
+      padding: const EdgeInsets.fromLTRB(12, 12, 8, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: TextField(
-              controller: controller,
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.search),
-                hintText: 'Search name, folder, or tag',
-                border: OutlineInputBorder(),
-                isDense: true,
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  decoration: InputDecoration(
+                    prefixIcon: const Icon(Icons.search),
+                    hintText: 'Search name, folder, or tag',
+                    border: const OutlineInputBorder(),
+                    isDense: true,
+                    suffixIcon: controller.text.isEmpty
+                        ? null
+                        : IconButton(
+                            tooltip: 'Clear search',
+                            icon: const Icon(Icons.close, size: 18),
+                            onPressed: () {
+                              controller.clear();
+                              onChanged('');
+                            },
+                          ),
+                  ),
+                  onChanged: onChanged,
+                ),
               ),
-              onChanged: onChanged,
-            ),
+              const SizedBox(width: 6),
+              // List and grid answer different questions: "which file is this"
+              // versus "which one looks right".
+              ToggleButtons(
+                isSelected: [!gridMode, gridMode],
+                constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                borderRadius: BorderRadius.circular(6),
+                onPressed: (index) => onGridModeChanged(index == 1),
+                children: const [
+                  Tooltip(message: 'List view', child: Icon(Icons.view_list)),
+                  Tooltip(
+                    message: 'Thumbnail grid',
+                    child: Icon(Icons.grid_view),
+                  ),
+                ],
+              ),
+            ],
           ),
-          const SizedBox(width: 14),
-          Text('$visibleCount visible / $totalCount cataloged'),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Text(
+                '$visibleCount / $totalCount',
+                style: const TextStyle(color: Colors.black54),
+              ),
+              const SizedBox(width: 10),
+              DropdownButtonHideUnderline(
+                child: DropdownButton<AssetSortMode>(
+                  value: sortMode,
+                  isDense: true,
+                  focusColor: Colors.transparent,
+                  items: [
+                    for (final mode in AssetSortMode.values)
+                      DropdownMenuItem(
+                        value: mode,
+                        child: Text(
+                          'Sort: ${mode.label}',
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                  ],
+                  onChanged: (next) {
+                    if (next != null) onSortChanged(next);
+                  },
+                ),
+              ),
+              const Spacer(),
+              if (visibleCount > 0)
+                TextButton(
+                  onPressed: onSelectAllVisible,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  child: const Text('Select all'),
+                ),
+              if (selectedCount > 0)
+                TextButton(
+                  onPressed: onClearSelection,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  child: Text('Clear ($selectedCount)'),
+                ),
+            ],
+          ),
         ],
       ),
     );
   }
 }
+
+/// Icon shown for an asset's kind, used by both the list and the grid.
+IconData iconForAssetType(String effectiveType) => switch (effectiveType) {
+  'image' => Icons.image_outlined,
+  'audio' => Icons.graphic_eq,
+  'animation' => Icons.directions_run,
+  'model' => Icons.view_in_ar_outlined,
+  _ => Icons.insert_drive_file_outlined,
+};
+
+typedef AssetSelectCallback =
+    void Function(AssetItem asset, bool selected, {bool range});
 
 class AssetList extends StatelessWidget {
   const AssetList({
@@ -1501,7 +1946,7 @@ class AssetList extends StatelessWidget {
   final AssetItem? active;
   final Set<String> selectedIds;
   final ValueChanged<AssetItem> onActivate;
-  final void Function(AssetItem asset, bool selected) onSelect;
+  final AssetSelectCallback onSelect;
   final void Function(AssetItem asset, bool ignored) onIgnoredChanged;
 
   @override
@@ -1515,59 +1960,348 @@ class AssetList extends StatelessWidget {
       itemBuilder: (context, index) {
         final asset = assets[index];
         final isActive = active?.id == asset.id;
+        final isSelected = selectedIds.contains(asset.id);
         return Material(
           color: isActive
               ? Theme.of(
                   context,
                 ).colorScheme.primaryContainer.withValues(alpha: .55)
               : Colors.transparent,
-          child: ListTile(
-            leading: Checkbox(
-              value: selectedIds.contains(asset.id),
-              onChanged: (value) => onSelect(asset, value ?? false),
-            ),
-            title: Text(
-              asset.name,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            subtitle: Text(
-              asset.relativePath,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  tooltip: 'Copy asset path',
-                  icon: const Icon(Icons.content_copy, size: 18),
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: asset.path));
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Asset path copied.')),
-                    );
-                  },
-                ),
-                Text(asset.ext.toUpperCase()),
-                const SizedBox(width: 12),
-                Tooltip(
-                  message: asset.ignored ? 'Ignored' : 'Not ignored',
-                  child: Checkbox(
-                    value: asset.ignored,
-                    onChanged: (value) =>
-                        onIgnoredChanged(asset, value ?? false),
-                  ),
-                ),
-              ],
-            ),
+          child: InkWell(
             onTap: () => onActivate(asset),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              child: Row(
+                children: [
+                  Tooltip(
+                    message: isSelected
+                        ? 'Selected for copy'
+                        : 'Select for copy (shift-click for a range)',
+                    child: Checkbox(
+                      value: isSelected,
+                      visualDensity: VisualDensity.compact,
+                      onChanged: (value) => onSelect(
+                        asset,
+                        value ?? false,
+                        range: HardwareKeyboard.instance.isShiftPressed,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    iconForAssetType(asset.effectiveType),
+                    size: 18,
+                    color: Colors.black54,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          asset.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontWeight: isActive
+                                ? FontWeight.w600
+                                : FontWeight.normal,
+                            decoration: asset.ignored
+                                ? TextDecoration.lineThrough
+                                : null,
+                            color: asset.ignored ? Colors.black45 : null,
+                          ),
+                        ),
+                        Tooltip(
+                          message: asset.path,
+                          waitDuration: const Duration(milliseconds: 600),
+                          child: Text(
+                            asset.relativePath,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.black54,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    asset.ext.toUpperCase(),
+                    style: const TextStyle(fontSize: 11, color: Colors.black45),
+                  ),
+                  // An eye reads as "hidden", where a second unlabelled
+                  // checkbox next to the select box did not.
+                  IconButton(
+                    tooltip: asset.ignored
+                        ? 'Ignored - click to un-ignore'
+                        : 'Ignore this asset',
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
+                    ),
+                    icon: Icon(
+                      asset.ignored
+                          ? Icons.visibility_off_outlined
+                          : Icons.visibility_outlined,
+                      size: 17,
+                      color: asset.ignored ? Colors.black87 : Colors.black26,
+                    ),
+                    onPressed: () => onIgnoredChanged(asset, !asset.ignored),
+                  ),
+                  IconButton(
+                    tooltip: 'Copy asset path',
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
+                    ),
+                    icon: const Icon(Icons.content_copy, size: 15),
+                    onPressed: () async {
+                      await Clipboard.setData(ClipboardData(text: asset.path));
+                      if (!context.mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Asset path copied.')),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
           ),
         );
       },
     );
   }
+}
+
+/// Thumbnail grid. Recognising an asset by eye is most of what this app is
+/// for, and a column of filenames does not support that.
+class AssetGrid extends StatelessWidget {
+  const AssetGrid({
+    required this.assets,
+    required this.active,
+    required this.selectedIds,
+    required this.onActivate,
+    required this.onSelect,
+    super.key,
+  });
+
+  final List<AssetItem> assets;
+  final AssetItem? active;
+  final Set<String> selectedIds;
+  final ValueChanged<AssetItem> onActivate;
+  final AssetSelectCallback onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    if (assets.isEmpty) {
+      return const Center(child: Text('Scan a folder to catalog assets.'));
+    }
+
+    return GridView.builder(
+      padding: const EdgeInsets.all(8),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 140,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+        childAspectRatio: 0.82,
+      ),
+      itemCount: assets.length,
+      itemBuilder: (context, index) {
+        final asset = assets[index];
+        final isSelected = selectedIds.contains(asset.id);
+        return AssetGridTile(
+          asset: asset,
+          isActive: active?.id == asset.id,
+          isSelected: isSelected,
+          onActivate: () => onActivate(asset),
+          onToggleSelected: () => onSelect(
+            asset,
+            !isSelected,
+            range: HardwareKeyboard.instance.isShiftPressed,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class AssetGridTile extends StatelessWidget {
+  const AssetGridTile({
+    required this.asset,
+    required this.isActive,
+    required this.isSelected,
+    required this.onActivate,
+    required this.onToggleSelected,
+    super.key,
+  });
+
+  final AssetItem asset;
+  final bool isActive;
+  final bool isSelected;
+  final VoidCallback onActivate;
+  final VoidCallback onToggleSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: asset.relativePath,
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: isActive
+            ? scheme.primaryContainer.withValues(alpha: .5)
+            : const Color(0xfff4f6fa),
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: onActivate,
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: isActive ? scheme.primary : Colors.black12,
+                width: isActive ? 2 : 1,
+              ),
+            ),
+            child: Column(
+              children: [
+                Expanded(
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: Padding(
+                          padding: const EdgeInsets.all(6),
+                          child: AssetThumbnail(asset: asset),
+                        ),
+                      ),
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        child: Checkbox(
+                          value: isSelected,
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          onChanged: (_) => onToggleSelected(),
+                        ),
+                      ),
+                      if (asset.ignored)
+                        const Positioned(
+                          top: 4,
+                          right: 4,
+                          child: Icon(
+                            Icons.visibility_off_outlined,
+                            size: 16,
+                            color: Colors.black45,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
+                  child: Text(
+                    asset.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11,
+                      decoration: asset.ignored
+                          ? TextDecoration.lineThrough
+                          : null,
+                      color: asset.ignored ? Colors.black45 : null,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Image thumbnails are decoded at tile size, not full size: a 4K texture
+/// atlas decoded per tile would exhaust memory in a grid of any size.
+class AssetThumbnail extends StatelessWidget {
+  const AssetThumbnail({required this.asset, super.key});
+
+  final AssetItem asset;
+
+  static const _decodeWidth = 160;
+
+  @override
+  Widget build(BuildContext context) {
+    if (asset.effectiveType == 'image') {
+      if (isZipVirtualPath(asset.path)) {
+        return FutureBuilder<Uint8List?>(
+          future: ZipThumbnailCache.bytesFor(asset),
+          builder: (context, snapshot) {
+            final bytes = snapshot.data;
+            if (bytes == null || bytes.isEmpty) return _fallbackIcon();
+            return Image.memory(
+              bytes,
+              fit: BoxFit.contain,
+              cacheWidth: _decodeWidth,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) => _fallbackIcon(),
+            );
+          },
+        );
+      }
+      return Image.file(
+        File(asset.path),
+        fit: BoxFit.contain,
+        cacheWidth: _decodeWidth,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => _fallbackIcon(),
+      );
+    }
+    return _fallbackIcon();
+  }
+
+  Widget _fallbackIcon() {
+    return Center(
+      child: Icon(
+        iconForAssetType(asset.effectiveType),
+        size: 34,
+        color: Colors.black26,
+      ),
+    );
+  }
+}
+
+/// Small bounded cache of decompressed ZIP entries for thumbnails. Without it
+/// scrolling a grid re-inflates the same archive entries continuously.
+class ZipThumbnailCache {
+  ZipThumbnailCache._();
+
+  static const maxEntries = 200;
+  static final _entries = <String, Future<Uint8List?>>{};
+
+  static Future<Uint8List?> bytesFor(AssetItem asset) {
+    final cached = _entries.remove(asset.id);
+    if (cached != null) {
+      _entries[asset.id] = cached;
+      return cached;
+    }
+    final future = readZipVirtualAssetBytesByPath(asset.path);
+    _entries[asset.id] = future;
+    while (_entries.length > maxEntries) {
+      _entries.remove(_entries.keys.first);
+    }
+    return future;
+  }
+
+  static void clear() => _entries.clear();
 }
 
 class PreviewPanel extends StatefulWidget {
@@ -2253,11 +2987,7 @@ class AnimationClipPreview extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(
-              Icons.directions_run,
-              size: 56,
-              color: Colors.black54,
-            ),
+            const Icon(Icons.directions_run, size: 56, color: Colors.black54),
             const SizedBox(height: 12),
             const Text(
               'Animation clip',
@@ -2489,7 +3219,9 @@ class MeshPainter extends CustomPainter {
         // Opaque unless the material itself asks for transparency. The old
         // blanket .92 in textured mode let interior geometry bleed through
         // solid walls, which reads as a broken asset.
-        final fillAlpha = renderMode == RenderMode.solid ? 1.0 : materialOpacity;
+        final fillAlpha = renderMode == RenderMode.solid
+            ? 1.0
+            : materialOpacity;
         facePaint.color = faceColor.withValues(alpha: fillAlpha);
         canvas.drawPath(path, facePaint);
       }
@@ -2722,6 +3454,43 @@ List<int> selectRenderedFaceOrder({
   return order;
 }
 
+enum AssetSortMode { path, name, size, modified, type }
+
+extension AssetSortModeLabel on AssetSortMode {
+  String get label => switch (this) {
+    AssetSortMode.path => 'Path',
+    AssetSortMode.name => 'Name',
+    AssetSortMode.size => 'Size',
+    AssetSortMode.modified => 'Modified',
+    AssetSortMode.type => 'Type',
+  };
+}
+
+/// Sorts a copy of [assets]. Ties always fall back to the relative path so the
+/// order is total and does not wobble between rebuilds.
+List<AssetItem> sortAssets(List<AssetItem> assets, AssetSortMode mode) {
+  int byPath(AssetItem a, AssetItem b) =>
+      a.relativePath.toLowerCase().compareTo(b.relativePath.toLowerCase());
+
+  final sorted = [...assets];
+  sorted.sort((a, b) {
+    final primary = switch (mode) {
+      AssetSortMode.path => 0,
+      AssetSortMode.name => a.name.toLowerCase().compareTo(
+        b.name.toLowerCase(),
+      ),
+      // Largest first: when sorting by size you are usually hunting for the
+      // heavy assets.
+      AssetSortMode.size => b.size.compareTo(a.size),
+      AssetSortMode.modified => b.modified.compareTo(a.modified),
+      AssetSortMode.type => a.effectiveType.compareTo(b.effectiveType),
+    };
+    if (primary != 0) return primary;
+    return byPath(a, b);
+  });
+  return sorted;
+}
+
 enum RenderMode { textured, solid, wireframe }
 
 enum LightingMode { corner, top, unlit }
@@ -2932,11 +3701,7 @@ class DetailRow extends StatelessWidget {
               ),
             ),
           ),
-          Expanded(
-            child: isPath
-                ? CopyablePathText(path: value)
-                : Text(value),
-          ),
+          Expanded(child: isPath ? CopyablePathText(path: value) : Text(value)),
         ],
       ),
     );
@@ -3428,15 +4193,17 @@ String? findDeterministicTextureRelink(
   // Score once per candidate, then break ties on the normalized path so the
   // winner cannot depend on catalog order or on List.sort being stable
   // (it is not).
-  final scored = [
-    for (final asset in sourceCandidates) (asset: asset, score: score(asset)),
-  ]..sort((a, b) {
-      final byScore = b.score.compareTo(a.score);
-      if (byScore != 0) return byScore;
-      return normalizePathKey(
-        a.asset.path,
-      ).compareTo(normalizePathKey(b.asset.path));
-    });
+  final scored =
+      [
+        for (final asset in sourceCandidates)
+          (asset: asset, score: score(asset)),
+      ]..sort((a, b) {
+        final byScore = b.score.compareTo(a.score);
+        if (byScore != 0) return byScore;
+        return normalizePathKey(
+          a.asset.path,
+        ).compareTo(normalizePathKey(b.asset.path));
+      });
 
   final best = scored.first;
   if (best.score < 80) return null;
@@ -3482,15 +4249,15 @@ String? findFallbackTexture(
   }
 
   // Same decorate-sort-undecorate and tie-break as the deterministic relink.
-  final scored = [
-    for (final asset in supported) (asset: asset, score: score(asset)),
-  ]..sort((a, b) {
-      final byScore = b.score.compareTo(a.score);
-      if (byScore != 0) return byScore;
-      return normalizePathKey(
-        a.asset.path,
-      ).compareTo(normalizePathKey(b.asset.path));
-    });
+  final scored =
+      [for (final asset in supported) (asset: asset, score: score(asset))]
+        ..sort((a, b) {
+          final byScore = b.score.compareTo(a.score);
+          if (byScore != 0) return byScore;
+          return normalizePathKey(
+            a.asset.path,
+          ).compareTo(normalizePathKey(b.asset.path));
+        });
 
   final best = scored.first;
   return best.score > 0 ? best.asset.path : null;
@@ -4031,8 +4798,7 @@ class CopyReport {
 /// incrementing ` (n)` suffix inserted before the extension. Mirrors the
 /// Windows Explorer convention so renamed output reads as familiar.
 String resolveNonCollidingPath(String desiredPath) {
-  if (!File(desiredPath).existsSync() &&
-      !Directory(desiredPath).existsSync()) {
+  if (!File(desiredPath).existsSync() && !Directory(desiredPath).existsSync()) {
     return desiredPath;
   }
 
@@ -5280,8 +6046,7 @@ class AssetItem {
 
   /// The type to show and filter by. An FBX holding only a skeleton and curves
   /// is an animation, not a model, but only a parse can tell you that.
-  String get effectiveType =>
-      modelKind == 'animation' ? 'animation' : type;
+  String get effectiveType => modelKind == 'animation' ? 'animation' : type;
 }
 
 class ScanResult {
@@ -5777,6 +6542,4 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
-
-
 
