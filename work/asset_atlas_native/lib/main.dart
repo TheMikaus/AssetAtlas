@@ -51,6 +51,7 @@ const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
 const appVersion = '1.1.1';
+const _maxConcurrentModelValidations = 3;
 const enableFbxLogs = true;
 String fbxLogFilePath =
     '${Directory.systemTemp.path}${Platform.pathSeparator}asset_atlas_fbx.log';
@@ -164,6 +165,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool _processingModelValidationQueue = false;
   final List<String> _assetHistory = <String>[];
   int _assetHistoryIndex = -1;
+
+  /// Incremented whenever the catalog contents change. Preview widgets compare
+  /// this to decide whether a cached import is still valid; comparing list
+  /// lengths missed same-size changes.
+  int catalogRevision = 0;
 
   bool get canGoBackInHistory => _assetHistoryIndex > 0;
   bool get canGoForwardInHistory =>
@@ -324,18 +330,30 @@ class _CatalogScreenState extends State<CatalogScreen> {
     if (_processingModelValidationQueue) return;
     _processingModelValidationQueue = true;
     while (_modelValidationQueue.isNotEmpty) {
-      final asset = _modelValidationQueue.removeFirst();
-      await _validateModelTexture(asset);
+      // A few at a time: each FBX validation is a subprocess plus a parse, and
+      // strictly serial made the filter feel frozen on large catalogs.
+      final batch = <AssetItem>[];
+      while (batch.length < _maxConcurrentModelValidations &&
+          _modelValidationQueue.isNotEmpty) {
+        batch.add(_modelValidationQueue.removeFirst());
+      }
+      await Future.wait(batch.map(_validateModelTexture));
     }
     _processingModelValidationQueue = false;
   }
 
   Future<void> _validateModelTexture(AssetItem asset) async {
+    // Already answered by an earlier pass.
+    if (modelHasValidTextures.containsKey(asset.id)) {
+      _modelValidationInFlight.remove(asset.id);
+      return;
+    }
+
     var hasValidTexture = false;
     try {
       if (asset.ext == 'fbx') {
-        final refs = await loadModelTextureReferences(asset, assets);
-        hasValidTexture = refs.any((value) => value.contains('(found)'));
+        final entries = await loadModelTextureReferenceEntries(asset, assets);
+        hasValidTexture = entries.any((entry) => entry.resolved);
       } else {
         hasValidTexture = findNearbyTextures(asset, assets).isNotEmpty;
       }
@@ -369,6 +387,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ..clear()
           ..addAll(snapshot.assets);
         modelHasValidTextures.clear();
+        MeshLoadCache.clear();
+        catalogRevision += 1;
         active = assets.isNotEmpty ? assets.first : null;
         _seedHistoryWithActive();
         loadingPersisted = false;
@@ -736,6 +756,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
       sourceRoots.add(rootPath);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
       assets.addAll(result.assets);
+      MeshLoadCache.clear();
+      catalogRevision += 1;
       modelHasValidTextures.removeWhere(
         (assetId, _) => !assets.any((asset) => asset.id == assetId),
       );
@@ -763,6 +785,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
     setState(() {
       sourceRoots.remove(rootPath);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
+      MeshLoadCache.clear();
+      catalogRevision += 1;
       modelHasValidTextures.removeWhere(
         (assetId, _) => !assets.any((asset) => asset.id == assetId),
       );
@@ -917,6 +941,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                               child: PreviewPanel(
                                 asset: active,
                                 allAssets: assets,
+                                catalogRevision: catalogRevision,
                                 onActivateAsset: _activateAsset,
                               ),
                             ),
@@ -1439,12 +1464,14 @@ class PreviewPanel extends StatefulWidget {
   const PreviewPanel({
     required this.asset,
     required this.allAssets,
+    required this.catalogRevision,
     required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem? asset;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
   @override
@@ -1453,6 +1480,20 @@ class PreviewPanel extends StatefulWidget {
 
 class _PreviewPanelState extends State<PreviewPanel> {
   double detailsWidth = 360;
+
+  // Same reason as the diagnostics panel: a future built inline in build()
+  // re-read and re-inflated the archive entry on every rebuild.
+  String? _zipBytesKey;
+  Future<Uint8List?>? _zipBytesFuture;
+
+  Future<Uint8List?> _zipBytesFor(AssetItem item) {
+    final key = '${item.id}|${widget.catalogRevision}';
+    if (_zipBytesKey != key || _zipBytesFuture == null) {
+      _zipBytesKey = key;
+      _zipBytesFuture = readZipVirtualAssetBytesByPath(item.path);
+    }
+    return _zipBytesFuture!;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1493,6 +1534,7 @@ class _PreviewPanelState extends State<PreviewPanel> {
                 child: AssetDetailsPanel(
                   item: item,
                   allAssets: widget.allAssets,
+                  catalogRevision: widget.catalogRevision,
                   onActivateAsset: widget.onActivateAsset,
                 ),
               ),
@@ -1507,7 +1549,7 @@ class _PreviewPanelState extends State<PreviewPanel> {
     if (item.type == 'image') {
       if (isZipVirtualPath(item.path)) {
         return FutureBuilder<Uint8List?>(
-          future: readZipVirtualAssetBytesByPath(item.path),
+          future: _zipBytesFor(item),
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
               return const Center(child: CircularProgressIndicator());
@@ -1562,7 +1604,11 @@ class _PreviewPanelState extends State<PreviewPanel> {
           item.ext != 'fbx') {
         return _unsupportedZipModelPreview(item);
       }
-      return ModelPreview(asset: item, allAssets: widget.allAssets);
+      return ModelPreview(
+        asset: item,
+        allAssets: widget.allAssets,
+        catalogRevision: widget.catalogRevision,
+      );
     }
 
     return DecoratedBox(
@@ -1733,10 +1779,16 @@ class _AudioPreviewState extends State<AudioPreview> {
 }
 
 class ModelPreview extends StatefulWidget {
-  const ModelPreview({required this.asset, required this.allAssets, super.key});
+  const ModelPreview({
+    required this.asset,
+    required this.allAssets,
+    required this.catalogRevision,
+    super.key,
+  });
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
 
   @override
   State<ModelPreview> createState() => _ModelPreviewState();
@@ -1753,7 +1805,7 @@ class _ModelPreviewState extends State<ModelPreview> {
   LightingMode lightingMode = LightingMode.corner;
 
   Future<MeshModel> _loadCurrentMesh() {
-    return loadMesh(
+    return MeshLoadCache.load(
       widget.asset,
       allAssets: widget.allAssets,
       fallbackCheckerSquareSize: checkerSquareSize,
@@ -1769,8 +1821,8 @@ class _ModelPreviewState extends State<ModelPreview> {
   @override
   void didUpdateWidget(covariant ModelPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.asset.path != widget.asset.path ||
-        oldWidget.allAssets.length != widget.allAssets.length) {
+    if (oldWidget.asset.id != widget.asset.id ||
+        oldWidget.catalogRevision != widget.catalogRevision) {
       meshFuture = _loadCurrentMesh();
       yaw = -0.6;
       pitch = 0.35;
@@ -2406,12 +2458,14 @@ class AssetDetailsPanel extends StatelessWidget {
   const AssetDetailsPanel({
     required this.item,
     required this.allAssets,
+    required this.catalogRevision,
     required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem item;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
   @override
@@ -2475,6 +2529,7 @@ class AssetDetailsPanel extends StatelessWidget {
               ModelTextureDiagnostics(
                 asset: item,
                 allAssets: allAssets,
+                catalogRevision: catalogRevision,
                 onActivateAsset: onActivateAsset,
               ),
             ],
@@ -2515,24 +2570,59 @@ class DetailRow extends StatelessWidget {
   }
 }
 
-class ModelTextureDiagnostics extends StatelessWidget {
+class ModelTextureDiagnostics extends StatefulWidget {
   const ModelTextureDiagnostics({
     required this.asset,
     required this.allAssets,
+    required this.catalogRevision,
     required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
   @override
+  State<ModelTextureDiagnostics> createState() =>
+      _ModelTextureDiagnosticsState();
+}
+
+class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
+  // Held in state, never built inline: creating this future in build() made
+  // every unrelated rebuild re-run the FBX importer.
+  Future<List<TextureDiscoveryEntry>>? referencesFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    referencesFuture = _loadReferences();
+  }
+
+  @override
+  void didUpdateWidget(covariant ModelTextureDiagnostics oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.asset.id != widget.asset.id ||
+        oldWidget.catalogRevision != widget.catalogRevision) {
+      referencesFuture = _loadReferences();
+    }
+  }
+
+  Future<List<TextureDiscoveryEntry>>? _loadReferences() {
+    if (widget.asset.ext != 'fbx') return null;
+    return loadModelTextureReferenceEntries(widget.asset, widget.allAssets);
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final asset = widget.asset;
+    final allAssets = widget.allAssets;
+    final onActivateAsset = widget.onActivateAsset;
     final nearby = findNearbyTextures(asset, allAssets);
     if (asset.ext == 'fbx') {
       return FutureBuilder<List<TextureDiscoveryEntry>>(
-        future: loadModelTextureReferenceEntries(asset, allAssets),
+        future: referencesFuture,
         builder: (context, snapshot) {
           final referenced = snapshot.data ?? const <TextureDiscoveryEntry>[];
           final pathKeys = referenced
@@ -2588,11 +2678,16 @@ class TextureDiscoveryEntry {
   const TextureDiscoveryEntry({
     required this.label,
     required this.copyPath,
+    this.resolved = true,
     this.jumpAsset,
   });
 
   final String label;
   final String copyPath;
+
+  /// Whether the reference points at a texture that actually exists. Callers
+  /// must read this rather than parsing [label], which is display text.
+  final bool resolved;
   final AssetItem? jumpAsset;
 }
 
@@ -2703,19 +2798,18 @@ Future<List<String>> loadModelTextureReferences(
   return entries.map((entry) => entry.label).toList();
 }
 
+/// Number of texture-reference scans started. Test visibility only: the
+/// diagnostics panel must not restart one per rebuild.
+int textureReferenceScanCount = 0;
+
 Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   AssetItem asset,
   List<AssetItem> allAssets,
 ) async {
   if (asset.ext != 'fbx') return const [];
-  final mesh = await importFbxWithUfbx(
-    asset.path,
-    asset.name,
-    inputBytes: isZipVirtualPath(asset.path)
-        ? await readZipVirtualAssetBytesByPath(asset.path)
-        : null,
-    allAssets: allAssets,
-  );
+  textureReferenceScanCount += 1;
+  // Shares the import with the 3D preview instead of spawning a second helper.
+  final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
   return mesh.allTexturePaths.map((path) {
     final resolved = resolveTextureReference(
       asset.path,
@@ -2741,6 +2835,7 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
         }
       }
     }
+    // The label is built from `exists`; nothing may parse it back out.
     late final String label;
     if (resolved == null || resolved == path) {
       label = '$path ${exists ? "(found)" : "(missing)"}';
@@ -2750,6 +2845,7 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
     return TextureDiscoveryEntry(
       label: label,
       copyPath: existingPath,
+      resolved: exists,
       jumpAsset: jumpAsset,
     );
   }).toList();
@@ -3742,6 +3838,66 @@ String parentPath(String path) {
   final index = normalized.lastIndexOf(separator);
   if (index <= 0) return normalized;
   return normalized.substring(0, index);
+}
+
+/// Shares one in-flight mesh import between everything that needs it.
+///
+/// Both the 3D preview and the texture diagnostics panel want the same parsed
+/// mesh, and every widget rebuild used to launch its own importer subprocess.
+/// Caching the [Future] (not the value) means widgets asking during the same
+/// frame join one import instead of racing several.
+class MeshLoadCache {
+  MeshLoadCache._();
+
+  static const maxEntries = 8;
+  static final _entries = <String, Future<MeshModel>>{};
+
+  /// Number of imports actually started. Test visibility only.
+  static int importCount = 0;
+
+  static String _keyFor(AssetItem asset, int fallbackCheckerSquareSize) =>
+      '${asset.id}|$fallbackCheckerSquareSize';
+
+  static Future<MeshModel> load(
+    AssetItem asset, {
+    List<AssetItem> allAssets = const [],
+    int fallbackCheckerSquareSize = 16,
+  }) {
+    final key = _keyFor(asset, fallbackCheckerSquareSize);
+    final cached = _entries.remove(key);
+    if (cached != null) {
+      // Reinsert to promote for LRU eviction.
+      _entries[key] = cached;
+      return cached;
+    }
+
+    importCount += 1;
+    final future = loadMesh(
+      asset,
+      allAssets: allAssets,
+      fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+    );
+    _entries[key] = future;
+    // Do not keep a failure cached forever; the next selection should retry.
+    // Consumers still receive the error - this listener only stops it being
+    // reported as unhandled.
+    future.then<void>(
+      (_) {},
+      onError: (Object _) {
+        _entries.remove(key);
+      },
+    );
+
+    while (_entries.length > maxEntries) {
+      _entries.remove(_entries.keys.first);
+    }
+    return future;
+  }
+
+  /// Call when the catalog changes: relink results depend on its contents.
+  static void clear() {
+    _entries.clear();
+  }
 }
 
 Future<MeshModel> loadMesh(
