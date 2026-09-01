@@ -55,6 +55,7 @@ struct MaterialInfo {
   int shader_type;
   std::string shading_model;
   std::vector<std::string> textures;
+  std::string normal_texture;
   std::string uv_set;
   std::vector<uint8_t> embedded_texture;
 };
@@ -337,6 +338,14 @@ int main(int argc, char** argv) {
     add_texture_path(info.textures, material->fbx.diffuse_color.texture);
     add_texture_path(info.textures, material->pbr.normal_map.texture);
     add_texture_path(info.textures, material->fbx.normal_map.texture);
+    // Named separately as well: the renderer has to know which of a
+    // material's textures is the normal map, not just that one exists.
+    {
+      ufbx_texture* normal_texture = material->pbr.normal_map.texture;
+      if (!normal_texture) normal_texture = material->fbx.normal_map.texture;
+      if (!normal_texture) normal_texture = material->fbx.bump.texture;
+      if (normal_texture) info.normal_texture = texture_path(normal_texture);
+    }
     add_texture_path(info.textures, material->pbr.emission_color.texture);
     add_texture_path(info.textures, material->fbx.emission_color.texture);
     add_texture_path(info.textures, material->pbr.opacity.texture);
@@ -542,6 +551,8 @@ int main(int argc, char** argv) {
     printf(",\"shaderType\":%d", material.shader_type);
     printf(",\"shadingModel\":");
     print_json_string(material.shading_model.c_str());
+    printf(",\"normalTexture\":");
+    print_json_string(material.normal_texture.c_str());
     printf(",\"uvSet\":");
     print_json_string(material.uv_set.c_str());
     printf(",\"embeddedTextureBase64\":");

@@ -41,6 +41,25 @@ single `drawVertices` call with per-vertex colours.
 This is not an optimisation detail: before it existed, every such face rendered
 as the material's untextured base colour, which is most of a low-poly model.
 
+## Normal Maps
+
+The importer emits each material's normal map separately (`normalTexture`), and
+it is resolved and read back to CPU like the base texture. Shading applies it
+per face: a tangent frame is built from the triangle's position and UV
+derivatives, the sampled tangent-space normal is rotated into view space, and
+the diffuse term uses that instead of the geometric normal.
+
+Two honest limits:
+
+- This is per face, not per pixel. A normal map can tilt a whole triangle; it
+  cannot add detail inside one. Per-pixel would need a fragment shader.
+- Faces pinned to a single texel (the palette case) have no UV gradient, so
+  there is no tangent frame and they keep their geometric normal.
+
+The viewer only offers the toggle when the model actually carries a normal map.
+Note that palette-atlas packs such as Synty ship none: a 60-model sample of the
+reference catalog found zero.
+
 ## Rendering Modes
 
 - `Textured`
