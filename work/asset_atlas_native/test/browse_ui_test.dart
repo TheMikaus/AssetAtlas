@@ -30,6 +30,12 @@ AssetItem _asset({
 }
 
 void main() {
+  setUp(() {
+    // These tests are about layout, not about importing models.
+    ModelThumbnailCache.enabled = false;
+  });
+  tearDown(() => ModelThumbnailCache.enabled = true);
+
   group('sortAssets', () {
     final assets = [
       _asset(relativePath: 'Pack/b.png', size: 300, modifiedMs: 3000),
