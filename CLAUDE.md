@@ -69,11 +69,22 @@ Changes to the JSON contract must be made on both sides at once: the emitter in 
 
 Software rendering only — `MeshPainter` is a `CustomPainter` doing its own projection and triangle fill. Faces beyond `maxRenderedFaces` are capped by depth priority and the overlay says so; backface culling is user-toggleable and its sign convention is pinned by `test/renderer_geometry_test.dart`. FBX imports go through `MeshLoadCache`, not `loadMesh` directly, so the preview and the diagnostics panel share one importer run. `RenderMode` is textured/solid/wireframe; `LightingMode` is corner/top/unlit. Texturing is triangle-affine (documented distortion at extreme angles) and material channels (opacity/roughness/metalness/emissive/specular) are deliberately approximate color modifiers, not a PBR model. Don't "fix" this toward engine parity without an explicit ask — see `docs/TECH_SPEC_RENDERING_FBX.md` non-goals.
 
+**Palette faces.** Synty-style models pin all three UV corners of a face to a
+single texel; roughly half the faces of a typical model do this. Such a UV
+triangle has no invertible transform, so the per-triangle texture path cannot
+draw it — it used to bail out and leave the untextured base colour showing,
+which made half of every model render flat white. `isDegenerateUvTriangle`
+detects them and the painter fills them with the sampled texel instead
+(`MeshMaterial.sampleTexture`, which needs the CPU-side `texturePixels`
+readback). Runs of these are batched into one `drawVertices` call, which also
+removes the antialiasing seams that per-face `drawPath` left between triangles.
+If a model renders as flat untextured colour, check this path first.
+
 Texture resolution order: absolute path → relative to model dir → deterministic relink against scanned candidates (filename and Synty-style variant matching, constrained to the same ZIP/pack) → fallback lookup → checker fallback.
 
 ### Catalog and persistence
 
-`AssetAtlasDatabase` is a singleton over `sqflite_common_ffi`, DB file in the app support dir (or `initialize(databasePath:)` in tests), schema `version: 3` with tables `catalog_assets`, `catalog_sources`, `projects`, `project_assets`. `onUpgrade` exists and is tested — add a migration step there and mirror any DDL in `onCreate`, since `test/database_test.dart` asserts the two paths converge. Asset ids come from `buildAssetId()` (source root + relative path, content-independent); never build one inline.
+`AssetAtlasDatabase` is a singleton over `sqflite_common_ffi`, DB file in the app support dir (or `initialize(databasePath:)` in tests), schema `version: 5` with tables `catalog_assets`, `catalog_sources`, `projects`, `project_assets`. `onUpgrade` exists and is tested — add a migration step there and mirror any DDL in `onCreate`, since `test/database_test.dart` asserts the two paths converge. Asset ids come from `buildAssetId()` (source root + relative path, content-independent); never build one inline.
 
 Assets inside `.zip` archives are indexed as virtual paths shaped `zip:<container>::<entry>`. Any code that touches a path must handle this: `isZipVirtualPath()` gates reads through `readZipVirtualAssetBytesByPath()` and an LRU-ish archive cache. ZIP entries are searchable, previewable (images, audio, OBJ and FBX), and copyable — the copy flow writes them out under their archive-relative path. Introspection is capped by `maxZipIntrospectionBytes` / `maxZipEntriesToInspect`.
 
