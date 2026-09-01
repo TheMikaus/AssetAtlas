@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.7.0';
+const appVersion = '1.8.0';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3160,6 +3160,7 @@ class _ModelPreviewState extends State<ModelPreview> {
   String? uvSetOverride;
   LightingMode lightingMode = LightingMode.corner;
   bool cullBackFaces = true;
+  bool useNormalMaps = true;
 
   Future<MeshModel> _loadCurrentMesh() {
     return MeshLoadCache.load(
@@ -3248,6 +3249,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                         uvSetOverride: uvSetOverride,
                         lightingMode: lightingMode,
                         cullBackFaces: cullBackFaces,
+                        useNormalMaps: useNormalMaps,
                       ),
                       child: Align(
                         alignment: Alignment.bottomLeft,
@@ -3377,6 +3379,36 @@ class _ModelPreviewState extends State<ModelPreview> {
                         ),
                       ),
                       const SizedBox(height: 8),
+                      // Only shown when there is a normal map to apply: an
+                      // inert control invites the question "why is nothing
+                      // happening".
+                      if (mesh.materials.any(
+                        (material) => material.hasNormalMap,
+                      )) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: .9),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.black12),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text('Normal map'),
+                              Switch(
+                                value: useNormalMaps,
+                                onChanged: (next) =>
+                                    setState(() => useNormalMaps = next),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
                       if (mesh.availableUvSets.length > 1) ...[
                         Container(
                           padding: const EdgeInsets.symmetric(
@@ -3564,6 +3596,7 @@ class MeshPainter extends CustomPainter {
     required this.renderMode,
     required this.lightingMode,
     required this.cullBackFaces,
+    this.useNormalMaps = true,
     this.uvSetOverride,
   });
 
@@ -3575,6 +3608,7 @@ class MeshPainter extends CustomPainter {
   final LightingMode lightingMode;
   final String? uvSetOverride;
   final bool cullBackFaces;
+  final bool useNormalMaps;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3670,7 +3704,14 @@ class MeshPainter extends CustomPainter {
           ? mesh.materials[face.materialIndex]
           : null;
       final textureUvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
-      final light = _faceLight(viewVertices, face, lightingMode);
+      final light = _faceLight(
+        viewVertices,
+        face,
+        lightingMode,
+        material: material,
+        uvs: textureUvs,
+        useNormalMap: useNormalMaps,
+      );
       // Synty-style palette models map an entire face to one texel, which
       // makes the UV triangle degenerate. The textured path bails out on that
       // (its inverse transform does not exist), so those faces used to render
@@ -3859,8 +3900,11 @@ class MeshPainter extends CustomPainter {
   static double _faceLight(
     List<Vec3> vertices,
     MeshFace face,
-    LightingMode mode,
-  ) {
+    LightingMode mode, {
+    MeshMaterial? material,
+    List<Vec2> uvs = const [],
+    bool useNormalMap = true,
+  }) {
     if (mode == LightingMode.unlit || face.indices.length < 3) return 1;
     final a = vertices[face.indices[0]];
     final b = vertices[face.indices[1]];
@@ -3880,10 +3924,23 @@ class MeshPainter extends CustomPainter {
     final (lx, ly, lz) = mode == LightingMode.top
         ? (0.0, 1.0, 0.0)
         : (-0.45, 0.75, -0.5);
-    final lightLength = math.sqrt(lx * lx + ly * ly + lz * lz);
-    final diffuse =
-        ((nx * lx + ny * ly + nz * lz) / (normalLength * lightLength)).abs();
-    return 0.42 + diffuse * 0.58;
+
+    final sampled = useNormalMap && material != null && material.hasNormalMap
+        ? material.sampleNormal(
+            Vec2(
+              (uvs[0].x + uvs[1].x + uvs[2].x) / 3,
+              (uvs[0].y + uvs[1].y + uvs[2].y) / 3,
+            ),
+          )
+        : null;
+
+    return faceDiffuseWithNormalMap(
+      geometricNormal: Vec3(nx, ny, nz),
+      lightDirection: Vec3(lx, ly, lz),
+      viewPositions: [a, b, c],
+      uvs: uvs,
+      sampledNormal: uvs.length == 3 ? sampled : null,
+    );
   }
 
   static void _drawTexturedTriangle(
@@ -3983,6 +4040,7 @@ class MeshPainter extends CustomPainter {
         oldDelegate.renderMode != renderMode ||
         oldDelegate.lightingMode != lightingMode ||
         oldDelegate.cullBackFaces != cullBackFaces ||
+        oldDelegate.useNormalMaps != useNormalMaps ||
         oldDelegate.uvSetOverride != uvSetOverride;
   }
 }
@@ -3991,6 +4049,89 @@ class MeshPainter extends CustomPainter {
 /// viewer draws the nearest [maxRenderedFaces] and says so in the overlay --
 /// it must never quietly drop geometry in an inspection tool.
 const maxRenderedFaces = 14000;
+
+/// Diffuse term for a face, optionally perturbed by a normal map.
+///
+/// Shading here is per face, not per pixel: this renderer draws a triangle at a
+/// time, so a normal map can tilt a whole face but cannot add detail inside it.
+/// Faces pinned to a single texel (the palette case) have no UV gradient and
+/// therefore no tangent frame, so they keep their geometric normal.
+double faceDiffuseWithNormalMap({
+  required Vec3 geometricNormal,
+  required Vec3 lightDirection,
+  required List<Vec3> viewPositions,
+  required List<Vec2> uvs,
+  Vec3? sampledNormal,
+}) {
+  Vec3 normal = geometricNormal;
+
+  if (sampledNormal != null && uvs.length == 3 && viewPositions.length == 3) {
+    // Tangent from the triangle's position and UV derivatives.
+    final e1 = Vec3(
+      viewPositions[1].x - viewPositions[0].x,
+      viewPositions[1].y - viewPositions[0].y,
+      viewPositions[1].z - viewPositions[0].z,
+    );
+    final e2 = Vec3(
+      viewPositions[2].x - viewPositions[0].x,
+      viewPositions[2].y - viewPositions[0].y,
+      viewPositions[2].z - viewPositions[0].z,
+    );
+    final du1 = uvs[1].x - uvs[0].x;
+    final dv1 = uvs[1].y - uvs[0].y;
+    final du2 = uvs[2].x - uvs[0].x;
+    final dv2 = uvs[2].y - uvs[0].y;
+    final determinant = du1 * dv2 - du2 * dv1;
+
+    if (determinant.abs() > 1e-9) {
+      final inverse = 1.0 / determinant;
+      final tangent = Vec3(
+        (e1.x * dv2 - e2.x * dv1) * inverse,
+        (e1.y * dv2 - e2.y * dv1) * inverse,
+        (e1.z * dv2 - e2.z * dv1) * inverse,
+      );
+      final bitangent = Vec3(
+        (e2.x * du1 - e1.x * du2) * inverse,
+        (e2.y * du1 - e1.y * du2) * inverse,
+        (e2.z * du1 - e1.z * du2) * inverse,
+      );
+
+      Vec3 unit(Vec3 v) {
+        final length = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        if (length < 1e-9) return v;
+        return Vec3(v.x / length, v.y / length, v.z / length);
+      }
+
+      final t = unit(tangent);
+      final b = unit(bitangent);
+      final n = unit(geometricNormal);
+      final perturbed = Vec3(
+        t.x * sampledNormal.x + b.x * sampledNormal.y + n.x * sampledNormal.z,
+        t.y * sampledNormal.x + b.y * sampledNormal.y + n.y * sampledNormal.z,
+        t.z * sampledNormal.x + b.z * sampledNormal.y + n.z * sampledNormal.z,
+      );
+      normal = unit(perturbed);
+    }
+  }
+
+  final normalLength = math.sqrt(
+    normal.x * normal.x + normal.y * normal.y + normal.z * normal.z,
+  );
+  final lightLength = math.sqrt(
+    lightDirection.x * lightDirection.x +
+        lightDirection.y * lightDirection.y +
+        lightDirection.z * lightDirection.z,
+  );
+  if (normalLength < 1e-9 || lightLength < 1e-9) return 1;
+
+  final diffuse =
+      ((normal.x * lightDirection.x +
+                  normal.y * lightDirection.y +
+                  normal.z * lightDirection.z) /
+              (normalLength * lightLength))
+          .abs();
+  return 0.42 + diffuse * 0.58;
+}
 
 /// Whether a face's three UV corners land on (effectively) one texel.
 ///
@@ -6330,6 +6471,43 @@ Future<MeshModel> meshModelFromImporterJson(
       }
     }
 
+    // Normal map: resolved through the same pipeline as the base texture, and
+    // read back to CPU because shading here is computed per face, not on the
+    // GPU.
+    final normalRef = (material['normalTexture'] as String?)?.trim() ?? '';
+    Uint8List? normalPixels;
+    var normalWidth = 0;
+    var normalHeight = 0;
+    if (normalRef.isNotEmpty) {
+      final resolvedNormal = resolveTextureReference(
+        modelPath,
+        normalRef,
+        allAssets: allAssets,
+        allowFallbackLookup: false,
+      );
+      if (resolvedNormal != null) {
+        try {
+          final normalImage = await firstTextureImage([resolvedNormal]);
+          if (normalImage != null) {
+            final data = await normalImage.toByteData(
+              format: ui.ImageByteFormat.rawRgba,
+            );
+            normalPixels = data?.buffer.asUint8List();
+            normalWidth = normalImage.width;
+            normalHeight = normalImage.height;
+            fbxLog(
+              'Normal map for ${(material['name'] as String?) ?? 'Material'}: '
+              '$resolvedNormal (${normalWidth}x$normalHeight)',
+            );
+          }
+        } catch (error) {
+          fbxLog('Normal map decode failed: $error');
+        }
+      } else {
+        fbxLog('Normal map referenced but not resolved: $normalRef');
+      }
+    }
+
     materials.add(
       MeshMaterial(
         name: (material['name'] as String?) ?? 'Material',
@@ -6344,6 +6522,10 @@ Future<MeshModel> meshModelFromImporterJson(
         textureColor: textureColor,
         textureImage: textureImage,
         texturePixels: texturePixels,
+        normalTexture: normalRef,
+        normalPixels: normalPixels,
+        normalWidth: normalWidth,
+        normalHeight: normalHeight,
         textureWidth: textureImage?.width ?? 0,
         textureHeight: textureImage?.height ?? 0,
         opacity: opacity,
@@ -6877,6 +7059,10 @@ class MeshMaterial {
     this.texturePixels,
     this.textureWidth = 0,
     this.textureHeight = 0,
+    this.normalTexture = '',
+    this.normalPixels,
+    this.normalWidth = 0,
+    this.normalHeight = 0,
     this.opacity = 1.0,
     this.roughness = 0.7,
     this.metalness = 0.0,
@@ -6902,6 +7088,41 @@ class MeshMaterial {
   final Uint8List? texturePixels;
   final int textureWidth;
   final int textureHeight;
+
+  /// The normal map this material asked for, and its pixels once resolved.
+  final String normalTexture;
+  final Uint8List? normalPixels;
+  final int normalWidth;
+  final int normalHeight;
+
+  bool get hasNormalMap => normalPixels != null && normalWidth > 0;
+
+  /// Tangent-space normal at [uv], decoded from the usual RGB encoding where
+  /// (0.5, 0.5, 1.0) means "straight out of the surface".
+  Vec3? sampleNormal(Vec2 uv) {
+    final pixels = normalPixels;
+    if (pixels == null || normalWidth <= 0 || normalHeight <= 0) return null;
+    double wrap(double value) {
+      final fraction = value - value.floorToDouble();
+      return fraction < 0 ? fraction + 1 : fraction;
+    }
+
+    final x = (wrap(uv.x) * (normalWidth - 1)).round().clamp(
+      0,
+      normalWidth - 1,
+    );
+    final y = (wrap(uv.y) * (normalHeight - 1)).round().clamp(
+      0,
+      normalHeight - 1,
+    );
+    final index = (y * normalWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return Vec3(
+      pixels[index] / 127.5 - 1.0,
+      pixels[index + 1] / 127.5 - 1.0,
+      pixels[index + 2] / 127.5 - 1.0,
+    );
+  }
 
   /// The colour at [uv], or null when there is nothing to sample.
   Color? sampleTexture(Vec2 uv) {
@@ -7622,6 +7843,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 

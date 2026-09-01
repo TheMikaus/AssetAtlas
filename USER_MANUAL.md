@@ -136,6 +136,9 @@ In the model preview:
   **Material default** selected.
 - Use **Fallback** to adjust the checkerboard size shown when a UV-mapped model
   has no usable texture.
+- **Normal map** appears only when the model provides one, and toggles whether
+  its surface detail affects lighting. Flat-shaded palette packs (Synty and
+  similar) do not ship normal maps, so the control will not appear for them.
 - **Hide back faces** (on by default) skips triangles facing away from you, which
   makes large models noticeably smoother. Turn it off for single-sided geometry
   such as foliage cards or planes, where those triangles are meant to be seen.
