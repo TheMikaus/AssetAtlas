@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.5.0';
+const appVersion = '1.6.0';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -175,6 +175,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool hideZipAssets = false;
   bool scanning = false;
   double assetListWidth = 420;
+  double filterPanelWidth = 260;
   bool gridMode = false;
   AssetSortMode sortMode = AssetSortMode.path;
   String? _lastSelectionAnchorId;
@@ -289,6 +290,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
     // The preview is about to import this file regardless, so the
     // classification is nearly free here.
     _scheduleModelKindClassification([asset]);
+    if (asset.type == 'model') {
+      unawaited(_recordTexturesUsedBy(asset));
+    }
     setState(() {
       active = asset;
       if (!addToHistory) return;
@@ -615,6 +619,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ..addAll(snapshot.assets);
         modelHasValidTextures.clear();
         MeshLoadCache.clear();
+        ModelThumbnailCache.clear();
         catalogRevision += 1;
         active = assets.isNotEmpty ? assets.first : null;
         _seedHistoryWithActive();
@@ -998,6 +1003,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
       assets.addAll(result.assets);
       MeshLoadCache.clear();
+      ModelThumbnailCache.clear();
       catalogRevision += 1;
       modelHasValidTextures.removeWhere(
         (assetId, _) => !assets.any((asset) => asset.id == assetId),
@@ -1027,6 +1033,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       sourceRoots.remove(rootPath);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
       MeshLoadCache.clear();
+      ModelThumbnailCache.clear();
       catalogRevision += 1;
       modelHasValidTextures.removeWhere(
         (assetId, _) => !assets.any((asset) => asset.id == assetId),
@@ -1100,6 +1107,35 @@ class _CatalogScreenState extends State<CatalogScreen> {
       if (!mounted) return;
       setState(() => query = value);
     });
+  }
+
+  /// Marks the images a model actually uses, so they show as textures.
+  ///
+  /// Only what the model itself resolved counts: a folder name is a guess,
+  /// this is evidence.
+  Future<void> _recordTexturesUsedBy(AssetItem model) async {
+    try {
+      final mesh = await MeshLoadCache.load(model, allAssets: assets);
+      final used = <String>{
+        for (final material in mesh.materials)
+          for (final path in material.resolvedTextures) normalizePathKey(path),
+      };
+      if (used.isEmpty) return;
+
+      final newlyMarked = <String>[];
+      for (final asset in assets) {
+        if (asset.referencedByModel) continue;
+        if (used.contains(normalizePathKey(asset.path))) {
+          asset.referencedByModel = true;
+          newlyMarked.add(asset.id);
+        }
+      }
+      if (newlyMarked.isEmpty || !mounted) return;
+      setState(_invalidateAssetViews);
+      _persistInBackground(() => db.markAssetsReferencedByModel(newlyMarked));
+    } catch (_) {
+      // A model that will not import tells us nothing about textures.
+    }
   }
 
   void _selectAll(List<AssetItem> visible) {
@@ -1183,6 +1219,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final counts = {
       'all': assets.length,
       'image': assets.where((asset) => asset.effectiveType == 'image').length,
+      'texture': assets
+          .where((asset) => asset.effectiveType == 'texture')
+          .length,
       'model': assets.where((asset) => asset.effectiveType == 'model').length,
       'animation': assets
           .where((asset) => asset.effectiveType == 'animation')
@@ -1219,6 +1258,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 child: Row(
                   children: [
                     FilterPanel(
+                      width: filterPanelWidth,
                       counts: counts,
                       unclassifiedFbxCount: unclassifiedFbxCount,
                       typeFilter: typeFilter,
@@ -1273,6 +1313,15 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         });
                       },
                       onRemoveSource: removeSource,
+                    ),
+                    VerticalResizeHandle(
+                      onDrag: (delta) {
+                        setState(() {
+                          filterPanelWidth = (filterPanelWidth + delta)
+                              .clamp(200.0, 520.0)
+                              .toDouble();
+                        });
+                      },
                     ),
                     // The browse list gets its own full-height column: as a bottom
                     // strip it showed a handful of rows out of tens of thousands.
@@ -1793,6 +1842,7 @@ class _FolderRow extends StatelessWidget {
 
 class FilterPanel extends StatelessWidget {
   const FilterPanel({
+    required this.width,
     required this.counts,
     required this.unclassifiedFbxCount,
     required this.typeFilter,
@@ -1813,6 +1863,7 @@ class FilterPanel extends StatelessWidget {
     super.key,
   });
 
+  final double width;
   final Map<String, int> counts;
   final int unclassifiedFbxCount;
   final String typeFilter;
@@ -1834,7 +1885,7 @@ class FilterPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 260,
+      width: width,
       child: Material(
         color: const Color(0xfff7f8fb),
         child: ListView(
@@ -1842,7 +1893,14 @@ class FilterPanel extends StatelessWidget {
           children: [
             const Text('Types', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
-            for (final type in ['all', 'image', 'model', 'animation', 'audio'])
+            for (final type in [
+              'all',
+              'image',
+              'texture',
+              'model',
+              'animation',
+              'audio',
+            ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: Tooltip(
@@ -2119,6 +2177,7 @@ class SearchAndSummary extends StatelessWidget {
 /// Icon shown for an asset's kind, used by both the list and the grid.
 IconData iconForAssetType(String effectiveType) => switch (effectiveType) {
   'image' => Icons.image_outlined,
+  'texture' => Icons.texture,
   'audio' => Icons.graphic_eq,
   'animation' => Icons.directions_run,
   'model' => Icons.view_in_ar_outlined,
@@ -2314,6 +2373,7 @@ class AssetGrid extends StatelessWidget {
         final isSelected = selectedIds.contains(asset.id);
         return AssetGridTile(
           asset: asset,
+          allAssets: assets,
           isActive: active?.id == asset.id,
           isSelected: isSelected,
           onActivate: () => onActivate(asset),
@@ -2331,6 +2391,7 @@ class AssetGrid extends StatelessWidget {
 class AssetGridTile extends StatelessWidget {
   const AssetGridTile({
     required this.asset,
+    required this.allAssets,
     required this.isActive,
     required this.isSelected,
     required this.onActivate,
@@ -2339,6 +2400,7 @@ class AssetGridTile extends StatelessWidget {
   });
 
   final AssetItem asset;
+  final List<AssetItem> allAssets;
   final bool isActive;
   final bool isSelected;
   final VoidCallback onActivate;
@@ -2374,7 +2436,10 @@ class AssetGridTile extends StatelessWidget {
                       Positioned.fill(
                         child: Padding(
                           padding: const EdgeInsets.all(6),
-                          child: AssetThumbnail(asset: asset),
+                          child: AssetThumbnail(
+                            asset: asset,
+                            allAssets: allAssets,
+                          ),
                         ),
                       ),
                       Positioned(
@@ -2426,18 +2491,154 @@ class AssetGridTile extends StatelessWidget {
   }
 }
 
+/// Renders small previews of models for the grid, and remembers them.
+///
+/// A grid of file-type icons does not answer "which one is the crate", which
+/// is the whole reason to look at a grid. Rendering costs an FBX import, so
+/// this is strictly on demand: only tiles that are actually built ask for one,
+/// a couple render at a time, and results are kept in a bounded cache.
+class ModelThumbnailCache {
+  ModelThumbnailCache._();
+
+  static const size = 128;
+  static const maxEntries = 300;
+  static const _maxConcurrent = 2;
+
+  /// Requests waiting to render. Beyond this the oldest are dropped: they are
+  /// almost certainly off screen by now, and asking again is cheap.
+  static const maxQueued = 48;
+
+  /// Rendering a thumbnail means importing the model. Turn this off to keep
+  /// the grid to plain type icons -- tests do, so that unrelated widget tests
+  /// are not dragged into FBX imports.
+  static bool enabled = true;
+
+  static final _entries = <String, ui.Image?>{};
+  static final _pending = <String>{};
+  static final _queue = Queue<_ThumbnailRequest>();
+  static var _running = 0;
+
+  /// Bumped whenever a thumbnail lands, so grids can rebuild.
+  static final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  /// Rendered thumbnails started. Test visibility only.
+  static int renderCount = 0;
+
+  /// Returns the cached image, or null and schedules a render.
+  static ui.Image? imageFor(AssetItem asset, List<AssetItem> allAssets) {
+    if (!enabled) return null;
+    final cached = _entries.remove(asset.id);
+    if (cached != null) {
+      _entries[asset.id] = cached;
+      return cached;
+    }
+    if (_entries.containsKey(asset.id)) {
+      // Known to be unrenderable; do not keep trying.
+      return null;
+    }
+    if (_pending.add(asset.id)) {
+      // Newest first: while scrolling, the tile you are looking at now matters
+      // more than one you flew past. An unbounded queue would keep rendering
+      // thousands of thumbnails nobody can see any more.
+      _queue.addFirst(_ThumbnailRequest(asset, allAssets));
+      while (_queue.length > maxQueued) {
+        _pending.remove(_queue.removeLast().asset.id);
+      }
+      unawaited(_drain());
+    }
+    return null;
+  }
+
+  static Future<void> _drain() async {
+    if (_running >= _maxConcurrent || _queue.isEmpty) return;
+    _running += 1;
+    while (_queue.isNotEmpty) {
+      final request = _queue.removeFirst();
+      ui.Image? image;
+      try {
+        renderCount += 1;
+        image = await renderModelThumbnail(
+          request.asset,
+          allAssets: request.allAssets,
+        );
+      } catch (_) {
+        image = null;
+      }
+      _entries[request.asset.id] = image;
+      _pending.remove(request.asset.id);
+      while (_entries.length > maxEntries) {
+        final oldest = _entries.keys.first;
+        _entries.remove(oldest)?.dispose();
+      }
+      revision.value += 1;
+    }
+    _running -= 1;
+  }
+
+  /// Test visibility: how many requests are waiting.
+  static int get queuedCount => _queue.length;
+
+  static void clear() {
+    for (final image in _entries.values) {
+      image?.dispose();
+    }
+    _entries.clear();
+    _pending.clear();
+    _queue.clear();
+    revision.value += 1;
+  }
+}
+
+class _ThumbnailRequest {
+  const _ThumbnailRequest(this.asset, this.allAssets);
+  final AssetItem asset;
+  final List<AssetItem> allAssets;
+}
+
+/// Draws one model into a square image with the same painter the preview uses,
+/// so a thumbnail looks like what you get when you click it.
+Future<ui.Image?> renderModelThumbnail(
+  AssetItem asset, {
+  List<AssetItem> allAssets = const [],
+  int size = ModelThumbnailCache.size,
+}) async {
+  final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
+  if (mesh.isAnimationOnly || mesh.faces.isEmpty) return null;
+
+  final recorder = ui.PictureRecorder();
+  final canvas = Canvas(recorder);
+  MeshPainter(
+    mesh: mesh,
+    yaw: -0.6,
+    pitch: 0.35,
+    zoom: 1,
+    renderMode: RenderMode.textured,
+    lightingMode: LightingMode.corner,
+    cullBackFaces: true,
+  ).paint(canvas, Size(size.toDouble(), size.toDouble()));
+  return recorder.endRecording().toImage(size, size);
+}
+
 /// Image thumbnails are decoded at tile size, not full size: a 4K texture
 /// atlas decoded per tile would exhaust memory in a grid of any size.
 class AssetThumbnail extends StatelessWidget {
-  const AssetThumbnail({required this.asset, super.key});
+  const AssetThumbnail({
+    required this.asset,
+    this.allAssets = const [],
+    super.key,
+  });
 
   final AssetItem asset;
+  final List<AssetItem> allAssets;
 
   static const _decodeWidth = 160;
 
   @override
   Widget build(BuildContext context) {
-    if (asset.effectiveType == 'image') {
+    if (asset.type == 'model' && asset.modelKind != 'animation') {
+      return ModelThumbnail(asset: asset, allAssets: allAssets);
+    }
+    if (asset.type == 'image') {
       if (isZipVirtualPath(asset.path)) {
         return FutureBuilder<Uint8List?>(
           future: ZipThumbnailCache.bytesFor(asset),
@@ -2472,6 +2673,39 @@ class AssetThumbnail extends StatelessWidget {
         size: 34,
         color: Colors.black26,
       ),
+    );
+  }
+}
+
+/// Shows a model's rendered thumbnail once it exists, and its type icon until
+/// then, so the grid fills in as you look at it instead of blocking.
+class ModelThumbnail extends StatelessWidget {
+  const ModelThumbnail({
+    required this.asset,
+    required this.allAssets,
+    super.key,
+  });
+
+  final AssetItem asset;
+  final List<AssetItem> allAssets;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<int>(
+      valueListenable: ModelThumbnailCache.revision,
+      builder: (context, _, _) {
+        final image = ModelThumbnailCache.imageFor(asset, allAssets);
+        if (image == null) {
+          return Center(
+            child: Icon(
+              iconForAssetType(asset.effectiveType),
+              size: 34,
+              color: Colors.black26,
+            ),
+          );
+        }
+        return RawImage(image: image, fit: BoxFit.contain);
+      },
     );
   }
 }
@@ -4062,11 +4296,13 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
   // Held in state, never built inline: creating this future in build() made
   // every unrelated rebuild re-run the FBX importer.
   Future<List<TextureDiscoveryEntry>>? referencesFuture;
+  Future<MeshModel>? meshFuture;
 
   @override
   void initState() {
     super.initState();
     referencesFuture = _loadReferences();
+    meshFuture = _loadMesh();
   }
 
   @override
@@ -4075,12 +4311,20 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
     if (oldWidget.asset.id != widget.asset.id ||
         oldWidget.catalogRevision != widget.catalogRevision) {
       referencesFuture = _loadReferences();
+      meshFuture = _loadMesh();
     }
   }
 
   Future<List<TextureDiscoveryEntry>>? _loadReferences() {
     if (widget.asset.ext != 'fbx') return null;
     return loadModelTextureReferenceEntries(widget.asset, widget.allAssets);
+  }
+
+  /// The mesh itself, so the panel can tell "this material is a flat colour"
+  /// apart from "this model's textures are missing". Shares the cached import.
+  Future<MeshModel>? _loadMesh() {
+    if (widget.asset.ext != 'fbx') return null;
+    return MeshLoadCache.load(widget.asset, allAssets: widget.allAssets);
   }
 
   @override
@@ -4090,7 +4334,11 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
     final onActivateAsset = widget.onActivateAsset;
     final nearby = findNearbyTextures(asset, allAssets);
     if (asset.ext == 'fbx') {
-      return FutureBuilder<List<TextureDiscoveryEntry>>(
+      return FutureBuilder<MeshModel>(
+        future: meshFuture,
+        builder: (context, meshSnapshot) => FutureBuilder<
+          List<TextureDiscoveryEntry>
+        >(
         future: referencesFuture,
         builder: (context, snapshot) {
           final referenced = snapshot.data ?? const <TextureDiscoveryEntry>[];
@@ -4116,12 +4364,16 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
                 ? 'Texture discovery'
                 : 'Texture discovery...',
             message: combined.isEmpty
-                ? 'No FBX texture references or nearby scanned textures found. The material may be embedded, procedural, or untextured.'
+                ? 'No texture references and no nearby candidates.'
                 : '${referenced.length} FBX references · ${nearby.length} nearby scanned candidates.',
             entries: combined,
             onActivateAsset: onActivateAsset,
+            mesh: snapshot.connectionState == ConnectionState.done
+                ? meshSnapshot.data
+                : null,
           );
         },
+        ),
       );
     }
     return TextureDiscoveryBox(
@@ -4160,18 +4412,94 @@ class TextureDiscoveryEntry {
   final AssetItem? jumpAsset;
 }
 
+/// One material, with its resolved texture shown rather than described.
+///
+/// "Is this model textured?" is a question a swatch answers instantly, and a
+/// list of paths does not: a model can resolve its atlas correctly and still
+/// look grey, because that is the part of the atlas it uses.
+class MaterialSummaryRow extends StatelessWidget {
+  const MaterialSummaryRow({required this.material, super.key});
+
+  final MeshMaterial material;
+
+  @override
+  Widget build(BuildContext context) {
+    final image = material.textureImage;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: material.color,
+              border: Border.all(color: Colors.black26),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: image == null
+                ? null
+                : RawImage(image: image, fit: BoxFit.cover),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  material.name.isEmpty ? '(unnamed material)' : material.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12.5),
+                ),
+                Text(
+                  image != null
+                      ? 'textured ${image.width}x${image.height}'
+                          '${material.hasEmbeddedTexture ? " (embedded)" : ""}'
+                      : 'flat colour, no texture',
+                  style: const TextStyle(fontSize: 11, color: Colors.black54),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class TextureDiscoveryBox extends StatelessWidget {
   const TextureDiscoveryBox({
     required this.title,
     required this.message,
     required this.entries,
     required this.onActivateAsset,
+    this.mesh,
     super.key,
   });
+
+  /// Present once the model has been read, so the box can show what the
+  /// material actually is instead of only listing paths.
+  final MeshModel? mesh;
 
   final String title;
   final String message;
   final List<TextureDiscoveryEntry> entries;
+
+  /// A model whose materials carry no texture at all is not a problem to be
+  /// solved -- Synty collision hulls, for instance, are a flat colour. Saying
+  /// so beats implying something is missing.
+  bool get _isDeliberatelyUntextured =>
+      mesh != null &&
+      mesh!.materials.isNotEmpty &&
+      mesh!.materials.every(
+        (material) =>
+            material.textures.isEmpty &&
+            material.resolvedTextures.isEmpty &&
+            !material.hasEmbeddedTexture,
+      );
   final ValueChanged<AssetItem> onActivateAsset;
 
   String _copyablePath(String value) {
@@ -4201,7 +4529,19 @@ class TextureDiscoveryBox extends StatelessWidget {
           children: [
             Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 6),
-            Text(message, style: const TextStyle(color: Colors.black54)),
+            Text(
+              _isDeliberatelyUntextured
+                  ? 'This model has no textures: its material is a flat '
+                        'colour. Collision hulls and blockout meshes normally '
+                        'look like this.'
+                  : message,
+              style: const TextStyle(color: Colors.black54),
+            ),
+            if (mesh != null && mesh!.materials.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              for (final material in mesh!.materials.take(4))
+                MaterialSummaryRow(material: material),
+            ],
             const SizedBox(height: 8),
             for (final entry in entries.take(10))
               Row(
@@ -4896,6 +5236,18 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
     );
   }
 }
+
+/// Images that live in a texture folder are textures in practice: Synty and
+/// most other packs put them under `Textures/`, and 1,925 of the 2,104 images
+/// in the reference catalog sit there. The authoritative signal is being
+/// referenced by a model, which is only known once that model has been read.
+final _textureFolderPattern = RegExp(
+  r'(^|[\\/])(textures?|materials?)([\\/]|$)',
+  caseSensitive: false,
+);
+
+bool looksLikeTextureLocation(String relativePath) =>
+    _textureFolderPattern.hasMatch(relativePath.replaceAll('\\', '/'));
 
 /// AppleDouble sidecars: macOS writes a `._name` stub beside the real file
 /// (and a `__MACOSX/` mirror inside archives) holding resource-fork metadata.
@@ -6496,6 +6848,7 @@ class AssetItem {
     required this.tags,
     this.ignored = false,
     this.modelKind,
+    this.referencedByModel = false,
   });
 
   final String id;
@@ -6516,9 +6869,20 @@ class AssetItem {
   /// costs an importer run, so it happens lazily and is persisted.
   String? modelKind;
 
+  /// Set once some model has been read and found to use this image. Persisted,
+  /// because it is only learned by importing a model.
+  bool referencedByModel;
+
   /// The type to show and filter by. An FBX holding only a skeleton and curves
   /// is an animation, not a model, but only a parse can tell you that.
-  String get effectiveType => modelKind == 'animation' ? 'animation' : type;
+  String get effectiveType {
+    if (modelKind == 'animation') return 'animation';
+    if (type == 'image' &&
+        (referencedByModel || looksLikeTextureLocation(relativePath))) {
+      return 'texture';
+    }
+    return type;
+  }
 
   String? _searchText;
 
@@ -6567,7 +6931,8 @@ class AssetAtlasDatabase {
   ///   v3 - asset ids rebuilt from source root + relative path, so editing a
   ///        file no longer orphans it from projects and ignore flags
   ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
-  static const schemaVersion = 4;
+  ///   v5 - referenced_by_model, images a model was found to use
+  static const schemaVersion = 5;
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -6613,6 +6978,12 @@ class AssetAtlasDatabase {
               'ALTER TABLE catalog_assets ADD COLUMN model_kind TEXT',
             );
           }
+          if (oldVersion < 5) {
+            await db.execute(
+              'ALTER TABLE catalog_assets '
+              'ADD COLUMN referenced_by_model INTEGER NOT NULL DEFAULT 0',
+            );
+          }
         },
         onCreate: (db, _) async {
           await db.execute('''
@@ -6629,7 +7000,8 @@ class AssetAtlasDatabase {
               modified_ms INTEGER NOT NULL,
               tags_json TEXT NOT NULL,
               ignored INTEGER NOT NULL DEFAULT 0,
-              model_kind TEXT
+              model_kind TEXT,
+              referenced_by_model INTEGER NOT NULL DEFAULT 0
             )
           ''');
           await db.execute('''
@@ -6683,6 +7055,7 @@ class AssetAtlasDatabase {
             .cast<String>()),
         ignored: (row['ignored'] as int) == 1,
         modelKind: row['model_kind'] as String?,
+        referencedByModel: (row['referenced_by_model'] as int? ?? 0) == 1,
       );
     }).toList();
     final sourceRoots = sourceRows
@@ -6807,6 +7180,7 @@ class AssetAtlasDatabase {
     'tags_json': jsonEncode(asset.tags),
     'ignored': asset.ignored ? 1 : 0,
     'model_kind': asset.modelKind,
+    'referenced_by_model': asset.referencedByModel ? 1 : 0,
   };
 
   /// Full replace. Only correct after a scan, where the catalog really did
@@ -6878,6 +7252,25 @@ class AssetAtlasDatabase {
           {'model_kind': entry.value},
           where: 'id = ?',
           whereArgs: [entry.key],
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  /// Records that a model uses these images, so they read as textures rather
+  /// than as ordinary pictures.
+  Future<void> markAssetsReferencedByModel(List<String> assetIds) async {
+    if (assetIds.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in assetIds) {
+        batch.update(
+          'catalog_assets',
+          {'referenced_by_model': 1},
+          where: 'id = ?',
+          whereArgs: [id],
         );
       }
       await batch.commit(noResult: true);
@@ -7081,6 +7474,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
