@@ -30,6 +30,17 @@ Resolution order for referenced textures:
 
 If no usable texture exists, fallback material logic applies (including checker fallback in eligible cases).
 
+## Flat Palette Faces
+
+Palette-atlas content (Synty and similar) maps an entire face to one texel, so
+the face's UV triangle has zero area. These are detected and filled with the
+sampled texel colour rather than drawn through the affine texture path, which
+cannot invert a degenerate transform. Consecutive flat faces are batched into a
+single `drawVertices` call with per-vertex colours.
+
+This is not an optimisation detail: before it existed, every such face rendered
+as the material's untextured base colour, which is most of a low-poly model.
+
 ## Rendering Modes
 
 - `Textured`

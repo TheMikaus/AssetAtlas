@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.6.0';
+const appVersion = '1.7.0';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3604,6 +3604,31 @@ class MeshPainter extends CustomPainter {
     }
 
     final facePaint = Paint()..style = PaintingStyle.fill;
+
+    // Flat palette faces are the bulk of this kind of content, and they all
+    // draw the same way: one triangle, one colour. Collect runs of them and
+    // issue a single drawVertices instead of a path per face. The batch is
+    // flushed whenever a differently-drawn face comes up, so the painter's
+    // back-to-front order still holds.
+    final batchPositions = <double>[];
+    final batchColors = <int>[];
+    final batchPaint = Paint()
+      ..style = PaintingStyle.fill
+      // Interior edges of a shared mesh line up exactly; antialiasing them
+      // leaves visible seams between triangles.
+      ..isAntiAlias = false;
+
+    void flushFlatBatch() {
+      if (batchPositions.isEmpty) return;
+      final vertices = ui.Vertices.raw(
+        ui.VertexMode.triangles,
+        Float32List.fromList(batchPositions),
+        colors: Int32List.fromList(batchColors),
+      );
+      canvas.drawVertices(vertices, BlendMode.dst, batchPaint);
+      batchPositions.clear();
+      batchColors.clear();
+    }
     final edgePaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
@@ -3646,6 +3671,60 @@ class MeshPainter extends CustomPainter {
           : null;
       final textureUvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
       final light = _faceLight(viewVertices, face, lightingMode);
+      // Synty-style palette models map an entire face to one texel, which
+      // makes the UV triangle degenerate. The textured path bails out on that
+      // (its inverse transform does not exist), so those faces used to render
+      // as the bare base colour -- half of every model, unpainted. Sample the
+      // texel and fill instead: same result, far cheaper.
+      final flatTexel =
+          renderMode == RenderMode.textured &&
+              material != null &&
+              textureUvs.length == 3 &&
+              isDegenerateUvTriangle(textureUvs)
+          // If the readback failed, the average texture colour still beats
+          // showing the untextured base.
+          ? (material.sampleTexture(textureUvs[0]) ?? material.textureColor)
+          : null;
+
+      if (flatTexel != null) {
+        var faceColor = flatTexel;
+        final vertexTint = mesh.averageFaceVertexColor(face);
+        if (vertexTint != null) {
+          faceColor = _multiplyColor(faceColor, vertexTint);
+        }
+        faceColor = _shadeColor(faceColor, light);
+        final shaded = faceColor.withValues(
+          alpha: mesh.opacityForMaterial(face.materialIndex),
+        );
+
+        if (face.indices.length == 3 && !drawEdges) {
+          final p0 = projected[face.indices[0]];
+          final p1 = projected[face.indices[1]];
+          final p2 = projected[face.indices[2]];
+          batchPositions.addAll([p0.x, p0.y, p1.x, p1.y, p2.x, p2.y]);
+          final argb = shaded.toARGB32();
+          batchColors.addAll([argb, argb, argb]);
+          continue;
+        }
+
+        flushFlatBatch();
+        final path = Path();
+        final first = projected[face.indices.first];
+        path.moveTo(first.x, first.y);
+        for (final vertexIndex in face.indices.skip(1)) {
+          final point = projected[vertexIndex];
+          path.lineTo(point.x, point.y);
+        }
+        path.close();
+        facePaint.color = shaded;
+        canvas.drawPath(path, facePaint);
+        if (drawEdges) canvas.drawPath(path, edgePaint);
+        continue;
+      }
+
+      // Anything drawn another way has to wait for the batch to land first.
+      flushFlatBatch();
+
       if (renderMode == RenderMode.textured &&
           material?.textureImage != null &&
           textureUvs.length == 3) {
@@ -3741,6 +3820,7 @@ class MeshPainter extends CustomPainter {
         canvas.drawPath(path, edgePaint);
       }
     }
+    flushFlatBatch();
   }
 
   static bool _isApproximatelyWhite(Color color) {
@@ -3911,6 +3991,19 @@ class MeshPainter extends CustomPainter {
 /// viewer draws the nearest [maxRenderedFaces] and says so in the overlay --
 /// it must never quietly drop geometry in an inspection tool.
 const maxRenderedFaces = 14000;
+
+/// Whether a face's three UV corners land on (effectively) one texel.
+///
+/// True for flat-colour palette faces, which is most of a Synty model. Such a
+/// triangle has no invertible UV-to-screen transform, so it cannot be drawn by
+/// sampling across the triangle; it has to be filled with the single colour.
+bool isDegenerateUvTriangle(List<Vec2> uvs, {double epsilon = 1e-6}) {
+  if (uvs.length < 3) return true;
+  final area =
+      (uvs[1].x - uvs[0].x) * (uvs[2].y - uvs[0].y) -
+      (uvs[2].x - uvs[0].x) * (uvs[1].y - uvs[0].y);
+  return area.abs() < epsilon;
+}
 
 /// Screen-space signed area of a projected triangle.
 ///
@@ -6223,6 +6316,20 @@ Future<MeshModel> meshModelFromImporterJson(
       }
     }
     textureImage ??= await firstTextureImage(resolvedTextures);
+
+    // Read the texture back once so single-texel faces can be filled directly.
+    Uint8List? texturePixels;
+    if (textureImage != null) {
+      try {
+        final data = await textureImage.toByteData(
+          format: ui.ImageByteFormat.rawRgba,
+        );
+        texturePixels = data?.buffer.asUint8List();
+      } catch (error) {
+        fbxLog('Texture readback failed: $error');
+      }
+    }
+
     materials.add(
       MeshMaterial(
         name: (material['name'] as String?) ?? 'Material',
@@ -6236,6 +6343,9 @@ Future<MeshModel> meshModelFromImporterJson(
         resolvedTextures: resolvedTextures,
         textureColor: textureColor,
         textureImage: textureImage,
+        texturePixels: texturePixels,
+        textureWidth: textureImage?.width ?? 0,
+        textureHeight: textureImage?.height ?? 0,
         opacity: opacity,
         roughness: roughness,
         metalness: metalness,
@@ -6764,6 +6874,9 @@ class MeshMaterial {
     this.resolvedTextures = const [],
     this.textureColor,
     this.textureImage,
+    this.texturePixels,
+    this.textureWidth = 0,
+    this.textureHeight = 0,
     this.opacity = 1.0,
     this.roughness = 0.7,
     this.metalness = 0.0,
@@ -6782,6 +6895,41 @@ class MeshMaterial {
   final List<String> resolvedTextures;
   final Color? textureColor;
   final ui.Image? textureImage;
+
+  /// Raw RGBA of [textureImage], kept so a single texel can be read without
+  /// going through the GPU. Synty-style models map a whole face to one texel,
+  /// and those faces are drawn as a flat fill rather than a texture draw.
+  final Uint8List? texturePixels;
+  final int textureWidth;
+  final int textureHeight;
+
+  /// The colour at [uv], or null when there is nothing to sample.
+  Color? sampleTexture(Vec2 uv) {
+    final pixels = texturePixels;
+    if (pixels == null || textureWidth <= 0 || textureHeight <= 0) return null;
+    // UVs outside 0..1 wrap, which is what a tiling material expects.
+    double wrap(double value) {
+      final fraction = value - value.floorToDouble();
+      return fraction < 0 ? fraction + 1 : fraction;
+    }
+
+    final x = (wrap(uv.x) * (textureWidth - 1)).round().clamp(
+      0,
+      textureWidth - 1,
+    );
+    final y = (wrap(uv.y) * (textureHeight - 1)).round().clamp(
+      0,
+      textureHeight - 1,
+    );
+    final index = (y * textureWidth + x) * 4;
+    if (index + 3 >= pixels.length) return null;
+    return Color.fromARGB(
+      pixels[index + 3],
+      pixels[index],
+      pixels[index + 1],
+      pixels[index + 2],
+    );
+  }
   final double opacity;
   final double roughness;
   final double metalness;
@@ -7474,6 +7622,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
