@@ -166,6 +166,7 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
   printf(",\"frameRate\":%.6g", frame_count > 1 && duration > 0.0
     ? (double)(frame_count - 1) / duration
     : kSkeletonSampleRate);
+  printf(",\"stride\":12");
   printf(",\"frames\":[");
   for (size_t frame = 0; frame < frame_count; ++frame) {
     const double t = frame_count > 1
@@ -183,13 +184,16 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
           node = (ufbx_node*)element;
         }
       }
-      const ufbx_vec3 position = {
-        node->node_to_world.cols[3].x,
-        node->node_to_world.cols[3].y,
-        node->node_to_world.cols[3].z,
-      };
+      // Column-major 3x4: the three basis columns then the translation.
+      // The translation is the bone's world position, which is all the
+      // stick-figure view reads.
+      const ufbx_matrix m = node->node_to_world;
       if (i) putchar(0x2C);
-      printf("%.5g,%.5g,%.5g", position.x, position.y, position.z);
+      printf("%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+        m.cols[0].x, m.cols[0].y, m.cols[0].z,
+        m.cols[1].x, m.cols[1].y, m.cols[1].z,
+        m.cols[2].x, m.cols[2].y, m.cols[2].z,
+        m.cols[3].x, m.cols[3].y, m.cols[3].z);
     }
     if (posed) ufbx_free_scene(posed);
     putchar(0x5D);
@@ -485,8 +489,68 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Skin data, gathered across every mesh in the file.
+  //
+  // `skin_bone_names` is the join key: a clip and a character are separate
+  // files, and the Synty rigs use identical bone names, so a name is what
+  // connects an animated bone to the vertices it moves.
+  std::vector<std::string> skin_bone_names;
+  // `geometry_to_bone` composed with the inverse of the mesh's own
+  // geometry-to-world, because the vertices emitted below are already in world
+  // space. Without that second term a posed character lands in the wrong place.
+  std::vector<ufbx_matrix> skin_bind_inverse;
+  // Four influences per vertex as (bone, weight); zero-weight padded. Four is
+  // what game rigs use and what Synty's export carries.
+  std::vector<std::array<double, 8>> skin_vertices;
+  // Per emitted vertex, an index into `skin_vertices`, or -1.
+  std::vector<int> vertex_skin;
+
+  auto skin_bone_index = [&](ufbx_skin_cluster* cluster,
+                             const ufbx_matrix* geometry_to_world) -> int {
+    if (!cluster || !cluster->bone_node) return -1;
+    const std::string name = string_from_ufbx(cluster->bone_node->name);
+    for (size_t i = 0; i < skin_bone_names.size(); ++i) {
+      if (skin_bone_names[i] == name) return (int)i;
+    }
+    ufbx_matrix bind = cluster->geometry_to_bone;
+    if (geometry_to_world) {
+      const ufbx_matrix world_to_geometry = ufbx_matrix_invert(geometry_to_world);
+      bind = ufbx_matrix_mul(&bind, &world_to_geometry);
+    }
+    skin_bone_names.push_back(name);
+    skin_bind_inverse.push_back(bind);
+    return (int)skin_bone_names.size() - 1;
+  };
+
   auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world) {
     if (!mesh || mesh->num_faces == 0) return;
+
+    // Build this mesh's vertex influence table before walking its faces, so a
+    // corner only has to look up its vertex.
+    ufbx_skin_deformer* skin = mesh->skin_deformers.count > 0
+      ? mesh->skin_deformers.data[0]
+      : NULL;
+    const size_t skin_base = skin_vertices.size();
+    if (skin) {
+      for (size_t v = 0; v < mesh->num_vertices; ++v) {
+        std::array<double, 8> influences = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (v < skin->vertices.count) {
+          const ufbx_skin_vertex sv = skin->vertices.data[v];
+          const size_t take = sv.num_weights < 4 ? sv.num_weights : 4;
+          for (size_t w = 0; w < take; ++w) {
+            const ufbx_skin_weight weight = skin->weights.data[sv.weight_begin + w];
+            ufbx_skin_cluster* cluster = weight.cluster_index < skin->clusters.count
+              ? skin->clusters.data[weight.cluster_index]
+              : NULL;
+            const int bone = skin_bone_index(cluster, geometry_to_world);
+            if (bone < 0) continue;
+            influences[w * 2 + 0] = (double)bone;
+            influences[w * 2 + 1] = weight.weight;
+          }
+        }
+        skin_vertices.push_back(influences);
+      }
+    }
 
     std::vector<unsigned int> tri_indices(mesh->max_face_triangles * 3);
     for (size_t face_index = 0; face_index < mesh->num_faces; ++face_index) {
@@ -513,6 +577,12 @@ int main(int argc, char** argv) {
             p = ufbx_transform_position(geometry_to_world, p);
           }
           vertices.push_back({p.x, p.y, p.z});
+          if (skin && vertex_index < mesh->vertex_indices.count) {
+            vertex_skin.push_back(
+              (int)(skin_base + mesh->vertex_indices.data[vertex_index]));
+          } else {
+            vertex_skin.push_back(-1);
+          }
           Vec4 color = {1.0, 1.0, 1.0, 1.0};
           if (mesh->vertex_color.exists) {
             ufbx_vec4 c = ufbx_get_vertex_vec4(&mesh->vertex_color, vertex_index);
@@ -674,7 +744,41 @@ int main(int argc, char** argv) {
     }
     printf("]}");
   }
-  printf("],\"uvSets\":[");
+  if (!skin_bone_names.empty()) {
+    printf("],\"skin\":{\"bones\":[");
+    for (size_t i = 0; i < skin_bone_names.size(); ++i) {
+      if (i) putchar(0x2C);
+      printf("{\"name\":");
+      print_json_string(skin_bone_names[i].c_str());
+      const ufbx_matrix m = skin_bind_inverse[i];
+      printf(",\"bindInverse\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]}",
+        m.cols[0].x, m.cols[0].y, m.cols[0].z,
+        m.cols[1].x, m.cols[1].y, m.cols[1].z,
+        m.cols[2].x, m.cols[2].y, m.cols[2].z,
+        m.cols[3].x, m.cols[3].y, m.cols[3].z);
+    }
+    printf("],\"vertices\":[");
+    for (size_t i = 0; i < skin_vertices.size(); ++i) {
+      if (i) putchar(0x2C);
+      const std::array<double, 8>& w = skin_vertices[i];
+      printf("%d,%.5g,%d,%.5g,%d,%.5g,%d,%.5g",
+        (int)w[0], w[1], (int)w[2], w[3],
+        (int)w[4], w[5], (int)w[6], w[7]);
+    }
+    printf("],\"vertexSkin\":[");
+    for (size_t i = 0; i < vertex_skin.size(); ++i) {
+      if (i) putchar(0x2C);
+      printf("%d", vertex_skin[i]);
+    }
+    printf("]}");
+    // A skinned mesh needs its own rest pose too: it is the reference a clip's
+    // motion is applied against, and without it there is nothing to check the
+    // skinning maths against.
+    print_skeleton(scene, 0.0);
+    printf(",\"uvSets\":[");
+  } else {
+    printf("],\"uvSets\":[");
+  }
   for (size_t uv_set_index = 0; uv_set_index < uv_set_names.size(); ++uv_set_index) {
     if (uv_set_index) putchar(',');
     printf("{\"name\":");

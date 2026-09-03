@@ -30,6 +30,9 @@ Future<void> main() async {
     }
     fbxLog('FBX logging enabled. File: $fbxLogFilePath');
   }
+  // Restoring this before the first frame keeps a clip from briefly showing
+  // the stick figure when a character was already chosen.
+  await AnimationCharacter.instance.load();
   runApp(const AssetAtlasApp());
 }
 
@@ -52,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.5';
+const appVersion = '1.10.6';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3304,7 +3307,10 @@ class _ModelPreviewState extends State<ModelPreview> {
             }
             final mesh = snapshot.data!;
             if (mesh.isAnimationOnly) {
-              return AnimationClipPreview(mesh: mesh);
+              return AnimationClipPreview(
+                mesh: mesh,
+                allAssets: widget.allAssets,
+              );
             }
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3314,6 +3320,19 @@ class _ModelPreviewState extends State<ModelPreview> {
                 // the viewport costs a little height and covers nothing.
                 ModelToolbarBar(
                   children: [
+                    if (mesh.skin != null)
+                      ValueListenableBuilder<String?>(
+                        valueListenable: AnimationCharacter.instance.path,
+                        builder: (context, chosen, _) =>
+                            AnimationCharacterButton(
+                              isChosen: chosen == widget.asset.path,
+                              onPressed: () => AnimationCharacter.instance.set(
+                                chosen == widget.asset.path
+                                    ? null
+                                    : widget.asset.path,
+                              ),
+                            ),
+                      ),
                     SegmentedButton<RenderMode>(
                       segments: const [
                         ButtonSegment(
@@ -3689,9 +3708,10 @@ class SkeletonPainter extends CustomPainter {
     final cosYaw = math.cos(yaw);
 
     Offset project(int bone) {
-      final x = positions[bone * 3] - centerX;
-      final y = positions[bone * 3 + 1] - centerY;
-      final z = positions[bone * 3 + 2];
+      final base = bone * 12;
+      final x = positions[base + 9] - centerX;
+      final y = positions[base + 10] - centerY;
+      final z = positions[base + 11];
       final rotated = x * cosYaw + z * sinYaw;
       return Offset(
         size.width / 2 + rotated * scale,
@@ -3724,9 +3744,18 @@ class SkeletonPainter extends CustomPainter {
 
 /// Plays a clip's rig: drag to turn, scrub to a frame, or let it run.
 class SkeletonPlayer extends StatefulWidget {
-  const SkeletonPlayer({required this.skeleton, super.key});
+  const SkeletonPlayer({
+    required this.skeleton,
+    this.characterPath,
+    this.allAssets = const [],
+    super.key,
+  });
 
   final SkeletonAnimation skeleton;
+
+  /// The model to play this clip on. Null falls back to the stick figure.
+  final String? characterPath;
+  final List<AssetItem> allAssets;
 
   @override
   State<SkeletonPlayer> createState() => _SkeletonPlayerState();
@@ -3738,6 +3767,8 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   Duration _elapsed = Duration.zero;
   bool _playing = true;
   double _yaw = 0.4;
+  MeshModel? _character;
+  String? _characterError;
 
   @override
   void initState() {
@@ -3746,6 +3777,50 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       if (!_playing) return;
       setState(() => _elapsed = elapsed);
     })..start();
+    _loadCharacter();
+  }
+
+  @override
+  void didUpdateWidget(covariant SkeletonPlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.characterPath != widget.characterPath) {
+      _character = null;
+      _characterError = null;
+      _loadCharacter();
+    }
+  }
+
+  Future<void> _loadCharacter() async {
+    final path = widget.characterPath;
+    if (path == null) return;
+    AssetItem? asset;
+    for (final candidate in widget.allAssets) {
+      if (candidate.path == path) {
+        asset = candidate;
+        break;
+      }
+    }
+    if (asset == null) {
+      setState(
+        () => _characterError =
+            'The chosen character is not in the '
+            'catalog any more.',
+      );
+      return;
+    }
+    try {
+      final mesh = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
+      if (!mounted) return;
+      setState(() {
+        _character = mesh.skin == null ? null : mesh;
+        _characterError = mesh.skin == null
+            ? '${asset!.name} has no skin weights, so a clip cannot move it.'
+            : null;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _characterError = 'Could not load the character: $error');
+    }
   }
 
   @override
@@ -3779,20 +3854,52 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   Widget build(BuildContext context) {
     final skeleton = widget.skeleton;
     final frame = _frame;
+    final character = _character;
     return Column(
       children: [
+        if (_characterError != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              _characterError!,
+              style: const TextStyle(fontSize: 12, color: Color(0xffb3261e)),
+            ),
+          ),
         Expanded(
           child: GestureDetector(
             onHorizontalDragUpdate: (details) =>
                 setState(() => _yaw += details.delta.dx * 0.01),
-            child: CustomPaint(
-              painter: SkeletonPainter(
-                skeleton: skeleton,
-                frame: frame,
-                yaw: _yaw,
-              ),
-              child: const SizedBox.expand(),
-            ),
+            child: character == null
+                ? CustomPaint(
+                    painter: SkeletonPainter(
+                      skeleton: skeleton,
+                      frame: frame,
+                      yaw: _yaw,
+                    ),
+                    child: const SizedBox.expand(),
+                  )
+                : RasterModelView(
+                    mesh: character.withVertices(
+                      poseSkinnedVertices(
+                        character: character,
+                        clip: skeleton,
+                        frame: frame,
+                      ),
+                    ),
+                    yaw: _yaw,
+                    pitch: 0,
+                    zoom: 1,
+                    renderMode: RenderMode.textured,
+                    lightingMode: LightingMode.corner,
+                    cullBackFaces: false,
+                    useBaseTexture: true,
+                    useNormalMaps: true,
+                    useEmissiveMaps: true,
+                    useSpecular: true,
+                    // Every frame is a new mesh, so never wait on an isolate
+                    // round trip for a sharp one.
+                    interacting: true,
+                  ),
           ),
         ),
         Padding(
@@ -3838,9 +3945,16 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
 }
 
 class AnimationClipPreview extends StatelessWidget {
-  const AnimationClipPreview({required this.mesh, super.key});
+  const AnimationClipPreview({
+    required this.mesh,
+    this.allAssets = const [],
+    super.key,
+  });
 
   final MeshModel mesh;
+
+  /// Needed to find the chosen character, which lives elsewhere in the catalog.
+  final List<AssetItem> allAssets;
 
   String get _duration {
     if (mesh.durationSeconds <= 0) return 'unknown';
@@ -3853,7 +3967,16 @@ class AnimationClipPreview extends StatelessWidget {
     if (skeleton != null) {
       return Column(
         children: [
-          Expanded(child: SkeletonPlayer(skeleton: skeleton)),
+          Expanded(
+            child: ValueListenableBuilder<String?>(
+              valueListenable: AnimationCharacter.instance.path,
+              builder: (context, characterPath, _) => SkeletonPlayer(
+                skeleton: skeleton,
+                characterPath: characterPath,
+                allAssets: allAssets,
+              ),
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
             child: Text(
@@ -6090,6 +6213,30 @@ class TexturePickerButton extends StatelessWidget {
   }
 }
 
+/// Makes this model the one animation clips are played on.
+///
+/// Only offered for a model that actually carries skin weights: a prop has
+/// nothing for a clip to move, and offering it would just fail later.
+class AnimationCharacterButton extends StatelessWidget {
+  const AnimationCharacterButton({
+    required this.isChosen,
+    required this.onPressed,
+    super.key,
+  });
+
+  final bool isChosen;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return FilledButton.tonalIcon(
+      onPressed: onPressed,
+      icon: Icon(isChosen ? Icons.person : Icons.person_outline, size: 18),
+      label: Text(isChosen ? 'Animation character' : 'Use for animations'),
+    );
+  }
+}
+
 /// The strip of controls above the 3D viewport.
 ///
 /// These used to float over the model in the top-right corner, which is where
@@ -8245,6 +8392,10 @@ Future<MeshModel> meshModelFromImporterJson(
       namedUvsByFace[faceIndex],
     );
   }).toList();
+  final skin = SkinBinding.fromJson(json['skin'] as Map<String, dynamic>?);
+  final restSkeleton = SkeletonAnimation.fromJson(
+    json['skeleton'] as Map<String, dynamic>?,
+  );
   final vertexColors = ((json['vertexColors'] as List<dynamic>?) ?? const [])
       .map((item) {
         final values = item as List<dynamic>;
@@ -8580,6 +8731,8 @@ Future<MeshModel> meshModelFromImporterJson(
     materials: materials,
     textureFiles: textureFiles,
     vertexColors: vertexColors,
+    skin: skin,
+    skeleton: restSkeleton,
   );
 }
 
@@ -8900,6 +9053,218 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
   return true;
 }
 
+/// Settings key for the model clips are played on.
+const animationCharacterKey = 'animation.character.path';
+
+/// The model animation clips are played on, and the clip preview's fallback.
+///
+/// Held here rather than threaded through the widget tree because a clip and
+/// the character it plays on are selected in completely different places: you
+/// pick the character once from a model's own preview, then click clips.
+class AnimationCharacter {
+  AnimationCharacter._();
+
+  static final AnimationCharacter instance = AnimationCharacter._();
+
+  /// Notifies when the choice changes, so an open clip preview re-poses.
+  final ValueNotifier<String?> path = ValueNotifier<String?>(null);
+
+  Future<void> load() async {
+    try {
+      path.value = await AssetAtlasDatabase.instance.readSetting(
+        animationCharacterKey,
+      );
+    } catch (error) {
+      // A missing settings row is not worth failing startup over.
+      fbxLog('Could not read the animation character: $error');
+    }
+  }
+
+  Future<void> set(String? assetPath) async {
+    path.value = assetPath;
+    try {
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterKey,
+        assetPath,
+      );
+    } catch (error) {
+      fbxLog('Could not save the animation character: $error');
+    }
+  }
+}
+
+/// How a mesh's vertices follow a rig.
+///
+/// Emitted once with the character; a clip supplies only the bone matrices, so
+/// posing is a weighted matrix blend per vertex and nothing else.
+class SkinBinding {
+  const SkinBinding({
+    required this.boneNames,
+    required this.bindInverse,
+    required this.influences,
+    required this.vertexSkin,
+  });
+
+  /// Reads the `skin` object the importer emits. Null when absent or unusable.
+  static SkinBinding? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final boneList = (json['bones'] as List<dynamic>?) ?? const [];
+    if (boneList.isEmpty) return null;
+
+    final names = <String>[];
+    final bind = Float32List(boneList.length * 12);
+    for (var i = 0; i < boneList.length; i += 1) {
+      final bone = boneList[i] as Map<String, dynamic>;
+      names.add((bone['name'] ?? '').toString());
+      final matrix = (bone['bindInverse'] as List<dynamic>?) ?? const [];
+      if (matrix.length != 12) return null;
+      for (var j = 0; j < 12; j += 1) {
+        bind[i * 12 + j] = (matrix[j] as num).toDouble();
+      }
+    }
+
+    final rawInfluences = (json['vertices'] as List<dynamic>?) ?? const [];
+    final influences = Float32List(rawInfluences.length);
+    for (var i = 0; i < rawInfluences.length; i += 1) {
+      influences[i] = (rawInfluences[i] as num).toDouble();
+    }
+
+    final rawVertexSkin = (json['vertexSkin'] as List<dynamic>?) ?? const [];
+    final vertexSkin = Int32List(rawVertexSkin.length);
+    for (var i = 0; i < rawVertexSkin.length; i += 1) {
+      vertexSkin[i] = (rawVertexSkin[i] as num).toInt();
+    }
+    if (vertexSkin.isEmpty || influences.isEmpty) return null;
+
+    return SkinBinding(
+      boneNames: names,
+      bindInverse: bind,
+      influences: influences,
+      vertexSkin: vertexSkin,
+    );
+  }
+
+  final List<String> boneNames;
+
+  /// Per bone, a column-major 3x4 taking a mesh vertex into bone space at the
+  /// bind pose. The mesh's own geometry-to-world is already folded in, so it
+  /// applies to the vertices as imported.
+  final Float32List bindInverse;
+
+  /// Four (bone, weight) pairs per skinned vertex, zero-weight padded.
+  final Float32List influences;
+
+  /// Per mesh vertex, an index into [influences] blocks, or -1.
+  final Int32List vertexSkin;
+}
+
+/// Applies `matrix` (column-major 3x4) to a point.
+Vec3 transformByMatrix(Float32List matrix, int offset, Vec3 point) {
+  return Vec3(
+    matrix[offset] * point.x +
+        matrix[offset + 3] * point.y +
+        matrix[offset + 6] * point.z +
+        matrix[offset + 9],
+    matrix[offset + 1] * point.x +
+        matrix[offset + 4] * point.y +
+        matrix[offset + 7] * point.z +
+        matrix[offset + 10],
+    matrix[offset + 2] * point.x +
+        matrix[offset + 5] * point.y +
+        matrix[offset + 8] * point.z +
+        matrix[offset + 11],
+  );
+}
+
+/// Multiplies two column-major 3x4 matrices into `out` at `outOffset`.
+void multiplyMatrices(
+  Float32List a,
+  int aOffset,
+  Float32List b,
+  int bOffset,
+  Float32List out,
+  int outOffset,
+) {
+  for (var column = 0; column < 4; column += 1) {
+    final bx = b[bOffset + column * 3];
+    final by = b[bOffset + column * 3 + 1];
+    final bz = b[bOffset + column * 3 + 2];
+    // The fourth column is a point, so it picks up the translation; the first
+    // three are directions and do not.
+    final translate = column == 3 ? 1.0 : 0.0;
+    for (var row = 0; row < 3; row += 1) {
+      out[outOffset + column * 3 + row] =
+          a[aOffset + row] * bx +
+          a[aOffset + 3 + row] * by +
+          a[aOffset + 6 + row] * bz +
+          a[aOffset + 9 + row] * translate;
+    }
+  }
+}
+
+/// Poses a character's vertices with one frame of a clip.
+///
+/// The join is by bone name, which is exact for Synty rigs. A bone the clip
+/// does not have contributes nothing, and a vertex left with no influence at
+/// all keeps its bind position rather than collapsing to the origin.
+List<Vec3> poseSkinnedVertices({
+  required MeshModel character,
+  required SkeletonAnimation clip,
+  required int frame,
+}) {
+  final skin = character.skin;
+  if (skin == null || frame < 0 || frame >= clip.frameCount) {
+    return character.vertices;
+  }
+
+  final boneCount = skin.boneNames.length;
+  final skinMatrices = Float32List(boneCount * 12);
+  final usable = List<bool>.filled(boneCount, false);
+  final clipFrame = clip.positions[frame];
+  for (var i = 0; i < boneCount; i += 1) {
+    final clipBone = clip.indexOfBone(skin.boneNames[i]);
+    if (clipBone < 0) continue;
+    multiplyMatrices(
+      clipFrame,
+      clipBone * 12,
+      skin.bindInverse,
+      i * 12,
+      skinMatrices,
+      i * 12,
+    );
+    usable[i] = true;
+  }
+
+  final posed = <Vec3>[];
+  for (var v = 0; v < character.vertices.length; v += 1) {
+    final vertex = character.vertices[v];
+    final block = v < skin.vertexSkin.length ? skin.vertexSkin[v] : -1;
+    if (block < 0) {
+      posed.add(vertex);
+      continue;
+    }
+    var x = 0.0;
+    var y = 0.0;
+    var z = 0.0;
+    var total = 0.0;
+    for (var k = 0; k < 4; k += 1) {
+      final base = block * 8 + k * 2;
+      if (base + 1 >= skin.influences.length) break;
+      final weight = skin.influences[base + 1];
+      if (weight <= 0) continue;
+      final bone = skin.influences[base].toInt();
+      if (bone < 0 || bone >= boneCount || !usable[bone]) continue;
+      final moved = transformByMatrix(skinMatrices, bone * 12, vertex);
+      x += moved.x * weight;
+      y += moved.y * weight;
+      z += moved.z * weight;
+      total += weight;
+    }
+    posed.add(total > 0 ? Vec3(x / total, y / total, z / total) : vertex);
+  }
+  return posed;
+}
+
 /// One bone of a rig: a name, and where it hangs.
 class SkeletonBone {
   const SkeletonBone({required this.name, required this.parent});
@@ -8937,7 +9302,7 @@ class SkeletonAnimation {
     ];
 
     final frameList = (json['frames'] as List<dynamic>?) ?? const [];
-    final stride = bones.length * 3;
+    final stride = bones.length * ((json['stride'] as num?)?.toInt() ?? 12);
     final positions = <Float32List>[];
     for (final frame in frameList) {
       final values = frame as List<dynamic>;
@@ -8960,11 +9325,31 @@ class SkeletonAnimation {
 
   final List<SkeletonBone> bones;
 
-  /// One entry per frame, each `bones.length * 3` floats of x, y, z.
+  /// One entry per frame, each `bones.length * 12` floats: a column-major
+  /// 3x4 world matrix per bone. The last three are the bone's position, which
+  /// is all the stick-figure view reads.
   final List<Float32List> positions;
   final double frameRate;
 
   int get frameCount => positions.length;
+
+  /// The world position of one bone in one frame.
+  ({double x, double y, double z}) bonePosition(int frame, int bone) {
+    final values = positions[frame];
+    final base = bone * 12;
+    return (x: values[base + 9], y: values[base + 10], z: values[base + 11]);
+  }
+
+  /// The bone of this rig with the given name, or -1.
+  ///
+  /// Names are how a clip and a character are joined: Synty rigs share them
+  /// exactly, so no mapping table is needed.
+  int indexOfBone(String name) {
+    for (var i = 0; i < bones.length; i += 1) {
+      if (bones[i].name == name) return i;
+    }
+    return -1;
+  }
 
   /// The frame nearest a time in seconds, clamped to the clip.
   int frameAt(double seconds) {
@@ -8981,11 +9366,11 @@ class SkeletonAnimation {
     var minY = double.infinity;
     var maxY = -double.infinity;
     for (final frame in positions) {
-      for (var i = 0; i + 2 < frame.length; i += 3) {
-        minX = math.min(minX, frame[i]);
-        maxX = math.max(maxX, frame[i]);
-        minY = math.min(minY, frame[i + 1]);
-        maxY = math.max(maxY, frame[i + 1]);
+      for (var i = 0; i + 11 < frame.length; i += 12) {
+        minX = math.min(minX, frame[i + 9]);
+        maxX = math.max(maxX, frame[i + 9]);
+        minY = math.min(minY, frame[i + 10]);
+        maxY = math.max(maxY, frame[i + 10]);
       }
     }
     if (!minX.isFinite) return (minX: 0, maxX: 1, minY: 0, maxY: 1);
@@ -9008,6 +9393,7 @@ class MeshModel {
     this.kind = FbxContentKind.mesh,
     this.animationStacks = 0,
     this.skeleton,
+    this.skin,
     this.boneCount = 0,
     this.durationSeconds = 0,
     this.animationNames = const [],
@@ -9070,6 +9456,27 @@ class MeshModel {
   /// The rig and its sampled motion, when the file carries one.
   final SkeletonAnimation? skeleton;
 
+  /// How this mesh's vertices follow that rig, when it is skinned.
+  final SkinBinding? skin;
+
+  /// This mesh with different vertex positions. Everything else is shared,
+  /// so posing a character per frame does not rebuild its materials.
+  MeshModel withVertices(List<Vec3> replacements) => MeshModel(
+    name: name,
+    vertices: replacements,
+    faces: faces,
+    materials: materials,
+    textureFiles: textureFiles,
+    vertexColors: vertexColors,
+    kind: kind,
+    animationStacks: animationStacks,
+    skeleton: skeleton,
+    skin: skin,
+    boneCount: boneCount,
+    durationSeconds: durationSeconds,
+    animationNames: animationNames,
+  );
+
   /// This mesh with its materials replaced. Geometry is untouched.
   MeshModel withMaterials(List<MeshMaterial> replacements) => MeshModel(
     name: name,
@@ -9081,6 +9488,7 @@ class MeshModel {
     kind: kind,
     animationStacks: animationStacks,
     skeleton: skeleton,
+    skin: skin,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -9550,7 +9958,7 @@ class AssetAtlasDatabase {
   ///        file no longer orphans it from projects and ignore flags
   ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
   ///   v5 - referenced_by_model, images a model was found to use
-  static const schemaVersion = 5;
+  static const schemaVersion = 6;
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -9602,6 +10010,14 @@ class AssetAtlasDatabase {
               'ADD COLUMN referenced_by_model INTEGER NOT NULL DEFAULT 0',
             );
           }
+          if (oldVersion < 6) {
+            await db.execute('''
+            CREATE TABLE settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+            ''');
+          }
         },
         onCreate: (db, _) async {
           await db.execute('''
@@ -9642,12 +10058,44 @@ class AssetAtlasDatabase {
               PRIMARY KEY (project_id, asset_id)
             )
           ''');
+          await db.execute('''
+            CREATE TABLE settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+          ''');
           for (final statement in _indexStatements) {
             await db.execute(statement);
           }
         },
       ),
     );
+  }
+
+  /// Reads one setting, or null when it was never written.
+  Future<String?> readSetting(String key) async {
+    await initialize();
+    final rows = await _db!.query(
+      'settings',
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['value'] as String?;
+  }
+
+  /// Writes one setting. A null value clears it.
+  Future<void> writeSetting(String key, String? value) async {
+    await initialize();
+    if (value == null) {
+      await _db!.delete('settings', where: 'key = ?', whereArgs: [key]);
+      return;
+    }
+    await _db!.insert('settings', {
+      'key': key,
+      'value': value,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<PersistedCatalog> loadCatalog() async {
