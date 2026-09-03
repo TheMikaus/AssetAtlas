@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.9.0';
+const appVersion = '1.10.0';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -2653,18 +2653,21 @@ Future<ui.Image?> renderModelThumbnail(
   final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
   if (mesh.isAnimationOnly || mesh.faces.isEmpty) return null;
 
-  final recorder = ui.PictureRecorder();
-  final canvas = Canvas(recorder);
-  MeshPainter(
+  // Same rasteriser as the preview, so a thumbnail matches what you get when
+  // you click it -- including depth-correct overlaps.
+  final raster = rasterizeMesh(
     mesh: mesh,
     yaw: -0.6,
     pitch: 0.35,
     zoom: 1,
+    width: size,
+    height: size,
     renderMode: RenderMode.textured,
     lightingMode: LightingMode.corner,
     cullBackFaces: true,
-  ).paint(canvas, Size(size.toDouble(), size.toDouble()));
-  return recorder.endRecording().toImage(size, size);
+    backgroundArgb: 0x00000000,
+  );
+  return imageFromRaster(raster);
 }
 
 /// Image thumbnails are decoded at tile size, not full size: a 4K texture
@@ -3209,6 +3212,18 @@ class _ModelPreviewState extends State<ModelPreview> {
   LightingMode lightingMode = LightingMode.corner;
   bool cullBackFaces = true;
   bool useNormalMaps = true;
+  bool interacting = false;
+  Timer? _interactionTimer;
+
+  /// Marks the camera as moving, and settles shortly after the last change so
+  /// the view can re-render sharp.
+  void _touchInteraction() {
+    if (!interacting) setState(() => interacting = true);
+    _interactionTimer?.cancel();
+    _interactionTimer = Timer(const Duration(milliseconds: 180), () {
+      if (mounted) setState(() => interacting = false);
+    });
+  }
 
   Future<MeshModel> _loadCurrentMesh() {
     return MeshLoadCache.load(
@@ -3222,6 +3237,12 @@ class _ModelPreviewState extends State<ModelPreview> {
   void initState() {
     super.initState();
     meshFuture = _loadCurrentMesh();
+  }
+
+  @override
+  void dispose() {
+    _interactionTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -3270,6 +3291,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                 Listener(
                   onPointerSignal: (event) {
                     if (event is PointerScrollEvent) {
+                      _touchInteraction();
                       setState(() {
                         zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
                             .clamp(.35, 4)
@@ -3280,6 +3302,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
                     onPanUpdate: (details) {
+                      _touchInteraction();
                       setState(() {
                         yaw += details.delta.dx * .01;
                         pitch = (pitch + details.delta.dy * .01)
@@ -3287,19 +3310,41 @@ class _ModelPreviewState extends State<ModelPreview> {
                             .toDouble();
                       });
                     },
-                    child: CustomPaint(
-                      painter: MeshPainter(
-                        mesh: mesh,
-                        yaw: yaw,
-                        pitch: pitch,
-                        zoom: zoom,
-                        renderMode: renderMode,
-                        uvSetOverride: uvSetOverride,
-                        lightingMode: lightingMode,
-                        cullBackFaces: cullBackFaces,
-                        useNormalMaps: useNormalMaps,
-                      ),
-                      child: Align(
+                    child: Stack(
+                      children: [
+                        Positioned.fill(
+                          // Wireframe is lines only, where per-pixel depth
+                          // buys nothing; everything filled goes through the
+                          // rasteriser so interpenetrating and coplanar faces
+                          // resolve correctly.
+                          child: renderMode == RenderMode.wireframe
+                              ? CustomPaint(
+                                  painter: MeshPainter(
+                                    mesh: mesh,
+                                    yaw: yaw,
+                                    pitch: pitch,
+                                    zoom: zoom,
+                                    renderMode: renderMode,
+                                    uvSetOverride: uvSetOverride,
+                                    lightingMode: lightingMode,
+                                    cullBackFaces: cullBackFaces,
+                                    useNormalMaps: useNormalMaps,
+                                  ),
+                                )
+                              : RasterModelView(
+                                  mesh: mesh,
+                                  yaw: yaw,
+                                  pitch: pitch,
+                                  zoom: zoom,
+                                  renderMode: renderMode,
+                                  lightingMode: lightingMode,
+                                  cullBackFaces: cullBackFaces,
+                                  useNormalMaps: useNormalMaps,
+                                  uvSetOverride: uvSetOverride,
+                                  interacting: interacting,
+                                ),
+                        ),
+                        Align(
                         alignment: Alignment.bottomLeft,
                         child: Container(
                           margin: const EdgeInsets.all(12),
@@ -3330,6 +3375,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                           ),
                         ),
                       ),
+                      ],
                     ),
                   ),
                 ),
@@ -3633,6 +3679,533 @@ class AnimationClipPreview extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Turns a [RasterResult] into an image the widget layer can draw.
+Future<ui.Image> imageFromRaster(RasterResult raster) {
+  final completer = Completer<ui.Image>();
+  ui.decodeImageFromPixels(
+    raster.pixels,
+    raster.width,
+    raster.height,
+    ui.PixelFormat.rgba8888,
+    completer.complete,
+  );
+  return completer.future;
+}
+
+/// Shows a mesh rendered by the depth-buffered rasteriser.
+///
+/// Rasterising costs tens of milliseconds, so while the camera is moving this
+/// renders at half resolution and sharpens once you stop. The previous frame
+/// stays on screen in the meantime rather than flashing empty.
+class RasterModelView extends StatefulWidget {
+  const RasterModelView({
+    required this.mesh,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    required this.useNormalMaps,
+    required this.interacting,
+    this.uvSetOverride,
+    super.key,
+  });
+
+  final MeshModel mesh;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool useNormalMaps;
+
+  /// True while the user is dragging or zooming.
+  final bool interacting;
+  final String? uvSetOverride;
+
+  @override
+  State<RasterModelView> createState() => _RasterModelViewState();
+}
+
+class _RasterModelViewState extends State<RasterModelView> {
+  ui.Image? _image;
+  String? _renderedKey;
+  bool _rendering = false;
+  Size _lastSize = Size.zero;
+
+  @override
+  void dispose() {
+    _image?.dispose();
+    super.dispose();
+  }
+
+  String _keyFor(Size size, double scale) => [
+    identityHashCode(widget.mesh),
+    widget.yaw.toStringAsFixed(4),
+    widget.pitch.toStringAsFixed(4),
+    widget.zoom.toStringAsFixed(4),
+    widget.renderMode.name,
+    widget.lightingMode.name,
+    widget.cullBackFaces,
+    widget.useNormalMaps,
+    widget.uvSetOverride ?? '',
+    size.width.round(),
+    size.height.round(),
+    scale,
+  ].join('|');
+
+  Future<void> _render(Size size) async {
+    if (_rendering || size.isEmpty) return;
+    // Coarse while the camera moves, sharp once it settles.
+    final scale = widget.interacting ? 0.5 : 1.0;
+    final key = _keyFor(size, scale);
+    if (key == _renderedKey) return;
+
+    _rendering = true;
+    try {
+      final width = math.max(1, (size.width * scale).round());
+      final height = math.max(1, (size.height * scale).round());
+      final raster = rasterizeMesh(
+        mesh: widget.mesh,
+        yaw: widget.yaw,
+        pitch: widget.pitch,
+        zoom: widget.zoom,
+        width: width,
+        height: height,
+        renderMode: widget.renderMode,
+        lightingMode: widget.lightingMode,
+        cullBackFaces: widget.cullBackFaces,
+        useNormalMaps: widget.useNormalMaps,
+        uvSetOverride: widget.uvSetOverride,
+      );
+      final image = await imageFromRaster(raster);
+      if (!mounted) {
+        image.dispose();
+        return;
+      }
+      setState(() {
+        _image?.dispose();
+        _image = image;
+        _renderedKey = key;
+      });
+    } finally {
+      _rendering = false;
+    }
+    // The camera may have moved on while this frame was in flight, and a
+    // coarse frame has to be followed by a sharp one once movement stops.
+    if (mounted && _keyFor(size, widget.interacting ? 0.5 : 1.0) != _renderedKey) {
+      unawaited(Future.microtask(() => _render(size)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = Size(constraints.maxWidth, constraints.maxHeight);
+        _lastSize = size;
+        WidgetsBinding.instance.addPostFrameCallback((_) => _render(_lastSize));
+
+        final image = _image;
+        if (image == null) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        return RawImage(
+          image: image,
+          width: size.width,
+          height: size.height,
+          fit: BoxFit.fill,
+          // A half-resolution frame stretched to fit reads better smoothed.
+          filterQuality: FilterQuality.low,
+        );
+      },
+    );
+  }
+}
+
+/// A software rasteriser with a depth buffer.
+///
+/// The canvas painter sorts whole faces by depth and draws them back to front.
+/// That cannot resolve geometry that interpenetrates or sits coplanar — window
+/// frames flush with a wall, roof details flush with a roof — because the
+/// answer differs *within* a face. Those cases showed up as notches and stray
+/// slivers along polygon edges. Depth per pixel is the only thing that fixes
+/// it, so this walks the triangles itself and keeps a z value per pixel.
+///
+/// It also buys two things the canvas path could not do: perspective-correct
+/// texture sampling, and per-pixel normal mapping.
+class RasterResult {
+  const RasterResult({
+    required this.pixels,
+    required this.width,
+    required this.height,
+    required this.drawnFaces,
+    required this.totalFaces,
+  });
+
+  /// RGBA, row major, ready for [ui.decodeImageFromPixels].
+  final Uint8List pixels;
+  final int width;
+  final int height;
+  final int drawnFaces;
+  final int totalFaces;
+
+  bool get capped => drawnFaces < totalFaces;
+}
+
+/// Rasterises [mesh] into an RGBA buffer.
+///
+/// Pure and synchronous so it can run on a worker isolate; nothing here touches
+/// `dart:ui`.
+RasterResult rasterizeMesh({
+  required MeshModel mesh,
+  required double yaw,
+  required double pitch,
+  required double zoom,
+  required int width,
+  required int height,
+  required RenderMode renderMode,
+  required LightingMode lightingMode,
+  required bool cullBackFaces,
+  bool useNormalMaps = true,
+  String? uvSetOverride,
+  int backgroundArgb = 0xffe9edf3,
+  int maxFaces = maxRenderedFaces,
+}) {
+  final pixels = Uint8List(width * height * 4);
+  final depth = Float32List(width * height);
+
+  final bgR = (backgroundArgb >> 16) & 0xff;
+  final bgG = (backgroundArgb >> 8) & 0xff;
+  final bgB = backgroundArgb & 0xff;
+  final bgA = (backgroundArgb >> 24) & 0xff;
+  for (var i = 0; i < pixels.length; i += 4) {
+    pixels[i] = bgR;
+    pixels[i + 1] = bgG;
+    pixels[i + 2] = bgB;
+    pixels[i + 3] = bgA;
+  }
+  // Larger is nearer, so the buffer starts at "infinitely far".
+  depth.fillRange(0, depth.length, -double.infinity);
+
+  final vertexCount = mesh.vertices.length;
+  final screenX = Float32List(vertexCount);
+  final screenY = Float32List(vertexCount);
+  final invW = Float32List(vertexCount);
+  final viewX = Float32List(vertexCount);
+  final viewY = Float32List(vertexCount);
+  final viewZ = Float32List(vertexCount);
+
+  final centerX = width / 2;
+  final centerY = height / 2;
+  final scale = math.min(width, height) * .38 * zoom;
+  final sy = math.sin(yaw);
+  final cy = math.cos(yaw);
+  final sx = math.sin(pitch);
+  final cx = math.cos(pitch);
+
+  for (var i = 0; i < vertexCount; i += 1) {
+    final vertex = mesh.vertices[i];
+    final x1 = vertex.x * cy + vertex.z * sy;
+    final z1 = -vertex.x * sy + vertex.z * cy;
+    final y1 = vertex.y * cx - z1 * sx;
+    final z2 = vertex.y * sx + z1 * cx;
+    final perspective = 2.8 / (2.8 + z2);
+    viewX[i] = x1;
+    viewY[i] = y1;
+    viewZ[i] = z2;
+    invW[i] = perspective;
+    screenX[i] = centerX + x1 * scale * perspective;
+    screenY[i] = centerY - y1 * scale * perspective;
+  }
+
+  // Triangles first, so the face budget counts what is actually drawn.
+  final triangles = <List<int>>[];
+  final triangleFace = <MeshFace>[];
+  for (final face in mesh.faces) {
+    final indices = face.indices;
+    if (indices.length < 3) continue;
+    var valid = true;
+    for (final index in indices) {
+      if (index < 0 || index >= vertexCount) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid) continue;
+    for (var i = 1; i + 1 < indices.length; i += 1) {
+      triangles.add([indices[0], indices[i], indices[i + 1]]);
+      triangleFace.add(face);
+    }
+  }
+
+  // With a depth buffer the drawing order no longer matters, but a budget
+  // still does: keep the nearest triangles when a mesh is enormous.
+  var order = List<int>.generate(triangles.length, (i) => i);
+  if (maxFaces >= 0 && order.length > maxFaces) {
+    final nearest = Float32List(triangles.length);
+    for (var i = 0; i < triangles.length; i += 1) {
+      final t = triangles[i];
+      nearest[i] = math.max(
+        invW[t[0]],
+        math.max(invW[t[1]], invW[t[2]]),
+      );
+    }
+    order.sort((a, b) => nearest[b].compareTo(nearest[a]));
+    order = order.sublist(0, maxFaces);
+  }
+
+  final (lx, ly, lz) = lightingMode == LightingMode.top
+      ? (0.0, 1.0, 0.0)
+      : (-0.45, 0.75, -0.5);
+  final lightDirection = Vec3(lx, ly, lz);
+
+  var drawn = 0;
+  for (final triangleIndex in order) {
+    final tri = triangles[triangleIndex];
+    final face = triangleFace[triangleIndex];
+    final i0 = tri[0], i1 = tri[1], i2 = tri[2];
+
+    final x0 = screenX[i0], y0 = screenY[i0];
+    final x1 = screenX[i1], y1 = screenY[i1];
+    final x2 = screenX[i2], y2 = screenY[i2];
+
+    final area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area == 0) continue;
+    if (cullBackFaces && area < 0) continue;
+    drawn += 1;
+
+    final material =
+        (face.materialIndex >= 0 && face.materialIndex < mesh.materials.length)
+        ? mesh.materials[face.materialIndex]
+        : null;
+    final uvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
+    final hasUvs = uvs.length == 3;
+
+    // Flat lighting for the face, refined per pixel when a normal map is in
+    // play and the face has a UV gradient to build a tangent frame from.
+    final geometricNormal = _rasterFaceNormal(
+      viewX,
+      viewY,
+      viewZ,
+      i0,
+      i1,
+      i2,
+    );
+    final viewTriangle = [
+      Vec3(viewX[i0], viewY[i0], viewZ[i0]),
+      Vec3(viewX[i1], viewY[i1], viewZ[i1]),
+      Vec3(viewX[i2], viewY[i2], viewZ[i2]),
+    ];
+    final faceLight = lightingMode == LightingMode.unlit
+        ? 1.0
+        : faceDiffuseWithNormalMap(
+            geometricNormal: geometricNormal,
+            lightDirection: lightDirection,
+            viewPositions: viewTriangle,
+            uvs: hasUvs ? uvs : const [],
+          );
+
+    final perPixelNormals =
+        useNormalMaps &&
+        lightingMode != LightingMode.unlit &&
+        hasUvs &&
+        material != null &&
+        material.hasNormalMap &&
+        !isDegenerateUvTriangle(uvs);
+
+    final baseColor = mesh.colorForMaterial(
+      face.materialIndex,
+      textured: renderMode == RenderMode.textured,
+    );
+    final vertexTint = mesh.averageFaceVertexColor(face);
+    final opacity = mesh.opacityForMaterial(face.materialIndex);
+
+    final sampleTexture =
+        renderMode == RenderMode.textured &&
+        material != null &&
+        material.texturePixels != null &&
+        hasUvs;
+
+    var minX = math.min(x0, math.min(x1, x2)).floor();
+    var maxX = math.max(x0, math.max(x1, x2)).ceil();
+    var minY = math.min(y0, math.min(y1, y2)).floor();
+    var maxY = math.max(y0, math.max(y1, y2)).ceil();
+    if (minX < 0) minX = 0;
+    if (minY < 0) minY = 0;
+    if (maxX > width - 1) maxX = width - 1;
+    if (maxY > height - 1) maxY = height - 1;
+    if (minX > maxX || minY > maxY) continue;
+
+    final invArea = 1.0 / area;
+    final w0 = invW[i0], w1 = invW[i1], w2 = invW[i2];
+
+    // Everything constant across the face is computed once. Doing this per
+    // pixel (Color.r is a getter returning a double) cost more than the
+    // shading itself.
+    final flatR = (baseColor.r * 255).round();
+    final flatG = (baseColor.g * 255).round();
+    final flatB = (baseColor.b * 255).round();
+    final tintRFixed = ((vertexTint == null ? 1.0 : vertexTint.r) * 256)
+        .toInt();
+    final tintGFixed = ((vertexTint == null ? 1.0 : vertexTint.g) * 256)
+        .toInt();
+    final tintBFixed = ((vertexTint == null ? 1.0 : vertexTint.b) * 256)
+        .toInt();
+    final tinted = vertexTint != null;
+    final opaque = opacity >= 0.999;
+    final inverseOpacity = 1 - opacity;
+
+    // Hoisted into locals: a method call plus field loads per pixel was the
+    // single biggest cost in this loop.
+    final texPixels = sampleTexture ? material.texturePixels : null;
+    final texWidth = material?.textureWidth ?? 0;
+    final texMaxX = texWidth - 1;
+    final texMaxY = (material?.textureHeight ?? 0) - 1;
+    // Light as 8.8 fixed point, so shading is an integer multiply and shift.
+    final lightFixed = (faceLight * 256).toInt();
+
+    final u0w = hasUvs ? uvs[0].x * w0 : 0.0;
+    final v0w = hasUvs ? uvs[0].y * w0 : 0.0;
+    final u1w = hasUvs ? uvs[1].x * w1 : 0.0;
+    final v1w = hasUvs ? uvs[1].y * w1 : 0.0;
+    final u2w = hasUvs ? uvs[2].x * w2 : 0.0;
+    final v2w = hasUvs ? uvs[2].y * w2 : 0.0;
+
+    // Barycentric weights are affine in screen space, so step them instead of
+    // recomputing two edge functions per pixel.
+    final b0dx = (y1 - y2) * invArea;
+    final b1dx = (y2 - y0) * invArea;
+    final b0dy = (x2 - x1) * invArea;
+    final b1dy = (x0 - x2) * invArea;
+
+    final startX = minX + 0.5;
+    final startY = minY + 0.5;
+    var rowB0 =
+        ((x1 - startX) * (y2 - startY) - (x2 - startX) * (y1 - startY)) *
+        invArea;
+    var rowB1 =
+        ((x2 - startX) * (y0 - startY) - (x0 - startX) * (y2 - startY)) *
+        invArea;
+
+    for (var py = minY; py <= maxY; py += 1) {
+      var b0 = rowB0;
+      var b1 = rowB1;
+      var offset = py * width + minX;
+      for (var px = minX; px <= maxX; px += 1, offset += 1) {
+        final b2 = 1.0 - b0 - b1;
+        if (b0 >= 0 && b1 >= 0 && b2 >= 0) {
+          final pixelInvW = b0 * w0 + b1 * w1 + b2 * w2;
+          if (pixelInvW > depth[offset]) {
+            int r = flatR, g = flatG, b = flatB;
+            double u = 0, v = 0;
+            final needsUv = sampleTexture || perPixelNormals;
+            if (needsUv) {
+              u = (b0 * u0w + b1 * u1w + b2 * u2w) / pixelInvW;
+              v = (b0 * v0w + b1 * v1w + b2 * v2w) / pixelInvW;
+            }
+            if (texPixels != null) {
+              var fu = u - u.floorToDouble();
+              var fv = v - v.floorToDouble();
+              if (fu < 0) fu += 1;
+              if (fv < 0) fv += 1;
+              final texelIndex =
+                  (((fv * texMaxY).toInt() * texWidth) +
+                      (fu * texMaxX).toInt()) *
+                  4;
+              if (texelIndex >= 0 && texelIndex + 2 < texPixels.length) {
+                r = texPixels[texelIndex];
+                g = texPixels[texelIndex + 1];
+                b = texPixels[texelIndex + 2];
+              }
+            }
+            if (tinted) {
+              r = (r * tintRFixed) >> 8;
+              g = (g * tintGFixed) >> 8;
+              b = (b * tintBFixed) >> 8;
+            }
+
+            var shade = lightFixed;
+            if (perPixelNormals) {
+              final sampled = material.sampleNormal(Vec2(u, v));
+              if (sampled != null) {
+                shade =
+                    (faceDiffuseWithNormalMap(
+                              geometricNormal: geometricNormal,
+                              lightDirection: lightDirection,
+                              viewPositions: viewTriangle,
+                              uvs: uvs,
+                              sampledNormal: sampled,
+                            ) *
+                            256)
+                        .toInt();
+              }
+            }
+
+            r = (r * shade) >> 8;
+            g = (g * shade) >> 8;
+            b = (b * shade) >> 8;
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+
+            final target = offset * 4;
+            if (opaque) {
+              pixels[target] = r;
+              pixels[target + 1] = g;
+              pixels[target + 2] = b;
+              pixels[target + 3] = 255;
+            } else {
+              // Translucent faces blend with whatever is already there.
+              // Without sorting that is approximate: the documented price of
+              // getting opaque depth right.
+              pixels[target] = (r * opacity + pixels[target] * inverseOpacity)
+                  .toInt();
+              pixels[target + 1] =
+                  (g * opacity + pixels[target + 1] * inverseOpacity).toInt();
+              pixels[target + 2] =
+                  (b * opacity + pixels[target + 2] * inverseOpacity).toInt();
+              pixels[target + 3] = 255;
+            }
+            depth[offset] = pixelInvW;
+          }
+        }
+        b0 += b0dx;
+        b1 += b1dx;
+      }
+      rowB0 += b0dy;
+      rowB1 += b1dy;
+    }
+  }
+
+  return RasterResult(
+    pixels: pixels,
+    width: width,
+    height: height,
+    drawnFaces: drawn,
+    totalFaces: triangles.length,
+  );
+}
+
+Vec3 _rasterFaceNormal(
+  Float32List viewX,
+  Float32List viewY,
+  Float32List viewZ,
+  int i0,
+  int i1,
+  int i2,
+) {
+  final ux = viewX[i1] - viewX[i0];
+  final uy = viewY[i1] - viewY[i0];
+  final uz = viewZ[i1] - viewZ[i0];
+  final vx = viewX[i2] - viewX[i0];
+  final vy = viewY[i2] - viewY[i0];
+  final vz = viewZ[i2] - viewZ[i0];
+  return Vec3(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
 }
 
 class MeshPainter extends CustomPainter {
@@ -7282,6 +7855,27 @@ class MeshMaterial {
     );
   }
 
+  /// Texel at (u, v) packed as 0xRRGGBB, or null when there is nothing to
+  /// sample. Used by the rasteriser's inner loop, where allocating a [Color]
+  /// per pixel would cost more than the shading.
+  int? sampleTextureRgb(double u, double v) {
+    final pixels = texturePixels;
+    if (pixels == null || textureWidth <= 0 || textureHeight <= 0) return null;
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    var x = (fu * (textureWidth - 1)).round();
+    var y = (fv * (textureHeight - 1)).round();
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > textureWidth - 1) x = textureWidth - 1;
+    if (y > textureHeight - 1) y = textureHeight - 1;
+    final index = (y * textureWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return (pixels[index] << 16) | (pixels[index + 1] << 8) | pixels[index + 2];
+  }
+
   /// The colour at [uv], or null when there is nothing to sample.
   Color? sampleTexture(Vec2 uv) {
     final pixels = texturePixels;
@@ -8001,6 +8595,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 

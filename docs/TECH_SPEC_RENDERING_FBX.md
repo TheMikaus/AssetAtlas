@@ -60,6 +60,27 @@ The viewer only offers the toggle when the model actually carries a normal map.
 Note that palette-atlas packs such as Synty ship none: a 60-model sample of the
 reference catalog found zero.
 
+## Depth Buffer
+
+Filled rendering goes through `rasterizeMesh`, a software rasteriser with a
+per-pixel depth buffer, rather than through the canvas painter.
+
+Sorting whole faces and painting back to front cannot resolve geometry whose
+depth order changes *within* a face: interpenetrating surfaces, and the
+coplanar detail that low-poly packs are full of (window frames flush with a
+wall, vents flush with a roof). Those appeared as notches, steps and stray
+slivers along polygon edges. The rasteriser also gives perspective-correct
+texture sampling and per-pixel normal mapping, neither of which the
+triangle-at-a-time canvas path could do.
+
+Wireframe still uses the canvas painter: it draws lines, where per-pixel depth
+buys nothing.
+
+The cost is CPU fill rate. Measured at 900x700 on this content: ~40ms for a
+4,180-face building, ~79ms for a 227-face one (large triangles, so fill-rate
+bound rather than triangle bound). The preview renders at half resolution while
+the camera is moving and re-renders sharp ~180ms after it stops.
+
 ## Rendering Modes
 
 - `Textured`
