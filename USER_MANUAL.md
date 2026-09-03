@@ -29,6 +29,10 @@ including `.git`, `.vs`, `.vscode`, `Intermediate`, `Saved`, and
 Your catalog and source-folder list are stored locally and restored the next
 time AssetAtlas starts.
 
+Scanning runs in the background, so the window stays usable while it works, and
+the **Stop scan** button ends it at any point. A cancelled scan leaves the
+catalog exactly as it was.
+
 ## 3. Browse and Search
 
 The window has three columns: filters and folders on the left, the browse list in

@@ -92,7 +92,16 @@ Type classification is driven by the top-level `const` sets in `lib/main.dart` (
 
 ### Known structural constraints
 
-`lib/main.dart` is a deliberate monolith: UI widgets, scanning, ZIP handling, mesh import, renderer, and the database layer all live there. Scanning and mesh parsing run on the UI thread (moving them to isolates is a standing roadmap item). Prefer adding to the existing structure over speculative refactors unless the task is the refactor.
+`lib/main.dart` is a deliberate monolith: UI widgets, scanning, ZIP handling, mesh import, renderer, and the database layer all live there. Prefer adding to the existing structure over speculative refactors unless the task is the refactor.
+
+Two things now run on worker isolates, and both follow the same rule: **the
+entry point and the launcher must be top-level**. A closure built inside a
+`State` method captures `this`, drags the widget tree into the isolate message,
+and fails with "object is unsendable" — see `runFbxClassifyChunk` and
+`scanWorkerEntry`. Folder scanning goes through `startFolderScan`, which
+returns a `ScanHandle` carrying progress and `cancel()`; FBX classification
+goes through `buildFbxClassifyChunks` + `runFbxClassifyChunk`. Model previews
+and thumbnails still import on the UI isolate, cached by `MeshLoadCache`.
 
 ## Testing
 
