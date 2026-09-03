@@ -56,6 +56,7 @@ struct MaterialInfo {
   std::string shading_model;
   std::vector<std::string> textures;
   std::string normal_texture;
+  std::string emissive_texture;
   std::string uv_set;
   std::vector<uint8_t> embedded_texture;
 };
@@ -346,6 +347,11 @@ int main(int argc, char** argv) {
       if (!normal_texture) normal_texture = material->fbx.bump.texture;
       if (normal_texture) info.normal_texture = texture_path(normal_texture);
     }
+    {
+      ufbx_texture* emissive_texture = material->pbr.emission_color.texture;
+      if (!emissive_texture) emissive_texture = material->fbx.emission_color.texture;
+      if (emissive_texture) info.emissive_texture = texture_path(emissive_texture);
+    }
     add_texture_path(info.textures, material->pbr.emission_color.texture);
     add_texture_path(info.textures, material->fbx.emission_color.texture);
     add_texture_path(info.textures, material->pbr.opacity.texture);
@@ -551,6 +557,8 @@ int main(int argc, char** argv) {
     printf(",\"shaderType\":%d", material.shader_type);
     printf(",\"shadingModel\":");
     print_json_string(material.shading_model.c_str());
+    printf(",\"emissiveTexture\":");
+    print_json_string(material.emissive_texture.c_str());
     printf(",\"normalTexture\":");
     print_json_string(material.normal_texture.c_str());
     printf(",\"uvSet\":");
