@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.1';
+const appVersion = '1.10.2';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3211,7 +3211,10 @@ class _ModelPreviewState extends State<ModelPreview> {
   String? uvSetOverride;
   LightingMode lightingMode = LightingMode.corner;
   bool cullBackFaces = true;
+  bool useBaseTexture = true;
   bool useNormalMaps = true;
+  bool useEmissiveMaps = true;
+  bool useSpecular = true;
   bool interacting = false;
   Timer? _interactionTimer;
 
@@ -3328,6 +3331,8 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     uvSetOverride: uvSetOverride,
                                     lightingMode: lightingMode,
                                     cullBackFaces: cullBackFaces,
+                                    // Wireframe draws no surface, so the
+                                    // shading channels do not apply to it.
                                     useNormalMaps: useNormalMaps,
                                   ),
                                 )
@@ -3339,7 +3344,10 @@ class _ModelPreviewState extends State<ModelPreview> {
                                   renderMode: renderMode,
                                   lightingMode: lightingMode,
                                   cullBackFaces: cullBackFaces,
+                                  useBaseTexture: useBaseTexture,
                                   useNormalMaps: useNormalMaps,
+                                  useEmissiveMaps: useEmissiveMaps,
+                                  useSpecular: useSpecular,
                                   uvSetOverride: uvSetOverride,
                                   interacting: interacting,
                                 ),
@@ -3476,30 +3484,46 @@ class _ModelPreviewState extends State<ModelPreview> {
                       // Only shown when there is a normal map to apply: an
                       // inert control invites the question "why is nothing
                       // happening".
-                      if (mesh.materials.any(
-                        (material) => material.hasNormalMap,
-                      )) ...[
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .9),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.black12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text('Normal map'),
-                              Switch(
+                      if (renderMode == RenderMode.textured) ...[
+                        ShadingChannelPanel(
+                          channels: [
+                            if (mesh.materials.any(
+                              (material) => material.texturePixels != null,
+                            ))
+                              ShadingChannel(
+                                label: 'Base texture',
+                                value: useBaseTexture,
+                                onChanged: (next) =>
+                                    setState(() => useBaseTexture = next),
+                              ),
+                            if (mesh.materials.any(
+                              (material) => material.hasNormalMap,
+                            ))
+                              ShadingChannel(
+                                label: 'Normal map',
                                 value: useNormalMaps,
                                 onChanged: (next) =>
                                     setState(() => useNormalMaps = next),
                               ),
-                            ],
-                          ),
+                            if (mesh.materials.any(
+                              (material) => material.hasEmissiveMap,
+                            ))
+                              ShadingChannel(
+                                label: 'Emissive',
+                                value: useEmissiveMaps,
+                                onChanged: (next) =>
+                                    setState(() => useEmissiveMaps = next),
+                              ),
+                            if (mesh.materials.any(
+                              (material) => material.specularFactor > 0,
+                            ))
+                              ShadingChannel(
+                                label: 'Specular',
+                                value: useSpecular,
+                                onChanged: (next) =>
+                                    setState(() => useSpecular = next),
+                              ),
+                          ],
                         ),
                         const SizedBox(height: 8),
                       ],
@@ -3708,7 +3732,10 @@ class RasterModelView extends StatefulWidget {
     required this.renderMode,
     required this.lightingMode,
     required this.cullBackFaces,
+    required this.useBaseTexture,
     required this.useNormalMaps,
+    required this.useEmissiveMaps,
+    required this.useSpecular,
     required this.interacting,
     this.uvSetOverride,
     super.key,
@@ -3721,7 +3748,10 @@ class RasterModelView extends StatefulWidget {
   final RenderMode renderMode;
   final LightingMode lightingMode;
   final bool cullBackFaces;
+  final bool useBaseTexture;
   final bool useNormalMaps;
+  final bool useEmissiveMaps;
+  final bool useSpecular;
 
   /// True while the user is dragging or zooming.
   final bool interacting;
@@ -3753,7 +3783,10 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.renderMode.name,
     widget.lightingMode.name,
     widget.cullBackFaces,
+    widget.useBaseTexture,
     widget.useNormalMaps,
+    widget.useEmissiveMaps,
+    widget.useSpecular,
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -3794,7 +3827,10 @@ class _RasterModelViewState extends State<RasterModelView> {
         renderMode: widget.renderMode,
         lightingMode: widget.lightingMode,
         cullBackFaces: widget.cullBackFaces,
+        useBaseTexture: widget.useBaseTexture,
         useNormalMaps: widget.useNormalMaps,
+        useEmissiveMaps: widget.useEmissiveMaps,
+        useSpecular: widget.useSpecular,
       );
 
       // Coarse frames are small and wanted immediately; spending an isolate
@@ -4107,7 +4143,10 @@ RasterResult rasterizeMesh({
   required RenderMode renderMode,
   required LightingMode lightingMode,
   required bool cullBackFaces,
+  bool useBaseTexture = true,
   bool useNormalMaps = true,
+  bool useEmissiveMaps = true,
+  bool useSpecular = true,
   String? uvSetOverride,
   int backgroundArgb = 0xffe9edf3,
   int maxFaces = maxRenderedFaces,
@@ -4123,7 +4162,10 @@ RasterResult rasterizeMesh({
       renderMode: renderMode,
       lightingMode: lightingMode,
       cullBackFaces: cullBackFaces,
+      useBaseTexture: useBaseTexture,
       useNormalMaps: useNormalMaps,
+      useEmissiveMaps: useEmissiveMaps,
+      useSpecular: useSpecular,
       backgroundArgb: backgroundArgb,
       maxFaces: maxFaces,
     ),
@@ -4142,7 +4184,10 @@ class RasterRequest {
     required this.renderMode,
     required this.lightingMode,
     required this.cullBackFaces,
+    this.useBaseTexture = true,
     this.useNormalMaps = true,
+    this.useEmissiveMaps = true,
+    this.useSpecular = true,
     this.backgroundArgb = 0xffe9edf3,
     this.maxFaces = maxRenderedFaces,
   });
@@ -4156,7 +4201,16 @@ class RasterRequest {
   final RenderMode renderMode;
   final LightingMode lightingMode;
   final bool cullBackFaces;
+
+  /// The shading channels, each switchable on its own.
+  ///
+  /// Turning one off is how you find out what it was contributing: a model
+  /// that looks wrong with normal maps on and right with them off has a bad
+  /// tangent frame, not a bad texture.
+  final bool useBaseTexture;
   final bool useNormalMaps;
+  final bool useEmissiveMaps;
+  final bool useSpecular;
   final int backgroundArgb;
   final int maxFaces;
 }
@@ -4327,13 +4381,17 @@ RasterResult rasterizeScene(RasterRequest request) {
     // down +z), so the half vector is constant per face and only the normal
     // varies -- cheap enough to afford per pixel when a normal map is active.
     final specularStrength =
-        textured && request.lightingMode != LightingMode.unlit
+        textured &&
+            request.useSpecular &&
+            request.lightingMode != LightingMode.unlit
         ? (material?.specularFactor ?? 0).clamp(0.0, 1.0)
         : 0.0;
     final shininess = material == null
         ? 8.0
         : 4 + (1 - material.roughness.clamp(0.0, 1.0)) * 120;
-    final emissivePixels = textured ? material?.emissivePixels : null;
+    final emissivePixels = textured && request.useEmissiveMaps
+        ? material?.emissivePixels
+        : null;
     final emissiveFactor = material?.emissiveFactor ?? 0;
     final emissiveWidth = material?.emissiveWidth ?? 0;
     // Exporters routinely leave the factor at 0 while still assigning an
@@ -4343,7 +4401,9 @@ RasterResult rasterizeScene(RasterRequest request) {
         ? 1.0
         : emissiveFactor.clamp(0.0, 4.0);
 
-    final texPixels = textured && hasUvs ? material?.texturePixels : null;
+    final texPixels = textured && request.useBaseTexture && hasUvs
+        ? material?.texturePixels
+        : null;
     final texWidth = material?.textureWidth ?? 0;
     final texMaxX = texWidth - 1;
     final texMaxY = (material?.textureHeight ?? 0) - 1;
@@ -5523,7 +5583,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
   /// The mesh itself, so the panel can tell "this material is a flat colour"
   /// apart from "this model's textures are missing". Shares the cached import.
   Future<MeshModel>? _loadMesh() {
-    if (widget.asset.ext != 'fbx') return null;
+    if (!_previewableModelExts.contains(widget.asset.ext)) return null;
     return MeshLoadCache.load(widget.asset, allAssets: widget.allAssets);
   }
 
@@ -5533,7 +5593,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
     final allAssets = widget.allAssets;
     final onActivateAsset = widget.onActivateAsset;
     final nearby = findNearbyTextures(asset, allAssets);
-    if (asset.ext == 'fbx') {
+    if (_previewableModelExts.contains(asset.ext)) {
       return FutureBuilder<MeshModel>(
         future: meshFuture,
         builder: (context, meshSnapshot) => FutureBuilder<
@@ -5565,7 +5625,8 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
                 : 'Texture discovery...',
             message: combined.isEmpty
                 ? 'No texture references and no nearby candidates.'
-                : '${referenced.length} FBX references · ${nearby.length} nearby scanned candidates.',
+                : '${referenced.length} model references · '
+                      '${nearby.length} nearby scanned candidates.',
             entries: combined,
             onActivateAsset: onActivateAsset,
             mesh: snapshot.connectionState == ConnectionState.done
@@ -5612,6 +5673,13 @@ class TextureDiscoveryEntry {
   final AssetItem? jumpAsset;
 }
 
+/// Model formats the preview can import and therefore introspect.
+///
+/// OBJ is here because the parser now keeps `vt` and `usemtl`; before that it
+/// produced geometry with no texture information, so there was nothing for the
+/// discovery panel to say about one.
+const _previewableModelExts = {'fbx', 'obj'};
+
 /// One material, with its resolved texture shown rather than described.
 ///
 /// "Is this model textured?" is a question a swatch answers instantly, and a
@@ -5639,6 +5707,58 @@ String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
     return 'missing: asks for $count $noun, none found$suffix';
   }
   return 'flat colour, no texture$suffix';
+}
+
+/// One switchable shading channel.
+class ShadingChannel {
+  const ShadingChannel({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String label;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+}
+
+/// The per-channel switches over the 3D preview.
+///
+/// Only channels the model actually carries are listed, so the panel is empty
+/// for a flat-colour collision hull and four rows deep for a full PBR-ish
+/// material. Switching one off answers "what is this channel doing?", which
+/// staring at the combined result cannot.
+class ShadingChannelPanel extends StatelessWidget {
+  const ShadingChannelPanel({required this.channels, super.key});
+
+  final List<ShadingChannel> channels;
+
+  @override
+  Widget build(BuildContext context) {
+    if (channels.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: .9),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          for (final channel in channels)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(channel.label),
+                Switch(value: channel.value, onChanged: channel.onChanged),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
 }
 
 class MaterialSummaryRow extends StatelessWidget {
@@ -5863,7 +5983,7 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   AssetItem asset,
   List<AssetItem> allAssets,
 ) async {
-  if (asset.ext != 'fbx') return const [];
+  if (!_previewableModelExts.contains(asset.ext)) return const [];
   textureReferenceScanCount += 1;
   // Shares the import with the 3D preview instead of spawning a second helper.
   final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
@@ -5955,6 +6075,47 @@ String normalizePathKey(String value) {
 // Rebuilding these inside the scorers dominated relink cost.
 final _extensionPattern = RegExp(r'\.[^.]+$');
 final _nonAlphanumericPattern = RegExp(r'[^a-z0-9]+');
+final _texturePrefixPattern = RegExp(r'^(?:t|tx|tex|texture)_');
+/// The marker a download folder adds to a second copy of a file.
+///
+/// Deliberately narrow: a trailing `_01` is part of the name, so only a
+/// number set off by a space or parentheses counts, plus a literal `copy`.
+final _duplicateCopyPattern = RegExp(
+  r'(?:[ ]+[(]?[0-9]{1,2}[)]?|[ _-]*copy)+$',
+);
+
+/// Texture names that mean the same thing rarely spell it the same way.
+///
+/// A model may ask for `PolygonApocalypse_Texture_01_A 1` while its own pack
+/// ships `T_PolygonApocalypse_01`: an exporter prefix, a dropped variant
+/// letter, and a duplicate-copy suffix Windows added on the way through a
+/// download folder. Stripping that noise is what lets the two be compared.
+String stripTextureNameNoise(String base) {
+  var value = base.toLowerCase().trim();
+  value = value.replaceFirst(_texturePrefixPattern, '');
+  value = value.replaceFirst(_duplicateCopyPattern, '');
+  return value.trim();
+}
+
+/// The parts of a texture name that actually distinguish it.
+///
+/// Single characters and the word "texture" are dropped: a variant letter and
+/// a word that appears in most of the library identify nothing on their own.
+/// Numbers are kept, but callers must not treat a shared number as evidence --
+/// a pack is full of `_01`.
+List<String> textureNameTokens(String base) {
+  const generic = {'texture', 'textures', 'tex', 'mat', 'material', 'diffuse'};
+  return [
+    for (final token in stripTextureNameNoise(base).split(_nonAlphanumericPattern))
+      if (token.length > 1 && !generic.contains(token)) token,
+  ];
+}
+
+/// Whether a token carries identity rather than just position in a set.
+bool _isDistinctiveToken(String token) =>
+    token.length >= 4 && !RegExp(r'^[0-9]+$').hasMatch(token);
+
+
 final _pathSeparatorPattern = RegExp(r'[\\/]');
 final _paletteTailPattern = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*');
 
@@ -6156,8 +6317,22 @@ String? findDeterministicTextureRelink(
       value += 80;
     }
 
+    // Nothing above matched by name. Inside one container the art is one
+    // consistent set, so shared distinctive words are real evidence -- but a
+    // shared number alone is not, or every `_01` in the pack would match.
+    if (value == 0) {
+      final requestedTokens = textureNameTokens(requestedBase).toSet();
+      final candidateTokens = textureNameTokens(base).toSet();
+      final shared = requestedTokens.intersection(candidateTokens);
+      if (shared.any(_isDistinctiveToken)) {
+        value += 70 + math.min(30, (shared.length - 1) * 20);
+      }
+    }
+
     final dirLower = parentPath(asset.path).toLowerCase().replaceAll('\\', '/');
     if (dirLower.contains('/textures')) value += 20;
+    // Synty demo packs keep their atlas in Demo_Textures, not Textures.
+    if (dirLower.contains('textures')) value += 5;
 
     final modelDirLower = parentPath(
       modelPath,
@@ -8061,9 +8236,30 @@ String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
   return selected;
 }
 
+/// Parses an OBJ, including the parts the first version threw away.
+///
+/// `vt` lines and the `v/vt/vn` corner references were being dropped, so an
+/// OBJ could never be textured no matter what else resolved -- a Synty barn
+/// carries 12k texture coordinates and arrived with none. `usemtl` splits the
+/// mesh into materials and `mtllib` records the sidecar so the texture
+/// resolver can chase it; an OBJ that names neither still parses, it just gets
+/// one unnamed material.
 MeshModel parseObjMesh(String text, String name) {
   final vertices = <Vec3>[];
+  final texCoords = <Vec2>[];
   final faces = <MeshFace>[];
+  final materialNames = <String>[];
+  final materialLibraries = <String>[];
+  var currentMaterial = 0;
+
+  int? resolveIndex(String token, int count) {
+    final raw = int.tryParse(token);
+    if (raw == null || raw == 0) return null;
+    // OBJ indices are 1-based, and negative counts back from the current end.
+    final index = raw < 0 ? count + raw : raw - 1;
+    return index >= 0 && index < count ? index : null;
+  }
+
   for (final rawLine in text.split(RegExp(r'\r?\n'))) {
     final line = rawLine.trim();
     if (line.startsWith('v ')) {
@@ -8077,27 +8273,102 @@ MeshModel parseObjMesh(String text, String name) {
           ),
         );
       }
+    } else if (line.startsWith('vt ')) {
+      final parts = line.split(RegExp(r'\s+'));
+      if (parts.length >= 3) {
+        // OBJ's V axis points up; the sampler's points down.
+        texCoords.add(
+          Vec2(
+            double.tryParse(parts[1]) ?? 0,
+            1 - (double.tryParse(parts[2]) ?? 0),
+          ),
+        );
+      }
+    } else if (line.startsWith('mtllib ')) {
+      final library = line.substring(7).trim();
+      if (library.isNotEmpty && !materialLibraries.contains(library)) {
+        materialLibraries.add(library);
+      }
+    } else if (line.startsWith('usemtl ')) {
+      final material = line.substring(7).trim();
+      final existing = materialNames.indexOf(material);
+      if (existing >= 0) {
+        currentMaterial = existing;
+      } else {
+        materialNames.add(material);
+        currentMaterial = materialNames.length - 1;
+      }
     } else if (line.startsWith('f ')) {
       final indices = <int>[];
+      final uvs = <Vec2?>[];
       for (final token in line.substring(2).trim().split(RegExp(r'\s+'))) {
-        final rawIndex = int.tryParse(token.split('/').first);
-        if (rawIndex == null) continue;
-        indices.add(rawIndex < 0 ? vertices.length + rawIndex : rawIndex - 1);
+        final fields = token.split('/');
+        final vertexIndex = resolveIndex(fields.first, vertices.length);
+        if (vertexIndex == null) continue;
+        indices.add(vertexIndex);
+        // The middle field is the texture coordinate; "v//vn" leaves it empty.
+        final uvIndex = fields.length > 1 && fields[1].isNotEmpty
+            ? resolveIndex(fields[1], texCoords.length)
+            : null;
+        uvs.add(uvIndex == null ? null : texCoords[uvIndex]);
       }
-      _addTriangulatedFace(indices, faces);
+      _addTriangulatedFace(indices, faces, uvs: uvs, material: currentMaterial);
     }
   }
   if (vertices.isEmpty || faces.isEmpty) {
     throw const FormatException('No OBJ geometry found.');
   }
-  return MeshModel.normalized(name: name, vertices: vertices, faces: faces);
+
+  final materials = [
+    for (final materialName in materialNames)
+      MeshMaterial(
+        name: materialName,
+        color: const Color(0xffb9c2cc),
+        textures: const [],
+      ),
+  ];
+  return MeshModel.normalized(
+    name: name,
+    vertices: vertices,
+    faces: faces,
+    materials: materials.isEmpty
+        ? const [
+            MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: []),
+          ]
+        : materials,
+    textureFiles: materialLibraries,
+  );
 }
 
-void _addTriangulatedFace(List<int> indices, List<MeshFace> faces) {
-  final clean = indices.where((index) => index >= 0).toList();
-  if (clean.length < 3) return;
-  for (var i = 1; i < clean.length - 1; i += 1) {
-    faces.add(MeshFace([clean[0], clean[i], clean[i + 1]]));
+void _addTriangulatedFace(
+  List<int> indices,
+  List<MeshFace> faces, {
+  List<Vec2?> uvs = const [],
+  int material = 0,
+}) {
+  if (indices.length < 3) return;
+  // A fan from the first corner. The UVs have to be fanned the same way, and
+  // a partly-textured polygon contributes none rather than a mix.
+  for (var i = 1; i < indices.length - 1; i += 1) {
+    final corners = [0, i, i + 1];
+    final faceUvs = <Vec2>[];
+    if (uvs.length == indices.length) {
+      for (final corner in corners) {
+        final uv = uvs[corner];
+        if (uv == null) {
+          faceUvs.clear();
+          break;
+        }
+        faceUvs.add(uv);
+      }
+    }
+    faces.add(
+      MeshFace(
+        [indices[0], indices[i], indices[i + 1]],
+        material,
+        faceUvs.length == 3 ? faceUvs : const [],
+      ),
+    );
   }
 }
 
@@ -8128,6 +8399,8 @@ class MeshModel {
     required List<Vec3> vertices,
     required List<MeshFace> faces,
     List<Color> vertexColors = const [],
+    List<MeshMaterial> materials = const [],
+    List<String> textureFiles = const [],
   }) {
     var minX = double.infinity;
     var minY = double.infinity;
@@ -8167,6 +8440,8 @@ class MeshModel {
           .toList(),
       faces: faces,
       vertexColors: vertexColors,
+      materials: materials,
+      textureFiles: textureFiles,
     );
   }
 
@@ -9135,6 +9410,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
