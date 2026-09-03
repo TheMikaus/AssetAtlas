@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.3';
+const appVersion = '1.10.4';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -1278,7 +1278,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 canGoBack: canGoBackInHistory,
                 canGoForward: canGoForwardInHistory,
                 onScan: chooseAndScan,
-            onCancelScan: cancelScan,
+                onCancelScan: cancelScan,
                 onSaveProject: saveProjectSnapshot,
                 onLoadProject: loadProjectSnapshot,
                 onCopySelected: copySelected,
@@ -3299,132 +3299,156 @@ class _ModelPreviewState extends State<ModelPreview> {
             if (mesh.isAnimationOnly) {
               return AnimationClipPreview(mesh: mesh);
             }
-            return Stack(
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Listener(
-                  onPointerSignal: (event) {
-                    if (event is PointerScrollEvent) {
-                      _touchInteraction();
-                      setState(() {
-                        zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
-                            .clamp(.35, 4)
-                            .toDouble();
-                      });
-                    }
-                  },
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanUpdate: (details) {
-                      _touchInteraction();
-                      setState(() {
-                        yaw += details.delta.dx * .01;
-                        pitch = (pitch + details.delta.dy * .01)
-                            .clamp(-1.45, 1.45)
-                            .toDouble();
-                      });
-                    },
-                    child: Stack(
-                      children: [
-                        Positioned.fill(
-                          // Wireframe is lines only, where per-pixel depth
-                          // buys nothing; everything filled goes through the
-                          // rasteriser so interpenetrating and coplanar faces
-                          // resolve correctly.
-                          child: renderMode == RenderMode.wireframe
-                              ? CustomPaint(
-                                  painter: MeshPainter(
-                                    mesh: mesh,
-                                    yaw: yaw,
-                                    pitch: pitch,
-                                    zoom: zoom,
-                                    renderMode: renderMode,
-                                    uvSetOverride: uvSetOverride,
-                                    lightingMode: lightingMode,
-                                    cullBackFaces: cullBackFaces,
-                                    // Wireframe draws no surface, so the
-                                    // shading channels do not apply to it.
-                                    useNormalMaps: useNormalMaps,
-                                  ),
-                                )
-                              : RasterModelView(
-                                  mesh: mesh,
-                                  yaw: yaw,
-                                  pitch: pitch,
-                                  zoom: zoom,
-                                  renderMode: renderMode,
-                                  lightingMode: lightingMode,
-                                  cullBackFaces: cullBackFaces,
-                                  useBaseTexture: useBaseTexture,
-                                  useNormalMaps: useNormalMaps,
-                                  useEmissiveMaps: useEmissiveMaps,
-                                  useSpecular: useSpecular,
-                                  uvSetOverride: uvSetOverride,
-                                  interacting: interacting,
-                                ),
+                // The controls used to float over the model, which put
+                // them exactly where you want to look. A real bar above
+                // the viewport costs a little height and covers nothing.
+                ModelToolbarBar(
+                  children: [
+                    SegmentedButton<RenderMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: RenderMode.textured,
+                          label: Text('Textured'),
                         ),
-                        Align(
-                        alignment: Alignment.bottomLeft,
-                        child: Container(
-                          margin: const EdgeInsets.all(12),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .86),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Builder(
-                            builder: (context) {
-                              final total = mesh.faces.length;
-                              final capped = total > maxRenderedFaces;
-                              final summary =
-                                  '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
-                              if (!capped) return Text(summary);
-                              return Text(
-                                '$summary · face cap: showing '
-                                '$maxRenderedFaces nearest',
-                                style: const TextStyle(
-                                  color: Color(0xffb3540a),
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              );
-                            },
-                          ),
+                        ButtonSegment(
+                          value: RenderMode.solid,
+                          label: Text('Solid'),
                         ),
-                      ),
+                        ButtonSegment(
+                          value: RenderMode.wireframe,
+                          label: Text('Wireframe'),
+                        ),
                       ],
+                      selected: {renderMode},
+                      onSelectionChanged: (selection) {
+                        if (selection.isEmpty) return;
+                        setState(() => renderMode = selection.first);
+                      },
                     ),
-                  ),
-                ),
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      SegmentedButton<RenderMode>(
-                        segments: const [
-                          ButtonSegment(
-                            value: RenderMode.textured,
-                            label: Text('Textured'),
-                          ),
-                          ButtonSegment(
-                            value: RenderMode.solid,
-                            label: Text('Solid'),
-                          ),
-                          ButtonSegment(
-                            value: RenderMode.wireframe,
-                            label: Text('Wireframe'),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Light'),
+                          const SizedBox(width: 8),
+                          DropdownButtonHideUnderline(
+                            child: DropdownButton<LightingMode>(
+                              value: lightingMode,
+                              isDense: true,
+                              items: const [
+                                DropdownMenuItem(
+                                  value: LightingMode.corner,
+                                  child: Text('Corner'),
+                                ),
+                                DropdownMenuItem(
+                                  value: LightingMode.top,
+                                  child: Text('Top'),
+                                ),
+                                DropdownMenuItem(
+                                  value: LightingMode.unlit,
+                                  child: Text('Unlit'),
+                                ),
+                              ],
+                              onChanged: (next) {
+                                if (next == null) return;
+                                setState(() => lightingMode = next);
+                              },
+                            ),
                           ),
                         ],
-                        selected: {renderMode},
-                        onSelectionChanged: (selection) {
-                          if (selection.isEmpty) return;
-                          setState(() => renderMode = selection.first);
-                        },
                       ),
-                      const SizedBox(height: 8),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Hide back faces'),
+                          Switch(
+                            value: cullBackFaces,
+                            onChanged: (next) =>
+                                setState(() => cullBackFaces = next),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // Only shown when there is a normal map to apply: an
+                    // inert control invites the question "why is nothing
+                    // happening".
+                    if (renderMode == RenderMode.textured) ...[
+                      TexturePickerButton(
+                        candidates: findNearbyTextures(
+                          widget.asset,
+                          widget.allAssets,
+                        ),
+                        chosenPath: chosenTexturePath,
+                        onChosen: (path) => setState(() {
+                          chosenTexturePath = path;
+                          meshFuture = _loadCurrentMesh();
+                        }),
+                      ),
+                      ShadingChannelPanel(
+                        channels: [
+                          if (mesh.materials.any(
+                            (material) => material.texturePixels != null,
+                          ))
+                            ShadingChannel(
+                              label: 'Base texture',
+                              value: useBaseTexture,
+                              onChanged: (next) =>
+                                  setState(() => useBaseTexture = next),
+                            ),
+                          if (mesh.materials.any(
+                            (material) => material.hasNormalMap,
+                          ))
+                            ShadingChannel(
+                              label: 'Normal map',
+                              value: useNormalMaps,
+                              onChanged: (next) =>
+                                  setState(() => useNormalMaps = next),
+                            ),
+                          if (mesh.materials.any(
+                            (material) => material.hasEmissiveMap,
+                          ))
+                            ShadingChannel(
+                              label: 'Emissive',
+                              value: useEmissiveMaps,
+                              onChanged: (next) =>
+                                  setState(() => useEmissiveMaps = next),
+                            ),
+                          if (mesh.materials.any(
+                            (material) => material.specularFactor > 0,
+                          ))
+                            ShadingChannel(
+                              label: 'Specular',
+                              value: useSpecular,
+                              onChanged: (next) =>
+                                  setState(() => useSpecular = next),
+                            ),
+                        ],
+                      ),
+                    ],
+                    if (mesh.availableUvSets.length > 1) ...[
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 10,
@@ -3438,199 +3462,30 @@ class _ModelPreviewState extends State<ModelPreview> {
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Text('Light'),
+                            const Text('UV set'),
                             const SizedBox(width: 8),
                             DropdownButtonHideUnderline(
-                              child: DropdownButton<LightingMode>(
-                                value: lightingMode,
+                              child: DropdownButton<String>(
+                                value: uvSetOverride ?? '',
                                 isDense: true,
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: LightingMode.corner,
-                                    child: Text('Corner'),
+                                items: [
+                                  const DropdownMenuItem(
+                                    value: '',
+                                    child: Text('Material default'),
                                   ),
-                                  DropdownMenuItem(
-                                    value: LightingMode.top,
-                                    child: Text('Top'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: LightingMode.unlit,
-                                    child: Text('Unlit'),
+                                  ...mesh.availableUvSets.map(
+                                    (name) => DropdownMenuItem(
+                                      value: name,
+                                      child: Text(name),
+                                    ),
                                   ),
                                 ],
                                 onChanged: (next) {
-                                  if (next == null) return;
-                                  setState(() => lightingMode = next);
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: .9),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.black12),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Text('Hide back faces'),
-                            Switch(
-                              value: cullBackFaces,
-                              onChanged: (next) =>
-                                  setState(() => cullBackFaces = next),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      // Only shown when there is a normal map to apply: an
-                      // inert control invites the question "why is nothing
-                      // happening".
-                      if (renderMode == RenderMode.textured) ...[
-                        TexturePickerButton(
-                          candidates: findNearbyTextures(
-                            widget.asset,
-                            widget.allAssets,
-                          ),
-                          chosenPath: chosenTexturePath,
-                          onChosen: (path) => setState(() {
-                            chosenTexturePath = path;
-                            meshFuture = _loadCurrentMesh();
-                          }),
-                        ),
-                        const SizedBox(height: 8),
-                        ShadingChannelPanel(
-                          channels: [
-                            if (mesh.materials.any(
-                              (material) => material.texturePixels != null,
-                            ))
-                              ShadingChannel(
-                                label: 'Base texture',
-                                value: useBaseTexture,
-                                onChanged: (next) =>
-                                    setState(() => useBaseTexture = next),
-                              ),
-                            if (mesh.materials.any(
-                              (material) => material.hasNormalMap,
-                            ))
-                              ShadingChannel(
-                                label: 'Normal map',
-                                value: useNormalMaps,
-                                onChanged: (next) =>
-                                    setState(() => useNormalMaps = next),
-                              ),
-                            if (mesh.materials.any(
-                              (material) => material.hasEmissiveMap,
-                            ))
-                              ShadingChannel(
-                                label: 'Emissive',
-                                value: useEmissiveMaps,
-                                onChanged: (next) =>
-                                    setState(() => useEmissiveMaps = next),
-                              ),
-                            if (mesh.materials.any(
-                              (material) => material.specularFactor > 0,
-                            ))
-                              ShadingChannel(
-                                label: 'Specular',
-                                value: useSpecular,
-                                onChanged: (next) =>
-                                    setState(() => useSpecular = next),
-                              ),
-                          ],
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                      if (mesh.availableUvSets.length > 1) ...[
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .9),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.black12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text('UV set'),
-                              const SizedBox(width: 8),
-                              DropdownButtonHideUnderline(
-                                child: DropdownButton<String>(
-                                  value: uvSetOverride ?? '',
-                                  isDense: true,
-                                  items: [
-                                    const DropdownMenuItem(
-                                      value: '',
-                                      child: Text('Material default'),
-                                    ),
-                                    ...mesh.availableUvSets.map(
-                                      (name) => DropdownMenuItem(
-                                        value: name,
-                                        child: Text(name),
-                                      ),
-                                    ),
-                                  ],
-                                  onChanged: (next) {
-                                    setState(() {
-                                      uvSetOverride = switch (next) {
-                                        null || '' => null,
-                                        _ => next,
-                                      };
-                                    });
-                                  },
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: .9),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.black12),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Text('Fallback'),
-                            const SizedBox(width: 8),
-                            DropdownButtonHideUnderline(
-                              child: DropdownButton<int>(
-                                value: checkerSquareSize,
-                                isDense: true,
-                                items: const [4, 8, 16, 32, 64]
-                                    .map(
-                                      (size) => DropdownMenuItem<int>(
-                                        value: size,
-                                        child: Text('${size}px square'),
-                                      ),
-                                    )
-                                    .toList(),
-                                onChanged: (next) {
-                                  if (next == null ||
-                                      next == checkerSquareSize) {
-                                    return;
-                                  }
                                   setState(() {
-                                    checkerSquareSize = next;
-                                    meshFuture = _loadCurrentMesh();
+                                    uvSetOverride = switch (next) {
+                                      null || '' => null,
+                                      _ => next,
+                                    };
                                   });
                                 },
                               ),
@@ -3639,6 +3494,145 @@ class _ModelPreviewState extends State<ModelPreview> {
                         ),
                       ),
                     ],
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Fallback'),
+                          const SizedBox(width: 8),
+                          DropdownButtonHideUnderline(
+                            child: DropdownButton<int>(
+                              value: checkerSquareSize,
+                              isDense: true,
+                              items: const [4, 8, 16, 32, 64]
+                                  .map(
+                                    (size) => DropdownMenuItem<int>(
+                                      value: size,
+                                      child: Text('${size}px square'),
+                                    ),
+                                  )
+                                  .toList(),
+                              onChanged: (next) {
+                                if (next == null || next == checkerSquareSize) {
+                                  return;
+                                }
+                                setState(() {
+                                  checkerSquareSize = next;
+                                  meshFuture = _loadCurrentMesh();
+                                });
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                Expanded(
+                  child: Listener(
+                    onPointerSignal: (event) {
+                      if (event is PointerScrollEvent) {
+                        _touchInteraction();
+                        setState(() {
+                          zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
+                              .clamp(.35, 4)
+                              .toDouble();
+                        });
+                      }
+                    },
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onPanUpdate: (details) {
+                        _touchInteraction();
+                        setState(() {
+                          yaw += details.delta.dx * .01;
+                          pitch = (pitch + details.delta.dy * .01)
+                              .clamp(-1.45, 1.45)
+                              .toDouble();
+                        });
+                      },
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            // Wireframe is lines only, where per-pixel depth
+                            // buys nothing; everything filled goes through the
+                            // rasteriser so interpenetrating and coplanar faces
+                            // resolve correctly.
+                            child: renderMode == RenderMode.wireframe
+                                ? CustomPaint(
+                                    painter: MeshPainter(
+                                      mesh: mesh,
+                                      yaw: yaw,
+                                      pitch: pitch,
+                                      zoom: zoom,
+                                      renderMode: renderMode,
+                                      uvSetOverride: uvSetOverride,
+                                      lightingMode: lightingMode,
+                                      cullBackFaces: cullBackFaces,
+                                      // Wireframe draws no surface, so the
+                                      // shading channels do not apply to it.
+                                      useNormalMaps: useNormalMaps,
+                                    ),
+                                  )
+                                : RasterModelView(
+                                    mesh: mesh,
+                                    yaw: yaw,
+                                    pitch: pitch,
+                                    zoom: zoom,
+                                    renderMode: renderMode,
+                                    lightingMode: lightingMode,
+                                    cullBackFaces: cullBackFaces,
+                                    useBaseTexture: useBaseTexture,
+                                    useNormalMaps: useNormalMaps,
+                                    useEmissiveMaps: useEmissiveMaps,
+                                    useSpecular: useSpecular,
+                                    uvSetOverride: uvSetOverride,
+                                    interacting: interacting,
+                                  ),
+                          ),
+                          Align(
+                            alignment: Alignment.bottomLeft,
+                            child: Container(
+                              margin: const EdgeInsets.all(12),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: .86),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Builder(
+                                builder: (context) {
+                                  final total = mesh.faces.length;
+                                  final capped = total > maxRenderedFaces;
+                                  final summary =
+                                      '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
+                                  if (!capped) return Text(summary);
+                                  return Text(
+                                    '$summary · face cap: showing '
+                                    '$maxRenderedFaces nearest',
+                                    style: const TextStyle(
+                                      color: Color(0xffb3540a),
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ],
@@ -3829,7 +3823,8 @@ class _RasterModelViewState extends State<RasterModelView> {
 
       // Flattening the mesh is the expensive part of setup, so keep it per
       // mesh rather than per frame.
-      final sceneKey = '${identityHashCode(widget.mesh)}|'
+      final sceneKey =
+          '${identityHashCode(widget.mesh)}|'
           '${widget.uvSetOverride ?? ''}';
       if (_scene == null || _sceneKey != sceneKey) {
         _scene = RasterScene.fromMesh(
@@ -3876,7 +3871,8 @@ class _RasterModelViewState extends State<RasterModelView> {
     }
     // The camera may have moved on while this frame was in flight, and a
     // coarse frame has to be followed by a sharp one once movement stops.
-    if (mounted && _keyFor(size, widget.interacting ? 0.5 : 1.0) != _renderedKey) {
+    if (mounted &&
+        _keyFor(size, widget.interacting ? 0.5 : 1.0) != _renderedKey) {
       unawaited(Future.microtask(() => _render(size)));
     }
   }
@@ -3995,7 +3991,8 @@ class RasterScene {
       if (!valid) continue;
 
       final material =
-          (face.materialIndex >= 0 && face.materialIndex < mesh.materials.length)
+          (face.materialIndex >= 0 &&
+              face.materialIndex < mesh.materials.length)
           ? mesh.materials[face.materialIndex]
           : null;
       final uvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
@@ -4014,9 +4011,12 @@ class RasterScene {
         triTint.add(packedTint);
         if (hasUv && i == 1) {
           triUvs.addAll([
-            uvs[0].x, uvs[0].y,
-            uvs[1].x, uvs[1].y,
-            uvs[2].x, uvs[2].y,
+            uvs[0].x,
+            uvs[0].y,
+            uvs[1].x,
+            uvs[1].y,
+            uvs[2].x,
+            uvs[2].y,
           ]);
           triHasUv.add(1);
         } else {
@@ -4711,6 +4711,7 @@ class MeshPainter extends CustomPainter {
       batchPositions.clear();
       batchColors.clear();
     }
+
     final edgePaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
@@ -5380,6 +5381,10 @@ class AssetDetailsPanel extends StatelessWidget {
                   ? item.relativePath
                   : parentPath(item.path),
               isPath: true,
+              // The details panel is narrow and these paths are long. Two
+              // lines cut a zip entry path down to something unreadable;
+              // four fits the ones that actually occur.
+              pathMaxLines: 4,
             ),
             DetailRow(label: 'Size', value: formatBytes(item.size)),
             DetailRow(
@@ -5467,10 +5472,7 @@ class CopyablePathText extends StatelessWidget {
   /// Inserts zero-width spaces after path separators so a long path can wrap
   /// at folder boundaries instead of being stuck on one line.
   static String breakableAtSeparators(String value) =>
-      value.replaceAllMapped(
-        RegExp(r'[\\/]'),
-        (match) => '${match[0]}\u200b',
-      );
+      value.replaceAllMapped(RegExp(r'[\\/]'), (match) => '${match[0]}\u200b');
 
   @override
   Widget build(BuildContext context) {
@@ -5522,6 +5524,7 @@ class DetailRow extends StatelessWidget {
     required this.label,
     required this.value,
     this.isPath = false,
+    this.pathMaxLines = 2,
     super.key,
   });
 
@@ -5530,6 +5533,9 @@ class DetailRow extends StatelessWidget {
 
   /// Render the value as a hoverable, copyable path.
   final bool isPath;
+
+  /// How many lines a path may use before it is trimmed from the front.
+  final int pathMaxLines;
 
   @override
   Widget build(BuildContext context) {
@@ -5548,7 +5554,11 @@ class DetailRow extends StatelessWidget {
               ),
             ),
           ),
-          Expanded(child: isPath ? CopyablePathText(path: value) : Text(value)),
+          Expanded(
+            child: isPath
+                ? CopyablePathText(path: value, maxLines: pathMaxLines)
+                : Text(value),
+          ),
         ],
       ),
     );
@@ -5618,45 +5628,46 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
     if (_previewableModelExts.contains(asset.ext)) {
       return FutureBuilder<MeshModel>(
         future: meshFuture,
-        builder: (context, meshSnapshot) => FutureBuilder<
-          List<TextureDiscoveryEntry>
-        >(
-        future: referencesFuture,
-        builder: (context, snapshot) {
-          final referenced = snapshot.data ?? const <TextureDiscoveryEntry>[];
-          final pathKeys = referenced
-              .where((entry) => entry.copyPath.isNotEmpty)
-              .map((entry) => normalizePathKey(entry.copyPath))
-              .toSet();
-          final nearbyEntries = nearby
-              .where(
-                (texture) => !pathKeys.contains(normalizePathKey(texture.path)),
-              )
-              .map(
-                (texture) => TextureDiscoveryEntry(
-                  label: texture.relativePath,
-                  copyPath: texture.path,
-                  jumpAsset: texture,
-                ),
-              )
-              .toList();
-          final combined = [...referenced, ...nearbyEntries];
-          return TextureDiscoveryBox(
-            title: snapshot.connectionState == ConnectionState.done
-                ? 'Texture discovery'
-                : 'Texture discovery...',
-            message: combined.isEmpty
-                ? 'No texture references and no nearby candidates.'
-                : '${referenced.length} model references · '
-                      '${nearby.length} nearby scanned candidates.',
-            entries: combined,
-            onActivateAsset: onActivateAsset,
-            mesh: snapshot.connectionState == ConnectionState.done
-                ? meshSnapshot.data
-                : null,
-          );
-        },
-        ),
+        builder: (context, meshSnapshot) =>
+            FutureBuilder<List<TextureDiscoveryEntry>>(
+              future: referencesFuture,
+              builder: (context, snapshot) {
+                final referenced =
+                    snapshot.data ?? const <TextureDiscoveryEntry>[];
+                final pathKeys = referenced
+                    .where((entry) => entry.copyPath.isNotEmpty)
+                    .map((entry) => normalizePathKey(entry.copyPath))
+                    .toSet();
+                final nearbyEntries = nearby
+                    .where(
+                      (texture) =>
+                          !pathKeys.contains(normalizePathKey(texture.path)),
+                    )
+                    .map(
+                      (texture) => TextureDiscoveryEntry(
+                        label: texture.relativePath,
+                        copyPath: texture.path,
+                        jumpAsset: texture,
+                      ),
+                    )
+                    .toList();
+                final combined = [...referenced, ...nearbyEntries];
+                return TextureDiscoveryBox(
+                  title: snapshot.connectionState == ConnectionState.done
+                      ? 'Texture discovery'
+                      : 'Texture discovery...',
+                  message: combined.isEmpty
+                      ? 'No texture references and no nearby candidates.'
+                      : '${referenced.length} model references · '
+                            '${nearby.length} nearby scanned candidates.',
+                  entries: combined,
+                  onActivateAsset: onActivateAsset,
+                  mesh: snapshot.connectionState == ConnectionState.done
+                      ? meshSnapshot.data
+                      : null,
+                );
+              },
+            ),
       );
     }
     return TextureDiscoveryBox(
@@ -5775,9 +5786,7 @@ class TexturePickerButton extends StatelessWidget {
         children: [
           Flexible(
             child: Text(
-              chosenName == null
-                  ? 'Texture: auto'
-                  : 'Texture: $chosenName',
+              chosenName == null ? 'Texture: auto' : 'Texture: $chosenName',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -5808,6 +5817,34 @@ class TexturePickerButton extends StatelessWidget {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// The strip of controls above the 3D viewport.
+///
+/// These used to float over the model in the top-right corner, which is where
+/// a model's head usually is. Wrapping keeps every control reachable at any
+/// panel width instead of running off the edge.
+class ModelToolbarBar extends StatelessWidget {
+  const ModelToolbarBar({required this.children, super.key});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0xfff4f6fa),
+        border: Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: children,
       ),
     );
   }
@@ -6180,6 +6217,7 @@ String normalizePathKey(String value) {
 final _extensionPattern = RegExp(r'\.[^.]+$');
 final _nonAlphanumericPattern = RegExp(r'[^a-z0-9]+');
 final _texturePrefixPattern = RegExp(r'^(?:t|tx|tex|texture)_');
+
 /// The marker a download folder adds to a second copy of a file.
 ///
 /// Deliberately narrow: a trailing `_01` is part of the name, so only a
@@ -6210,7 +6248,9 @@ String stripTextureNameNoise(String base) {
 List<String> textureNameTokens(String base) {
   const generic = {'texture', 'textures', 'tex', 'mat', 'material', 'diffuse'};
   return [
-    for (final token in stripTextureNameNoise(base).split(_nonAlphanumericPattern))
+    for (final token in stripTextureNameNoise(
+      base,
+    ).split(_nonAlphanumericPattern))
       if (token.length > 1 && !generic.contains(token)) token,
   ];
 }
@@ -6219,6 +6259,45 @@ List<String> textureNameTokens(String base) {
 bool _isDistinctiveToken(String token) =>
     token.length >= 4 && !RegExp(r'^[0-9]+$').hasMatch(token);
 
+/// Words that name which *channel* a texture is, not what it depicts.
+const _textureChannelWords = {
+  'emissive',
+  'emission',
+  'glow',
+  'normal',
+  'normals',
+  'bump',
+  'specular',
+  'spec',
+  'gloss',
+  'roughness',
+  'metallic',
+  'metalness',
+  'occlusion',
+  'opacity',
+  'alpha',
+  'height',
+  'displacement',
+};
+
+/// The channel a texture name declares itself to be, or the empty string.
+String textureChannelWord(String base) {
+  for (final token in textureNameTokens(base)) {
+    if (_textureChannelWords.contains(token)) return token;
+  }
+  return '';
+}
+
+/// Whether two texture names describe the same channel.
+///
+/// `PolygonApocalypse_Emissive_01` and `PolygonApocalypse_01` share every
+/// distinctive word they have, so word overlap alone would bind an emissive
+/// slot to the base atlas -- and an emissive map added at full strength over
+/// its own base colour washes a model out to grey. A name that declares a
+/// channel may only match one that declares the same channel, and a name that
+/// declares none may only match another that declares none.
+bool textureChannelsAgree(String requestedBase, String candidateBase) =>
+    textureChannelWord(requestedBase) == textureChannelWord(candidateBase);
 
 final _pathSeparatorPattern = RegExp(r'[\\/]');
 final _paletteTailPattern = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*');
@@ -6424,7 +6503,7 @@ String? findDeterministicTextureRelink(
     // Nothing above matched by name. Inside one container the art is one
     // consistent set, so shared distinctive words are real evidence -- but a
     // shared number alone is not, or every `_01` in the pack would match.
-    if (value == 0) {
+    if (value == 0 && textureChannelsAgree(requestedBase, base)) {
       final requestedTokens = textureNameTokens(requestedBase).toSet();
       final candidateTokens = textureNameTokens(base).toSet();
       final shared = requestedTokens.intersection(candidateTokens);
@@ -6467,22 +6546,23 @@ String? findDeterministicTextureRelink(
 
   // Nothing good enough beside the model. The reference may legitimately point
   // at another pack, so try that, on the stricter rules above.
-  final crossContainer = [
-    for (final asset in allAssets)
-      if (textureExts.contains(asset.ext) && !sameContainer(asset))
-        if (canRelinkAcrossContainers(
-          texturePath: texturePath,
-          candidatePath: asset.path,
-          requestedBase: requestedBase,
-          candidateBase: asset.name.toLowerCase().replaceAll(
-            _extensionPattern,
-            '',
-          ),
-        ))
-          asset,
-  ]..sort(
-    (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
-  );
+  final crossContainer =
+      [
+        for (final asset in allAssets)
+          if (textureExts.contains(asset.ext) && !sameContainer(asset))
+            if (canRelinkAcrossContainers(
+              texturePath: texturePath,
+              candidatePath: asset.path,
+              requestedBase: requestedBase,
+              candidateBase: asset.name.toLowerCase().replaceAll(
+                _extensionPattern,
+                '',
+              ),
+            ))
+              asset,
+      ]..sort(
+        (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+      );
   if (crossContainer.isNotEmpty) return crossContainer.first.path;
   return null;
 }
@@ -7671,13 +7751,7 @@ Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
   }
 
   final materials = mesh.materials.isEmpty
-      ? [
-          const MeshMaterial(
-            name: '',
-            color: Color(0xffb9c2cc),
-            textures: [],
-          ),
-        ]
+      ? [const MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
       : mesh.materials;
   return mesh.withMaterials([
     for (final material in materials)
@@ -8469,9 +8543,7 @@ MeshModel parseObjMesh(String text, String name) {
     vertices: vertices,
     faces: faces,
     materials: materials.isEmpty
-        ? const [
-            MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: []),
-          ]
+        ? const [MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
         : materials,
     textureFiles: materialLibraries,
   );
@@ -8911,6 +8983,7 @@ class MeshMaterial {
       pixels[index + 2],
     );
   }
+
   final double opacity;
   final double roughness;
   final double metalness;
@@ -9017,9 +9090,8 @@ class AssetItem {
 
   /// Name, path and tags folded to lowercase once, on first use. Search
   /// used to lowercase all three for every asset on every keystroke.
-  String get searchText =>
-      _searchText ??=
-          '$name\u0000$relativePath\u0000${tags.join(' ')}'.toLowerCase();
+  String get searchText => _searchText ??=
+      '$name\u0000$relativePath\u0000${tags.join(' ')}'.toLowerCase();
 }
 
 class ScanResult {
@@ -9413,11 +9485,7 @@ class AssetAtlasDatabase {
       final batch = txn.batch();
       for (final id in assetIds) {
         batch.delete('catalog_assets', where: 'id = ?', whereArgs: [id]);
-        batch.delete(
-          'project_assets',
-          where: 'asset_id = ?',
-          whereArgs: [id],
-        );
+        batch.delete('project_assets', where: 'asset_id = ?', whereArgs: [id]);
       }
       await batch.commit(noResult: true);
     });
@@ -9603,15 +9671,4 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
-
-
-
-
-
-
-
-
-
-
-
 
