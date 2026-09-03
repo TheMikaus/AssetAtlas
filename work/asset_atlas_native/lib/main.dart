@@ -13,6 +13,7 @@ import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
@@ -51,7 +52,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.4';
+const appVersion = '1.10.5';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -1310,8 +1311,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           }
                         });
                       },
-                      onTypeChanged: (value) =>
-                          setState(() => typeFilter = value),
+                      onTypeChanged: (value) => setState(() {
+                        typeFilter = value;
+                        // A query typed against one type almost never means
+                        // anything against the next, and leaving it set makes
+                        // the new type look empty.
+                        searchController.clear();
+                        _onSearchChanged('');
+                      }),
                       onModelTextureFilterChanged: (value) {
                         setState(() {
                           modelTextureFilter = value;
@@ -3647,6 +3654,189 @@ class _ModelPreviewState extends State<ModelPreview> {
 /// Shown for an FBX that carries a skeleton and curves but no geometry. There
 /// is nothing to draw, so report what the file actually holds instead of
 /// showing an import error.
+/// Draws one pose of a rig: a line from every bone to its parent.
+///
+/// The bounds come from the whole clip rather than the current frame, so the
+/// figure does not breathe in and out as it plays.
+class SkeletonPainter extends CustomPainter {
+  SkeletonPainter({
+    required this.skeleton,
+    required this.frame,
+    required this.yaw,
+  });
+
+  final SkeletonAnimation skeleton;
+  final int frame;
+
+  /// Rotation about the vertical axis, in radians.
+  final double yaw;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (frame < 0 || frame >= skeleton.frameCount) return;
+    final positions = skeleton.positions[frame];
+    final bounds = skeleton.bounds;
+
+    final spanX = math.max(bounds.maxX - bounds.minX, 0.001);
+    final spanY = math.max(bounds.maxY - bounds.minY, 0.001);
+    // Depth rotates into x, so reserve the wider of the two for the scale.
+    final scale =
+        math.min(size.width / math.max(spanX, spanY), size.height / spanY) *
+        0.82;
+    final centerX = (bounds.minX + bounds.maxX) / 2;
+    final centerY = (bounds.minY + bounds.maxY) / 2;
+    final sinYaw = math.sin(yaw);
+    final cosYaw = math.cos(yaw);
+
+    Offset project(int bone) {
+      final x = positions[bone * 3] - centerX;
+      final y = positions[bone * 3 + 1] - centerY;
+      final z = positions[bone * 3 + 2];
+      final rotated = x * cosYaw + z * sinYaw;
+      return Offset(
+        size.width / 2 + rotated * scale,
+        size.height / 2 - y * scale,
+      );
+    }
+
+    final bonePaint = Paint()
+      ..color = const Color(0xff2f3a4a)
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round;
+    final jointPaint = Paint()..color = const Color(0xff4c7fd4);
+
+    for (var i = 0; i < skeleton.bones.length; i += 1) {
+      final parent = skeleton.bones[i].parent;
+      final point = project(i);
+      if (parent >= 0 && parent < skeleton.bones.length) {
+        canvas.drawLine(project(parent), point, bonePaint);
+      }
+      canvas.drawCircle(point, 2.2, jointPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant SkeletonPainter oldDelegate) =>
+      oldDelegate.frame != frame ||
+      oldDelegate.yaw != yaw ||
+      !identical(oldDelegate.skeleton, skeleton);
+}
+
+/// Plays a clip's rig: drag to turn, scrub to a frame, or let it run.
+class SkeletonPlayer extends StatefulWidget {
+  const SkeletonPlayer({required this.skeleton, super.key});
+
+  final SkeletonAnimation skeleton;
+
+  @override
+  State<SkeletonPlayer> createState() => _SkeletonPlayerState();
+}
+
+class _SkeletonPlayerState extends State<SkeletonPlayer>
+    with SingleTickerProviderStateMixin {
+  late final Ticker _ticker;
+  Duration _elapsed = Duration.zero;
+  bool _playing = true;
+  double _yaw = 0.4;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker((elapsed) {
+      if (!_playing) return;
+      setState(() => _elapsed = elapsed);
+    })..start();
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  int get _frame {
+    final count = widget.skeleton.frameCount;
+    if (count <= 1) return 0;
+    final rate = widget.skeleton.frameRate <= 0
+        ? 30.0
+        : widget.skeleton.frameRate;
+    // Loop: a locomotion clip is meant to be watched repeatedly.
+    return ((_elapsed.inMicroseconds / 1e6) * rate).floor() % count;
+  }
+
+  /// Parks playback on one frame. Scrubbing implies pausing.
+  void _seek(int frame) {
+    final rate = widget.skeleton.frameRate <= 0
+        ? 30.0
+        : widget.skeleton.frameRate;
+    setState(() {
+      _playing = false;
+      _elapsed = Duration(microseconds: (frame / rate * 1e6).round());
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final skeleton = widget.skeleton;
+    final frame = _frame;
+    return Column(
+      children: [
+        Expanded(
+          child: GestureDetector(
+            onHorizontalDragUpdate: (details) =>
+                setState(() => _yaw += details.delta.dx * 0.01),
+            child: CustomPaint(
+              painter: SkeletonPainter(
+                skeleton: skeleton,
+                frame: frame,
+                yaw: _yaw,
+              ),
+              child: const SizedBox.expand(),
+            ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: _playing ? 'Pause' : 'Play',
+                icon: Icon(_playing ? Icons.pause : Icons.play_arrow),
+                onPressed: () => setState(() {
+                  if (_playing) {
+                    _playing = false;
+                  } else {
+                    // Resume from where the scrub left off rather than
+                    // jumping back to whatever the ticker has counted to.
+                    _playing = true;
+                  }
+                }),
+              ),
+              Expanded(
+                child: Slider(
+                  value: frame.toDouble(),
+                  max: math.max(1, skeleton.frameCount - 1).toDouble(),
+                  divisions: math.max(1, skeleton.frameCount - 1),
+                  label: 'Frame $frame',
+                  onChanged: (value) => _seek(value.round()),
+                ),
+              ),
+              SizedBox(
+                width: 96,
+                child: Text(
+                  '${frame + 1} / ${skeleton.frameCount}',
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class AnimationClipPreview extends StatelessWidget {
   const AnimationClipPreview({required this.mesh, super.key});
 
@@ -3659,6 +3849,23 @@ class AnimationClipPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final skeleton = mesh.skeleton;
+    if (skeleton != null) {
+      return Column(
+        children: [
+          Expanded(child: SkeletonPlayer(skeleton: skeleton)),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Text(
+              '${skeleton.bones.length} bones · $_duration · '
+              '${mesh.animationNames.join(", ")}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ),
+        ],
+      );
+    }
     return Center(
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
@@ -5689,6 +5896,67 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
   }
 }
 
+/// A texture reference, with the file name kept readable.
+///
+/// These are long -- a zip entry path runs to a hundred characters -- and the
+/// panel is narrow, so a single ellipsised line showed the folders and cut off
+/// the one part that identifies the file. The name goes on its own line and
+/// the folders sit under it, dimmed, wrapping if there is room.
+class TextureEntryLabel extends StatelessWidget {
+  const TextureEntryLabel({
+    required this.label,
+    required this.linked,
+    super.key,
+  });
+
+  final String label;
+
+  /// Whether this points at an asset the panel can jump to.
+  final bool linked;
+
+  @override
+  Widget build(BuildContext context) {
+    final (folder, name) = splitTextureLabel(label);
+    final linkColor = Theme.of(context).colorScheme.primary;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontWeight: FontWeight.w600,
+            color: linked ? linkColor : Colors.black87,
+            decoration: linked ? TextDecoration.underline : TextDecoration.none,
+          ),
+        ),
+        if (folder.isNotEmpty)
+          Text(
+            folder,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11, color: Colors.black45),
+          ),
+      ],
+    );
+  }
+}
+
+/// Splits a texture reference into (folders, file name).
+///
+/// Handles the arrow form the resolver writes ("asked -> found") by keeping
+/// the resolved side, and the trailing marker it adds ("(missing)") by leaving
+/// it on the name, where it is the point.
+(String, String) splitTextureLabel(String label) {
+  var value = label.trim();
+  final arrow = value.lastIndexOf(' -> ');
+  if (arrow >= 0) value = value.substring(arrow + 4).trim();
+  final separator = value.lastIndexOf(RegExp(r'[\\/]'));
+  if (separator < 0) return ('', value);
+  return (value.substring(0, separator), value.substring(separator + 1));
+}
+
 class TextureDiscoveryEntry {
   const TextureDiscoveryEntry({
     required this.label,
@@ -6062,18 +6330,9 @@ class TextureDiscoveryBox extends StatelessWidget {
                           : () => onActivateAsset(entry.jumpAsset!),
                       child: Padding(
                         padding: const EdgeInsets.symmetric(vertical: 6),
-                        child: Text(
-                          entry.label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: entry.jumpAsset == null
-                                ? Colors.black87
-                                : Theme.of(context).colorScheme.primary,
-                            decoration: entry.jumpAsset == null
-                                ? TextDecoration.none
-                                : TextDecoration.underline,
-                          ),
+                        child: TextureEntryLabel(
+                          label: entry.label,
+                          linked: entry.jumpAsset != null,
                         ),
                       ),
                     ),
@@ -7472,6 +7731,20 @@ List<String> inferTags(
   return {type, ext, ...words.take(8)}.toList();
 }
 
+/// Whether two assets live in the same archive, or under the same scan root.
+///
+/// The bound on "nearby": inside one pack the art is one set, across packs it
+/// is a coincidence of naming.
+bool _shareARoot(AssetItem a, AssetItem b) {
+  final zipA = parseZipVirtualPath(a.path);
+  final zipB = parseZipVirtualPath(b.path);
+  if (zipA != null || zipB != null) {
+    if (zipA == null || zipB == null) return false;
+    return normalizePathKey(zipA.zipPath) == normalizePathKey(zipB.zipPath);
+  }
+  return normalizePathKey(a.sourceRoot) == normalizePathKey(b.sourceRoot);
+}
+
 List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
   final modelDir = parentPath(model.path);
   final modelParent = parentPath(modelDir);
@@ -7493,6 +7766,16 @@ List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
     if (textureDir == '$modelGrandParent${Platform.pathSeparator}Textures') {
       return true;
     }
+
+    // Any folder whose name says "texture", anywhere under the same root.
+    // Matching the literal folder `Textures` missed `Demo_Textures`, which is
+    // where the Synty animation pack keeps the only atlas its character has --
+    // so the picker offered nothing for exactly the model that needed it.
+    final directoryName = textureDir.split(RegExp(r'[\\/]')).last.toLowerCase();
+    if (directoryName.contains('texture') && _shareARoot(model, asset)) {
+      return true;
+    }
+
     final lowerPath = asset.path.toLowerCase().replaceAll('\\', '/');
     if (lowerPath.contains('/textures/')) {
       final textureTokens = asset.name
@@ -7891,6 +8174,9 @@ Future<MeshModel> meshModelFromImporterJson(
       faces: const [],
       kind: FbxContentKind.animation,
       animationStacks: (json['animationStacks'] as num?)?.toInt() ?? 0,
+      skeleton: SkeletonAnimation.fromJson(
+        json['skeleton'] as Map<String, dynamic>?,
+      ),
       boneCount: (json['bones'] as num?)?.toInt() ?? 0,
       durationSeconds: (json['durationSeconds'] as num?)?.toDouble() ?? 0,
       animationNames: names,
@@ -7971,6 +8257,13 @@ Future<MeshModel> meshModelFromImporterJson(
         return Color.fromARGB(a, r, g, b);
       })
       .toList();
+  if (vertexColorSetIsUnusable(vertexColors)) {
+    fbxLog(
+      'Discarding ${vertexColors.length} vertex colors for $name: the whole '
+      'set is black or fully transparent, which would render the mesh black.',
+    );
+    vertexColors.clear();
+  }
   final nonWhiteVertexColors = vertexColors.where((color) {
     final r = (color.r * 255).round().clamp(0, 255);
     final g = (color.g * 255).round().clamp(0, 255);
@@ -8581,6 +8874,125 @@ void _addTriangulatedFace(
   }
 }
 
+/// Whether a vertex-colour set should be thrown away rather than applied.
+///
+/// Vertex colours multiply the shaded surface, so a set that is entirely black
+/// -- or entirely transparent -- renders the whole mesh black however well its
+/// textures resolved. No asset means that. It is what an exporter writes when
+/// it emits a colour layer nothing ever filled in:
+/// `PolygonSyntyCharacter.fbx` ships 14,688 vertex colours of (0, 0, 0, 0).
+///
+/// Deliberately all-or-nothing. Genuinely black *parts* of a model are real
+/// art; a uniformly black set is not.
+bool vertexColorSetIsUnusable(List<Color> colors) {
+  if (colors.isEmpty) return false;
+  var allBlack = true;
+  var allTransparent = true;
+  for (final color in colors) {
+    if ((color.r * 255).round() > 2 ||
+        (color.g * 255).round() > 2 ||
+        (color.b * 255).round() > 2) {
+      allBlack = false;
+    }
+    if ((color.a * 255).round() > 2) allTransparent = false;
+    if (!allBlack && !allTransparent) return false;
+  }
+  return true;
+}
+
+/// One bone of a rig: a name, and where it hangs.
+class SkeletonBone {
+  const SkeletonBone({required this.name, required this.parent});
+
+  final String name;
+
+  /// Index into the owning [SkeletonAnimation.bones], or -1 for a root.
+  final int parent;
+}
+
+/// A rig and the motion sampled onto it.
+///
+/// Positions only, in world space, one sample per frame. That is everything a
+/// stick-figure preview draws, and it means no curve evaluation or parent
+/// composition happens in Dart -- ufbx did both when the file was imported.
+class SkeletonAnimation {
+  const SkeletonAnimation({
+    required this.bones,
+    required this.positions,
+    required this.frameRate,
+  });
+
+  /// Reads the `skeleton` object the importer emits. Null when absent.
+  static SkeletonAnimation? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final boneList = (json['bones'] as List<dynamic>?) ?? const [];
+    if (boneList.isEmpty) return null;
+
+    final bones = [
+      for (final entry in boneList)
+        SkeletonBone(
+          name: ((entry as Map<String, dynamic>)['name'] ?? '').toString(),
+          parent: (entry['parent'] as num?)?.toInt() ?? -1,
+        ),
+    ];
+
+    final frameList = (json['frames'] as List<dynamic>?) ?? const [];
+    final stride = bones.length * 3;
+    final positions = <Float32List>[];
+    for (final frame in frameList) {
+      final values = frame as List<dynamic>;
+      // A frame that does not match the bone count cannot be indexed safely.
+      if (values.length != stride) continue;
+      final packed = Float32List(stride);
+      for (var i = 0; i < stride; i += 1) {
+        packed[i] = (values[i] as num).toDouble();
+      }
+      positions.add(packed);
+    }
+    if (positions.isEmpty) return null;
+
+    return SkeletonAnimation(
+      bones: bones,
+      positions: positions,
+      frameRate: (json['frameRate'] as num?)?.toDouble() ?? 30,
+    );
+  }
+
+  final List<SkeletonBone> bones;
+
+  /// One entry per frame, each `bones.length * 3` floats of x, y, z.
+  final List<Float32List> positions;
+  final double frameRate;
+
+  int get frameCount => positions.length;
+
+  /// The frame nearest a time in seconds, clamped to the clip.
+  int frameAt(double seconds) {
+    if (frameCount <= 1 || frameRate <= 0) return 0;
+    final index = (seconds * frameRate).round();
+    return index.clamp(0, frameCount - 1);
+  }
+
+  /// The axis-aligned bounds of every frame, so the view does not rescale as
+  /// the clip plays.
+  ({double minX, double maxX, double minY, double maxY}) get bounds {
+    var minX = double.infinity;
+    var maxX = -double.infinity;
+    var minY = double.infinity;
+    var maxY = -double.infinity;
+    for (final frame in positions) {
+      for (var i = 0; i + 2 < frame.length; i += 3) {
+        minX = math.min(minX, frame[i]);
+        maxX = math.max(maxX, frame[i]);
+        minY = math.min(minY, frame[i + 1]);
+        maxY = math.max(maxY, frame[i + 1]);
+      }
+    }
+    if (!minX.isFinite) return (minX: 0, maxX: 1, minY: 0, maxY: 1);
+    return (minX: minX, maxX: maxX, minY: minY, maxY: maxY);
+  }
+}
+
 /// What an FBX turned out to contain. A file with a skeleton and curves but no
 /// geometry is a legitimate asset, not an import failure.
 enum FbxContentKind { mesh, animation }
@@ -8595,6 +9007,7 @@ class MeshModel {
     this.vertexColors = const [],
     this.kind = FbxContentKind.mesh,
     this.animationStacks = 0,
+    this.skeleton,
     this.boneCount = 0,
     this.durationSeconds = 0,
     this.animationNames = const [],
@@ -8654,6 +9067,9 @@ class MeshModel {
     );
   }
 
+  /// The rig and its sampled motion, when the file carries one.
+  final SkeletonAnimation? skeleton;
+
   /// This mesh with its materials replaced. Geometry is untouched.
   MeshModel withMaterials(List<MeshMaterial> replacements) => MeshModel(
     name: name,
@@ -8664,6 +9080,7 @@ class MeshModel {
     vertexColors: vertexColors,
     kind: kind,
     animationStacks: animationStacks,
+    skeleton: skeleton,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,

@@ -86,7 +86,15 @@ Within one container the scoring also falls back to shared *words*: `stripTextur
 
 A material that named textures and resolved none is reported as such (`MeshMaterial.texturesMissing`, `materialSummaryLine`) rather than as "flat colour" — the two look identical on screen and mean opposite things. When nothing resolves at all, `TexturePickerButton` lets the user apply any scanned nearby texture by hand; `applyChosenTexture` puts it on every material and is deliberately *not* cached, since it is the user's choice rather than anything the file said.
 
+**Vertex colours.** They multiply the shaded surface, so a set that is entirely black — or entirely transparent — renders the whole mesh black however well its textures resolved. That is what an exporter writes for a colour layer nothing filled in: `PolygonSyntyCharacter.fbx` ships 14,688 vertex colours of `(0,0,0,0)`. `vertexColorSetIsUnusable` discards such a set at import. Deliberately all-or-nothing — black *parts* of a model are real art.
+
 **OBJ.** `parseObjMesh` keeps `vt` (flipping V — OBJ counts up, the sampler counts down), the `v/vt/vn` corner references, `usemtl` (which splits faces between materials) and `mtllib`. It used to keep none of that, so an OBJ could never be textured whatever else resolved. A corner with no texture coordinate makes the whole triangle untextured rather than half-textured. OBJ is in `_previewableModelExts`, so it reaches the texture discovery panel too.
+
+### Animation
+
+An FBX with a skeleton and no geometry is `FbxContentKind.animation`. The importer emits a `skeleton` object alongside the counts: the bone hierarchy once (`name` + `parent`, resolved to an index, `-1` for a root) and then the **world position of every bone at each sampled frame**, at 30fps capped to 120 frames. Positions rather than transforms because that is all a stick-figure preview draws; `ufbx_evaluate_scene` composes the hierarchy, so no curve evaluation or parent composition happens in Dart. `SkeletonAnimation.fromJson` reads it, `SkeletonPlayer` plays it, `SkeletonPainter` draws a line from each bone to its parent. Bounds come from the whole clip, not the current frame, or the figure breathes as it plays.
+
+The Synty rig is `Root / Hips / Spine_01..03 / Clavicle_L,R / Hand_L,R / IndexFinger_01..04 / Thumb_01..`, and the character files use the **same names as the clips** — so retargeting a clip onto a character is an exact name lookup, no mapping table. Skinning is not implemented: `ufbx_get_skin_vertex_matrix` would supply the per-vertex blended matrix if it is, so the remaining work is emitting weights and a per-frame vertex pass, not writing the blend maths.
 
 ### Catalog and persistence
 
