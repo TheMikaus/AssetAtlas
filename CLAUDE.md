@@ -94,7 +94,15 @@ A material that named textures and resolved none is reported as such (`MeshMater
 
 An FBX with a skeleton and no geometry is `FbxContentKind.animation`. The importer emits a `skeleton` object alongside the counts: the bone hierarchy once (`name` + `parent`, resolved to an index, `-1` for a root) and then the **world position of every bone at each sampled frame**, at 30fps capped to 120 frames. Positions rather than transforms because that is all a stick-figure preview draws; `ufbx_evaluate_scene` composes the hierarchy, so no curve evaluation or parent composition happens in Dart. `SkeletonAnimation.fromJson` reads it, `SkeletonPlayer` plays it, `SkeletonPainter` draws a line from each bone to its parent. Bounds come from the whole clip, not the current frame, or the figure breathes as it plays.
 
-The Synty rig is `Root / Hips / Spine_01..03 / Clavicle_L,R / Hand_L,R / IndexFinger_01..04 / Thumb_01..`, and the character files use the **same names as the clips** — so retargeting a clip onto a character is an exact name lookup, no mapping table. Skinning is not implemented: `ufbx_get_skin_vertex_matrix` would supply the per-vertex blended matrix if it is, so the remaining work is emitting weights and a per-frame vertex pass, not writing the blend maths.
+A frame is `bones * 12` floats — a column-major 3x4 world matrix per bone, whose last column is the position. Positions alone were enough for the stick figure but skinning needs the rotation.
+
+**Skinning.** A skinned mesh also emits a `skin` object (bone names, a `bindInverse` 3x4 per bone, four `(bone, weight)` pairs per skinned vertex, and a per-emitted-vertex index into that table) plus its own rest pose as a one-frame `skeleton`. `bindInverse` is `geometry_to_bone` composed with the inverse of the mesh's `geometry_to_world`, because the emitted vertices are already in world space — without that second term a posed character lands in the wrong place. `poseSkinnedVertices` blends `clipBoneWorld * bindInverse` per vertex.
+
+The join between a clip and a character is the **bone name**: the Synty rig is `Root / Hips / Spine_01..03 / Clavicle_L,R / Hand_L,R / IndexFinger_01..04 / Thumb_01..` and the character files use the same names, so no mapping table is needed. A bone the clip lacks contributes nothing and the vertex keeps its bind position rather than collapsing to the origin.
+
+The check that matters is the **identity test**: posing a character with its own rest skeleton must reproduce its vertices. It does, to 7e-6. Any future change to the matrix conventions should be validated that way before trusting a screenshot.
+
+`AnimationCharacter` (settings key `animation.character.path`, schema v6 `settings` table) holds the model clips play on; `AnimationCharacterButton` sets it, and only appears for a mesh that actually has skin weights.
 
 ### Catalog and persistence
 

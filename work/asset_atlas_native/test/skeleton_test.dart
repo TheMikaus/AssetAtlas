@@ -2,17 +2,29 @@ import 'package:asset_atlas_native/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+/// A bone's world transform: identity basis, then the position.
+///
+/// Frames carry full 3x4 matrices rather than bare positions, because skinning
+/// needs the rotation too; the position is the last column.
+List<double> _bone(double x, double y, double z) => [
+  1, 0, 0, //
+  0, 1, 0,
+  0, 0, 1,
+  x, y, z,
+];
+
 /// Two bones, three frames, the tip rising each frame.
 Map<String, dynamic> _clip() => <String, dynamic>{
   'bones': [
     {'name': 'Root', 'parent': -1},
     {'name': 'Hips', 'parent': 0},
   ],
+  'stride': 12,
   'frameRate': 30.0,
   'frames': [
-    [0, 0, 0, 0, 1, 0],
-    [0, 0, 0, 0, 2, 0],
-    [0, 0, 0, 0, 3, 0],
+    [..._bone(0, 0, 0), ..._bone(0, 1, 0)],
+    [..._bone(0, 0, 0), ..._bone(0, 2, 0)],
+    [..._bone(0, 0, 0), ..._bone(0, 3, 0)],
   ],
 };
 
@@ -27,15 +39,20 @@ void main() {
       expect(skeleton.frameRate, 30);
     });
 
-    test('packs each frame as bones * 3 floats', () {
+    test('packs each frame as bones * 12 floats', () {
       final skeleton = SkeletonAnimation.fromJson(_clip())!;
-      expect(skeleton.positions.first, hasLength(6));
-      expect(skeleton.positions[2][4], 3);
+      expect(skeleton.positions.first, hasLength(24));
+    });
+
+    test('the position is the matrix translation', () {
+      final skeleton = SkeletonAnimation.fromJson(_clip())!;
+      expect(skeleton.bonePosition(2, 1).y, 3);
+      expect(skeleton.bonePosition(0, 0).y, 0);
     });
 
     test('drops a frame whose length does not match the bone count', () {
       final json = _clip();
-      (json['frames'] as List).add([0, 0, 0]);
+      (json['frames'] as List<List<double>>).add(<double>[0, 0, 0]);
       final skeleton = SkeletonAnimation.fromJson(json)!;
       expect(
         skeleton.frameCount,
@@ -58,6 +75,14 @@ void main() {
       final json = _clip();
       json['bones'] = <dynamic>[];
       expect(SkeletonAnimation.fromJson(json), isNull);
+    });
+  });
+
+  group('indexOfBone', () {
+    test('finds a bone by name, which is how a clip meets a character', () {
+      final skeleton = SkeletonAnimation.fromJson(_clip())!;
+      expect(skeleton.indexOfBone('Hips'), 1);
+      expect(skeleton.indexOfBone('NotInThisRig'), -1);
     });
   });
 
@@ -104,9 +129,7 @@ void main() {
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(body: AnimationClipPreview(mesh: mesh)),
-        ),
+        MaterialApp(home: Scaffold(body: AnimationClipPreview(mesh: mesh))),
       );
       expect(find.byType(SkeletonPlayer), findsOneWidget);
       expect(find.byType(Slider), findsOneWidget);
@@ -117,19 +140,17 @@ void main() {
     ) async {
       final mesh = MeshModel(
         name: 'A_Idle.fbx',
-        vertices: [],
-        faces: [],
+        vertices: const [],
+        faces: const [],
         kind: FbxContentKind.animation,
         animationStacks: 1,
         boneCount: 52,
         durationSeconds: 1.5,
-        animationNames: ['A_Idle'],
+        animationNames: const ['A_Idle'],
       );
 
       await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(body: AnimationClipPreview(mesh: mesh)),
-        ),
+        MaterialApp(home: Scaffold(body: AnimationClipPreview(mesh: mesh))),
       );
       expect(find.byType(SkeletonPlayer), findsNothing);
       expect(find.text('Animation clip'), findsOneWidget);
