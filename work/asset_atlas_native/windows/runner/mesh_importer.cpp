@@ -97,6 +97,106 @@ static std::string string_from_ufbx(ufbx_string value) {
   return std::string(value.data, value.length);
 }
 
+// How many poses to sample out of a clip.
+//
+// A preview only has to read as motion, and every frame costs a full scene
+// evaluation plus 3 floats per bone in the JSON. 30 per second up to 120 keeps
+// a two-second locomotion clip whole and bounds a long one.
+static const double kSkeletonSampleRate = 30.0;
+static const size_t kMaxSkeletonFrames = 120;
+
+// Emits the skeleton and its motion: the bone hierarchy once, then the world
+// position of every bone at each sampled time.
+//
+// Positions rather than transforms because that is all a stick-figure preview
+// draws -- a line from each bone to its parent. ufbx evaluates the whole
+// hierarchy, so no curve interpolation or parent composition happens here.
+static void print_skeleton(ufbx_scene* scene, double duration) {
+  std::vector<ufbx_node*> bones;
+  for (size_t i = 0; i < scene->nodes.count; ++i) {
+    ufbx_node* node = scene->nodes.data[i];
+    if (!node || node->is_root) continue;
+    if (node->bone || node->attrib_type == UFBX_ELEMENT_BONE) {
+      bones.push_back(node);
+    }
+  }
+  // A rig exported without bone attributes still has the hierarchy; fall back
+  // to every non-root node so such a file is not silently empty.
+  if (bones.empty()) {
+    for (size_t i = 0; i < scene->nodes.count; ++i) {
+      ufbx_node* node = scene->nodes.data[i];
+      if (node && !node->is_root) bones.push_back(node);
+    }
+  }
+
+  printf(",\"skeleton\":{\"bones\":[");
+  for (size_t i = 0; i < bones.size(); ++i) {
+    if (i) putchar(0x2C);
+    printf("{\"name\":");
+    print_json_string(string_from_ufbx(bones[i]->name).c_str());
+    // Index into this same list, or -1 for a root. Resolved here because the
+    // consumer would otherwise have to match names a second time.
+    int parent_index = -1;
+    const ufbx_node* parent = bones[i]->parent;
+    if (parent) {
+      for (size_t j = 0; j < bones.size(); ++j) {
+        if (bones[j] == parent) {
+          parent_index = (int)j;
+          break;
+        }
+      }
+    }
+    printf(",\"parent\":%d}", parent_index);
+  }
+  printf("]");
+
+  size_t frame_count = 1;
+  if (duration > 0.0) {
+    frame_count = (size_t)(duration * kSkeletonSampleRate) + 1;
+    if (frame_count > kMaxSkeletonFrames) frame_count = kMaxSkeletonFrames;
+    if (frame_count < 2) frame_count = 2;
+  }
+
+  const ufbx_anim* anim = scene->anim;
+  double time_begin = 0.0;
+  if (scene->anim_stacks.count > 0 && scene->anim_stacks.data[0]) {
+    time_begin = scene->anim_stacks.data[0]->time_begin;
+  }
+
+  printf(",\"frameRate\":%.6g", frame_count > 1 && duration > 0.0
+    ? (double)(frame_count - 1) / duration
+    : kSkeletonSampleRate);
+  printf(",\"frames\":[");
+  for (size_t frame = 0; frame < frame_count; ++frame) {
+    const double t = frame_count > 1
+      ? time_begin + duration * ((double)frame / (double)(frame_count - 1))
+      : time_begin;
+    if (frame) putchar(0x2C);
+    putchar(0x5B);
+    ufbx_error eval_error;
+    ufbx_scene* posed = ufbx_evaluate_scene(scene, anim, t, NULL, &eval_error);
+    for (size_t i = 0; i < bones.size(); ++i) {
+      ufbx_node* node = bones[i];
+      if (posed && node->element_id < posed->elements.count) {
+        ufbx_element* element = posed->elements.data[node->element_id];
+        if (element && element->type == UFBX_ELEMENT_NODE) {
+          node = (ufbx_node*)element;
+        }
+      }
+      const ufbx_vec3 position = {
+        node->node_to_world.cols[3].x,
+        node->node_to_world.cols[3].y,
+        node->node_to_world.cols[3].z,
+      };
+      if (i) putchar(0x2C);
+      printf("%.5g,%.5g,%.5g", position.x, position.y, position.z);
+    }
+    if (posed) ufbx_free_scene(posed);
+    putchar(0x5D);
+  }
+  printf("]}");
+}
+
 static std::string texture_path(ufbx_texture* texture) {
   if (!texture) return std::string();
   std::string path = string_from_ufbx(texture->filename);
@@ -493,7 +593,9 @@ int main(int argc, char** argv) {
         if (i) putchar(0x2C);
         print_json_string(stack ? string_from_ufbx(stack->name).c_str() : "");
       }
-      printf("]}");
+      printf("]");
+      print_skeleton(scene, duration);
+      printf("}");
       ufbx_free_scene(scene);
       return 0;
     }
