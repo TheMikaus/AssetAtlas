@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.2';
+const appVersion = '1.10.3';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3211,6 +3211,9 @@ class _ModelPreviewState extends State<ModelPreview> {
   String? uvSetOverride;
   LightingMode lightingMode = LightingMode.corner;
   bool cullBackFaces = true;
+
+  /// A texture the user picked by hand, overriding whatever resolved.
+  String? chosenTexturePath;
   bool useBaseTexture = true;
   bool useNormalMaps = true;
   bool useEmissiveMaps = true;
@@ -3228,12 +3231,17 @@ class _ModelPreviewState extends State<ModelPreview> {
     });
   }
 
-  Future<MeshModel> _loadCurrentMesh() {
-    return MeshLoadCache.load(
+  Future<MeshModel> _loadCurrentMesh() async {
+    final mesh = await MeshLoadCache.load(
       widget.asset,
       allAssets: widget.allAssets,
       fallbackCheckerSquareSize: checkerSquareSize,
     );
+    final chosen = chosenTexturePath;
+    if (chosen == null) return mesh;
+    // Not cached: the cache is keyed on the file, and this is the user's
+    // choice rather than anything the file said.
+    return applyChosenTexture(mesh, chosen);
   }
 
   @override
@@ -3258,6 +3266,8 @@ class _ModelPreviewState extends State<ModelPreview> {
       pitch = 0.35;
       zoom = 1;
       uvSetOverride = null;
+      // A texture chosen for one model means nothing for the next.
+      chosenTexturePath = null;
     }
   }
 
@@ -3485,6 +3495,18 @@ class _ModelPreviewState extends State<ModelPreview> {
                       // inert control invites the question "why is nothing
                       // happening".
                       if (renderMode == RenderMode.textured) ...[
+                        TexturePickerButton(
+                          candidates: findNearbyTextures(
+                            widget.asset,
+                            widget.allAssets,
+                          ),
+                          chosenPath: chosenTexturePath,
+                          onChosen: (path) => setState(() {
+                            chosenTexturePath = path;
+                            meshFuture = _loadCurrentMesh();
+                          }),
+                        ),
+                        const SizedBox(height: 8),
                         ShadingChannelPanel(
                           channels: [
                             if (mesh.materials.any(
@@ -5709,6 +5731,88 @@ String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
   return 'flat colour, no texture$suffix';
 }
 
+/// Picks a texture for a model by hand, from what was scanned beside it.
+///
+/// Automatic resolution covers the models that say what they want. This covers
+/// the ones that do not: an OBJ with no `mtllib`, or a model whose pack is
+/// missing. The candidates are the same nearby textures the discovery panel
+/// lists, so the answer is already on screen -- this applies one.
+class TexturePickerButton extends StatelessWidget {
+  const TexturePickerButton({
+    required this.candidates,
+    required this.chosenPath,
+    required this.onChosen,
+    super.key,
+  });
+
+  final List<AssetItem> candidates;
+  final String? chosenPath;
+
+  /// Null clears the choice and goes back to whatever resolved on its own.
+  final ValueChanged<String?> onChosen;
+
+  @override
+  Widget build(BuildContext context) {
+    if (candidates.isEmpty) return const SizedBox.shrink();
+    final chosen = chosenPath;
+    final chosenName = chosen == null
+        ? null
+        : candidates
+              .where((asset) => asset.path == chosen)
+              .map((asset) => asset.name)
+              .firstOrNull;
+
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 260),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: .9),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Text(
+              chosenName == null
+                  ? 'Texture: auto'
+                  : 'Texture: $chosenName',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                color: chosenName == null ? Colors.black54 : Colors.black87,
+              ),
+            ),
+          ),
+          PopupMenuButton<String?>(
+            tooltip: 'Apply a scanned texture to this model',
+            icon: const Icon(Icons.texture, size: 18),
+            onSelected: onChosen,
+            itemBuilder: (context) => [
+              const PopupMenuItem<String?>(
+                value: null,
+                child: Text('Auto (whatever the model asks for)'),
+              ),
+              const PopupMenuDivider(),
+              for (final asset in candidates.take(40))
+                PopupMenuItem<String?>(
+                  value: asset.path,
+                  child: Text(
+                    asset.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// One switchable shading channel.
 class ShadingChannel {
   const ShadingChannel({
@@ -7548,6 +7652,39 @@ class MeshLoadCache {
   }
 }
 
+/// Puts one chosen image on every material of a mesh.
+///
+/// The last resort when automatic resolution has nothing to work with: an OBJ
+/// that names no material at all, or a model whose pack is not in the library.
+/// The UVs are the model's own, so a correct atlas lands correctly; a wrong
+/// one is obvious at a glance, which is the point of choosing by hand.
+Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
+  final bytes = await readAssetBytes(texturePath);
+  if (bytes == null || bytes.isEmpty) return mesh;
+  final image = await decodeImage(bytes);
+  Uint8List? pixels;
+  try {
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    pixels = data?.buffer.asUint8List();
+  } catch (error) {
+    fbxLog('Chosen texture readback failed: $error');
+  }
+
+  final materials = mesh.materials.isEmpty
+      ? [
+          const MeshMaterial(
+            name: '',
+            color: Color(0xffb9c2cc),
+            textures: [],
+          ),
+        ]
+      : mesh.materials;
+  return mesh.withMaterials([
+    for (final material in materials)
+      material.withBaseTexture(path: texturePath, image: image, pixels: pixels),
+  ]);
+}
+
 Future<MeshModel> loadMesh(
   AssetItem asset, {
   List<AssetItem> allAssets = const [],
@@ -8445,6 +8582,21 @@ class MeshModel {
     );
   }
 
+  /// This mesh with its materials replaced. Geometry is untouched.
+  MeshModel withMaterials(List<MeshMaterial> replacements) => MeshModel(
+    name: name,
+    vertices: vertices,
+    faces: faces,
+    materials: replacements,
+    textureFiles: textureFiles,
+    vertexColors: vertexColors,
+    kind: kind,
+    animationStacks: animationStacks,
+    boneCount: boneCount,
+    durationSeconds: durationSeconds,
+    animationNames: animationNames,
+  );
+
   final String name;
   final List<Vec3> vertices;
   final List<MeshFace> faces;
@@ -8590,6 +8742,47 @@ class MeshMaterial {
     this.uvSet = '',
     this.hasEmbeddedTexture = false,
   });
+
+  /// This material with a different base texture, everything else kept.
+  ///
+  /// Used when the user picks a texture by hand: a model whose materials name
+  /// nothing (an OBJ with no `mtllib`) or name a file that is not in the
+  /// library still has UVs, so a chosen atlas maps onto it correctly.
+  MeshMaterial withBaseTexture({
+    required String path,
+    required ui.Image image,
+    required Uint8List? pixels,
+  }) {
+    return MeshMaterial(
+      name: name,
+      color: color,
+      textures: textures,
+      resolvedTextures: [path],
+      textureColor: textureColor,
+      textureImage: image,
+      texturePixels: pixels,
+      textureWidth: image.width,
+      textureHeight: image.height,
+      normalTexture: normalTexture,
+      normalPixels: normalPixels,
+      normalWidth: normalWidth,
+      normalHeight: normalHeight,
+      emissiveTexture: emissiveTexture,
+      emissivePixels: emissivePixels,
+      emissiveWidth: emissiveWidth,
+      emissiveHeight: emissiveHeight,
+      opacity: opacity,
+      roughness: roughness,
+      metalness: metalness,
+      specularFactor: specularFactor,
+      emissiveFactor: emissiveFactor,
+      emissiveColor: emissiveColor,
+      shaderType: shaderType,
+      shadingModel: shadingModel,
+      uvSet: uvSet,
+      hasEmbeddedTexture: hasEmbeddedTexture,
+    );
+  }
 
   final String name;
   final Color color;
@@ -9410,6 +9603,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
