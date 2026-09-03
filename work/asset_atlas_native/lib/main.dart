@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.8.0';
+const appVersion = '1.9.0';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -182,6 +182,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   String? folderFilter;
   final expandedFolders = <String>{};
   Timer? _searchDebounce;
+  ScanHandle? _activeScan;
 
   /// Bumped whenever something that affects filtering changes without the
   /// catalog itself changing: an ignore toggle, a texture validation result, an
@@ -601,6 +602,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   @override
   void dispose() {
+    _activeScan?.cancel();
     _searchDebounce?.cancel();
     searchController.dispose();
     super.dispose();
@@ -963,6 +965,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
     });
   }
 
+  void cancelScan() {
+    _activeScan?.cancel();
+  }
+
   Future<void> chooseAndScan() async {
     final selectedPath = await FilePicker.getDirectoryPath(
       dialogTitle: 'Choose asset folder',
@@ -989,16 +995,41 @@ class _CatalogScreenState extends State<CatalogScreen> {
       status = ScanStatus('Scanning', rootPath);
     });
 
-    final result = await scanAssetFolder(
+    // Off the UI isolate: this walks a whole tree and inflates every archive
+    // it meets, which used to lock the window for the duration.
+    final handle = await startFolderScan(
       rootPath,
       onStatus: (next) {
         if (!mounted) return;
         setState(() => status = next);
       },
     );
+    _activeScan = handle;
+
+    final ScanResult result;
+    try {
+      result = await handle.result;
+    } on ScanCancelledException {
+      if (!mounted) return;
+      setState(() {
+        scanning = false;
+        _activeScan = null;
+        status = ScanStatus('Scan cancelled', rootPath);
+      });
+      return;
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        scanning = false;
+        _activeScan = null;
+        status = ScanStatus('Scan failed', error.toString());
+      });
+      return;
+    }
 
     if (!mounted) return;
     setState(() {
+      _activeScan = null;
       sourceRoots.add(rootPath);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
       assets.addAll(result.assets);
@@ -1247,6 +1278,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                 canGoBack: canGoBackInHistory,
                 canGoForward: canGoForwardInHistory,
                 onScan: chooseAndScan,
+            onCancelScan: cancelScan,
                 onSaveProject: saveProjectSnapshot,
                 onLoadProject: loadProjectSnapshot,
                 onCopySelected: copySelected,
@@ -1437,6 +1469,7 @@ class HeaderBar extends StatelessWidget {
     required this.canGoBack,
     required this.canGoForward,
     required this.onScan,
+    required this.onCancelScan,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
@@ -1451,6 +1484,7 @@ class HeaderBar extends StatelessWidget {
   final bool canGoBack;
   final bool canGoForward;
   final VoidCallback onScan;
+  final VoidCallback onCancelScan;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
@@ -1478,6 +1512,7 @@ class HeaderBar extends StatelessWidget {
             canGoForward: canGoForward,
             selectedCount: selectedCount,
             onScan: onScan,
+            onCancelScan: onCancelScan,
             onSaveProject: onSaveProject,
             onLoadProject: onLoadProject,
             onCopySelected: onCopySelected,
@@ -1576,6 +1611,7 @@ class _HeaderActions extends StatelessWidget {
     required this.canGoForward,
     required this.selectedCount,
     required this.onScan,
+    required this.onCancelScan,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
@@ -1588,6 +1624,7 @@ class _HeaderActions extends StatelessWidget {
   final bool canGoForward;
   final int selectedCount;
   final VoidCallback onScan;
+  final VoidCallback onCancelScan;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
@@ -1610,11 +1647,22 @@ class _HeaderActions extends StatelessWidget {
           onPressed: canGoForward ? onGoForward : null,
           icon: const Icon(Icons.arrow_forward),
         ),
-        FilledButton.icon(
-          onPressed: scanning ? null : onScan,
-          icon: const Icon(Icons.folder_open),
-          label: const Text('Scan folder'),
-        ),
+        if (scanning)
+          FilledButton.icon(
+            onPressed: onCancelScan,
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
+            icon: const Icon(Icons.stop_circle_outlined),
+            label: const Text('Stop scan'),
+          )
+        else
+          FilledButton.icon(
+            onPressed: onScan,
+            icon: const Icon(Icons.folder_open),
+            label: const Text('Scan folder'),
+          ),
         OutlinedButton.icon(
           onPressed: scanning ? null : onSaveProject,
           icon: const Icon(Icons.save_outlined),
@@ -5282,6 +5330,116 @@ Future<ui.Image> decodeImage(Uint8List bytes) {
       });
 }
 
+/// A scan running on a worker isolate.
+///
+/// Scanning walks a directory tree, stats every file and inflates every ZIP it
+/// finds. On the UI isolate that froze the window for as long as the scan took,
+/// with no way to stop it. Here it runs elsewhere and can be abandoned.
+class ScanHandle {
+  ScanHandle._(this._isolate, this._port, this._completer);
+
+  final Isolate _isolate;
+  final ReceivePort _port;
+  final Completer<ScanResult> _completer;
+
+  /// Completes with the scan, or with [ScanCancelledException] if abandoned.
+  Future<ScanResult> get result => _completer.future;
+
+  var _cancelled = false;
+  bool get cancelled => _cancelled;
+
+  /// Abandons the scan. The worker only reads the filesystem and returns a
+  /// list, so there is nothing half-written to clean up.
+  ///
+  /// The waiting future is settled here rather than left to the port: closing
+  /// the port silences the listener, so anyone awaiting the result would hang
+  /// forever instead of learning the scan was stopped.
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    _isolate.kill(priority: Isolate.immediate);
+    if (!_completer.isCompleted) {
+      _completer.completeError(const ScanCancelledException());
+    }
+    _port.close();
+  }
+}
+
+class ScanCancelledException implements Exception {
+  const ScanCancelledException();
+  @override
+  String toString() => 'Scan cancelled';
+}
+
+class ScanBootstrap {
+  const ScanBootstrap(this.sendPort, this.rootPath);
+  final SendPort sendPort;
+  final String rootPath;
+}
+
+/// Worker entry point. Top-level by necessity: isolates are spawned by
+/// function reference, and a closure here would capture its surroundings.
+Future<void> scanWorkerEntry(ScanBootstrap bootstrap) async {
+  try {
+    final result = await scanAssetFolder(
+      bootstrap.rootPath,
+      onStatus: bootstrap.sendPort.send,
+    );
+    bootstrap.sendPort.send(result);
+  } catch (error) {
+    bootstrap.sendPort.send('scan failed: $error');
+  }
+}
+
+/// Starts a scan on a worker isolate, reporting progress as it goes.
+Future<ScanHandle> startFolderScan(
+  String rootPath, {
+  required void Function(ScanStatus status) onStatus,
+}) async {
+  final port = ReceivePort();
+  final completer = Completer<ScanResult>();
+
+  // A caller that cancels without awaiting the result should not produce an
+  // unhandled async error. Real awaiters still see the exception; this only
+  // stops an abandoned future from being reported as unhandled.
+  completer.future.then((_) {}, onError: (Object _) {});
+
+  // One listener only: a ReceivePort allows a single subscription, and the
+  // isolate's exit notification arrives on this same port as a null.
+  port.listen((message) {
+    if (message is ScanStatus) {
+      onStatus(message);
+      return;
+    }
+    if (message is ScanResult) {
+      if (!completer.isCompleted) completer.complete(message);
+      port.close();
+      return;
+    }
+    if (message == null) {
+      // The worker exited without a result: killed, or it died.
+      if (!completer.isCompleted) {
+        completer.completeError(const ScanCancelledException());
+      }
+      port.close();
+      return;
+    }
+    if (!completer.isCompleted) {
+      completer.completeError(StateError(message.toString()));
+    }
+    port.close();
+  });
+
+  final isolate = await Isolate.spawn(
+    scanWorkerEntry,
+    ScanBootstrap(port.sendPort, rootPath),
+    onExit: port.sendPort,
+    errorsAreFatal: true,
+  );
+
+  return ScanHandle._(isolate, port, completer);
+}
+
 Future<ScanResult> scanAssetFolder(
   String rootPath, {
   required ValueChanged<ScanStatus> onStatus,
@@ -7843,6 +8001,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
