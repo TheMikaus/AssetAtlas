@@ -161,6 +161,91 @@ void main() {
     });
   });
 
+  group('crossing between archives', () {
+    test('a bare name never crosses: too many packs share one', () {
+      const packA = r'C:\Packs\pack_a.zip';
+      const packB = r'C:\Packs\pack_b.zip';
+      final modelInA = buildZipVirtualPath(packA, 'Models/SM_Wall_01.fbx');
+      final textureInB = _zipAsset(packB, 'Textures/Wall_01.png');
+
+      expect(
+        findDeterministicTextureRelink(modelInA, 'Wall_01.psd', [textureInB]),
+        isNull,
+        reason: 'nothing in the reference says which pack it means',
+      );
+    });
+
+    test('a reference naming another pack finds it', () {
+      const packA = r'C:\Packs\ANIMATION_Base.zip';
+      const packB = r'C:\Packs\PolygonApocalypse_SourceFiles.zip';
+      final modelInA = buildZipVirtualPath(packA, 'Demo_Models/SM_Obstacle.fbx');
+      final atlasInB = _zipAsset(
+        packB,
+        'PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A.png',
+      );
+
+      expect(
+        findDeterministicTextureRelink(
+          modelInA,
+          r'..\..\..\PolygonApocalypse\Textures\PolygonApocalypse_Texture_01_A.png',
+          [atlasInB],
+        ),
+        atlasInB.path,
+      );
+    });
+
+    test('the file name still has to match exactly', () {
+      const packA = r'C:\Packs\ANIMATION_Base.zip';
+      const packB = r'C:\Packs\PolygonApocalypse_SourceFiles.zip';
+      final modelInA = buildZipVirtualPath(packA, 'Demo_Models/SM_Obstacle.fbx');
+      final other = _zipAsset(
+        packB,
+        'PolygonApocalypse/Textures/PolygonApocalypse_Texture_02_B.png',
+      );
+
+      expect(
+        findDeterministicTextureRelink(
+          modelInA,
+          r'..\..\..\PolygonApocalypse\Textures\PolygonApocalypse_Texture_01_A.png',
+          [other],
+        ),
+        isNull,
+      );
+    });
+
+    test('a texture beside the model still wins', () {
+      const packA = r'C:\Packs\ANIMATION_Base.zip';
+      const packB = r'C:\Packs\PolygonApocalypse_SourceFiles.zip';
+      final modelInA = buildZipVirtualPath(packA, 'Demo_Models/SM_Obstacle.fbx');
+      final localAtlas = _zipAsset(
+        packA,
+        'Textures/PolygonApocalypse_Texture_01_A.png',
+      );
+      final remoteAtlas = _zipAsset(
+        packB,
+        'PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A.png',
+      );
+
+      expect(
+        findDeterministicTextureRelink(
+          modelInA,
+          r'..\..\..\PolygonApocalypse\Textures\PolygonApocalypse_Texture_01_A.png',
+          [remoteAtlas, localAtlas],
+        ),
+        localAtlas.path,
+        reason: 'the archive the model lives in is checked first',
+      );
+    });
+
+    test('generic folder names are not pack identity', () {
+      expect(texturePackHints(r'..\..\Textures\Misctlas.png'), isEmpty);
+      expect(
+        texturePackHints(r'..\PolygonApocalypse\Texturestlas.png'),
+        contains('polygonapocalypse'),
+      );
+    });
+  });
+
   group('findFallbackTexture', () {
     test('resolves ties the same way regardless of candidate order', () {
       final left = _asset('Textures/Wall_Detail_A.png');

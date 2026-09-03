@@ -51,7 +51,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.0';
+const appVersion = '1.10.1';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3733,6 +3733,8 @@ class RasterModelView extends StatefulWidget {
 
 class _RasterModelViewState extends State<RasterModelView> {
   ui.Image? _image;
+  RasterScene? _scene;
+  String? _sceneKey;
   String? _renderedKey;
   bool _rendering = false;
   Size _lastSize = Size.zero;
@@ -3769,8 +3771,21 @@ class _RasterModelViewState extends State<RasterModelView> {
     try {
       final width = math.max(1, (size.width * scale).round());
       final height = math.max(1, (size.height * scale).round());
-      final raster = rasterizeMesh(
-        mesh: widget.mesh,
+
+      // Flattening the mesh is the expensive part of setup, so keep it per
+      // mesh rather than per frame.
+      final sceneKey = '${identityHashCode(widget.mesh)}|'
+          '${widget.uvSetOverride ?? ''}';
+      if (_scene == null || _sceneKey != sceneKey) {
+        _scene = RasterScene.fromMesh(
+          widget.mesh,
+          uvSetOverride: widget.uvSetOverride,
+        );
+        _sceneKey = sceneKey;
+      }
+
+      final request = RasterRequest(
+        scene: _scene!,
         yaw: widget.yaw,
         pitch: widget.pitch,
         zoom: widget.zoom,
@@ -3780,8 +3795,14 @@ class _RasterModelViewState extends State<RasterModelView> {
         lightingMode: widget.lightingMode,
         cullBackFaces: widget.cullBackFaces,
         useNormalMaps: widget.useNormalMaps,
-        uvSetOverride: widget.uvSetOverride,
       );
+
+      // Coarse frames are small and wanted immediately; spending an isolate
+      // hop on them would add more latency than it saves. The sharp frame is
+      // the one that would stall the window, so that one goes to a worker.
+      final raster = widget.interacting
+          ? rasterizeScene(request)
+          : await rasterizeSceneInIsolate(request);
       final image = await imageFromRaster(raster);
       if (!mounted) {
         image.dispose();
@@ -3861,6 +3882,221 @@ class RasterResult {
 ///
 /// Pure and synchronous so it can run on a worker isolate; nothing here touches
 /// `dart:ui`.
+/// A mesh flattened into plain data a worker isolate can be handed.
+///
+/// [MeshModel] holds a `ui.Image` per material, which cannot cross an isolate
+/// boundary. The rasteriser never needed it -- it samples the CPU-side pixel
+/// buffers -- so this carries only what shading actually reads, with per-face
+/// lookups (material, UV set, vertex tint) resolved up front.
+class RasterScene {
+  const RasterScene({
+    required this.positions,
+    required this.triangleIndices,
+    required this.triangleMaterial,
+    required this.triangleUvs,
+    required this.triangleHasUv,
+    required this.triangleTint,
+    required this.materials,
+    required this.totalTriangles,
+  });
+
+  /// x, y, z per vertex.
+  final Float32List positions;
+
+  /// Three vertex indices per triangle.
+  final Int32List triangleIndices;
+  final Int32List triangleMaterial;
+
+  /// Six values per triangle: u, v for each corner.
+  final Float32List triangleUvs;
+  final Uint8List triangleHasUv;
+
+  /// Packed 0xRRGGBB vertex tint per triangle, or -1 for none.
+  final Int32List triangleTint;
+
+  final List<RasterMaterial> materials;
+  final int totalTriangles;
+
+  static RasterScene fromMesh(MeshModel mesh, {String? uvSetOverride}) {
+    final triangles = <int>[];
+    final triMaterial = <int>[];
+    final triUvs = <double>[];
+    final triHasUv = <int>[];
+    final triTint = <int>[];
+
+    for (final face in mesh.faces) {
+      final indices = face.indices;
+      if (indices.length < 3) continue;
+      var valid = true;
+      for (final index in indices) {
+        if (index < 0 || index >= mesh.vertices.length) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) continue;
+
+      final material =
+          (face.materialIndex >= 0 && face.materialIndex < mesh.materials.length)
+          ? mesh.materials[face.materialIndex]
+          : null;
+      final uvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
+      final hasUv = uvs.length == 3;
+      final tint = mesh.averageFaceVertexColor(face);
+      final packedTint = tint == null
+          ? -1
+          : (((tint.r * 255).round() & 0xff) << 16) |
+                (((tint.g * 255).round() & 0xff) << 8) |
+                ((tint.b * 255).round() & 0xff);
+
+      // Fan triangulation: an OBJ face may be a polygon.
+      for (var i = 1; i + 1 < indices.length; i += 1) {
+        triangles.addAll([indices[0], indices[i], indices[i + 1]]);
+        triMaterial.add(face.materialIndex);
+        triTint.add(packedTint);
+        if (hasUv && i == 1) {
+          triUvs.addAll([
+            uvs[0].x, uvs[0].y,
+            uvs[1].x, uvs[1].y,
+            uvs[2].x, uvs[2].y,
+          ]);
+          triHasUv.add(1);
+        } else {
+          // Only the first triangle of a polygon carries the face's UVs;
+          // beyond that there is nothing meaningful to assign.
+          triUvs.addAll([0, 0, 0, 0, 0, 0]);
+          triHasUv.add(hasUv && indices.length == 3 ? 1 : 0);
+        }
+      }
+    }
+
+    final positions = Float32List(mesh.vertices.length * 3);
+    for (var i = 0; i < mesh.vertices.length; i += 1) {
+      positions[i * 3] = mesh.vertices[i].x;
+      positions[i * 3 + 1] = mesh.vertices[i].y;
+      positions[i * 3 + 2] = mesh.vertices[i].z;
+    }
+
+    return RasterScene(
+      positions: positions,
+      triangleIndices: Int32List.fromList(triangles),
+      triangleMaterial: Int32List.fromList(triMaterial),
+      triangleUvs: Float32List.fromList(triUvs),
+      triangleHasUv: Uint8List.fromList(triHasUv),
+      triangleTint: Int32List.fromList(triTint),
+      materials: [
+        for (var i = 0; i < mesh.materials.length; i += 1)
+          RasterMaterial.from(mesh, i),
+      ],
+      totalTriangles: triMaterial.length,
+    );
+  }
+}
+
+class RasterMaterial {
+  const RasterMaterial({
+    required this.baseArgbTextured,
+    required this.baseArgbFlat,
+    required this.opacity,
+    required this.texturePixels,
+    required this.textureWidth,
+    required this.textureHeight,
+    required this.normalPixels,
+    required this.normalWidth,
+    required this.normalHeight,
+    required this.emissivePixels,
+    required this.emissiveWidth,
+    required this.emissiveHeight,
+    required this.emissiveFactor,
+    required this.specularFactor,
+    required this.roughness,
+    required this.texturesMissing,
+  });
+
+  factory RasterMaterial.from(MeshModel mesh, int index) {
+    final material = mesh.materials[index];
+    int pack(Color color) =>
+        (((color.r * 255).round() & 0xff) << 16) |
+        (((color.g * 255).round() & 0xff) << 8) |
+        ((color.b * 255).round() & 0xff);
+    return RasterMaterial(
+      baseArgbTextured: pack(mesh.colorForMaterial(index, textured: true)),
+      baseArgbFlat: pack(mesh.colorForMaterial(index, textured: false)),
+      opacity: mesh.opacityForMaterial(index),
+      texturePixels: material.texturePixels,
+      textureWidth: material.textureWidth,
+      textureHeight: material.textureHeight,
+      normalPixels: material.normalPixels,
+      normalWidth: material.normalWidth,
+      normalHeight: material.normalHeight,
+      emissivePixels: material.emissivePixels,
+      emissiveWidth: material.emissiveWidth,
+      emissiveHeight: material.emissiveHeight,
+      emissiveFactor: material.emissiveFactor,
+      specularFactor: material.specularFactor,
+      roughness: material.roughness,
+      texturesMissing: material.texturesMissing,
+    );
+  }
+
+  final int baseArgbTextured;
+  final int baseArgbFlat;
+  final double opacity;
+  final Uint8List? texturePixels;
+  final int textureWidth;
+  final int textureHeight;
+  final Uint8List? normalPixels;
+  final int normalWidth;
+  final int normalHeight;
+  final Uint8List? emissivePixels;
+  final int emissiveWidth;
+  final int emissiveHeight;
+  final double emissiveFactor;
+  final double specularFactor;
+  final double roughness;
+  final bool texturesMissing;
+
+  bool get hasNormalMap => normalPixels != null && normalWidth > 0;
+  bool get hasEmissiveMap => emissivePixels != null && emissiveWidth > 0;
+
+  /// Emissive texel at (u, v) packed 0xRRGGBB, or null.
+  int? sampleEmissive(double u, double v) {
+    final pixels = emissivePixels;
+    if (pixels == null || emissiveWidth <= 0 || emissiveHeight <= 0) {
+      return null;
+    }
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    final x = (fu * (emissiveWidth - 1)).toInt();
+    final y = (fv * (emissiveHeight - 1)).toInt();
+    final index = (y * emissiveWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return (pixels[index] << 16) | (pixels[index + 1] << 8) | pixels[index + 2];
+  }
+
+  Vec3? sampleNormal(double u, double v) {
+    final pixels = normalPixels;
+    if (pixels == null || normalWidth <= 0 || normalHeight <= 0) return null;
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    final x = (fu * (normalWidth - 1)).toInt();
+    final y = (fv * (normalHeight - 1)).toInt();
+    final index = (y * normalWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return Vec3(
+      pixels[index] / 127.5 - 1.0,
+      pixels[index + 1] / 127.5 - 1.0,
+      pixels[index + 2] / 127.5 - 1.0,
+    );
+  }
+}
+
+/// Rasterises [mesh]. Convenience wrapper: flattens to a [RasterScene] and
+/// renders it.
 RasterResult rasterizeMesh({
   required MeshModel mesh,
   required double yaw,
@@ -3876,13 +4112,68 @@ RasterResult rasterizeMesh({
   int backgroundArgb = 0xffe9edf3,
   int maxFaces = maxRenderedFaces,
 }) {
+  return rasterizeScene(
+    RasterRequest(
+      scene: RasterScene.fromMesh(mesh, uvSetOverride: uvSetOverride),
+      yaw: yaw,
+      pitch: pitch,
+      zoom: zoom,
+      width: width,
+      height: height,
+      renderMode: renderMode,
+      lightingMode: lightingMode,
+      cullBackFaces: cullBackFaces,
+      useNormalMaps: useNormalMaps,
+      backgroundArgb: backgroundArgb,
+      maxFaces: maxFaces,
+    ),
+  );
+}
+
+/// Everything one frame needs, in a single sendable object.
+class RasterRequest {
+  const RasterRequest({
+    required this.scene,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.width,
+    required this.height,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    this.useNormalMaps = true,
+    this.backgroundArgb = 0xffe9edf3,
+    this.maxFaces = maxRenderedFaces,
+  });
+
+  final RasterScene scene;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final int width;
+  final int height;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool useNormalMaps;
+  final int backgroundArgb;
+  final int maxFaces;
+}
+
+/// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
+/// worker isolate; see [rasterizeSceneInIsolate].
+RasterResult rasterizeScene(RasterRequest request) {
+  final scene = request.scene;
+  final width = request.width;
+  final height = request.height;
   final pixels = Uint8List(width * height * 4);
   final depth = Float32List(width * height);
 
-  final bgR = (backgroundArgb >> 16) & 0xff;
-  final bgG = (backgroundArgb >> 8) & 0xff;
-  final bgB = backgroundArgb & 0xff;
-  final bgA = (backgroundArgb >> 24) & 0xff;
+  final bgR = (request.backgroundArgb >> 16) & 0xff;
+  final bgG = (request.backgroundArgb >> 8) & 0xff;
+  final bgB = request.backgroundArgb & 0xff;
+  final bgA = (request.backgroundArgb >> 24) & 0xff;
   for (var i = 0; i < pixels.length; i += 4) {
     pixels[i] = bgR;
     pixels[i + 1] = bgG;
@@ -3892,7 +4183,7 @@ RasterResult rasterizeMesh({
   // Larger is nearer, so the buffer starts at "infinitely far".
   depth.fillRange(0, depth.length, -double.infinity);
 
-  final vertexCount = mesh.vertices.length;
+  final vertexCount = scene.positions.length ~/ 3;
   final screenX = Float32List(vertexCount);
   final screenY = Float32List(vertexCount);
   final invW = Float32List(vertexCount);
@@ -3902,18 +4193,20 @@ RasterResult rasterizeMesh({
 
   final centerX = width / 2;
   final centerY = height / 2;
-  final scale = math.min(width, height) * .38 * zoom;
-  final sy = math.sin(yaw);
-  final cy = math.cos(yaw);
-  final sx = math.sin(pitch);
-  final cx = math.cos(pitch);
+  final scale = math.min(width, height) * .38 * request.zoom;
+  final sy = math.sin(request.yaw);
+  final cy = math.cos(request.yaw);
+  final sx = math.sin(request.pitch);
+  final cx = math.cos(request.pitch);
 
   for (var i = 0; i < vertexCount; i += 1) {
-    final vertex = mesh.vertices[i];
-    final x1 = vertex.x * cy + vertex.z * sy;
-    final z1 = -vertex.x * sy + vertex.z * cy;
-    final y1 = vertex.y * cx - z1 * sx;
-    final z2 = vertex.y * sx + z1 * cx;
+    final vx = scene.positions[i * 3];
+    final vy = scene.positions[i * 3 + 1];
+    final vz = scene.positions[i * 3 + 2];
+    final x1 = vx * cy + vz * sy;
+    final z1 = -vx * sy + vz * cy;
+    final y1 = vy * cx - z1 * sx;
+    final z2 = vy * sx + z1 * cx;
     final perspective = 2.8 / (2.8 + z2);
     viewX[i] = x1;
     viewY[i] = y1;
@@ -3923,52 +4216,33 @@ RasterResult rasterizeMesh({
     screenY[i] = centerY - y1 * scale * perspective;
   }
 
-  // Triangles first, so the face budget counts what is actually drawn.
-  final triangles = <List<int>>[];
-  final triangleFace = <MeshFace>[];
-  for (final face in mesh.faces) {
-    final indices = face.indices;
-    if (indices.length < 3) continue;
-    var valid = true;
-    for (final index in indices) {
-      if (index < 0 || index >= vertexCount) {
-        valid = false;
-        break;
-      }
-    }
-    if (!valid) continue;
-    for (var i = 1; i + 1 < indices.length; i += 1) {
-      triangles.add([indices[0], indices[i], indices[i + 1]]);
-      triangleFace.add(face);
-    }
-  }
-
-  // With a depth buffer the drawing order no longer matters, but a budget
-  // still does: keep the nearest triangles when a mesh is enormous.
-  var order = List<int>.generate(triangles.length, (i) => i);
-  if (maxFaces >= 0 && order.length > maxFaces) {
-    final nearest = Float32List(triangles.length);
-    for (var i = 0; i < triangles.length; i += 1) {
-      final t = triangles[i];
-      nearest[i] = math.max(
-        invW[t[0]],
-        math.max(invW[t[1]], invW[t[2]]),
-      );
+  final triangleCount = scene.totalTriangles;
+  var order = List<int>.generate(triangleCount, (i) => i);
+  if (request.maxFaces >= 0 && order.length > request.maxFaces) {
+    // Order no longer matters for correctness, but a budget still does: keep
+    // the nearest triangles when a mesh is enormous.
+    final nearest = Float32List(triangleCount);
+    for (var i = 0; i < triangleCount; i += 1) {
+      final a = scene.triangleIndices[i * 3];
+      final b = scene.triangleIndices[i * 3 + 1];
+      final c = scene.triangleIndices[i * 3 + 2];
+      nearest[i] = math.max(invW[a], math.max(invW[b], invW[c]));
     }
     order.sort((a, b) => nearest[b].compareTo(nearest[a]));
-    order = order.sublist(0, maxFaces);
+    order = order.sublist(0, request.maxFaces);
   }
 
-  final (lx, ly, lz) = lightingMode == LightingMode.top
+  final (lx, ly, lz) = request.lightingMode == LightingMode.top
       ? (0.0, 1.0, 0.0)
       : (-0.45, 0.75, -0.5);
   final lightDirection = Vec3(lx, ly, lz);
+  final textured = request.renderMode == RenderMode.textured;
 
   var drawn = 0;
   for (final triangleIndex in order) {
-    final tri = triangles[triangleIndex];
-    final face = triangleFace[triangleIndex];
-    final i0 = tri[0], i1 = tri[1], i2 = tri[2];
+    final i0 = scene.triangleIndices[triangleIndex * 3];
+    final i1 = scene.triangleIndices[triangleIndex * 3 + 1];
+    final i2 = scene.triangleIndices[triangleIndex * 3 + 2];
 
     final x0 = screenX[i0], y0 = screenY[i0];
     final x1 = screenX[i1], y1 = screenY[i1];
@@ -3976,60 +4250,52 @@ RasterResult rasterizeMesh({
 
     final area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
     if (area == 0) continue;
-    if (cullBackFaces && area < 0) continue;
+    if (request.cullBackFaces && area < 0) continue;
     drawn += 1;
 
+    final materialIndex = scene.triangleMaterial[triangleIndex];
     final material =
-        (face.materialIndex >= 0 && face.materialIndex < mesh.materials.length)
-        ? mesh.materials[face.materialIndex]
+        (materialIndex >= 0 && materialIndex < scene.materials.length)
+        ? scene.materials[materialIndex]
         : null;
-    final uvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
-    final hasUvs = uvs.length == 3;
+    final hasUvs = scene.triangleHasUv[triangleIndex] == 1;
+    final uvBase = triangleIndex * 6;
+    final uvs = hasUvs
+        ? <Vec2>[
+            Vec2(scene.triangleUvs[uvBase], scene.triangleUvs[uvBase + 1]),
+            Vec2(scene.triangleUvs[uvBase + 2], scene.triangleUvs[uvBase + 3]),
+            Vec2(scene.triangleUvs[uvBase + 4], scene.triangleUvs[uvBase + 5]),
+          ]
+        : const <Vec2>[];
 
-    // Flat lighting for the face, refined per pixel when a normal map is in
-    // play and the face has a UV gradient to build a tangent frame from.
-    final geometricNormal = _rasterFaceNormal(
-      viewX,
-      viewY,
-      viewZ,
-      i0,
-      i1,
-      i2,
-    );
+    final geometricNormal = _rasterFaceNormal(viewX, viewY, viewZ, i0, i1, i2);
     final viewTriangle = [
       Vec3(viewX[i0], viewY[i0], viewZ[i0]),
       Vec3(viewX[i1], viewY[i1], viewZ[i1]),
       Vec3(viewX[i2], viewY[i2], viewZ[i2]),
     ];
-    final faceLight = lightingMode == LightingMode.unlit
+    final faceLight = request.lightingMode == LightingMode.unlit
         ? 1.0
         : faceDiffuseWithNormalMap(
             geometricNormal: geometricNormal,
             lightDirection: lightDirection,
             viewPositions: viewTriangle,
-            uvs: hasUvs ? uvs : const [],
+            uvs: uvs,
           );
 
     final perPixelNormals =
-        useNormalMaps &&
-        lightingMode != LightingMode.unlit &&
+        request.useNormalMaps &&
+        request.lightingMode != LightingMode.unlit &&
         hasUvs &&
         material != null &&
         material.hasNormalMap &&
         !isDegenerateUvTriangle(uvs);
 
-    final baseColor = mesh.colorForMaterial(
-      face.materialIndex,
-      textured: renderMode == RenderMode.textured,
-    );
-    final vertexTint = mesh.averageFaceVertexColor(face);
-    final opacity = mesh.opacityForMaterial(face.materialIndex);
-
-    final sampleTexture =
-        renderMode == RenderMode.textured &&
-        material != null &&
-        material.texturePixels != null &&
-        hasUvs;
+    final baseArgb = material == null
+        ? 0xb4b4b4
+        : (textured ? material.baseArgbTextured : material.baseArgbFlat);
+    final opacity = material?.opacity ?? 1.0;
+    final packedTint = scene.triangleTint[triangleIndex];
 
     var minX = math.min(x0, math.min(x1, x2)).floor();
     var maxX = math.max(x0, math.max(x1, x2)).ceil();
@@ -4044,30 +4310,43 @@ RasterResult rasterizeMesh({
     final invArea = 1.0 / area;
     final w0 = invW[i0], w1 = invW[i1], w2 = invW[i2];
 
-    // Everything constant across the face is computed once. Doing this per
-    // pixel (Color.r is a getter returning a double) cost more than the
-    // shading itself.
-    final flatR = (baseColor.r * 255).round();
-    final flatG = (baseColor.g * 255).round();
-    final flatB = (baseColor.b * 255).round();
-    final tintRFixed = ((vertexTint == null ? 1.0 : vertexTint.r) * 256)
-        .toInt();
-    final tintGFixed = ((vertexTint == null ? 1.0 : vertexTint.g) * 256)
-        .toInt();
-    final tintBFixed = ((vertexTint == null ? 1.0 : vertexTint.b) * 256)
-        .toInt();
-    final tinted = vertexTint != null;
+    // Everything constant across the face, hoisted: doing this per pixel cost
+    // more than the shading itself.
+    final flatR = (baseArgb >> 16) & 0xff;
+    final flatG = (baseArgb >> 8) & 0xff;
+    final flatB = baseArgb & 0xff;
+    final tinted = packedTint >= 0;
+    final tintRFixed = tinted ? ((packedTint >> 16) & 0xff) : 256;
+    final tintGFixed = tinted ? ((packedTint >> 8) & 0xff) : 256;
+    final tintBFixed = tinted ? (packedTint & 0xff) : 256;
     final opaque = opacity >= 0.999;
     final inverseOpacity = 1 - opacity;
+    final lightFixed = (faceLight * 256).toInt();
 
-    // Hoisted into locals: a method call plus field loads per pixel was the
-    // single biggest cost in this loop.
-    final texPixels = sampleTexture ? material.texturePixels : null;
+    // Blinn-Phong specular. The view direction is fixed (the camera looks
+    // down +z), so the half vector is constant per face and only the normal
+    // varies -- cheap enough to afford per pixel when a normal map is active.
+    final specularStrength =
+        textured && request.lightingMode != LightingMode.unlit
+        ? (material?.specularFactor ?? 0).clamp(0.0, 1.0)
+        : 0.0;
+    final shininess = material == null
+        ? 8.0
+        : 4 + (1 - material.roughness.clamp(0.0, 1.0)) * 120;
+    final emissivePixels = textured ? material?.emissivePixels : null;
+    final emissiveFactor = material?.emissiveFactor ?? 0;
+    final emissiveWidth = material?.emissiveWidth ?? 0;
+    // Exporters routinely leave the factor at 0 while still assigning an
+    // emissive texture. Honouring that literally would hide every emissive map
+    // in the library, so a map with no factor renders at full strength.
+    final emissiveScale = emissiveFactor <= 0
+        ? 1.0
+        : emissiveFactor.clamp(0.0, 4.0);
+
+    final texPixels = textured && hasUvs ? material?.texturePixels : null;
     final texWidth = material?.textureWidth ?? 0;
     final texMaxX = texWidth - 1;
     final texMaxY = (material?.textureHeight ?? 0) - 1;
-    // Light as 8.8 fixed point, so shading is an integer multiply and shift.
-    final lightFixed = (faceLight * 256).toInt();
 
     final u0w = hasUvs ? uvs[0].x * w0 : 0.0;
     final v0w = hasUvs ? uvs[0].y * w0 : 0.0;
@@ -4076,7 +4355,7 @@ RasterResult rasterizeMesh({
     final u2w = hasUvs ? uvs[2].x * w2 : 0.0;
     final v2w = hasUvs ? uvs[2].y * w2 : 0.0;
 
-    // Barycentric weights are affine in screen space, so step them instead of
+    // Barycentric weights are affine in screen space, so step them rather than
     // recomputing two edge functions per pixel.
     final b0dx = (y1 - y2) * invArea;
     final b1dx = (y2 - y0) * invArea;
@@ -4103,8 +4382,7 @@ RasterResult rasterizeMesh({
           if (pixelInvW > depth[offset]) {
             int r = flatR, g = flatG, b = flatB;
             double u = 0, v = 0;
-            final needsUv = sampleTexture || perPixelNormals;
-            if (needsUv) {
+            if (texPixels != null || perPixelNormals) {
               u = (b0 * u0w + b1 * u1w + b2 * u2w) / pixelInvW;
               v = (b0 * v0w + b1 * v1w + b2 * v2w) / pixelInvW;
             }
@@ -4130,9 +4408,11 @@ RasterResult rasterizeMesh({
             }
 
             var shade = lightFixed;
+            Vec3? pixelNormal;
             if (perPixelNormals) {
-              final sampled = material.sampleNormal(Vec2(u, v));
+              final sampled = material.sampleNormal(u, v);
               if (sampled != null) {
+                pixelNormal = sampled;
                 shade =
                     (faceDiffuseWithNormalMap(
                               geometricNormal: geometricNormal,
@@ -4149,6 +4429,32 @@ RasterResult rasterizeMesh({
             r = (r * shade) >> 8;
             g = (g * shade) >> 8;
             b = (b * shade) >> 8;
+
+            if (specularStrength > 0) {
+              final highlight = _specularTerm(
+                normal: pixelNormal ?? geometricNormal,
+                lightDirection: lightDirection,
+                shininess: shininess,
+              );
+              if (highlight > 0) {
+                final add = (highlight * specularStrength * 255).toInt();
+                r += add;
+                g += add;
+                b += add;
+              }
+            }
+
+            if (emissivePixels != null && emissiveWidth > 0) {
+              final emissive = material!.sampleEmissive(u, v);
+              if (emissive != null) {
+                // Additive: an emissive surface is lit by itself, so it does
+                // not go dark when the geometric light misses it.
+                r += (((emissive >> 16) & 0xff) * emissiveScale).toInt();
+                g += (((emissive >> 8) & 0xff) * emissiveScale).toInt();
+                b += ((emissive & 0xff) * emissiveScale).toInt();
+              }
+            }
+
             if (r > 255) r = 255;
             if (g > 255) g = 255;
             if (b > 255) b = 255;
@@ -4160,9 +4466,9 @@ RasterResult rasterizeMesh({
               pixels[target + 2] = b;
               pixels[target + 3] = 255;
             } else {
-              // Translucent faces blend with whatever is already there.
-              // Without sorting that is approximate: the documented price of
-              // getting opaque depth right.
+              // Translucent faces blend against whatever is already there.
+              // Without sorting that is approximate: the price of correct
+              // opaque depth.
               pixels[target] = (r * opacity + pixels[target] * inverseOpacity)
                   .toInt();
               pixels[target + 1] =
@@ -4187,8 +4493,47 @@ RasterResult rasterizeMesh({
     width: width,
     height: height,
     drawnFaces: drawn,
-    totalFaces: triangles.length,
+    totalFaces: triangleCount,
   );
+}
+
+/// Renders a frame on a worker isolate, so a full-resolution frame does not
+/// stall the window.
+Future<RasterResult> rasterizeSceneInIsolate(RasterRequest request) {
+  return Isolate.run(() => rasterizeScene(request));
+}
+
+/// Blinn-Phong highlight for a normal under a light.
+///
+/// The camera looks down +z here, so the view direction is constant and the
+/// half vector needs no per-pixel camera maths.
+double _specularTerm({
+  required Vec3 normal,
+  required Vec3 lightDirection,
+  required double shininess,
+}) {
+  final lightLength = math.sqrt(
+    lightDirection.x * lightDirection.x +
+        lightDirection.y * lightDirection.y +
+        lightDirection.z * lightDirection.z,
+  );
+  final normalLength = math.sqrt(
+    normal.x * normal.x + normal.y * normal.y + normal.z * normal.z,
+  );
+  if (lightLength < 1e-9 || normalLength < 1e-9) return 0;
+
+  // View direction towards the camera, plus the light, normalised.
+  final hx = lightDirection.x / lightLength;
+  final hy = lightDirection.y / lightLength;
+  final hz = lightDirection.z / lightLength - 1;
+  final halfLength = math.sqrt(hx * hx + hy * hy + hz * hz);
+  if (halfLength < 1e-9) return 0;
+
+  final cosine =
+      ((normal.x * hx + normal.y * hy + normal.z * hz) /
+              (normalLength * halfLength))
+          .abs();
+  return math.pow(cosine, shininess).toDouble();
 }
 
 Vec3 _rasterFaceNormal(
@@ -5272,6 +5617,30 @@ class TextureDiscoveryEntry {
 /// "Is this model textured?" is a question a swatch answers instantly, and a
 /// list of paths does not: a model can resolve its atlas correctly and still
 /// look grey, because that is the part of the atlas it uses.
+/// The one-line status under a material's swatch.
+///
+/// "flat colour" and "asked for a texture and did not get one" look identical
+/// on screen but mean opposite things: the first is how a collision hull is
+/// supposed to look, the second is a broken link worth chasing.
+String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
+  final extras = <String>[
+    if (material.hasNormalMap) 'normal map',
+    if (material.hasEmissiveMap) 'emissive map',
+  ];
+  final suffix = extras.isEmpty ? '' : ', ${extras.join(', ')}';
+
+  if (width != null && height != null) {
+    final embedded = material.hasEmbeddedTexture ? ' (embedded)' : '';
+    return 'textured ${width}x$height$embedded$suffix';
+  }
+  if (material.texturesMissing) {
+    final count = material.textures.length;
+    final noun = count == 1 ? 'texture' : 'textures';
+    return 'missing: asks for $count $noun, none found$suffix';
+  }
+  return 'flat colour, no texture$suffix';
+}
+
 class MaterialSummaryRow extends StatelessWidget {
   const MaterialSummaryRow({required this.material, super.key});
 
@@ -5310,11 +5679,17 @@ class MaterialSummaryRow extends StatelessWidget {
                   style: const TextStyle(fontSize: 12.5),
                 ),
                 Text(
-                  image != null
-                      ? 'textured ${image.width}x${image.height}'
-                          '${material.hasEmbeddedTexture ? " (embedded)" : ""}'
-                      : 'flat colour, no texture',
-                  style: const TextStyle(fontSize: 11, color: Colors.black54),
+                  materialSummaryLine(
+                    material,
+                    width: image?.width,
+                    height: image?.height,
+                  ),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: image == null && material.texturesMissing
+                        ? const Color(0xffb3261e)
+                        : Colors.black54,
+                  ),
                 ),
               ],
             ),
@@ -5346,6 +5721,15 @@ class TextureDiscoveryBox extends StatelessWidget {
   /// A model whose materials carry no texture at all is not a problem to be
   /// solved -- Synty collision hulls, for instance, are a flat colour. Saying
   /// so beats implying something is missing.
+  /// Every material asked for textures and none of them resolved.
+  ///
+  /// Distinct from [_isDeliberatelyUntextured]: this model is meant to be
+  /// textured and the links are broken.
+  bool get _allTextureLinksBroken =>
+      mesh != null &&
+      mesh!.materials.isNotEmpty &&
+      mesh!.materials.every((material) => material.texturesMissing);
+
   bool get _isDeliberatelyUntextured =>
       mesh != null &&
       mesh!.materials.isNotEmpty &&
@@ -5385,12 +5769,21 @@ class TextureDiscoveryBox extends StatelessWidget {
             Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 6),
             Text(
-              _isDeliberatelyUntextured
+              _allTextureLinksBroken
+                  ? 'This model is meant to be textured, but none of the '
+                        'images its materials name could be found. It is '
+                        'rendering as flat colour because the links are '
+                        'broken, not because it has no textures.'
+                  : _isDeliberatelyUntextured
                   ? 'This model has no textures: its material is a flat '
                         'colour. Collision hulls and blockout meshes normally '
                         'look like this.'
                   : message,
-              style: const TextStyle(color: Colors.black54),
+              style: TextStyle(
+                color: _allTextureLinksBroken
+                    ? const Color(0xffb3261e)
+                    : Colors.black54,
+              ),
             ),
             if (mesh != null && mesh!.materials.isNotEmpty) ...[
               const SizedBox(height: 8),
@@ -5633,6 +6026,62 @@ String? resolveTextureReference(
   return fallback;
 }
 
+/// Directory names from a texture reference that could identify the pack it
+/// belongs to.
+///
+/// Generic folders carry no identity: half the packs in a library have a
+/// `Textures` folder, so matching on that would relink across unrelated packs.
+Set<String> texturePackHints(String texturePath) {
+  const generic = {
+    'textures',
+    'texture',
+    'misc',
+    'materials',
+    'material',
+    'sourcefiles',
+    'source files',
+    'assets',
+    'content',
+    'maps',
+  };
+  final segments = texturePath
+      .replaceAll('\\', '/')
+      .split('/')
+      .map((segment) => segment.trim().toLowerCase())
+      .toList();
+  if (segments.isNotEmpty) segments.removeLast(); // the file name itself
+  return segments
+      .where(
+        (segment) =>
+            segment.isNotEmpty &&
+            segment != '.' &&
+            segment != '..' &&
+            !generic.contains(segment),
+      )
+      .toSet();
+}
+
+/// Whether [candidatePath] may satisfy a reference that points outside its own
+/// archive.
+///
+/// Synty source files routinely reference a sibling pack, so refusing to leave
+/// the archive leaves those models untextured. Crossing needs strong evidence:
+/// the file names match exactly, and the reference names a folder that also
+/// appears in the candidate's path. Without the second test, a texture called
+/// `Texture_01_A.png` would match the same name in a dozen unrelated packs.
+bool canRelinkAcrossContainers({
+  required String texturePath,
+  required String candidatePath,
+  required String requestedBase,
+  required String candidateBase,
+}) {
+  if (requestedBase != candidateBase) return false;
+  final hints = texturePackHints(texturePath);
+  if (hints.isEmpty) return false;
+  final candidateLower = candidatePath.toLowerCase().replaceAll('\\', '/');
+  return hints.any((hint) => candidateLower.contains(hint));
+}
+
 String? findDeterministicTextureRelink(
   String modelPath,
   String texturePath,
@@ -5641,7 +6090,7 @@ String? findDeterministicTextureRelink(
   if (allAssets.isEmpty) return null;
   final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
   final zipModel = parseZipVirtualPath(modelPath);
-  final sourceCandidates = allAssets.where((asset) {
+  bool sameContainer(AssetItem asset) {
     if (!textureExts.contains(asset.ext)) return false;
     if (zipModel != null) {
       final zipCandidate = parseZipVirtualPath(asset.path);
@@ -5652,8 +6101,9 @@ String? findDeterministicTextureRelink(
     if (isZipVirtualPath(asset.path)) return false;
     final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
     return modelPathLower.startsWith(sourceLower);
-  }).toList();
-  if (sourceCandidates.isEmpty) return null;
+  }
+
+  final sourceCandidates = allAssets.where(sameContainer).toList();
 
   final requestedBase = texturePath
       .split(_pathSeparatorPattern)
@@ -5731,9 +6181,31 @@ String? findDeterministicTextureRelink(
         ).compareTo(normalizePathKey(b.asset.path));
       });
 
-  final best = scored.first;
-  if (best.score < 80) return null;
-  return best.asset.path;
+  // May be empty: the model's own archive need not contain any texture.
+  if (scored.isNotEmpty && scored.first.score >= 80) {
+    return scored.first.asset.path;
+  }
+
+  // Nothing good enough beside the model. The reference may legitimately point
+  // at another pack, so try that, on the stricter rules above.
+  final crossContainer = [
+    for (final asset in allAssets)
+      if (textureExts.contains(asset.ext) && !sameContainer(asset))
+        if (canRelinkAcrossContainers(
+          texturePath: texturePath,
+          candidatePath: asset.path,
+          requestedBase: requestedBase,
+          candidateBase: asset.name.toLowerCase().replaceAll(
+            _extensionPattern,
+            '',
+          ),
+        ))
+          asset,
+  ]..sort(
+    (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+  );
+  if (crossContainer.isNotEmpty) return crossContainer.first.path;
+  return null;
 }
 
 String? findFallbackTexture(
@@ -7239,6 +7711,36 @@ Future<MeshModel> meshModelFromImporterJson(
       }
     }
 
+    // Emissive: same resolution path, sampled additively so lit signage and
+    // screens are not flattened to their base colour.
+    final emissiveRef = (material['emissiveTexture'] as String?)?.trim() ?? '';
+    Uint8List? emissivePixels;
+    var emissiveWidth = 0;
+    var emissiveHeight = 0;
+    if (emissiveRef.isNotEmpty) {
+      final resolvedEmissive = resolveTextureReference(
+        modelPath,
+        emissiveRef,
+        allAssets: allAssets,
+        allowFallbackLookup: false,
+      );
+      if (resolvedEmissive != null) {
+        try {
+          final emissiveImage = await firstTextureImage([resolvedEmissive]);
+          if (emissiveImage != null) {
+            final data = await emissiveImage.toByteData(
+              format: ui.ImageByteFormat.rawRgba,
+            );
+            emissivePixels = data?.buffer.asUint8List();
+            emissiveWidth = emissiveImage.width;
+            emissiveHeight = emissiveImage.height;
+          }
+        } catch (error) {
+          fbxLog('Emissive decode failed: $error');
+        }
+      }
+    }
+
     materials.add(
       MeshMaterial(
         name: (material['name'] as String?) ?? 'Material',
@@ -7254,6 +7756,10 @@ Future<MeshModel> meshModelFromImporterJson(
         textureImage: textureImage,
         texturePixels: texturePixels,
         normalTexture: normalRef,
+        emissiveTexture: emissiveRef,
+        emissivePixels: emissivePixels,
+        emissiveWidth: emissiveWidth,
+        emissiveHeight: emissiveHeight,
         normalPixels: normalPixels,
         normalWidth: normalWidth,
         normalHeight: normalHeight,
@@ -7794,6 +8300,10 @@ class MeshMaterial {
     this.normalPixels,
     this.normalWidth = 0,
     this.normalHeight = 0,
+    this.emissiveTexture = '',
+    this.emissivePixels,
+    this.emissiveWidth = 0,
+    this.emissiveHeight = 0,
     this.opacity = 1.0,
     this.roughness = 0.7,
     this.metalness = 0.0,
@@ -7827,6 +8337,36 @@ class MeshMaterial {
   final int normalHeight;
 
   bool get hasNormalMap => normalPixels != null && normalWidth > 0;
+
+  /// Emissive map: light the material gives off, added after shading.
+  final String emissiveTexture;
+  final Uint8List? emissivePixels;
+  final int emissiveWidth;
+  final int emissiveHeight;
+
+  bool get hasEmissiveMap => emissivePixels != null && emissiveWidth > 0;
+
+  /// True when the material named textures and none of them could be found.
+  /// Such a model renders as flat base colour, which reads as broken rather
+  /// than as "the textures are elsewhere".
+  bool get texturesMissing => textures.isNotEmpty && resolvedTextures.isEmpty;
+
+  /// Emissive texel at (u, v) packed 0xRRGGBB, or null.
+  int? sampleEmissiveRgb(double u, double v) {
+    final pixels = emissivePixels;
+    if (pixels == null || emissiveWidth <= 0 || emissiveHeight <= 0) {
+      return null;
+    }
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    final x = (fu * (emissiveWidth - 1)).toInt();
+    final y = (fv * (emissiveHeight - 1)).toInt();
+    final index = (y * emissiveWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return (pixels[index] << 16) | (pixels[index + 1] << 8) | pixels[index + 2];
+  }
 
   /// Tangent-space normal at [uv], decoded from the usual RGB encoding where
   /// (0.5, 0.5, 1.0) means "straight out of the surface".
@@ -8595,6 +9135,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
