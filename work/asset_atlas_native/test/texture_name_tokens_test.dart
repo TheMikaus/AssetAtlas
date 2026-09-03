@@ -134,4 +134,67 @@ void main() {
       );
     }, skip: available ? false : 'Synty corpus not mounted');
   });
+
+  group('a texture may only relink within its own channel', () {
+    const pack = r'C:\Packs\ANIMATION_Base_Locomotion_SourceFiles_v3.zip';
+    final model = buildZipVirtualPath(pack, 'SourceFiles/Demo_Models/SM_Obstacle_10.fbx');
+    final atlas = _zipAsset(pack, 'SourceFiles/Demo_Textures/T_PolygonApocalypse_01.png');
+
+    test('an emissive reference does not bind to the base atlas', () {
+      // These share every distinctive word they have, so word overlap alone
+      // matched -- and an emissive map added over its own base colour washes
+      // the model out to grey, which is exactly what showed up on screen.
+      expect(
+        findDeterministicTextureRelink(
+          model,
+          r'..\..\..\PolygonApocalypse\Textures\Misc\PolygonApocalypse_Emissive_01.png',
+          [atlas],
+        ),
+        isNull,
+      );
+    });
+
+    test('a normal map reference does not bind to the base atlas', () {
+      expect(
+        findDeterministicTextureRelink(
+          model,
+          r'..\..\..\PolygonApocalypse\Textures\Misc\PolygonApocalypse_Normal.png',
+          [atlas],
+        ),
+        isNull,
+      );
+    });
+
+    test('the base colour still binds', () {
+      expect(
+        findDeterministicTextureRelink(
+          model,
+          r'..\..\..\PolygonApocalypse\Textures\PolygonApocalypse_Texture_01_A 1.png',
+          [atlas],
+        ),
+        atlas.path,
+      );
+    });
+
+    test('an emissive reference binds to an emissive candidate', () {
+      final emissive = _zipAsset(
+        pack,
+        'SourceFiles/Demo_Textures/T_PolygonApocalypse_Emissive_01.png',
+      );
+      expect(
+        findDeterministicTextureRelink(
+          model,
+          r'..\..\..\PolygonApocalypse\Textures\Misc\PolygonApocalypse_Emissive_01.png',
+          [atlas, emissive],
+        ),
+        emissive.path,
+      );
+    });
+
+    test('textureChannelWord names the channel a file declares', () {
+      expect(textureChannelWord('PolygonApocalypse_Emissive_01'), 'emissive');
+      expect(textureChannelWord('PolygonApocalypse_Normal'), 'normal');
+      expect(textureChannelWord('PolygonApocalypse_Texture_01_A'), '');
+    });
+  });
 }
