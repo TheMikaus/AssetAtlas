@@ -218,4 +218,91 @@ void main() {
       );
     });
   });
+  group('poseSkinnedPositions', () {
+    test('writes the same answer as the list form', () {
+      final character = _oneBoneCharacter();
+      final clip = _clip([_matrix(ty: 10)]);
+      final expected = poseSkinnedVertices(
+        character: character,
+        clip: clip,
+        frame: 0,
+      );
+      final out = Float32List(character.vertices.length * 3);
+      poseSkinnedPositions(
+        character: character,
+        clip: clip,
+        frame: 0,
+        out: out,
+      );
+      for (var i = 0; i < expected.length; i += 1) {
+        expect(out[i * 3], closeTo(expected[i].x, 1e-5));
+        expect(out[i * 3 + 1], closeTo(expected[i].y, 1e-5));
+        expect(out[i * 3 + 2], closeTo(expected[i].z, 1e-5));
+      }
+    });
+
+    test('a reused buffer is fully overwritten, not blended', () {
+      final character = _oneBoneCharacter();
+      final out = Float32List(character.vertices.length * 3);
+      poseSkinnedPositions(
+        character: character,
+        clip: _clip([_matrix(ty: 10)]),
+        frame: 0,
+        out: out,
+      );
+      poseSkinnedPositions(
+        character: character,
+        clip: _clip([_matrix(ty: 0)]),
+        frame: 0,
+        out: out,
+      );
+      expect(out[1], character.vertices[0].y);
+    });
+
+    test('an unskinned mesh fills the buffer with the bind pose', () {
+      final character = MeshModel(
+        name: 'prop',
+        vertices: const [Vec3(1, 2, 3)],
+        faces: const [],
+      );
+      final out = Float32List(3);
+      poseSkinnedPositions(
+        character: character,
+        clip: _clip([_matrix(ty: 10)]),
+        frame: 0,
+        out: out,
+      );
+      expect(out, Float32List.fromList([1, 2, 3]));
+    });
+  });
+
+  group('bone paths', () {
+    test('a path beats a name when names repeat', () {
+      final clip = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Finger_03', 'parent': -1, 'path': 'Hand_R/Finger_03'},
+          {'name': 'Finger_03', 'parent': -1, 'path': 'Hand_L/Finger_03'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'frames': [
+          [..._matrix(ty: 1), ..._matrix(ty: 2)],
+        ],
+      })!;
+      expect(clip.indexOfBone('Finger_03', path: 'Hand_L/Finger_03'), 1);
+      expect(clip.indexOfBone('Finger_03', path: 'Hand_R/Finger_03'), 0);
+    });
+
+    test('an unknown path falls back to the name', () {
+      final clip = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Hips', 'parent': -1, 'path': 'Root/Hips'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'frames': [_matrix().toList()],
+      })!;
+      expect(clip.indexOfBone('Hips', path: 'Somewhere/Else'), 0);
+    });
+  });
 }

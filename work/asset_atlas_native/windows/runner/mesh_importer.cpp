@@ -97,6 +97,23 @@ static std::string string_from_ufbx(ufbx_string value) {
   return std::string(value.data, value.length);
 }
 
+// A bone's path from the root, as "Hips/Spine_01/Clavicle_L/...".
+//
+// Bone *names* are not unique in these rigs: the left and right hands both
+// carry `Finger_03`, and ufbx disambiguates the second one it meets as
+// `Finger_03_1`. Which hand gets the suffix depends on node order, and that
+// order differs between a character file and a clip file -- so joining two
+// rigs on the bare name silently swapped left and right fingers. The chain
+// down from the root does not have that problem.
+static std::string bone_path(const ufbx_node* node) {
+  std::string path;
+  for (const ufbx_node* n = node; n && !n->is_root; n = n->parent) {
+    std::string name = string_from_ufbx(n->name);
+    path = path.empty() ? name : name + "/" + path;
+  }
+  return path;
+}
+
 // How many poses to sample out of a clip.
 //
 // A preview only has to read as motion, and every frame costs a full scene
@@ -134,6 +151,8 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
     if (i) putchar(0x2C);
     printf("{\"name\":");
     print_json_string(string_from_ufbx(bones[i]->name).c_str());
+    printf(",\"path\":");
+    print_json_string(bone_path(bones[i]).c_str());
     // Index into this same list, or -1 for a root. Resolved here because the
     // consumer would otherwise have to match names a second time.
     int parent_index = -1;
@@ -167,6 +186,26 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
     ? (double)(frame_count - 1) / duration
     : kSkeletonSampleRate);
   printf(",\"stride\":12");
+
+  // The rig's own rest pose, unevaluated.
+  //
+  // A clip and a character are different files whose rigs need not be posed
+  // the same way at rest, so a clip's absolute bone transforms cannot be
+  // applied to a character directly -- doing that threw the arms over the
+  // head. What transfers is the motion *relative* to each rig's own rest, and
+  // this is the half of that the clip has to supply.
+  printf(",\"rest\":[");
+  for (size_t i = 0; i < bones.size(); ++i) {
+    const ufbx_matrix m = bones[i]->node_to_world;
+    if (i) putchar(0x2C);
+    printf("%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+      m.cols[0].x, m.cols[0].y, m.cols[0].z,
+      m.cols[1].x, m.cols[1].y, m.cols[1].z,
+      m.cols[2].x, m.cols[2].y, m.cols[2].z,
+      m.cols[3].x, m.cols[3].y, m.cols[3].z);
+  }
+  printf("]");
+
   printf(",\"frames\":[");
   for (size_t frame = 0; frame < frame_count; ++frame) {
     const double t = frame_count > 1
@@ -289,6 +328,12 @@ int main(int argc, char** argv) {
   opts.target_axes.up = UFBX_COORDINATE_AXIS_POSITIVE_Y;
   opts.target_axes.front = UFBX_COORDINATE_AXIS_POSITIVE_Z;
   opts.target_unit_meters = 1.0f;
+  // Bake the unit conversion into the geometry rather than into a root
+  // transform. The default leaves mesh vertices in the file's own units while
+  // the skin cluster bind matrices come back converted, so a character's
+  // vertices sat at 0.88 while its bone origins sat at 166 -- the same rig,
+  // a hundred times apart.
+  opts.space_conversion = UFBX_SPACE_CONVERSION_MODIFY_GEOMETRY;
 
   ufbx_error error;
   ufbx_scene* scene = nullptr;
@@ -495,6 +540,7 @@ int main(int argc, char** argv) {
   // files, and the Synty rigs use identical bone names, so a name is what
   // connects an animated bone to the vertices it moves.
   std::vector<std::string> skin_bone_names;
+  std::vector<std::string> skin_bone_paths;
   // `geometry_to_bone` composed with the inverse of the mesh's own
   // geometry-to-world, because the vertices emitted below are already in world
   // space. Without that second term a posed character lands in the wrong place.
@@ -509,15 +555,22 @@ int main(int argc, char** argv) {
                              const ufbx_matrix* geometry_to_world) -> int {
     if (!cluster || !cluster->bone_node) return -1;
     const std::string name = string_from_ufbx(cluster->bone_node->name);
-    for (size_t i = 0; i < skin_bone_names.size(); ++i) {
-      if (skin_bone_names[i] == name) return (int)i;
+    const std::string path = bone_path(cluster->bone_node);
+    for (size_t i = 0; i < skin_bone_paths.size(); ++i) {
+      if (skin_bone_paths[i] == path) return (int)i;
     }
+    // `geometry_to_bone` maps the mesh's own geometry space to the bone. The
+    // vertices below are emitted in world space, so the inverse of the mesh's
+    // geometry-to-world has to come first -- a Synty character's geometry is
+    // centred on the origin while its skeleton stands on the ground, and
+    // without this term the two are 0.88m apart.
     ufbx_matrix bind = cluster->geometry_to_bone;
     if (geometry_to_world) {
       const ufbx_matrix world_to_geometry = ufbx_matrix_invert(geometry_to_world);
       bind = ufbx_matrix_mul(&bind, &world_to_geometry);
     }
     skin_bone_names.push_back(name);
+    skin_bone_paths.push_back(path);
     skin_bind_inverse.push_back(bind);
     return (int)skin_bone_names.size() - 1;
   };
@@ -750,6 +803,8 @@ int main(int argc, char** argv) {
       if (i) putchar(0x2C);
       printf("{\"name\":");
       print_json_string(skin_bone_names[i].c_str());
+      printf(",\"path\":");
+      print_json_string(skin_bone_paths[i].c_str());
       const ufbx_matrix m = skin_bind_inverse[i];
       printf(",\"bindInverse\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]}",
         m.cols[0].x, m.cols[0].y, m.cols[0].z,
