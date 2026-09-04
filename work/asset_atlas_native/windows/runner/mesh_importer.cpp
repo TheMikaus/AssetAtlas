@@ -240,6 +240,42 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
   printf("]}");
 }
 
+// The bones that separate one rig family from another, printed by --probe.
+//
+// Which family a file belongs to cannot be read off its name: `SK_` is an
+// Unreal skeletal-mesh prefix that Synty uses on Polygon-rigged characters,
+// and the Sidekick rig is the Unreal mannequin with extra bones. The bones
+// themselves are unambiguous, so the probe reports which of these it saw and
+// the caller decides what that means.
+static const char* const kRigMarkerBones[] = {
+  // Polygon: Synty's own rig, capitalised.
+  "Hips", "UpperLeg_R", "Clavicle_L", "Spine_01",
+  // Unreal mannequin: lowercase.
+  "pelvis", "thigh_l", "clavicle_l", "spine_01",
+  // Sidekick: the mannequin plus attachment and IK bones.
+  "hipAttachFront", "hipAttach_l", "ik_hand_gun", "ik_hand_root",
+};
+
+static void print_rig_markers(ufbx_scene* scene) {
+  printf(",\"rigMarkers\":[");
+  bool first = true;
+  for (size_t m = 0; m < sizeof(kRigMarkerBones) / sizeof(kRigMarkerBones[0]); ++m) {
+    const char* marker = kRigMarkerBones[m];
+    bool present = false;
+    for (size_t i = 0; i < scene->nodes.count && !present; ++i) {
+      const ufbx_node* node = scene->nodes.data[i];
+      if (!node || node->is_root) continue;
+      // Exact, case-sensitive: `Hips` and `hips` belong to different rigs.
+      if (string_from_ufbx(node->name) == marker) present = true;
+    }
+    if (!present) continue;
+    if (!first) putchar(0x2C);
+    first = false;
+    print_json_string(marker);
+  }
+  printf("]");
+}
+
 static bool debug_spaces_enabled() {
   size_t len = 0;
   char* value = nullptr;
@@ -394,7 +430,9 @@ int main(int argc, char** argv) {
       }
       printf("{\"kind\":\"animation\",\"animationStacks\":%zu", scene->anim_stacks.count);
       printf(",\"bones\":%zu", scene->bones.count);
-      printf(",\"durationSeconds\":%.6g}", duration);
+      printf(",\"durationSeconds\":%.6g", duration);
+      print_rig_markers(scene);
+      printf("}");
       ufbx_free_scene(scene);
       return 0;
     }
@@ -403,7 +441,10 @@ int main(int argc, char** argv) {
       ufbx_free_scene(scene);
       return 1;
     }
-    printf("{\"kind\":\"mesh\",\"faces\":%zu}", total_faces);
+    printf("{\"kind\":\"mesh\",\"faces\":%zu", total_faces);
+    printf(",\"bones\":%zu", scene->bones.count);
+    print_rig_markers(scene);
+    printf("}");
     ufbx_free_scene(scene);
     return 0;
   }
