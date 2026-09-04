@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.15';
+const appVersion = '1.10.16';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -501,7 +501,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
   void _scheduleModelKindClassification(Iterable<AssetItem> subset) {
     final pending = <AssetItem>[];
     for (final asset in subset) {
-      if (asset.ext != 'fbx' || asset.modelKind != null) continue;
+      if (asset.ext != 'fbx') continue;
+      // Either fact missing is reason enough to probe. A catalog written
+      // before the rig column existed holds a kind and no rig, and skipping on
+      // kind alone left those files permanently unclassified.
+      if (asset.modelKind != null && asset.rigFamily != null) continue;
       if (!_modelKindInFlight.add(asset.id)) continue;
       pending.add(asset);
     }
@@ -1310,7 +1314,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final visible = filteredAssets;
     // FBX files nothing has read yet, so the animation count is a lower bound.
     final unclassifiedFbxCount = assets
-        .where((asset) => asset.ext == 'fbx' && asset.modelKind == null)
+        .where(
+          (asset) =>
+              asset.ext == 'fbx' &&
+              (asset.modelKind == null || asset.rigFamily == null),
+        )
         .length;
     final counts = {
       'all': assets.length,
@@ -7453,28 +7461,96 @@ bool canRelinkAcrossContainers({
   return hints.any((hint) => candidateLower.contains(hint));
 }
 
+/// The candidate textures for one model, split by container.
+///
+/// Partitioning the catalog is the expensive part of relinking: it walks every
+/// asset, parsing zip virtual paths as it goes. A model with twelve materials
+/// asks for thirty-odd textures and each one repeated the whole walk, which on
+/// a 26,000-asset catalog cost about a second of frozen UI per model. The
+/// split depends only on the model and the catalog, so it is done once.
+class _RelinkCandidates {
+  const _RelinkCandidates(
+    this.sameContainer,
+    this.otherContainers,
+    this.otherByBaseName,
+  );
+
+  final List<AssetItem> sameContainer;
+  final List<AssetItem> otherContainers;
+
+  /// Assets outside the model's container, keyed by file name without its
+  /// extension.
+  ///
+  /// Crossing containers demands an exact name match, so this turns a walk of
+  /// the whole catalog per reference into a lookup. With 26,000 assets and a
+  /// model asking for thirty textures, that walk was the load.
+  final Map<String, List<AssetItem>> otherByBaseName;
+}
+
+String? _relinkCacheModelPath;
+int? _relinkCacheAssets;
+_RelinkCandidates? _relinkCache;
+
+/// Partitions [allAssets] for [modelPath], reusing the last answer.
+///
+/// One entry is enough: every reference in a model is resolved back to back,
+/// so the cache is hot for exactly as long as it is useful.
+_RelinkCandidates _relinkCandidatesFor(
+  String modelPath,
+  List<AssetItem> allAssets,
+) {
+  final assetsIdentity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _relinkCache;
+  if (cached != null &&
+      _relinkCacheModelPath == modelPath &&
+      _relinkCacheAssets == assetsIdentity) {
+    return cached;
+  }
+
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
+  final same = <AssetItem>[];
+  final other = <AssetItem>[];
+  final otherByBaseName = <String, List<AssetItem>>{};
+  for (final asset in allAssets) {
+    if (!textureExts.contains(asset.ext)) continue;
+    bool isSame;
+    if (zipModel != null) {
+      final zipCandidate = parseZipVirtualPath(asset.path);
+      isSame =
+          zipCandidate != null &&
+          normalizePathKey(zipCandidate.zipPath) ==
+              normalizePathKey(zipModel.zipPath);
+    } else if (isZipVirtualPath(asset.path)) {
+      isSame = false;
+    } else {
+      final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
+      isSame = modelPathLower.startsWith(sourceLower);
+    }
+    if (isSame) {
+      same.add(asset);
+    } else {
+      other.add(asset);
+      final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
+      (otherByBaseName[base] ??= <AssetItem>[]).add(asset);
+    }
+  }
+
+  final result = _RelinkCandidates(same, other, otherByBaseName);
+  _relinkCacheModelPath = modelPath;
+  _relinkCacheAssets = assetsIdentity;
+  _relinkCache = result;
+  return result;
+}
+
 String? findDeterministicTextureRelink(
   String modelPath,
   String texturePath,
   List<AssetItem> allAssets,
 ) {
   if (allAssets.isEmpty) return null;
-  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
-  final zipModel = parseZipVirtualPath(modelPath);
-  bool sameContainer(AssetItem asset) {
-    if (!textureExts.contains(asset.ext)) return false;
-    if (zipModel != null) {
-      final zipCandidate = parseZipVirtualPath(asset.path);
-      return zipCandidate != null &&
-          normalizePathKey(zipCandidate.zipPath) ==
-              normalizePathKey(zipModel.zipPath);
-    }
-    if (isZipVirtualPath(asset.path)) return false;
-    final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
-    return modelPathLower.startsWith(sourceLower);
-  }
-
-  final sourceCandidates = allAssets.where(sameContainer).toList();
+  final candidates = _relinkCandidatesFor(modelPath, allAssets);
+  final sourceCandidates = candidates.sameContainer;
 
   final requestedBase = texturePath
       .split(_pathSeparatorPattern)
@@ -7575,18 +7651,20 @@ String? findDeterministicTextureRelink(
   // at another pack, so try that, on the stricter rules above.
   final crossContainer =
       [
-        for (final asset in allAssets)
-          if (textureExts.contains(asset.ext) && !sameContainer(asset))
-            if (canRelinkAcrossContainers(
-              texturePath: texturePath,
-              candidatePath: asset.path,
-              requestedBase: requestedBase,
-              candidateBase: asset.name.toLowerCase().replaceAll(
-                _extensionPattern,
-                '',
-              ),
-            ))
-              asset,
+        // Only a name that already matches can qualify, so the rest of the
+        // catalog is never visited.
+        for (final asset
+            in candidates.otherByBaseName[requestedBase] ?? const <AssetItem>[])
+          if (canRelinkAcrossContainers(
+            texturePath: texturePath,
+            candidatePath: asset.path,
+            requestedBase: requestedBase,
+            candidateBase: asset.name.toLowerCase().replaceAll(
+              _extensionPattern,
+              '',
+            ),
+          ))
+            asset,
       ]..sort(
         (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
       );
@@ -7594,14 +7672,33 @@ String? findDeterministicTextureRelink(
   return null;
 }
 
+int? _imageAssetsIdentity;
+List<AssetItem>? _imageAssetsCache;
+
+/// Every image in the catalog, remembered between calls.
+///
+/// The fallback lookup runs once per unresolved texture reference, and a model
+/// with a dozen unresolved materials asks thirty times. Filtering the whole
+/// catalog each time is most of what made such a model freeze the window.
+List<AssetItem> _imageAssetsOf(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _imageAssetsCache;
+  if (cached != null && _imageAssetsIdentity == identity) return cached;
+  final images = [
+    for (final asset in allAssets)
+      if (imageExts.contains(asset.ext)) asset,
+  ];
+  _imageAssetsIdentity = identity;
+  _imageAssetsCache = images;
+  return images;
+}
+
 String? findFallbackTexture(
   String modelPath,
   String texturePath,
   List<AssetItem> allAssets,
 ) {
-  final supported = allAssets
-      .where((asset) => imageExts.contains(asset.ext))
-      .toList();
+  final supported = _imageAssetsOf(allAssets);
   if (supported.isEmpty) return null;
   final modelDir = parentPath(modelPath).toLowerCase();
   final modelParent = parentPath(parentPath(modelPath)).toLowerCase();
@@ -9688,6 +9785,13 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
 /// Settings key for the model clips are played on.
 const animationCharacterKey = 'animation.character.path';
 
+/// Settings key for that character's rig family.
+///
+/// Stored rather than looked up, because the filter is wanted before the
+/// catalog has necessarily finished classifying, and re-deriving it would mean
+/// importing the character at startup.
+const animationCharacterRigKey = 'animation.character.rig';
+
 /// The model animation clips are played on, and the clip preview's fallback.
 ///
 /// Held here rather than threaded through the widget tree because a clip and
@@ -9710,6 +9814,9 @@ class AnimationCharacter {
       path.value = await AssetAtlasDatabase.instance.readSetting(
         animationCharacterKey,
       );
+      rigFamily = await AssetAtlasDatabase.instance.readSetting(
+        animationCharacterRigKey,
+      );
     } catch (error) {
       // A missing settings row is not worth failing startup over.
       fbxLog('Could not read the animation character: $error');
@@ -9723,6 +9830,10 @@ class AnimationCharacter {
       await AssetAtlasDatabase.instance.writeSetting(
         animationCharacterKey,
         assetPath,
+      );
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterRigKey,
+        rigFamily,
       );
     } catch (error) {
       fbxLog('Could not save the animation character: $error');
