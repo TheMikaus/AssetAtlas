@@ -554,35 +554,59 @@ void main() {
   });
 
   group('rigAxisDifference', () {
-    test('a rig compared with itself is zero', () {
-      final r = SkeletonAnimation.fromJson({
+    // Rigs need at least `minimumRigOverlap` shared bones to be comparable,
+    // so these fixtures carry enough to clear it.
+    SkeletonAnimation rig(List<double> Function(int) boneAt) {
+      final rest = <double>[];
+      for (var i = 0; i < 5; i += 1) {
+        rest.addAll(boneAt(i));
+      }
+      return SkeletonAnimation.fromJson({
         'bones': [
-          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+          for (var i = 0; i < 5; i += 1)
+            {'name': 'Bone_$i', 'parent': i == 0 ? -1 : i - 1, 'path': 'Bone_$i'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': rest,
+        'frames': [rest],
+      })!;
+    }
+
+    test('a rig compared with itself is zero', () {
+      final r = rig((_) => _matrix().toList());
+      expect(rigAxisDifference(r, r), closeTo(0, 1e-6));
+    });
+
+    test('a bone turned a quarter turn reads as ninety degrees', () {
+      final a = rig((_) => _matrix().toList());
+      // Every x axis rotated from +x to +y.
+      final b = rig((_) => [0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0]);
+      expect(rigAxisDifference(a, b), closeTo(90, 0.01));
+    });
+
+    test('rigs with nothing in common are infinitely far apart', () {
+      final a = rig((_) => _matrix().toList());
+      final b = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Other_0', 'parent': -1, 'path': 'Other_0'},
         ],
         'stride': 12,
         'frameRate': 30.0,
         'rest': _matrix().toList(),
         'frames': [_matrix().toList()],
       })!;
-      expect(rigAxisDifference(r, r), closeTo(0, 1e-6));
+      expect(
+        rigAxisDifference(a, b),
+        double.infinity,
+        reason: 'zero would read as a flawless match and win the comparison',
+      );
+      expect(rigBoneOverlap(a, b), 0);
     });
 
-    test('a bone turned a quarter turn reads as ninety degrees', () {
-      Map<String, dynamic> rig(List<double> rest) => {
-        'bones': [
-          {'name': 'Root', 'parent': -1, 'path': 'Root'},
-        ],
-        'stride': 12,
-        'frameRate': 30.0,
-        'rest': rest,
-        'frames': [rest],
-      };
-      // x axis along +x, versus x axis along +y.
-      final a = SkeletonAnimation.fromJson(rig(_matrix().toList()))!;
-      final b = SkeletonAnimation.fromJson(
-        rig([0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0]),
-      )!;
-      expect(rigAxisDifference(a, b), closeTo(90, 0.01));
+    test('rigBoneOverlap counts the bones two rigs share', () {
+      final a = rig((_) => _matrix().toList());
+      expect(rigBoneOverlap(a, a), 5);
     });
   });
 }

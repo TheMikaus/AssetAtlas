@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.10';
+const appVersion = '1.10.11';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3816,7 +3816,8 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   @override
   void didUpdateWidget(covariant SkeletonPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.characterPath != widget.characterPath) {
+    if (oldWidget.characterPath != widget.characterPath ||
+        !identical(oldWidget.skeleton, widget.skeleton)) {
       _character = null;
       _characterError = null;
       _restScene = null;
@@ -3837,6 +3838,17 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   Future<void> _buildPlan(MeshModel character) async {
     final rest = character.skeleton;
     if (rest == null) return;
+    // A character with no bones in common with the clip cannot be driven by it
+    // at all; say so rather than showing a bind pose with no explanation.
+    if (rigBoneOverlap(rest, widget.skeleton) < minimumRigOverlap) {
+      _plan = null;
+      _boneWorld = null;
+      _retargetNote =
+          'This clip is for a different skeleton, so it cannot move this '
+          'character. Look for clips beside it built for the same rig.';
+      return;
+    }
+
     final difference = rigAxisDifference(rest, widget.skeleton);
     if (difference <= maxDirectPoseAngle) {
       _plan = null;
@@ -3845,21 +3857,42 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       return;
     }
 
+    // Measure every candidate against the clip and take the closest. This
+    // pack ships a Polygon and a Sidekick character side by side, and the
+    // clip was authored against exactly one of them; choosing by name picked
+    // whichever sorted first, which corrected half the clips against a rig
+    // they were never made for.
+    // The reference is the clip's own rig in a T-pose, so it is chosen by how
+    // many bones it shares with the clip -- not by how close its pose is. The
+    // pack ships a Polygon and a Sidekick character with no bones in common,
+    // and the clip belongs to exactly one of them.
     SkeletonAnimation? reference;
-    final referenceAsset = findClipReferenceCharacter(
+    AssetItem? referenceAsset;
+    var bestOverlap = 0;
+    for (final candidate in findClipReferenceCharacters(
       widget.clipPath,
       widget.allAssets,
-    );
-    if (referenceAsset != null) {
+    )) {
       try {
-        final referenceMesh = await MeshLoadCache.load(
-          referenceAsset,
+        final candidateMesh = await MeshLoadCache.load(
+          candidate,
           allAssets: widget.allAssets,
         );
-        reference = referenceMesh.skeleton;
+        final candidateRig = candidateMesh.skeleton;
+        if (candidateRig == null) continue;
+        final shared = rigBoneOverlap(candidateRig, widget.skeleton);
+        if (shared > bestOverlap) {
+          bestOverlap = shared;
+          reference = candidateRig;
+          referenceAsset = candidate;
+        }
       } catch (error) {
-        fbxLog('Could not load the reference rig: $error');
+        fbxLog('Could not load the reference rig ${candidate.name}: $error');
       }
+    }
+    if (bestOverlap < minimumRigOverlap) {
+      reference = null;
+      referenceAsset = null;
     }
 
     _plan = RetargetPlan.build(
@@ -3870,8 +3903,8 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     _boneWorld = Float32List(rest.bones.length * 12);
     _retargetNote = reference == null
         ? 'This rig sits ${difference.round()}° from the clip and no '
-              'reference character was found beside it, so only its own bind '
-              'pose can be shown.'
+              'matching reference character was found beside it, so only its '
+              'own bind pose can be shown.'
         : 'Retargeted through ${referenceAsset!.name}: this rig sits '
               '${difference.round()}° from the clip.';
   }
@@ -9417,7 +9450,7 @@ void multiplyMatrices(
   }
 }
 
-/// A character shipped alongside a clip, to use as its reference pose.
+/// Characters shipped alongside a clip, any of which may be its reference.
 ///
 /// Retargeting needs to know what the clip's rig looks like in the same
 /// physical pose the character is bound in -- both T-posed, in practice. A
@@ -9425,10 +9458,14 @@ void multiplyMatrices(
 /// left the rig, which for a locomotion pack is a standing idle.
 ///
 /// An animation pack ships a character on its own rig for exactly this reason,
-/// so the reference is looked for beside the clip, in the same archive. Nothing
-/// found means no retargeting, and a character whose rig already matches is
-/// unaffected either way.
-AssetItem? findClipReferenceCharacter(
+/// so references are looked for beside the clip, in the same archive. There
+/// can be more than one: the base locomotion pack ships clips for two rig
+/// families side by side, `Animations/Polygon` and `Animations/Sidekick`, with
+/// `PolygonSyntyCharacter` and `SidekickSyntyCharacter` to match. Picking the
+/// wrong one corrects against a rig the clip was never authored for, which
+/// mangles the result as thoroughly as no correction at all -- so the caller
+/// measures each against the clip rather than guessing from the name.
+List<AssetItem> findClipReferenceCharacters(
   String clipPath,
   List<AssetItem> allAssets,
 ) {
@@ -9453,12 +9490,12 @@ AssetItem? findClipReferenceCharacter(
     }
     candidates.add(asset);
   }
-  if (candidates.isEmpty) return null;
-  // Deterministic: the answer must not depend on scan order.
+  // Deterministic order: the caller measures each, and ties must not depend
+  // on scan order.
   candidates.sort(
     (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
   );
-  return candidates.first;
+  return candidates;
 }
 
 /// Transfers a clip's pose onto a character whose rig holds its bones at
@@ -9688,9 +9725,29 @@ double rigAxisDifference(
     final dot = (ax * bx + ay * by + az * bz).clamp(-1.0, 1.0);
     angles.add(math.acos(dot) * 180 / math.pi);
   }
-  if (angles.isEmpty) return 0;
+  // No shared bones is not a perfect match, it is no comparison at all.
+  // Returning zero here made a rig with nothing in common look like the best
+  // possible reference, which is how a Sidekick character got chosen to
+  // correct a Polygon clip.
+  if (angles.length < minimumRigOverlap) return double.infinity;
   angles.sort();
   return angles[angles.length ~/ 2];
+}
+
+/// How many bones two rigs must share before they can be compared at all.
+const minimumRigOverlap = 4;
+
+/// How many bones a character's rig shares with a clip.
+///
+/// The Synty families do not overlap at all -- Polygon has 52 bones, Sidekick
+/// 121, and not one name in common -- so this separates "a different pose of
+/// the same rig" from "a different rig entirely".
+int rigBoneOverlap(SkeletonAnimation rig, SkeletonAnimation clip) {
+  var shared = 0;
+  for (final bone in rig.bones) {
+    if (clip.indexOfBone(bone.name, path: bone.path) >= 0) shared += 1;
+  }
+  return shared;
 }
 
 /// Poses a character's vertices into a packed buffer.

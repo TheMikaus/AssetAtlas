@@ -112,6 +112,10 @@ Two checks that matter, in order:
 
 The reference pose matters and is easy to get wrong. A clip's *own* rest is wherever the animator left the rig — for a locomotion pack, a standing idle — so using it makes the correction cancel and the character stays in its bind: safe, never mangled, but never posed either. What is needed is the clip rig in the same *physical* pose the character is bound in, i.e. both T-posed. Animation packs ship a character on their own rig for this, so `findClipReferenceCharacter` looks for one in the same archive as the clip. No reference found means the character shows its bind pose and the UI says so.
 
+**Rig families.** The base locomotion pack ships clips for two skeletons side by side — `SourceFiles/Animations/Polygon` (52 bones) and `SourceFiles/Animations/Sidekick` (121 bones) — with `PolygonSyntyCharacter.fbx` and `SidekickSyntyCharacter.fbx` to match. They share **no bone names at all**, so a clip from one family cannot drive a character from the other, and `rigBoneOverlap` is what tells them apart. `rigAxisDifference` returns `double.infinity` below `minimumRigOverlap` shared bones: returning 0 there made an unrelated rig look like a flawless reference and win the selection, which is why the reference is chosen by overlap rather than by angle.
+
+Each FBX also records its authoring path in `Original|FileName` (`U:\Synty\Animation\BaseLocomotion\...\Export\Polygon\...` for a clip, `E:\Individual_Characters\...` for a newer character). It is a useful forensic hint about which pipeline a file came from, but it is not used for matching — measuring the rigs is more reliable than parsing someone else's folder names.
+
 There is no standalone skeleton asset in these packs. Every `SK_Chr_*.fbx` (1,551 of them across the library) embeds its own copy of the rig and its own skin weights, so a character is matched to a clip directly with no shared avatar in between.
 
 Diagnostics: set `ASSET_ATLAS_DEBUG_SPACES=1` and the importer prints each mesh's raw extent and geometry-to-world on stderr. That is what finally showed the mesh standing at y 0..1.79 while the emitted vertices sat at ±0.88.
