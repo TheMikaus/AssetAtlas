@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.11';
+const appVersion = '1.10.12';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -359,7 +359,44 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return _sortedCache!;
   }
 
-  List<AssetItem> get filteredAssets {
+  /// Everything the current filters allow, ignoring the search box.
+  ///
+  /// The denominator the count shows: "12 / 300" against the chosen type
+  /// answers a question you might have, while "12 / 26000" does not. Cached
+  /// separately from [filteredAssets] because both are wanted on every build,
+  /// and sharing one cache would miss on each in turn.
+  List<AssetItem> get filterableAssets => _assetsMatching(
+    query: '',
+    cache: _unqueriedCache,
+    cachedKey: _unqueriedCacheKey,
+    store: _storeUnqueried,
+  );
+
+  List<AssetItem> get filteredAssets => _assetsMatching(
+    query: query,
+    cache: _filteredCache,
+    cachedKey: _filteredCacheKey,
+    store: _storeFiltered,
+  );
+
+  List<AssetItem>? _unqueriedCache;
+  String? _unqueriedCacheKey;
+  void _storeUnqueried(List<AssetItem> value, String key) {
+    _unqueriedCache = value;
+    _unqueriedCacheKey = key;
+  }
+
+  void _storeFiltered(List<AssetItem> value, String key) {
+    _filteredCache = value;
+    _filteredCacheKey = key;
+  }
+
+  List<AssetItem> _assetsMatching({
+    required String query,
+    required List<AssetItem>? cache,
+    required String? cachedKey,
+    required void Function(List<AssetItem>, String) store,
+  }) {
     final lower = query.trim().toLowerCase();
     final cacheKey = [
       lower,
@@ -372,9 +409,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       catalogRevision,
       _listEpoch,
     ].join('|');
-    if (_filteredCache != null && _filteredCacheKey == cacheKey) {
-      return _filteredCache!;
-    }
+    if (cache != null && cachedKey == cacheKey) return cache;
 
     final matches = sortedAssets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
@@ -410,11 +445,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
       }
       if (lower.isEmpty) return true;
-      return asset.searchText.contains(lower);
+      return assetMatchesSearch(asset.searchText, lower);
     }).toList();
 
-    _filteredCache = matches;
-    _filteredCacheKey = cacheKey;
+    store(matches, cacheKey);
     return matches;
   }
 
@@ -1374,7 +1408,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           SearchAndSummary(
                             controller: searchController,
                             visibleCount: visible.length,
-                            totalCount: assets.length,
+                            totalCount: filterableAssets.length,
                             selectedCount: selectedIds.length,
                             sortMode: sortMode,
                             gridMode: gridMode,
@@ -1410,7 +1444,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
                     VerticalResizeHandle(
                       onDrag: (delta) {
                         setState(() {
-                          assetListWidth = (assetListWidth - delta)
+                          // The list is to the left of the handle, so dragging
+                          // right widens it. Subtracting sent it the other way.
+                          assetListWidth = (assetListWidth + delta)
                               .clamp(280.0, 900.0)
                               .toDouble();
                         });
@@ -2366,6 +2402,16 @@ class AssetList extends StatelessWidget {
                       color: asset.ignored ? Colors.black87 : Colors.black26,
                     ),
                     onPressed: () => onIgnoredChanged(asset, !asset.ignored),
+                  ),
+                  IconButton(
+                    tooltip: 'Show in Explorer',
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
+                    ),
+                    icon: const Icon(Icons.folder_open_outlined, size: 15),
+                    onPressed: () => revealAssetInExplorer(asset),
                   ),
                   IconButton(
                     tooltip: 'Copy asset path',
@@ -6266,6 +6312,45 @@ class TextureDiscoveryEntry {
   /// must read this rather than parsing [label], which is display text.
   final bool resolved;
   final AssetItem? jumpAsset;
+}
+
+/// Shows an asset in Windows Explorer, selecting it where possible.
+///
+/// A zip entry has no folder of its own, so the archive is revealed instead --
+/// which is where you would go to extract it anyway.
+Future<void> revealAssetInExplorer(AssetItem asset) async {
+  final zip = parseZipVirtualPath(asset.path);
+  final target = zip?.zipPath ?? asset.path;
+  if (!File(target).existsSync()) {
+    // Fall back to the containing folder: a stale catalog row still tells you
+    // roughly where to look.
+    final folder = parentPath(target);
+    if (Directory(folder).existsSync()) {
+      await Process.run('explorer.exe', [folder]);
+    }
+    return;
+  }
+  // `/select,` needs the path as one argument and backslashes throughout.
+  await Process.run('explorer.exe', [
+    '/select,${target.replaceAll('/', chr92)}',
+  ]);
+}
+
+/// The path separator Explorer insists on, kept out of string literals so a
+/// patching script cannot mangle it.
+final chr92 = String.fromCharCode(92);
+
+/// Whether an asset matches a search box that treats spaces as "and".
+///
+/// "Jump Fem" finds `A_Jump_Running_Femn.fbx` without the words being adjacent
+/// or in that order, which matters when the thing you remember about a file is
+/// two pieces of its name rather than a substring of it.
+bool assetMatchesSearch(String searchText, String query) {
+  final terms = query.toLowerCase().split(' ').where((t) => t.isNotEmpty);
+  for (final term in terms) {
+    if (!searchText.contains(term)) return false;
+  }
+  return true;
 }
 
 /// Model formats the preview can import and therefore introspect.
