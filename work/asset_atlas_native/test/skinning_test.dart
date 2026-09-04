@@ -305,4 +305,181 @@ void main() {
       expect(clip.indexOfBone('Hips', path: 'Somewhere/Else'), 0);
     });
   });
+  group('the importer framing transform', () {
+    // Every mesh is recentred and rescaled into a unit box for the viewer,
+    // while the bind matrices are written against the file's own coordinates.
+    // Forgetting to put a posed vertex back into that framing left the mesh
+    // 0.89m away from its own skeleton and tore the character apart.
+    SkinBinding framed({required Vec3 center, required double scale}) =>
+        SkinBinding(
+          boneNames: const ['Hips'],
+          bindInverse: _matrix(),
+          influences: Float32List.fromList([0, 1, 0, 0, 0, 0, 0, 0]),
+          vertexSkin: Int32List.fromList([0]),
+          normalizeCenter: center,
+          normalizeScale: scale,
+        );
+
+    MeshModel character(SkinBinding skin) => MeshModel(
+      name: 'framed',
+      vertices: const [Vec3(0, 4, 0)],
+      faces: const [],
+      skin: skin,
+    );
+
+    test('the posed vertex is put back into the viewer framing', () {
+      final posed = poseSkinnedVertices(
+        character: character(
+          framed(center: const Vec3(0, 4, 0), scale: 0.5),
+        ),
+        clip: _clip([_matrix()]),
+        frame: 0,
+      );
+      // The bone does not move, so the vertex lands on the centre and the
+      // framing puts it at the origin.
+      expect(posed.single.y, 0);
+    });
+
+    test('the scale is applied after the offset, not before', () {
+      final posed = poseSkinnedVertices(
+        character: character(
+          framed(center: const Vec3(0, 2, 0), scale: 0.5),
+        ),
+        clip: _clip([_matrix()]),
+        frame: 0,
+      );
+      expect(posed.single.y, 1, reason: '(4 - 2) * 0.5');
+    });
+
+    test('a moving bone is framed too', () {
+      final posed = poseSkinnedVertices(
+        character: character(
+          framed(center: const Vec3(0, 2, 0), scale: 0.5),
+        ),
+        clip: _clip([_matrix(ty: 10)]),
+        frame: 0,
+      );
+      expect(posed.single.y, 6, reason: '(4 + 10 - 2) * 0.5');
+    });
+
+    test('the buffer form frames identically', () {
+      final model = character(
+        framed(center: const Vec3(0, 2, 0), scale: 0.5),
+      );
+      final out = Float32List(3);
+      poseSkinnedPositions(
+        character: model,
+        clip: _clip([_matrix(ty: 10)]),
+        frame: 0,
+        out: out,
+      );
+      expect(out[1], 6);
+    });
+
+    test('no framing given leaves the vertex where the bones put it', () {
+      final posed = poseSkinnedVertices(
+        character: character(
+          framed(center: const Vec3(0, 0, 0), scale: 1),
+        ),
+        clip: _clip([_matrix(ty: 10)]),
+        frame: 0,
+      );
+      expect(posed.single.y, 14);
+    });
+
+    test('fromJson reads the framing the importer emitted', () {
+      final skin = SkinBinding.fromJson({
+        'bones': [
+          {'name': 'Hips', 'path': 'Hips', 'bindInverse': List.filled(12, 0)},
+        ],
+        'vertices': [0, 1, 0, 0, 0, 0, 0, 0],
+        'vertexSkin': [0],
+        'normalizeCenter': [0.0, 0.894, -0.004],
+        'normalizeScale': 0.9763,
+      })!;
+      expect(skin.normalizeCenter.y, closeTo(0.894, 1e-9));
+      expect(skin.normalizeScale, closeTo(0.9763, 1e-9));
+    });
+
+    test('a file without the framing fields is treated as unframed', () {
+      final skin = SkinBinding.fromJson({
+        'bones': [
+          {'name': 'Hips', 'bindInverse': List.filled(12, 0)},
+        ],
+        'vertices': [0, 1, 0, 0, 0, 0, 0, 0],
+        'vertexSkin': [0],
+      })!;
+      expect(skin.normalizeScale, 1);
+      expect(skin.normalizeCenter.y, 0);
+    });
+  });
+  group('normalizeBonePath', () {
+    test("removes the importer's duplicate suffix", () {
+      expect(
+        normalizeBonePath('Hand_R/IndexFinger_01_1'),
+        'Hand_R/IndexFinger_01',
+      );
+    });
+
+    test("keeps Synty's own two-digit numbering", () {
+      expect(normalizeBonePath('Spine_01/Spine_02'), 'Spine_01/Spine_02');
+      expect(normalizeBonePath('Root/Hips'), 'Root/Hips');
+    });
+
+    test('left and right stay distinct after normalising', () {
+      expect(
+        normalizeBonePath('Hand_L/Finger_01'),
+        isNot(normalizeBonePath('Hand_R/Finger_01_1')),
+      );
+    });
+
+    test('an empty path is left alone', () {
+      expect(normalizeBonePath(''), '');
+    });
+  });
+
+  group('matching a character to a clip numbered differently', () {
+    // The character calls its right-hand bone `IndexFinger_01`; the clip file
+    // met the left hand first, so its right-hand bone is `IndexFinger_01_1`.
+    // Matching on the bare name would bind the right hand to the left.
+    SkeletonAnimation twoHandedClip() => SkeletonAnimation.fromJson({
+      'bones': [
+        {
+          'name': 'IndexFinger_01',
+          'parent': -1,
+          'path': 'Hand_L/IndexFinger_01',
+        },
+        {
+          'name': 'IndexFinger_01_1',
+          'parent': -1,
+          'path': 'Hand_R/IndexFinger_01_1',
+        },
+      ],
+      'stride': 12,
+      'frameRate': 30.0,
+      'frames': [
+        [..._matrix(tx: -1), ..._matrix(tx: 1)],
+      ],
+    })!;
+
+    test('the right hand binds to the right hand', () {
+      expect(
+        twoHandedClip().indexOfBone(
+          'IndexFinger_01',
+          path: 'Hand_R/IndexFinger_01',
+        ),
+        1,
+      );
+    });
+
+    test('the left hand still binds to the left hand', () {
+      expect(
+        twoHandedClip().indexOfBone(
+          'IndexFinger_01',
+          path: 'Hand_L/IndexFinger_01',
+        ),
+        0,
+      );
+    });
+  });
 }
