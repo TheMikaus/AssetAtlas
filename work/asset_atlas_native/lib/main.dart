@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.13';
+const appVersion = '1.10.14';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -174,6 +174,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool loadingPersisted = true;
   String query = '';
   String typeFilter = 'all';
+
+  /// `all`, `compatible`, or a [RigFamily] name.
+  String rigFilter = 'all';
   String modelTextureFilter = 'all';
   bool hideIgnored = true;
   bool hideZipAssets = false;
@@ -401,6 +404,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final cacheKey = [
       lower,
       typeFilter,
+      rigFilter,
+      AnimationCharacter.instance.rigFamily ?? '',
       modelTextureFilter,
       hideIgnored,
       hideZipAssets,
@@ -431,6 +436,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
           return false;
         }
       } else if (typeFilter != 'all' && asset.effectiveType != typeFilter) {
+        return false;
+      }
+      if (!assetPassesRigFilter(
+        asset: asset,
+        rigFilter: rigFilter,
+        characterRig: AnimationCharacter.instance.rigFamily,
+      )) {
         return false;
       }
       if (asset.type == 'model' && modelTextureFilter != 'all') {
@@ -578,7 +590,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     if (kinds.isEmpty) return;
     final byId = {for (final asset in assets) asset.id: asset};
     for (final entry in kinds.entries) {
-      byId[entry.key]?.modelKind = entry.value;
+      final decoded = FbxClassification.decode(entry.value);
+      final asset = byId[entry.key];
+      if (asset != null) {
+        asset.modelKind = decoded.kind;
+        asset.rigFamily = decoded.rig;
+      }
       _modelKindInFlight.remove(entry.key);
     }
     _modelKindClassified += kinds.length;
@@ -1332,6 +1349,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       counts: counts,
                       unclassifiedFbxCount: unclassifiedFbxCount,
                       typeFilter: typeFilter,
+                      rigFilter: rigFilter,
+                      characterRig: AnimationCharacter.instance.rigFamily,
+                      onRigFilterChanged: (value) =>
+                          setState(() => rigFilter = value),
                       modelTextureFilter: modelTextureFilter,
                       hideIgnored: hideIgnored,
                       hideZipAssets: hideZipAssets,
@@ -1940,6 +1961,8 @@ class FilterPanel extends StatelessWidget {
     required this.counts,
     required this.unclassifiedFbxCount,
     required this.typeFilter,
+    required this.rigFilter,
+    required this.characterRig,
     required this.modelTextureFilter,
     required this.hideIgnored,
     required this.hideZipAssets,
@@ -1950,6 +1973,7 @@ class FilterPanel extends StatelessWidget {
     required this.onFolderSelected,
     required this.onFolderExpandToggled,
     required this.onTypeChanged,
+    required this.onRigFilterChanged,
     required this.onModelTextureFilterChanged,
     required this.onHideIgnoredChanged,
     required this.onHideZipAssetsChanged,
@@ -1961,6 +1985,11 @@ class FilterPanel extends StatelessWidget {
   final Map<String, int> counts;
   final int unclassifiedFbxCount;
   final String typeFilter;
+  final String rigFilter;
+
+  /// The chosen animation character's rig, so the compatible option can name
+  /// it rather than being an unexplained toggle.
+  final String? characterRig;
   final String modelTextureFilter;
   final bool hideIgnored;
   final bool hideZipAssets;
@@ -1971,6 +2000,7 @@ class FilterPanel extends StatelessWidget {
   final ValueChanged<String?> onFolderSelected;
   final ValueChanged<String> onFolderExpandToggled;
   final ValueChanged<String> onTypeChanged;
+  final ValueChanged<String> onRigFilterChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
   final ValueChanged<bool> onHideIgnoredChanged;
   final ValueChanged<bool> onHideZipAssetsChanged;
@@ -2013,6 +2043,36 @@ class FilterPanel extends StatelessWidget {
                     ),
                     onSelected: (_) => onTypeChanged(type),
                   ),
+                ),
+              ),
+            const SizedBox(height: 10),
+            const Text(
+              'Skeleton',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Read from the bones, not the file name.',
+              style: TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+            const SizedBox(height: 8),
+            for (final option in [
+              'all',
+              if (characterRig != null) 'compatible',
+              ...RigFamily.values.map((family) => family.name),
+            ])
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: ChoiceChip(
+                  selected: rigFilter == option,
+                  label: Text(switch (option) {
+                    'all' => 'Any skeleton',
+                    'compatible' =>
+                      'Works with my character '
+                          '(${rigFamilyByName(characterRig).label})',
+                    _ => rigFamilyByName(option).label,
+                  }),
+                  onSelected: (_) => onRigFilterChanged(option),
                 ),
               ),
             const SizedBox(height: 10),
@@ -3377,6 +3437,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                 chosen == widget.asset.path
                                     ? null
                                     : widget.asset.path,
+                                rig: widget.asset.rigFamily,
                               ),
                             ),
                       ),
@@ -6340,6 +6401,66 @@ Future<void> revealAssetInExplorer(AssetItem asset) async {
 /// patching script cannot mangle it.
 final chr92 = String.fromCharCode(92);
 
+/// Whether an asset passes the rig filter.
+///
+/// `all` passes everything. `compatible` keeps only files built on the same
+/// skeleton as the chosen animation character, which is the difference between
+/// "247 clips, most of which will not work" and a list you can trust. A file
+/// nothing has probed yet is kept, because hiding it would be a claim the
+/// catalog cannot make.
+bool assetPassesRigFilter({
+  required AssetItem asset,
+  required String rigFilter,
+  required String? characterRig,
+}) {
+  if (rigFilter == 'all') return true;
+  if (asset.rigFamily == null) return true;
+  if (rigFilter == 'compatible') {
+    if (characterRig == null) return true;
+    return rigFamiliesCompatible(
+      rigFamilyByName(asset.rigFamily),
+      rigFamilyByName(characterRig),
+    );
+  }
+  return asset.rigFamily == rigFilter;
+}
+
+/// Reads a [RigFamily] back from its stored name.
+RigFamily rigFamilyByName(String? name) {
+  for (final family in RigFamily.values) {
+    if (family.name == name) return family;
+  }
+  return RigFamily.none;
+}
+
+/// What one pass of the FBX probe learned about a file.
+///
+/// The classification pass crosses an isolate boundary and stores its answers
+/// in one map, so the two facts share a string rather than needing a second
+/// map threaded through every layer.
+class FbxClassification {
+  const FbxClassification({required this.kind, required this.rig});
+
+  /// Reads the encoded form. An older value with no rig reads as unknown,
+  /// which is what a catalog written before this existed will hold.
+  factory FbxClassification.decode(String value) {
+    final split = value.indexOf('#');
+    if (split < 0) return FbxClassification(kind: value, rig: null);
+    return FbxClassification(
+      kind: value.substring(0, split),
+      rig: value.substring(split + 1),
+    );
+  }
+
+  /// `mesh`, `animation`, or `unreadable`.
+  final String kind;
+
+  /// The [RigFamily] name, or null when the file was never probed for one.
+  final String? rig;
+
+  String encode() => rig == null ? kind : '$kind#$rig';
+}
+
 /// The skeleton a model or clip is built on.
 ///
 /// Not derivable from the file name. `SK_` is Unreal's skeletal-mesh prefix
@@ -8332,7 +8453,13 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
         continue;
       }
       final json = jsonDecode(result.stdout) as Map<String, dynamic>;
-      kinds[assetId] = json['kind'] == 'animation' ? 'animation' : 'mesh';
+      final markers = ((json['rigMarkers'] as List<dynamic>?) ?? const []).map(
+        (value) => value.toString(),
+      );
+      kinds[assetId] = FbxClassification(
+        kind: json['kind'] == 'animation' ? 'animation' : 'mesh',
+        rig: rigFamilyFromMarkers(markers).name,
+      ).encode();
     } catch (_) {
       kinds[assetId] = 'unreadable';
     }
@@ -9389,6 +9516,10 @@ class AnimationCharacter {
   /// Notifies when the choice changes, so an open clip preview re-poses.
   final ValueNotifier<String?> path = ValueNotifier<String?>(null);
 
+  /// The chosen character's rig family, for the "works with this character"
+  /// filter. Null until a character with a known rig is chosen.
+  String? rigFamily;
+
   Future<void> load() async {
     try {
       path.value = await AssetAtlasDatabase.instance.readSetting(
@@ -9400,7 +9531,8 @@ class AnimationCharacter {
     }
   }
 
-  Future<void> set(String? assetPath) async {
+  Future<void> set(String? assetPath, {String? rig}) async {
+    rigFamily = assetPath == null ? null : rig;
     path.value = assetPath;
     try {
       await AssetAtlasDatabase.instance.writeSetting(
@@ -10727,6 +10859,7 @@ class AssetItem {
     required this.tags,
     this.ignored = false,
     this.modelKind,
+    this.rigFamily,
     this.referencedByModel = false,
   });
 
@@ -10747,6 +10880,12 @@ class AssetItem {
   /// something has looked. Null means not classified yet -- classifying an FBX
   /// costs an importer run, so it happens lazily and is persisted.
   String? modelKind;
+
+  /// Which skeleton this file is built on, as a [RigFamily] name.
+  ///
+  /// Learned from the same probe that fills [modelKind] and persisted with it.
+  /// Null means not yet classified; `none` means classified and rigless.
+  String? rigFamily;
 
   /// Set once some model has been read and found to use this image. Persisted,
   /// because it is only learned by importing a model.
@@ -10810,7 +10949,7 @@ class AssetAtlasDatabase {
   ///        file no longer orphans it from projects and ignore flags
   ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
   ///   v5 - referenced_by_model, images a model was found to use
-  static const schemaVersion = 6;
+  static const schemaVersion = 7;
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -10862,6 +11001,11 @@ class AssetAtlasDatabase {
               'ADD COLUMN referenced_by_model INTEGER NOT NULL DEFAULT 0',
             );
           }
+          if (oldVersion < 7) {
+            await db.execute(
+              'ALTER TABLE catalog_assets ADD COLUMN rig_family TEXT',
+            );
+          }
           if (oldVersion < 6) {
             await db.execute('''
             CREATE TABLE settings (
@@ -10887,6 +11031,7 @@ class AssetAtlasDatabase {
               tags_json TEXT NOT NULL,
               ignored INTEGER NOT NULL DEFAULT 0,
               model_kind TEXT,
+              rig_family TEXT,
               referenced_by_model INTEGER NOT NULL DEFAULT 0
             )
           ''');
@@ -10973,6 +11118,7 @@ class AssetAtlasDatabase {
             .cast<String>()),
         ignored: (row['ignored'] as int) == 1,
         modelKind: row['model_kind'] as String?,
+        rigFamily: row['rig_family'] as String?,
         referencedByModel: (row['referenced_by_model'] as int? ?? 0) == 1,
       );
     }).toList();
@@ -11159,15 +11305,20 @@ class AssetAtlasDatabase {
 
   /// Writes a chunk of classifications in one transaction. Doing this per
   /// asset meant tens of thousands of separate writes.
+  /// Stores what the classification pass learned.
+  ///
+  /// Values are [FbxClassification.encode]d, carrying both the kind and the
+  /// rig family, which are written to their own columns here.
   Future<void> updateAssetModelKinds(Map<String, String> kindByAssetId) async {
     if (kindByAssetId.isEmpty) return;
     await initialize();
     await _db!.transaction((txn) async {
       final batch = txn.batch();
       for (final entry in kindByAssetId.entries) {
+        final decoded = FbxClassification.decode(entry.value);
         batch.update(
           'catalog_assets',
-          {'model_kind': entry.value},
+          {'model_kind': decoded.kind, 'rig_family': decoded.rig},
           where: 'id = ?',
           whereArgs: [entry.key],
         );
