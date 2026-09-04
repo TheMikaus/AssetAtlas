@@ -29,9 +29,18 @@ including `.git`, `.vs`, `.vscode`, `Intermediate`, `Saved`, and
 Your catalog and source-folder list are stored locally and restored the next
 time AssetAtlas starts.
 
+Scanning runs in the background, so the window stays usable while it works, and
+the **Stop scan** button ends it at any point. A cancelled scan leaves the
+catalog exactly as it was.
+
 ## 3. Browse and Search
 
-Select an asset in the lower list to open its preview and details.
+The window has three columns: filters and folders on the left, the browse list in
+the middle, and the preview with asset details on the right. Drag the divider
+between the list and the preview to trade list width for preview size.
+
+Select an asset in the list to open its preview and details. **Arrow up and arrow
+down** move through the list without touching the mouse.
 
 Use the search box to search by:
 
@@ -39,9 +48,54 @@ Use the search box to search by:
 - Relative path
 - Automatically generated tags
 
-Use the left panel to filter the catalog by image, model, or audio assets. The
+### List and grid views
+
+The toggle beside the search box switches between:
+
+- **List** - one row per asset, with its folder underneath. Best when you know
+  what you are looking for.
+- **Grid** - thumbnails for images and a type icon for everything else. Best when
+  you are looking for the asset that *looks* right.
+
+**Sort** reorders the visible assets by path, name, size, modified date, or type.
+Size and date sort largest and newest first.
+
+### Folders
+
+The **Folders** tree in the left panel mirrors the folder structure of everything
+you have scanned, with a count beside each folder. Click a folder to limit the
+list to it and everything beneath it; click **All folders** to clear that filter.
+This is the fastest way to work through a large pack without knowing file names.
+
+### Types
+
+Filter the catalog by image, model, animation, or audio assets. The
 model-texture filters can show all models, models with valid textures, or models
 whose textures could not be located.
+
+FBX files that contain only a skeleton and animation curves are listed as
+**animation** rather than model. AssetAtlas has to read a file to know which it
+is, so a file is classified when you select it, or in the background when you
+choose the ANIMATION filter. The answer is remembered afterwards.
+
+While a background sweep runs, the count reads for example **ANIMATION (783+)**:
+the plus means files are still unread, so the number can only grow. The sweep
+uses several background workers and reads roughly 26,000 files in about three
+minutes; the app stays usable throughout, and progress appears in the status
+area at the top.
+
+### Selecting assets
+
+- Click the checkbox on a row to select it for copying.
+- **Shift-click** a checkbox to select every asset between it and your last
+  click.
+- **Select all** selects everything currently visible, so filter or search first
+  and then select.
+- **Clear (n)** drops the whole selection.
+
+The eye icon on each row is separate from selection: it marks an asset as
+ignored. Ignored assets are struck through, and **Hide ignored** removes them
+from the list entirely.
 
 ### ZIP archives
 
@@ -61,6 +115,13 @@ are read directly from the archive.
 
 ### Audio
 
+Some archives contain macOS sidecar files - names beginning with `._`, or
+anything under a `__MACOSX` folder - which carry a real file's extension but
+none of its content. AssetAtlas skips these when scanning and removes any that
+older scans left behind, and it checks that a file really contains audio before
+playing it, reporting a message rather than attempting playback.
+
+
 Select an audio file, then use **Play preview**, pause, seek, and the time display.
 ZIP-contained audio is played from its archived bytes.
 
@@ -79,6 +140,17 @@ In the model preview:
   **Material default** selected.
 - Use **Fallback** to adjust the checkerboard size shown when a UV-mapped model
   has no usable texture.
+- **Normal map** appears only when the model provides one, and toggles whether
+  its surface detail affects lighting. Flat-shaded palette packs (Synty and
+  similar) do not ship normal maps, so the control will not appear for them.
+- **Hide back faces** (on by default) skips triangles facing away from you, which
+  makes large models noticeably smoother. Turn it off for single-sided geometry
+  such as foliage cards or planes, where those triangles are meant to be seen.
+
+Very dense models are capped for responsiveness. When that happens the label under
+the model reads "face cap: showing 14000 nearest" — the model is complete, but the
+viewer is drawing only the nearest triangles, so gaps you see in that state are the
+cap and not the asset.
 
 AssetAtlas supports FBX embedded textures, scene transforms, repeated mesh
 instances, and named UV sets. It can also relink many stale texture references,
@@ -86,7 +158,7 @@ including common Synty authoring-path and pack-name variants.
 
 An animation-only FBX may contain a skeleton and animation curves but no mesh to
 draw. AssetAtlas identifies this condition in the preview. Animation playback is
-not implemented in v1.1.0.
+not implemented yet.
 
 ## 5. Texture Diagnostics
 
@@ -118,12 +190,19 @@ AssetAtlas copies selected ordinary files and extracts selected ZIP entries to
 the destination. Archive entry paths are sanitized to prevent files from being
 written outside the chosen destination.
 
-The copy operation does not delete or move the source assets.
+The copy operation does not delete or move the source assets, and it never
+overwrites a file that is already in the destination. Asset libraries often reuse
+names, so if two selected assets are both called `Albedo.png` the second is
+written as `Albedo (2).png`. The status line reports exactly what happened, for
+example `12 copied · 2 renamed to avoid overwrite · 1 skipped (source missing)`.
+Assets whose source file has since been deleted or moved are reported as skipped;
+one file failing to copy does not stop the rest.
 
 ## 7. Ignore Assets
 
-Use the checkbox at the right side of an asset row to mark that asset as ignored.
-Selected assets can be ignored together.
+Use the eye icon at the right side of an asset row to mark that asset as ignored.
+If the row is part of the current selection, every selected asset is ignored
+together.
 
 Enable **Hide ignored** in the left panel to remove ignored entries from the
 visible list. Ignore state is saved in the local catalog.

@@ -10,17 +10,21 @@ spec says otherwise.
 
 ## Order of work
 
-| # | Task | Stage | Size | Depends on |
-|---|------|-------|------|------------|
-| [TASK-01](TASK-01-copy-collisions.md) | Copy flow: collisions, skips, and error reporting | 1 | S | — |
-| [TASK-02](TASK-02-version-test-coupling.md) | Stop version bumps from breaking the tests | 1 | XS | — |
-| [TASK-03](TASK-03-importer-stdout-encoding.md) | UTF-8 across the importer boundary | 1 | S | — |
-| [TASK-04](TASK-04-deterministic-texture-relink.md) | Make texture relink actually deterministic | 1 | M | — |
-| [TASK-09](TASK-09-ci-windows.md) | CI: analyze + test on every push | 1 | S | — |
-| [TASK-05](TASK-05-texture-diagnostics-cache.md) | Stop re-importing FBX on every rebuild | 2 | M | — |
-| [TASK-06](TASK-06-renderer-frame-cost.md) | Renderer frame cost and an honest face cap | 2 | M | — |
-| [TASK-07](TASK-07-incremental-catalog-persistence.md) | Incremental catalog persistence | 2 | M | — |
-| [TASK-08](TASK-08-stable-asset-identity.md) | Stable asset identity + schema migration | 3 | L | 07 |
+| # | Task | Stage | Size | Status |
+|---|------|-------|------|--------|
+| [TASK-01](TASK-01-copy-collisions.md) | Copy flow: collisions, skips, and error reporting | 1 | S | Done — `fc1c478` |
+| [TASK-02](TASK-02-version-test-coupling.md) | Stop version bumps from breaking the tests | 1 | XS | Done — `fc1c478` |
+| [TASK-03](TASK-03-importer-stdout-encoding.md) | UTF-8 across the importer boundary | 1 | S | Done — `fc1c478` |
+| [TASK-04](TASK-04-deterministic-texture-relink.md) | Make texture relink actually deterministic | 1 | M | Done — `075174b` |
+| [TASK-09](TASK-09-ci-windows.md) | CI: analyze + test on every push | 1 | S | Done — `c48b86f` |
+| [TASK-05](TASK-05-texture-diagnostics-cache.md) | Stop re-importing FBX on every rebuild | 2 | M | Done — `f1b7170` |
+| [TASK-06](TASK-06-renderer-frame-cost.md) | Renderer frame cost and an honest face cap | 2 | M | Steps 1–3 done — `bc17424`; step 4 split out as TASK-10 |
+| [TASK-07](TASK-07-incremental-catalog-persistence.md) | Incremental catalog persistence | 2 | M | Done — `4d6107c` |
+| [TASK-08](TASK-08-stable-asset-identity.md) | Stable asset identity + schema migration | 3 | L | Done — `e135319` |
+| [TASK-10](TASK-10-drawvertices-batching.md) | Batch the textured path into drawVertices | 2 | M–L | **Open** |
+
+Completed specs are kept rather than deleted: they record why the change was made
+and what the tests are protecting.
 
 Sizes: XS ≈ under an hour · S ≈ half a day · M ≈ 1–2 days · L ≈ 3–5 days, pair with a senior.
 

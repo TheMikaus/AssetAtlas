@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:developer' as developer;
@@ -12,6 +13,7 @@ import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
@@ -28,6 +30,9 @@ Future<void> main() async {
     }
     fbxLog('FBX logging enabled. File: $fbxLogFilePath');
   }
+  // Restoring this before the first frame keeps a clip from briefly showing
+  // the stick figure when a character was already chosen.
+  await AnimationCharacter.instance.load();
   runApp(const AssetAtlasApp());
 }
 
@@ -50,11 +55,28 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.1.0';
+const appVersion = '1.10.9';
+const _maxConcurrentModelValidations = 3;
+
+/// How many chunks are classified at once.
+///
+/// Each worker holds one archive in memory while it works through a chunk, and
+/// the largest here is ~126 MB, so this is capped well below the core count:
+/// the ceiling is memory, not CPU. Two cores are left for the UI isolate and
+/// the importer subprocesses the workers drive.
+final _classificationWorkerCount = math.max(
+  1,
+  math.min(6, Platform.numberOfProcessors - 2),
+);
+
+/// Assets per worker chunk. Bigger amortises opening the archive; smaller
+/// makes progress visible sooner.
+const fbxClassifyChunkSize = 400;
 const enableFbxLogs = true;
 String fbxLogFilePath =
     '${Directory.systemTemp.path}${Platform.pathSeparator}asset_atlas_fbx.log';
 const ignoredFolderNames = {
+  '__macosx',
   '.git',
   '.vs',
   '.vscode',
@@ -156,14 +178,43 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool hideIgnored = true;
   bool hideZipAssets = false;
   bool scanning = false;
-  double assetListHeight = 280;
+  double assetListWidth = 420;
+  double filterPanelWidth = 260;
+  bool gridMode = false;
+  AssetSortMode sortMode = AssetSortMode.path;
+  String? _lastSelectionAnchorId;
+  String? folderFilter;
+  final expandedFolders = <String>{};
+  Timer? _searchDebounce;
+  ScanHandle? _activeScan;
+
+  /// Bumped whenever something that affects filtering changes without the
+  /// catalog itself changing: an ignore toggle, a texture validation result, an
+  /// FBX classification.
+  int _listEpoch = 0;
+  List<AssetItem>? _sortedCache;
+  String? _sortedCacheKey;
+  List<AssetItem>? _filteredCache;
+  String? _filteredCacheKey;
+  List<FolderNode>? _folderRootsCache;
+  int _folderRootsRevision = -1;
   ScanStatus status = const ScanStatus('Ready', 'Choose a folder to catalog.');
   final modelHasValidTextures = <String, bool>{};
   final _modelValidationInFlight = <String>{};
+  final _modelKindInFlight = <String>{};
+  final Queue<AssetItem> _modelKindQueue = Queue<AssetItem>();
+  bool _processingModelKindQueue = false;
+  int _modelKindClassified = 0;
+  int _classificationFailures = 0;
   final Queue<AssetItem> _modelValidationQueue = Queue<AssetItem>();
   bool _processingModelValidationQueue = false;
   final List<String> _assetHistory = <String>[];
   int _assetHistoryIndex = -1;
+
+  /// Incremented whenever the catalog contents change. Preview widgets compare
+  /// this to decide whether a cached import is still valid; comparing list
+  /// lengths missed same-size changes.
+  int catalogRevision = 0;
 
   bool get canGoBackInHistory => _assetHistoryIndex > 0;
   bool get canGoForwardInHistory =>
@@ -241,6 +292,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   void _activateAsset(AssetItem asset, {bool addToHistory = true}) {
+    // The preview is about to import this file regardless, so the
+    // classification is nearly free here.
+    _scheduleModelKindClassification([asset]);
+    if (asset.type == 'model') {
+      unawaited(_recordTexturesUsedBy(asset));
+    }
     setState(() {
       active = asset;
       if (!addToHistory) return;
@@ -280,12 +337,67 @@ class _CatalogScreenState extends State<CatalogScreen> {
     });
   }
 
+  /// Rebuilt only when the catalog changes: walking 48k paths on every
+  /// rebuild would be pure waste.
+  List<FolderNode> get folderRoots {
+    if (_folderRootsCache == null || _folderRootsRevision != catalogRevision) {
+      _folderRootsCache = buildFolderTree(assets);
+      _folderRootsRevision = catalogRevision;
+    }
+    return _folderRootsCache!;
+  }
+
+  /// The catalog in display order, sorted once per (catalog, sort mode).
+  /// Filtering a sorted list yields a sorted list, so searching no longer has
+  /// to re-sort tens of thousands of assets on every keystroke.
+  List<AssetItem> get sortedAssets {
+    final key = '$catalogRevision|${sortMode.name}|$_listEpoch';
+    if (_sortedCache == null || _sortedCacheKey != key) {
+      _sortedCache = sortAssets(assets, sortMode);
+      _sortedCacheKey = key;
+    }
+    return _sortedCache!;
+  }
+
   List<AssetItem> get filteredAssets {
     final lower = query.trim().toLowerCase();
-    return assets.where((asset) {
+    final cacheKey = [
+      lower,
+      typeFilter,
+      modelTextureFilter,
+      hideIgnored,
+      hideZipAssets,
+      folderFilter ?? '',
+      sortMode.name,
+      catalogRevision,
+      _listEpoch,
+    ].join('|');
+    if (_filteredCache != null && _filteredCacheKey == cacheKey) {
+      return _filteredCache!;
+    }
+
+    final matches = sortedAssets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
+      if (folderFilter != null &&
+          !isUnderFolder(asset.relativePath, folderFilter!)) {
+        return false;
+      }
       if (hideZipAssets && isZipVirtualPath(asset.path)) return false;
-      if (typeFilter != 'all' && asset.type != typeFilter) return false;
+      if (typeFilter == 'animation') {
+        // Only a parse can tell an animation clip from a mesh, so ask for one
+        // and leave the asset out of the list until the answer arrives.
+        if (asset.type == 'model' && asset.ext == 'fbx') {
+          if (asset.modelKind == null) {
+            _scheduleModelKindClassification([asset]);
+            return false;
+          }
+          if (asset.modelKind != 'animation') return false;
+        } else if (asset.effectiveType != 'animation') {
+          return false;
+        }
+      } else if (typeFilter != 'all' && asset.effectiveType != typeFilter) {
+        return false;
+      }
       if (asset.type == 'model' && modelTextureFilter != 'all') {
         final hasValid = modelHasValidTextures[asset.id];
         if (hasValid == null) {
@@ -298,10 +410,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
       }
       if (lower.isEmpty) return true;
-      return asset.name.toLowerCase().contains(lower) ||
-          asset.relativePath.toLowerCase().contains(lower) ||
-          asset.tags.any((tag) => tag.contains(lower));
-    }).toList()..sort((a, b) => a.relativePath.compareTo(b.relativePath));
+      return asset.searchText.contains(lower);
+    }).toList();
+
+    _filteredCache = matches;
+    _filteredCacheKey = cacheKey;
+    return matches;
+  }
+
+  /// Invalidate the memoised list after a change that filtering depends on.
+  void _invalidateAssetViews() {
+    _listEpoch += 1;
   }
 
   void _scheduleModelTextureValidation([Iterable<AssetItem>? subset]) {
@@ -320,22 +439,155 @@ class _CatalogScreenState extends State<CatalogScreen> {
     unawaited(_processModelValidationQueue());
   }
 
+  /// Classifying an FBX means reading it, so this is deliberately lazy:
+  /// assets are classified when something needs the answer, and the result is
+  /// persisted so it is paid for once.
+  void _scheduleModelKindClassification(Iterable<AssetItem> subset) {
+    final pending = <AssetItem>[];
+    for (final asset in subset) {
+      if (asset.ext != 'fbx' || asset.modelKind != null) continue;
+      if (!_modelKindInFlight.add(asset.id)) continue;
+      pending.add(asset);
+    }
+    if (pending.isEmpty) return;
+    _modelKindQueue.addAll(pending);
+    unawaited(_processModelKindQueue());
+  }
+
+  /// Runs classification on worker isolates, several at a time, folding the
+  /// answers back in chunks.
+  ///
+  /// Inflating archive entries is genuine CPU work; doing it inline made the
+  /// UI stutter, and applying one result at a time invalidated the filtered
+  /// list once per file.
+  Future<void> _processModelKindQueue() async {
+    if (_processingModelKindQueue) return;
+    _processingModelKindQueue = true;
+
+    final helper = meshImporterPath();
+    if (!File(helper).existsSync()) {
+      _processingModelKindQueue = false;
+      _modelKindQueue.clear();
+      _modelKindInFlight.clear();
+      return;
+    }
+
+    while (_modelKindQueue.isNotEmpty) {
+      final pending = _modelKindQueue.toList();
+      _modelKindQueue.clear();
+
+      final chunks = buildFbxClassifyChunks(
+        assets: pending,
+        helperPath: helper,
+      );
+      final total = pending.length;
+      var completed = 0;
+      var nextChunk = 0;
+      var failedChunks = 0;
+
+      Future<void> worker() async {
+        while (nextChunk < chunks.length) {
+          final chunk = chunks[nextChunk++];
+          Map<String, String> kinds;
+          try {
+            kinds = await runFbxClassifyChunk(chunk);
+          } catch (error, stack) {
+            // A failure here is ours, not the files'. Recording 'unreadable'
+            // would bake a bug into the catalog as a verdict about 400 assets,
+            // which is exactly what happened once already: leave them
+            // unclassified so a later pass retries them, and say so.
+            fbxLog('Classify chunk failed (${chunk.length} assets): $error');
+            fbxLog('$stack');
+            for (final id in chunk.assetIds) {
+              _modelKindInFlight.remove(id);
+            }
+            failedChunks += 1;
+            completed += chunk.length;
+            continue;
+          }
+          completed += chunk.length;
+          if (!mounted) return;
+          _applyModelKinds(kinds, completed: completed, total: total);
+        }
+      }
+
+      await Future.wait([
+        for (var i = 0; i < _classificationWorkerCount; i += 1) worker(),
+      ]);
+      _classificationFailures += failedChunks;
+      if (!mounted) break;
+    }
+
+    _processingModelKindQueue = false;
+    if (!mounted) return;
+    setState(() {
+      status = _classificationFailures > 0
+          ? ScanStatus(
+              'Classification finished with errors',
+              '$_modelKindClassified read, '
+                  '$_classificationFailures chunks failed - see '
+                  'logs/asset_atlas_fbx.log',
+            )
+          : ScanStatus(
+              'Classification complete',
+              '$_modelKindClassified FBX files read',
+            );
+    });
+  }
+
+  /// One rebuild and one database write per chunk, not per asset.
+  void _applyModelKinds(
+    Map<String, String> kinds, {
+    required int completed,
+    required int total,
+  }) {
+    if (kinds.isEmpty) return;
+    final byId = {for (final asset in assets) asset.id: asset};
+    for (final entry in kinds.entries) {
+      byId[entry.key]?.modelKind = entry.value;
+      _modelKindInFlight.remove(entry.key);
+    }
+    _modelKindClassified += kinds.length;
+
+    setState(() {
+      _invalidateAssetViews();
+      status = ScanStatus(
+        'Classifying FBX content',
+        '$completed of $total read',
+      );
+    });
+
+    _persistInBackground(() => db.updateAssetModelKinds(kinds));
+  }
+
   Future<void> _processModelValidationQueue() async {
     if (_processingModelValidationQueue) return;
     _processingModelValidationQueue = true;
     while (_modelValidationQueue.isNotEmpty) {
-      final asset = _modelValidationQueue.removeFirst();
-      await _validateModelTexture(asset);
+      // A few at a time: each FBX validation is a subprocess plus a parse, and
+      // strictly serial made the filter feel frozen on large catalogs.
+      final batch = <AssetItem>[];
+      while (batch.length < _maxConcurrentModelValidations &&
+          _modelValidationQueue.isNotEmpty) {
+        batch.add(_modelValidationQueue.removeFirst());
+      }
+      await Future.wait(batch.map(_validateModelTexture));
     }
     _processingModelValidationQueue = false;
   }
 
   Future<void> _validateModelTexture(AssetItem asset) async {
+    // Already answered by an earlier pass.
+    if (modelHasValidTextures.containsKey(asset.id)) {
+      _modelValidationInFlight.remove(asset.id);
+      return;
+    }
+
     var hasValidTexture = false;
     try {
       if (asset.ext == 'fbx') {
-        final refs = await loadModelTextureReferences(asset, assets);
-        hasValidTexture = refs.any((value) => value.contains('(found)'));
+        final entries = await loadModelTextureReferenceEntries(asset, assets);
+        hasValidTexture = entries.any((entry) => entry.resolved);
       } else {
         hasValidTexture = findNearbyTextures(asset, assets).isNotEmpty;
       }
@@ -346,6 +598,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     if (mounted) {
       setState(() {
         modelHasValidTextures[asset.id] = hasValidTexture;
+        _invalidateAssetViews();
       });
     }
     _modelValidationInFlight.remove(asset.id);
@@ -353,6 +606,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   @override
   void dispose() {
+    _activeScan?.cancel();
+    _searchDebounce?.cancel();
     searchController.dispose();
     super.dispose();
   }
@@ -369,6 +624,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ..clear()
           ..addAll(snapshot.assets);
         modelHasValidTextures.clear();
+        MeshLoadCache.clear();
+        ModelThumbnailCache.clear();
+        catalogRevision += 1;
         active = assets.isNotEmpty ? assets.first : null;
         _seedHistoryWithActive();
         loadingPersisted = false;
@@ -393,6 +651,20 @@ class _CatalogScreenState extends State<CatalogScreen> {
   Future<void> _persistCatalog() async {
     if (!widget.enablePersistence) return;
     await db.saveCatalog(assets: assets, sourceRoots: sourceRoots.toList());
+  }
+
+  /// Runs a persistence call without blocking the caller, but surfaces a
+  /// failure instead of letting it vanish into an unawaited future.
+  void _persistInBackground(Future<void> Function() work) {
+    if (!widget.enablePersistence) return;
+    unawaited(
+      work().catchError((Object error) {
+        if (!mounted) return;
+        setState(() {
+          status = ScanStatus('Save failed', error.toString());
+        });
+      }),
+    );
   }
 
   Future<void> saveProjectSnapshot() async {
@@ -697,6 +969,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
     });
   }
 
+  void cancelScan() {
+    _activeScan?.cancel();
+  }
+
   Future<void> chooseAndScan() async {
     final selectedPath = await FilePicker.getDirectoryPath(
       dialogTitle: 'Choose asset folder',
@@ -723,19 +999,47 @@ class _CatalogScreenState extends State<CatalogScreen> {
       status = ScanStatus('Scanning', rootPath);
     });
 
-    final result = await scanAssetFolder(
+    // Off the UI isolate: this walks a whole tree and inflates every archive
+    // it meets, which used to lock the window for the duration.
+    final handle = await startFolderScan(
       rootPath,
       onStatus: (next) {
         if (!mounted) return;
         setState(() => status = next);
       },
     );
+    _activeScan = handle;
+
+    final ScanResult result;
+    try {
+      result = await handle.result;
+    } on ScanCancelledException {
+      if (!mounted) return;
+      setState(() {
+        scanning = false;
+        _activeScan = null;
+        status = ScanStatus('Scan cancelled', rootPath);
+      });
+      return;
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        scanning = false;
+        _activeScan = null;
+        status = ScanStatus('Scan failed', error.toString());
+      });
+      return;
+    }
 
     if (!mounted) return;
     setState(() {
+      _activeScan = null;
       sourceRoots.add(rootPath);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
       assets.addAll(result.assets);
+      MeshLoadCache.clear();
+      ModelThumbnailCache.clear();
+      catalogRevision += 1;
       modelHasValidTextures.removeWhere(
         (assetId, _) => !assets.any((asset) => asset.id == assetId),
       );
@@ -763,6 +1067,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
     setState(() {
       sourceRoots.remove(rootPath);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
+      MeshLoadCache.clear();
+      ModelThumbnailCache.clear();
+      catalogRevision += 1;
       modelHasValidTextures.removeWhere(
         (assetId, _) => !assets.any((asset) => asset.id == assetId),
       );
@@ -778,7 +1085,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       }
       _pruneHistoryToVisibleAssets();
     });
-    unawaited(_persistCatalog());
+    _persistInBackground(() => db.deleteAssetsForSourceRoot(rootPath));
   }
 
   Future<void> copySelected() async {
@@ -791,11 +1098,120 @@ class _CatalogScreenState extends State<CatalogScreen> {
     );
     if (target == null) return;
 
-    final copied = await copyAssetsToTarget(selected, target);
-    if (!mounted) return;
-    setState(() {
-      status = ScanStatus('Copied assets', '$copied files copied to $target');
+    try {
+      final report = await copyAssetsToTarget(selected, target);
+      if (!mounted) return;
+      setState(() {
+        status = ScanStatus(
+          report.failedCount > 0 ? 'Copied with errors' : 'Copied assets',
+          '${report.summaryLine} · target: $target',
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        status = ScanStatus('Copy failed', error.toString());
+      });
+    }
+  }
+
+  /// Arrow keys walk the visible list, so you can flick through candidates
+  /// without moving the mouse back to the list for every one.
+  void _stepActiveAsset(int delta) {
+    final visible = filteredAssets;
+    if (visible.isEmpty) return;
+    final currentIndex = active == null
+        ? -1
+        : visible.indexWhere((asset) => asset.id == active!.id);
+    final nextIndex = currentIndex < 0
+        ? (delta > 0 ? 0 : visible.length - 1)
+        : (currentIndex + delta).clamp(0, visible.length - 1);
+    if (nextIndex == currentIndex) return;
+    _activateAsset(visible[nextIndex]);
+  }
+
+  /// A scan of 48k assets costs tens of milliseconds, so run it when typing
+  /// pauses rather than on every character.
+  void _onSearchChanged(String value) {
+    _searchDebounce?.cancel();
+    if (value.isEmpty) {
+      setState(() => query = '');
+      return;
+    }
+    _searchDebounce = Timer(const Duration(milliseconds: 120), () {
+      if (!mounted) return;
+      setState(() => query = value);
     });
+  }
+
+  /// Marks the images a model actually uses, so they show as textures.
+  ///
+  /// Only what the model itself resolved counts: a folder name is a guess,
+  /// this is evidence.
+  Future<void> _recordTexturesUsedBy(AssetItem model) async {
+    try {
+      final mesh = await MeshLoadCache.load(model, allAssets: assets);
+      final used = <String>{
+        for (final material in mesh.materials)
+          for (final path in material.resolvedTextures) normalizePathKey(path),
+      };
+      if (used.isEmpty) return;
+
+      final newlyMarked = <String>[];
+      for (final asset in assets) {
+        if (asset.referencedByModel) continue;
+        if (used.contains(normalizePathKey(asset.path))) {
+          asset.referencedByModel = true;
+          newlyMarked.add(asset.id);
+        }
+      }
+      if (newlyMarked.isEmpty || !mounted) return;
+      setState(_invalidateAssetViews);
+      _persistInBackground(() => db.markAssetsReferencedByModel(newlyMarked));
+    } catch (_) {
+      // A model that will not import tells us nothing about textures.
+    }
+  }
+
+  void _selectAll(List<AssetItem> visible) {
+    setState(() {
+      selectedIds.addAll(visible.map((asset) => asset.id));
+    });
+  }
+
+  void _clearSelection() {
+    setState(() {
+      selectedIds.clear();
+      _lastSelectionAnchorId = null;
+    });
+  }
+
+  /// Shift-click extends from the last clicked row, the way every file browser
+  /// behaves. Without it, selecting a run of assets means one click each.
+  void _selectWithRange(AssetItem asset, bool selected, {bool range = false}) {
+    final visible = filteredAssets;
+    if (range && _lastSelectionAnchorId != null) {
+      final anchorIndex = visible.indexWhere(
+        (item) => item.id == _lastSelectionAnchorId,
+      );
+      final targetIndex = visible.indexWhere((item) => item.id == asset.id);
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        final start = math.min(anchorIndex, targetIndex);
+        final end = math.max(anchorIndex, targetIndex);
+        setState(() {
+          for (var i = start; i <= end; i += 1) {
+            if (selected) {
+              selectedIds.add(visible[i].id);
+            } else {
+              selectedIds.remove(visible[i].id);
+            }
+          }
+        });
+        return;
+      }
+    }
+    _lastSelectionAnchorId = asset.id;
+    toggleSelected(asset, selected);
   }
 
   void toggleSelected(AssetItem asset, bool selected) {
@@ -809,137 +1225,211 @@ class _CatalogScreenState extends State<CatalogScreen> {
   }
 
   void setIgnored(AssetItem asset, bool ignored) {
+    final changed = <AssetItem>[];
     setState(() {
       final selected = selectedIds.contains(asset.id)
           ? assets.where((item) => selectedIds.contains(item.id))
           : [asset];
       for (final item in selected) {
         item.ignored = ignored;
+        changed.add(item);
+      }
+      _invalidateAssetViews();
+    });
+    // One UPDATE per changed asset, not a rewrite of the whole catalog.
+    _persistInBackground(() async {
+      for (final item in changed) {
+        await db.updateAssetIgnored(assetId: item.id, ignored: item.ignored);
       }
     });
-    unawaited(_persistCatalog());
   }
 
   @override
   Widget build(BuildContext context) {
     final visible = filteredAssets;
+    // FBX files nothing has read yet, so the animation count is a lower bound.
+    final unclassifiedFbxCount = assets
+        .where((asset) => asset.ext == 'fbx' && asset.modelKind == null)
+        .length;
     final counts = {
       'all': assets.length,
-      'image': assets.where((asset) => asset.type == 'image').length,
-      'model': assets.where((asset) => asset.type == 'model').length,
-      'audio': assets.where((asset) => asset.type == 'audio').length,
+      'image': assets.where((asset) => asset.effectiveType == 'image').length,
+      'texture': assets
+          .where((asset) => asset.effectiveType == 'texture')
+          .length,
+      'model': assets.where((asset) => asset.effectiveType == 'model').length,
+      'animation': assets
+          .where((asset) => asset.effectiveType == 'animation')
+          .length,
+      'audio': assets.where((asset) => asset.effectiveType == 'audio').length,
     };
 
     return Scaffold(
-      body: Column(
-        children: [
-          HeaderBar(
-            scanning: scanning,
-            status: status,
-            canGoBack: canGoBackInHistory,
-            canGoForward: canGoForwardInHistory,
-            onScan: chooseAndScan,
-            onSaveProject: saveProjectSnapshot,
-            onLoadProject: loadProjectSnapshot,
-            onCopySelected: copySelected,
-            onGoBack: _goBackHistory,
-            onGoForward: _goForwardHistory,
-            selectedCount: selectedIds.length,
-          ),
-          Expanded(
-            child: Row(
-              children: [
-                FilterPanel(
-                  counts: counts,
-                  typeFilter: typeFilter,
-                  modelTextureFilter: modelTextureFilter,
-                  hideIgnored: hideIgnored,
-                  hideZipAssets: hideZipAssets,
-                  sourceRoots: sourceRoots.toList()..sort(),
-                  onTypeChanged: (value) => setState(() => typeFilter = value),
-                  onModelTextureFilterChanged: (value) {
-                    setState(() {
-                      modelTextureFilter = value;
-                      if (value == 'all') {
-                        _modelValidationQueue.clear();
-                        _modelValidationInFlight.clear();
-                      }
-                    });
-                    if (value != 'all') {
-                      _scheduleModelTextureValidation();
-                    }
-                  },
-                  onHideIgnoredChanged: (value) =>
-                      setState(() => hideIgnored = value),
-                  onHideZipAssetsChanged: (value) {
-                    setState(() {
-                      hideZipAssets = value;
-                      if (value &&
-                          active != null &&
-                          isZipVirtualPath(active!.path)) {
-                        active = assets
-                            .where((asset) => !isZipVirtualPath(asset.path))
-                            .firstOrNull;
-                        _seedHistoryWithActive();
-                      }
-                      if (value) {
-                        _modelValidationQueue.removeWhere(
-                          (asset) => isZipVirtualPath(asset.path),
-                        );
-                      }
-                    });
-                  },
-                  onRemoveSource: removeSource,
-                ),
-                Expanded(
-                  child: Column(
-                    children: [
-                      SearchAndSummary(
-                        controller: searchController,
-                        visibleCount: visible.length,
-                        totalCount: assets.length,
-                        onChanged: (value) => setState(() => query = value),
+      body: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
+              _stepActiveAsset(1),
+          const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
+              _stepActiveAsset(-1),
+        },
+        child: Focus(
+          autofocus: true,
+          child: Column(
+            children: [
+              HeaderBar(
+                scanning: scanning,
+                status: status,
+                canGoBack: canGoBackInHistory,
+                canGoForward: canGoForwardInHistory,
+                onScan: chooseAndScan,
+                onCancelScan: cancelScan,
+                onSaveProject: saveProjectSnapshot,
+                onLoadProject: loadProjectSnapshot,
+                onCopySelected: copySelected,
+                onGoBack: _goBackHistory,
+                onGoForward: _goForwardHistory,
+                selectedCount: selectedIds.length,
+              ),
+              Expanded(
+                child: Row(
+                  children: [
+                    FilterPanel(
+                      width: filterPanelWidth,
+                      counts: counts,
+                      unclassifiedFbxCount: unclassifiedFbxCount,
+                      typeFilter: typeFilter,
+                      modelTextureFilter: modelTextureFilter,
+                      hideIgnored: hideIgnored,
+                      hideZipAssets: hideZipAssets,
+                      sourceRoots: sourceRoots.toList()..sort(),
+                      folderRoots: folderRoots,
+                      selectedFolder: folderFilter,
+                      expandedFolders: expandedFolders,
+                      onFolderSelected: (value) =>
+                          setState(() => folderFilter = value),
+                      onFolderExpandToggled: (path) {
+                        setState(() {
+                          if (!expandedFolders.remove(path)) {
+                            expandedFolders.add(path);
+                          }
+                        });
+                      },
+                      onTypeChanged: (value) => setState(() {
+                        typeFilter = value;
+                        // A query typed against one type almost never means
+                        // anything against the next, and leaving it set makes
+                        // the new type look empty.
+                        searchController.clear();
+                        _onSearchChanged('');
+                      }),
+                      onModelTextureFilterChanged: (value) {
+                        setState(() {
+                          modelTextureFilter = value;
+                          if (value == 'all') {
+                            _modelValidationQueue.clear();
+                            _modelValidationInFlight.clear();
+                          }
+                        });
+                        if (value != 'all') {
+                          _scheduleModelTextureValidation();
+                        }
+                      },
+                      onHideIgnoredChanged: (value) =>
+                          setState(() => hideIgnored = value),
+                      onHideZipAssetsChanged: (value) {
+                        setState(() {
+                          hideZipAssets = value;
+                          if (value &&
+                              active != null &&
+                              isZipVirtualPath(active!.path)) {
+                            active = assets
+                                .where((asset) => !isZipVirtualPath(asset.path))
+                                .firstOrNull;
+                            _seedHistoryWithActive();
+                          }
+                          if (value) {
+                            _modelValidationQueue.removeWhere(
+                              (asset) => isZipVirtualPath(asset.path),
+                            );
+                          }
+                        });
+                      },
+                      onRemoveSource: removeSource,
+                    ),
+                    VerticalResizeHandle(
+                      onDrag: (delta) {
+                        setState(() {
+                          filterPanelWidth = (filterPanelWidth + delta)
+                              .clamp(200.0, 520.0)
+                              .toDouble();
+                        });
+                      },
+                    ),
+                    // The browse list gets its own full-height column: as a bottom
+                    // strip it showed a handful of rows out of tens of thousands.
+                    SizedBox(
+                      width: assetListWidth,
+                      child: Column(
+                        children: [
+                          SearchAndSummary(
+                            controller: searchController,
+                            visibleCount: visible.length,
+                            totalCount: assets.length,
+                            selectedCount: selectedIds.length,
+                            sortMode: sortMode,
+                            gridMode: gridMode,
+                            onChanged: _onSearchChanged,
+                            onSortChanged: (value) =>
+                                setState(() => sortMode = value),
+                            onGridModeChanged: (value) =>
+                                setState(() => gridMode = value),
+                            onSelectAllVisible: () => _selectAll(visible),
+                            onClearSelection: _clearSelection,
+                          ),
+                          Expanded(
+                            child: gridMode
+                                ? AssetGrid(
+                                    assets: visible,
+                                    active: active,
+                                    selectedIds: selectedIds,
+                                    onActivate: _activateAsset,
+                                    onSelect: _selectWithRange,
+                                  )
+                                : AssetList(
+                                    assets: visible,
+                                    active: active,
+                                    selectedIds: selectedIds,
+                                    onActivate: _activateAsset,
+                                    onSelect: _selectWithRange,
+                                    onIgnoredChanged: setIgnored,
+                                  ),
+                          ),
+                        ],
                       ),
-                      Expanded(
-                        child: Column(
-                          children: [
-                            Expanded(
-                              child: PreviewPanel(
-                                asset: active,
-                                allAssets: assets,
-                                onActivateAsset: _activateAsset,
-                              ),
-                            ),
-                            ListResizeHandle(
-                              onDrag: (delta) {
-                                setState(() {
-                                  assetListHeight = (assetListHeight - delta)
-                                      .clamp(180, 520)
-                                      .toDouble();
-                                });
-                              },
-                            ),
-                            SizedBox(
-                              height: assetListHeight,
-                              child: AssetList(
-                                assets: visible,
-                                active: active,
-                                selectedIds: selectedIds,
-                                onActivate: _activateAsset,
-                                onSelect: toggleSelected,
-                                onIgnoredChanged: setIgnored,
-                              ),
-                            ),
-                          ],
-                        ),
+                    ),
+                    VerticalResizeHandle(
+                      onDrag: (delta) {
+                        setState(() {
+                          assetListWidth = (assetListWidth - delta)
+                              .clamp(280.0, 900.0)
+                              .toDouble();
+                        });
+                      },
+                    ),
+                    Expanded(
+                      child: PreviewPanel(
+                        asset: active,
+                        allAssets: assets,
+                        catalogRevision: catalogRevision,
+                        onActivateAsset: _activateAsset,
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -989,6 +1479,7 @@ class HeaderBar extends StatelessWidget {
     required this.canGoBack,
     required this.canGoForward,
     required this.onScan,
+    required this.onCancelScan,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
@@ -1003,6 +1494,7 @@ class HeaderBar extends StatelessWidget {
   final bool canGoBack;
   final bool canGoForward;
   final VoidCallback onScan;
+  final VoidCallback onCancelScan;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
@@ -1030,6 +1522,7 @@ class HeaderBar extends StatelessWidget {
             canGoForward: canGoForward,
             selectedCount: selectedCount,
             onScan: onScan,
+            onCancelScan: onCancelScan,
             onSaveProject: onSaveProject,
             onLoadProject: onLoadProject,
             onCopySelected: onCopySelected,
@@ -1128,6 +1621,7 @@ class _HeaderActions extends StatelessWidget {
     required this.canGoForward,
     required this.selectedCount,
     required this.onScan,
+    required this.onCancelScan,
     required this.onSaveProject,
     required this.onLoadProject,
     required this.onCopySelected,
@@ -1140,6 +1634,7 @@ class _HeaderActions extends StatelessWidget {
   final bool canGoForward;
   final int selectedCount;
   final VoidCallback onScan;
+  final VoidCallback onCancelScan;
   final VoidCallback onSaveProject;
   final VoidCallback onLoadProject;
   final VoidCallback onCopySelected;
@@ -1162,11 +1657,22 @@ class _HeaderActions extends StatelessWidget {
           onPressed: canGoForward ? onGoForward : null,
           icon: const Icon(Icons.arrow_forward),
         ),
-        FilledButton.icon(
-          onPressed: scanning ? null : onScan,
-          icon: const Icon(Icons.folder_open),
-          label: const Text('Scan folder'),
-        ),
+        if (scanning)
+          FilledButton.icon(
+            onPressed: onCancelScan,
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(context).colorScheme.error,
+              foregroundColor: Theme.of(context).colorScheme.onError,
+            ),
+            icon: const Icon(Icons.stop_circle_outlined),
+            label: const Text('Stop scan'),
+          )
+        else
+          FilledButton.icon(
+            onPressed: onScan,
+            icon: const Icon(Icons.folder_open),
+            label: const Text('Scan folder'),
+          ),
         OutlinedButton.icon(
           onPressed: scanning ? null : onSaveProject,
           icon: const Icon(Icons.save_outlined),
@@ -1187,14 +1693,226 @@ class _HeaderActions extends StatelessWidget {
   }
 }
 
+/// One folder in the browse tree, with the number of assets at or below it.
+class FolderNode {
+  FolderNode({required this.name, required this.path});
+
+  final String name;
+
+  /// Full prefix as it appears in [AssetItem.relativePath], with no trailing
+  /// separator. Filtering is a prefix match on this.
+  final String path;
+
+  int assetCount = 0;
+  final Map<String, FolderNode> childrenByName = <String, FolderNode>{};
+
+  List<FolderNode> get sortedChildren {
+    final children = childrenByName.values.toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return children;
+  }
+}
+
+/// Builds the folder hierarchy from asset relative paths.
+///
+/// A flat list of tens of thousands of assets cannot be browsed by location,
+/// and search only helps when you already know the name.
+List<FolderNode> buildFolderTree(List<AssetItem> assets) {
+  final roots = <String, FolderNode>{};
+  for (final asset in assets) {
+    final segments = asset.relativePath
+        .replaceAll('\\', '/')
+        .split('/')
+        .where((segment) => segment.isNotEmpty)
+        .toList();
+    if (segments.length < 2) continue; // file sitting directly at the root
+    segments.removeLast(); // drop the file name
+
+    var levelMap = roots;
+    final walked = <String>[];
+    for (final segment in segments) {
+      walked.add(segment);
+      final node = levelMap.putIfAbsent(
+        segment,
+        () => FolderNode(name: segment, path: walked.join('/')),
+      );
+      node.assetCount += 1;
+      levelMap = node.childrenByName;
+    }
+  }
+  final sorted = roots.values.toList()
+    ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  return sorted;
+}
+
+/// True when [relativePath] sits at or below [folderPath].
+bool isUnderFolder(String relativePath, String folderPath) {
+  if (folderPath.isEmpty) return true;
+  final normalized = relativePath.replaceAll('\\', '/');
+  return normalized == folderPath || normalized.startsWith('$folderPath/');
+}
+
+class FolderTreeView extends StatelessWidget {
+  const FolderTreeView({
+    required this.roots,
+    required this.selectedFolder,
+    required this.expandedFolders,
+    required this.onSelect,
+    required this.onToggleExpanded,
+    super.key,
+  });
+
+  final List<FolderNode> roots;
+  final String? selectedFolder;
+  final Set<String> expandedFolders;
+  final ValueChanged<String?> onSelect;
+  final ValueChanged<String> onToggleExpanded;
+
+  @override
+  Widget build(BuildContext context) {
+    if (roots.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 6),
+        child: Text('No folders yet.', style: TextStyle(color: Colors.black54)),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _FolderRow(
+          label: 'All folders',
+          count: null,
+          depth: 0,
+          selected: selectedFolder == null,
+          expandable: false,
+          expanded: false,
+          onTap: () => onSelect(null),
+          onToggleExpanded: () {},
+        ),
+        for (final root in roots) ..._buildNode(root, 0),
+      ],
+    );
+  }
+
+  List<Widget> _buildNode(FolderNode node, int depth) {
+    final expanded = expandedFolders.contains(node.path);
+    return [
+      _FolderRow(
+        label: node.name,
+        count: node.assetCount,
+        depth: depth,
+        selected: selectedFolder == node.path,
+        expandable: node.childrenByName.isNotEmpty,
+        expanded: expanded,
+        onTap: () => onSelect(node.path),
+        onToggleExpanded: () => onToggleExpanded(node.path),
+      ),
+      if (expanded)
+        for (final child in node.sortedChildren)
+          ..._buildNode(child, depth + 1),
+    ];
+  }
+}
+
+class _FolderRow extends StatelessWidget {
+  const _FolderRow({
+    required this.label,
+    required this.count,
+    required this.depth,
+    required this.selected,
+    required this.expandable,
+    required this.expanded,
+    required this.onTap,
+    required this.onToggleExpanded,
+  });
+
+  final String label;
+  final int? count;
+  final int depth;
+  final bool selected;
+  final bool expandable;
+  final bool expanded;
+  final VoidCallback onTap;
+  final VoidCallback onToggleExpanded;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: selected
+          ? scheme.primaryContainer.withValues(alpha: .55)
+          : Colors.transparent,
+      borderRadius: BorderRadius.circular(4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(4),
+        onTap: onTap,
+        child: Padding(
+          padding: EdgeInsets.only(left: depth * 12.0, top: 1, bottom: 1),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 20,
+                child: expandable
+                    ? InkWell(
+                        onTap: onToggleExpanded,
+                        child: Icon(
+                          expanded
+                              ? Icons.keyboard_arrow_down
+                              : Icons.keyboard_arrow_right,
+                          size: 16,
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+              Expanded(
+                child: Tooltip(
+                  message: label,
+                  waitDuration: const Duration(milliseconds: 700),
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: selected
+                          ? FontWeight.w600
+                          : FontWeight.normal,
+                    ),
+                  ),
+                ),
+              ),
+              if (count != null)
+                Padding(
+                  padding: const EdgeInsets.only(left: 4, right: 2),
+                  child: Text(
+                    '$count',
+                    style: const TextStyle(fontSize: 11, color: Colors.black45),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class FilterPanel extends StatelessWidget {
   const FilterPanel({
+    required this.width,
     required this.counts,
+    required this.unclassifiedFbxCount,
     required this.typeFilter,
     required this.modelTextureFilter,
     required this.hideIgnored,
     required this.hideZipAssets,
     required this.sourceRoots,
+    required this.folderRoots,
+    required this.selectedFolder,
+    required this.expandedFolders,
+    required this.onFolderSelected,
+    required this.onFolderExpandToggled,
     required this.onTypeChanged,
     required this.onModelTextureFilterChanged,
     required this.onHideIgnoredChanged,
@@ -1203,12 +1921,19 @@ class FilterPanel extends StatelessWidget {
     super.key,
   });
 
+  final double width;
   final Map<String, int> counts;
+  final int unclassifiedFbxCount;
   final String typeFilter;
   final String modelTextureFilter;
   final bool hideIgnored;
   final bool hideZipAssets;
   final List<String> sourceRoots;
+  final List<FolderNode> folderRoots;
+  final String? selectedFolder;
+  final Set<String> expandedFolders;
+  final ValueChanged<String?> onFolderSelected;
+  final ValueChanged<String> onFolderExpandToggled;
   final ValueChanged<String> onTypeChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
   final ValueChanged<bool> onHideIgnoredChanged;
@@ -1218,7 +1943,7 @@ class FilterPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 260,
+      width: width,
       child: Material(
         color: const Color(0xfff7f8fb),
         child: ListView(
@@ -1226,13 +1951,32 @@ class FilterPanel extends StatelessWidget {
           children: [
             const Text('Types', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
-            for (final type in ['all', 'image', 'model', 'audio'])
+            for (final type in [
+              'all',
+              'image',
+              'texture',
+              'model',
+              'animation',
+              'audio',
+            ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
-                child: ChoiceChip(
-                  selected: typeFilter == type,
-                  label: Text('${type.toUpperCase()} (${counts[type] ?? 0})'),
-                  onSelected: (_) => onTypeChanged(type),
+                child: Tooltip(
+                  message: type == 'animation' && unclassifiedFbxCount > 0
+                      ? '$unclassifiedFbxCount FBX files have not been read '
+                            'yet. Pick this filter to classify them.'
+                      : '',
+                  child: ChoiceChip(
+                    selected: typeFilter == type,
+                    // "(0)" would claim there are no animation clips when in
+                    // fact nothing has looked yet.
+                    label: Text(
+                      type == 'animation' && unclassifiedFbxCount > 0
+                          ? 'ANIMATION (${counts[type] ?? 0}+)'
+                          : '${type.toUpperCase()} (${counts[type] ?? 0})',
+                    ),
+                    onSelected: (_) => onTypeChanged(type),
+                  ),
                 ),
               ),
             const SizedBox(height: 10),
@@ -1274,6 +2018,19 @@ class FilterPanel extends StatelessWidget {
             ),
             const Divider(height: 28),
             const Text(
+              'Folders',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            FolderTreeView(
+              roots: folderRoots,
+              selectedFolder: selectedFolder,
+              expandedFolders: expandedFolders,
+              onSelect: onFolderSelected,
+              onToggleExpanded: onFolderExpandToggled,
+            ),
+            const Divider(height: 28),
+            const Text(
               'Source Folders',
               style: TextStyle(fontWeight: FontWeight.w700),
             ),
@@ -1284,14 +2041,24 @@ class FilterPanel extends StatelessWidget {
                 style: TextStyle(color: Colors.black54),
               ),
             for (final root in sourceRoots)
-              ListTile(
-                dense: true,
-                contentPadding: EdgeInsets.zero,
-                title: Text(root, maxLines: 2, overflow: TextOverflow.ellipsis),
-                trailing: IconButton(
-                  tooltip: 'Remove source',
-                  icon: const Icon(Icons.close),
-                  onPressed: () => onRemoveSource(root),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(child: CopyablePathText(path: root)),
+                    IconButton(
+                      tooltip: 'Remove source',
+                      icon: const Icon(Icons.close, size: 18),
+                      visualDensity: VisualDensity.compact,
+                      constraints: const BoxConstraints(
+                        minWidth: 32,
+                        minHeight: 32,
+                      ),
+                      padding: EdgeInsets.zero,
+                      onPressed: () => onRemoveSource(root),
+                    ),
+                  ],
                 ),
               ),
           ],
@@ -1301,45 +2068,182 @@ class FilterPanel extends StatelessWidget {
   }
 }
 
+class _ViewModeButton extends StatelessWidget {
+  const _ViewModeButton({
+    required this.icon,
+    required this.tooltip,
+    required this.selected,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final bool selected;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      visualDensity: VisualDensity.compact,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+      style: IconButton.styleFrom(
+        backgroundColor: selected ? scheme.primaryContainer : null,
+        foregroundColor: selected ? scheme.onPrimaryContainer : Colors.black54,
+      ),
+      icon: Icon(icon, size: 20),
+    );
+  }
+}
+
 class SearchAndSummary extends StatelessWidget {
   const SearchAndSummary({
     required this.controller,
     required this.visibleCount,
     required this.totalCount,
+    required this.selectedCount,
+    required this.sortMode,
+    required this.gridMode,
     required this.onChanged,
+    required this.onSortChanged,
+    required this.onGridModeChanged,
+    required this.onSelectAllVisible,
+    required this.onClearSelection,
     super.key,
   });
 
   final TextEditingController controller;
   final int visibleCount;
   final int totalCount;
+  final int selectedCount;
+  final AssetSortMode sortMode;
+  final bool gridMode;
   final ValueChanged<String> onChanged;
+  final ValueChanged<AssetSortMode> onSortChanged;
+  final ValueChanged<bool> onGridModeChanged;
+  final VoidCallback onSelectAllVisible;
+  final VoidCallback onClearSelection;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-      child: Row(
+      padding: const EdgeInsets.fromLTRB(12, 12, 8, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: TextField(
-              controller: controller,
-              decoration: const InputDecoration(
-                prefixIcon: Icon(Icons.search),
-                hintText: 'Search name, folder, or tag',
-                border: OutlineInputBorder(),
-                isDense: true,
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  decoration: InputDecoration(
+                    prefixIcon: const Icon(Icons.search),
+                    hintText: 'Search name, folder, or tag',
+                    border: const OutlineInputBorder(),
+                    isDense: true,
+                    suffixIcon: controller.text.isEmpty
+                        ? null
+                        : IconButton(
+                            tooltip: 'Clear search',
+                            icon: const Icon(Icons.close, size: 18),
+                            onPressed: () {
+                              controller.clear();
+                              onChanged('');
+                            },
+                          ),
+                  ),
+                  onChanged: onChanged,
+                ),
               ),
-              onChanged: onChanged,
-            ),
+              const SizedBox(width: 6),
+              // List and grid answer different questions: "which file is this"
+              // versus "which one looks right".
+              // Two IconButtons rather than ToggleButtons: a Tooltip placed
+              // as a direct child of ToggleButtons corrupts the Windows
+              // accessibility tree, and the app then hard-crashes inside
+              // flutter_windows.dll on the next window resize. IconButton's
+              // own tooltip is safe and is what the rest of the app uses.
+              _ViewModeButton(
+                icon: Icons.view_list,
+                tooltip: 'List view',
+                selected: !gridMode,
+                onPressed: () => onGridModeChanged(false),
+              ),
+              _ViewModeButton(
+                icon: Icons.grid_view,
+                tooltip: 'Thumbnail grid',
+                selected: gridMode,
+                onPressed: () => onGridModeChanged(true),
+              ),
+            ],
           ),
-          const SizedBox(width: 14),
-          Text('$visibleCount visible / $totalCount cataloged'),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Text(
+                '$visibleCount / $totalCount',
+                style: const TextStyle(color: Colors.black54),
+              ),
+              const SizedBox(width: 10),
+              DropdownButtonHideUnderline(
+                child: DropdownButton<AssetSortMode>(
+                  value: sortMode,
+                  isDense: true,
+                  focusColor: Colors.transparent,
+                  items: [
+                    for (final mode in AssetSortMode.values)
+                      DropdownMenuItem(
+                        value: mode,
+                        child: Text(
+                          'Sort: ${mode.label}',
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                      ),
+                  ],
+                  onChanged: (next) {
+                    if (next != null) onSortChanged(next);
+                  },
+                ),
+              ),
+              const Spacer(),
+              if (visibleCount > 0)
+                TextButton(
+                  onPressed: onSelectAllVisible,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  child: const Text('Select all'),
+                ),
+              if (selectedCount > 0)
+                TextButton(
+                  onPressed: onClearSelection,
+                  style: TextButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  child: Text('Clear ($selectedCount)'),
+                ),
+            ],
+          ),
         ],
       ),
     );
   }
 }
+
+/// Icon shown for an asset's kind, used by both the list and the grid.
+IconData iconForAssetType(String effectiveType) => switch (effectiveType) {
+  'image' => Icons.image_outlined,
+  'texture' => Icons.texture,
+  'audio' => Icons.graphic_eq,
+  'animation' => Icons.directions_run,
+  'model' => Icons.view_in_ar_outlined,
+  _ => Icons.insert_drive_file_outlined,
+};
+
+typedef AssetSelectCallback =
+    void Function(AssetItem asset, bool selected, {bool range});
 
 class AssetList extends StatelessWidget {
   const AssetList({
@@ -1356,7 +2260,7 @@ class AssetList extends StatelessWidget {
   final AssetItem? active;
   final Set<String> selectedIds;
   final ValueChanged<AssetItem> onActivate;
-  final void Function(AssetItem asset, bool selected) onSelect;
+  final AssetSelectCallback onSelect;
   final void Function(AssetItem asset, bool ignored) onIgnoredChanged;
 
   @override
@@ -1370,54 +2274,118 @@ class AssetList extends StatelessWidget {
       itemBuilder: (context, index) {
         final asset = assets[index];
         final isActive = active?.id == asset.id;
+        final isSelected = selectedIds.contains(asset.id);
         return Material(
           color: isActive
               ? Theme.of(
                   context,
                 ).colorScheme.primaryContainer.withValues(alpha: .55)
               : Colors.transparent,
-          child: ListTile(
-            leading: Checkbox(
-              value: selectedIds.contains(asset.id),
-              onChanged: (value) => onSelect(asset, value ?? false),
-            ),
-            title: Text(
-              asset.name,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            subtitle: Text(
-              asset.relativePath,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                IconButton(
-                  tooltip: 'Copy asset path',
-                  icon: const Icon(Icons.content_copy, size: 18),
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: asset.path));
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Asset path copied.')),
-                    );
-                  },
-                ),
-                Text(asset.ext.toUpperCase()),
-                const SizedBox(width: 12),
-                Tooltip(
-                  message: asset.ignored ? 'Ignored' : 'Not ignored',
-                  child: Checkbox(
-                    value: asset.ignored,
-                    onChanged: (value) =>
-                        onIgnoredChanged(asset, value ?? false),
-                  ),
-                ),
-              ],
-            ),
+          child: InkWell(
             onTap: () => onActivate(asset),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              child: Row(
+                children: [
+                  Tooltip(
+                    message: isSelected
+                        ? 'Selected for copy'
+                        : 'Select for copy (shift-click for a range)',
+                    child: Checkbox(
+                      value: isSelected,
+                      visualDensity: VisualDensity.compact,
+                      onChanged: (value) => onSelect(
+                        asset,
+                        value ?? false,
+                        range: HardwareKeyboard.instance.isShiftPressed,
+                      ),
+                    ),
+                  ),
+                  Icon(
+                    iconForAssetType(asset.effectiveType),
+                    size: 18,
+                    color: Colors.black54,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          asset.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontWeight: isActive
+                                ? FontWeight.w600
+                                : FontWeight.normal,
+                            decoration: asset.ignored
+                                ? TextDecoration.lineThrough
+                                : null,
+                            color: asset.ignored ? Colors.black45 : null,
+                          ),
+                        ),
+                        Tooltip(
+                          message: asset.path,
+                          waitDuration: const Duration(milliseconds: 600),
+                          child: Text(
+                            asset.relativePath,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.black54,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    asset.ext.toUpperCase(),
+                    style: const TextStyle(fontSize: 11, color: Colors.black45),
+                  ),
+                  // An eye reads as "hidden", where a second unlabelled
+                  // checkbox next to the select box did not.
+                  IconButton(
+                    tooltip: asset.ignored
+                        ? 'Ignored - click to un-ignore'
+                        : 'Ignore this asset',
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
+                    ),
+                    icon: Icon(
+                      asset.ignored
+                          ? Icons.visibility_off_outlined
+                          : Icons.visibility_outlined,
+                      size: 17,
+                      color: asset.ignored ? Colors.black87 : Colors.black26,
+                    ),
+                    onPressed: () => onIgnoredChanged(asset, !asset.ignored),
+                  ),
+                  IconButton(
+                    tooltip: 'Copy asset path',
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
+                    ),
+                    icon: const Icon(Icons.content_copy, size: 15),
+                    onPressed: () async {
+                      await Clipboard.setData(ClipboardData(text: asset.path));
+                      if (!context.mounted) return;
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Asset path copied.')),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
           ),
         );
       },
@@ -1425,16 +2393,421 @@ class AssetList extends StatelessWidget {
   }
 }
 
+/// Thumbnail grid. Recognising an asset by eye is most of what this app is
+/// for, and a column of filenames does not support that.
+class AssetGrid extends StatelessWidget {
+  const AssetGrid({
+    required this.assets,
+    required this.active,
+    required this.selectedIds,
+    required this.onActivate,
+    required this.onSelect,
+    super.key,
+  });
+
+  final List<AssetItem> assets;
+  final AssetItem? active;
+  final Set<String> selectedIds;
+  final ValueChanged<AssetItem> onActivate;
+  final AssetSelectCallback onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    if (assets.isEmpty) {
+      return const Center(child: Text('Scan a folder to catalog assets.'));
+    }
+
+    return GridView.builder(
+      padding: const EdgeInsets.all(8),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 140,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+        childAspectRatio: 0.82,
+      ),
+      itemCount: assets.length,
+      itemBuilder: (context, index) {
+        final asset = assets[index];
+        final isSelected = selectedIds.contains(asset.id);
+        return AssetGridTile(
+          asset: asset,
+          allAssets: assets,
+          isActive: active?.id == asset.id,
+          isSelected: isSelected,
+          onActivate: () => onActivate(asset),
+          onToggleSelected: () => onSelect(
+            asset,
+            !isSelected,
+            range: HardwareKeyboard.instance.isShiftPressed,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class AssetGridTile extends StatelessWidget {
+  const AssetGridTile({
+    required this.asset,
+    required this.allAssets,
+    required this.isActive,
+    required this.isSelected,
+    required this.onActivate,
+    required this.onToggleSelected,
+    super.key,
+  });
+
+  final AssetItem asset;
+  final List<AssetItem> allAssets;
+  final bool isActive;
+  final bool isSelected;
+  final VoidCallback onActivate;
+  final VoidCallback onToggleSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: asset.relativePath,
+      waitDuration: const Duration(milliseconds: 600),
+      child: Material(
+        color: isActive
+            ? scheme.primaryContainer.withValues(alpha: .5)
+            : const Color(0xfff4f6fa),
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: onActivate,
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: isActive ? scheme.primary : Colors.black12,
+                width: isActive ? 2 : 1,
+              ),
+            ),
+            child: Column(
+              children: [
+                Expanded(
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: Padding(
+                          padding: const EdgeInsets.all(6),
+                          child: AssetThumbnail(
+                            asset: asset,
+                            allAssets: allAssets,
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        top: 0,
+                        left: 0,
+                        child: Checkbox(
+                          value: isSelected,
+                          visualDensity: VisualDensity.compact,
+                          materialTapTargetSize:
+                              MaterialTapTargetSize.shrinkWrap,
+                          onChanged: (_) => onToggleSelected(),
+                        ),
+                      ),
+                      if (asset.ignored)
+                        const Positioned(
+                          top: 4,
+                          right: 4,
+                          child: Icon(
+                            Icons.visibility_off_outlined,
+                            size: 16,
+                            color: Colors.black45,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
+                  child: Text(
+                    asset.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 11,
+                      decoration: asset.ignored
+                          ? TextDecoration.lineThrough
+                          : null,
+                      color: asset.ignored ? Colors.black45 : null,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Renders small previews of models for the grid, and remembers them.
+///
+/// A grid of file-type icons does not answer "which one is the crate", which
+/// is the whole reason to look at a grid. Rendering costs an FBX import, so
+/// this is strictly on demand: only tiles that are actually built ask for one,
+/// a couple render at a time, and results are kept in a bounded cache.
+class ModelThumbnailCache {
+  ModelThumbnailCache._();
+
+  static const size = 128;
+  static const maxEntries = 300;
+  static const _maxConcurrent = 2;
+
+  /// Requests waiting to render. Beyond this the oldest are dropped: they are
+  /// almost certainly off screen by now, and asking again is cheap.
+  static const maxQueued = 48;
+
+  /// Rendering a thumbnail means importing the model. Turn this off to keep
+  /// the grid to plain type icons -- tests do, so that unrelated widget tests
+  /// are not dragged into FBX imports.
+  static bool enabled = true;
+
+  static final _entries = <String, ui.Image?>{};
+  static final _pending = <String>{};
+  static final _queue = Queue<_ThumbnailRequest>();
+  static var _running = 0;
+
+  /// Bumped whenever a thumbnail lands, so grids can rebuild.
+  static final ValueNotifier<int> revision = ValueNotifier<int>(0);
+
+  /// Rendered thumbnails started. Test visibility only.
+  static int renderCount = 0;
+
+  /// Returns the cached image, or null and schedules a render.
+  static ui.Image? imageFor(AssetItem asset, List<AssetItem> allAssets) {
+    if (!enabled) return null;
+    final cached = _entries.remove(asset.id);
+    if (cached != null) {
+      _entries[asset.id] = cached;
+      return cached;
+    }
+    if (_entries.containsKey(asset.id)) {
+      // Known to be unrenderable; do not keep trying.
+      return null;
+    }
+    if (_pending.add(asset.id)) {
+      // Newest first: while scrolling, the tile you are looking at now matters
+      // more than one you flew past. An unbounded queue would keep rendering
+      // thousands of thumbnails nobody can see any more.
+      _queue.addFirst(_ThumbnailRequest(asset, allAssets));
+      while (_queue.length > maxQueued) {
+        _pending.remove(_queue.removeLast().asset.id);
+      }
+      unawaited(_drain());
+    }
+    return null;
+  }
+
+  static Future<void> _drain() async {
+    if (_running >= _maxConcurrent || _queue.isEmpty) return;
+    _running += 1;
+    while (_queue.isNotEmpty) {
+      final request = _queue.removeFirst();
+      ui.Image? image;
+      try {
+        renderCount += 1;
+        image = await renderModelThumbnail(
+          request.asset,
+          allAssets: request.allAssets,
+        );
+      } catch (_) {
+        image = null;
+      }
+      _entries[request.asset.id] = image;
+      _pending.remove(request.asset.id);
+      while (_entries.length > maxEntries) {
+        final oldest = _entries.keys.first;
+        _entries.remove(oldest)?.dispose();
+      }
+      revision.value += 1;
+    }
+    _running -= 1;
+  }
+
+  /// Test visibility: how many requests are waiting.
+  static int get queuedCount => _queue.length;
+
+  static void clear() {
+    for (final image in _entries.values) {
+      image?.dispose();
+    }
+    _entries.clear();
+    _pending.clear();
+    _queue.clear();
+    revision.value += 1;
+  }
+}
+
+class _ThumbnailRequest {
+  const _ThumbnailRequest(this.asset, this.allAssets);
+  final AssetItem asset;
+  final List<AssetItem> allAssets;
+}
+
+/// Draws one model into a square image with the same painter the preview uses,
+/// so a thumbnail looks like what you get when you click it.
+Future<ui.Image?> renderModelThumbnail(
+  AssetItem asset, {
+  List<AssetItem> allAssets = const [],
+  int size = ModelThumbnailCache.size,
+}) async {
+  final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
+  if (mesh.isAnimationOnly || mesh.faces.isEmpty) return null;
+
+  // Same rasteriser as the preview, so a thumbnail matches what you get when
+  // you click it -- including depth-correct overlaps.
+  final raster = rasterizeMesh(
+    mesh: mesh,
+    yaw: -0.6,
+    pitch: 0.35,
+    zoom: 1,
+    width: size,
+    height: size,
+    renderMode: RenderMode.textured,
+    lightingMode: LightingMode.corner,
+    cullBackFaces: true,
+    backgroundArgb: 0x00000000,
+  );
+  return imageFromRaster(raster);
+}
+
+/// Image thumbnails are decoded at tile size, not full size: a 4K texture
+/// atlas decoded per tile would exhaust memory in a grid of any size.
+class AssetThumbnail extends StatelessWidget {
+  const AssetThumbnail({
+    required this.asset,
+    this.allAssets = const [],
+    super.key,
+  });
+
+  final AssetItem asset;
+  final List<AssetItem> allAssets;
+
+  static const _decodeWidth = 160;
+
+  @override
+  Widget build(BuildContext context) {
+    if (asset.type == 'model' && asset.modelKind != 'animation') {
+      return ModelThumbnail(asset: asset, allAssets: allAssets);
+    }
+    if (asset.type == 'image') {
+      if (isZipVirtualPath(asset.path)) {
+        return FutureBuilder<Uint8List?>(
+          future: ZipThumbnailCache.bytesFor(asset),
+          builder: (context, snapshot) {
+            final bytes = snapshot.data;
+            if (bytes == null || bytes.isEmpty) return _fallbackIcon();
+            return Image.memory(
+              bytes,
+              fit: BoxFit.contain,
+              cacheWidth: _decodeWidth,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) => _fallbackIcon(),
+            );
+          },
+        );
+      }
+      return Image.file(
+        File(asset.path),
+        fit: BoxFit.contain,
+        cacheWidth: _decodeWidth,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => _fallbackIcon(),
+      );
+    }
+    return _fallbackIcon();
+  }
+
+  Widget _fallbackIcon() {
+    return Center(
+      child: Icon(
+        iconForAssetType(asset.effectiveType),
+        size: 34,
+        color: Colors.black26,
+      ),
+    );
+  }
+}
+
+/// Shows a model's rendered thumbnail once it exists, and its type icon until
+/// then, so the grid fills in as you look at it instead of blocking.
+class ModelThumbnail extends StatelessWidget {
+  const ModelThumbnail({
+    required this.asset,
+    required this.allAssets,
+    super.key,
+  });
+
+  final AssetItem asset;
+  final List<AssetItem> allAssets;
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<int>(
+      valueListenable: ModelThumbnailCache.revision,
+      builder: (context, _, _) {
+        final image = ModelThumbnailCache.imageFor(asset, allAssets);
+        if (image == null) {
+          return Center(
+            child: Icon(
+              iconForAssetType(asset.effectiveType),
+              size: 34,
+              color: Colors.black26,
+            ),
+          );
+        }
+        return RawImage(image: image, fit: BoxFit.contain);
+      },
+    );
+  }
+}
+
+/// Small bounded cache of decompressed ZIP entries for thumbnails. Without it
+/// scrolling a grid re-inflates the same archive entries continuously.
+class ZipThumbnailCache {
+  ZipThumbnailCache._();
+
+  static const maxEntries = 200;
+  static final _entries = <String, Future<Uint8List?>>{};
+
+  static Future<Uint8List?> bytesFor(AssetItem asset) {
+    final cached = _entries.remove(asset.id);
+    if (cached != null) {
+      _entries[asset.id] = cached;
+      return cached;
+    }
+    final future = readZipVirtualAssetBytesByPath(asset.path);
+    _entries[asset.id] = future;
+    while (_entries.length > maxEntries) {
+      _entries.remove(_entries.keys.first);
+    }
+    return future;
+  }
+
+  static void clear() => _entries.clear();
+}
+
 class PreviewPanel extends StatefulWidget {
   const PreviewPanel({
     required this.asset,
     required this.allAssets,
+    required this.catalogRevision,
     required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem? asset;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
   @override
@@ -1443,6 +2816,20 @@ class PreviewPanel extends StatefulWidget {
 
 class _PreviewPanelState extends State<PreviewPanel> {
   double detailsWidth = 360;
+
+  // Same reason as the diagnostics panel: a future built inline in build()
+  // re-read and re-inflated the archive entry on every rebuild.
+  String? _zipBytesKey;
+  Future<Uint8List?>? _zipBytesFuture;
+
+  Future<Uint8List?> _zipBytesFor(AssetItem item) {
+    final key = '${item.id}|${widget.catalogRevision}';
+    if (_zipBytesKey != key || _zipBytesFuture == null) {
+      _zipBytesKey = key;
+      _zipBytesFuture = readZipVirtualAssetBytesByPath(item.path);
+    }
+    return _zipBytesFuture!;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1483,6 +2870,7 @@ class _PreviewPanelState extends State<PreviewPanel> {
                 child: AssetDetailsPanel(
                   item: item,
                   allAssets: widget.allAssets,
+                  catalogRevision: widget.catalogRevision,
                   onActivateAsset: widget.onActivateAsset,
                 ),
               ),
@@ -1497,7 +2885,7 @@ class _PreviewPanelState extends State<PreviewPanel> {
     if (item.type == 'image') {
       if (isZipVirtualPath(item.path)) {
         return FutureBuilder<Uint8List?>(
-          future: readZipVirtualAssetBytesByPath(item.path),
+          future: _zipBytesFor(item),
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
               return const Center(child: CircularProgressIndicator());
@@ -1552,7 +2940,11 @@ class _PreviewPanelState extends State<PreviewPanel> {
           item.ext != 'fbx') {
         return _unsupportedZipModelPreview(item);
       }
-      return ModelPreview(asset: item, allAssets: widget.allAssets);
+      return ModelPreview(
+        asset: item,
+        allAssets: widget.allAssets,
+        catalogRevision: widget.catalogRevision,
+      );
     }
 
     return DecoratedBox(
@@ -1588,6 +2980,44 @@ class _PreviewPanelState extends State<PreviewPanel> {
   }
 }
 
+/// Whether [bytes] actually start like the audio container their extension
+/// claims.
+///
+/// audioplayers_windows dies with an access violation on malformed input --
+/// a native crash Dart cannot catch -- so nothing unverified may reach it.
+/// Confirmed against a 268-byte AppleDouble stub named ".mp3", which took the
+/// whole app down.
+bool looksLikePlayableAudio(List<int> bytes, String ext) {
+  if (bytes.length < 12) return false;
+
+  bool startsWith(List<int> magic, {int offset = 0}) {
+    if (bytes.length < offset + magic.length) return false;
+    for (var i = 0; i < magic.length; i += 1) {
+      if (bytes[offset + i] != magic[i]) return false;
+    }
+    return true;
+  }
+
+  switch (ext) {
+    case 'mp3':
+      // ID3v2 tag, or an MPEG frame sync (11 set bits).
+      if (startsWith([0x49, 0x44, 0x33])) return true;
+      return bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0;
+    case 'wav':
+      return startsWith([0x52, 0x49, 0x46, 0x46]) &&
+          startsWith([0x57, 0x41, 0x56, 0x45], offset: 8);
+    case 'ogg':
+      return startsWith([0x4F, 0x67, 0x67, 0x53]);
+    case 'flac':
+      return startsWith([0x66, 0x4C, 0x61, 0x43]) ||
+          startsWith([0x49, 0x44, 0x33]);
+    case 'mid':
+    case 'midi':
+      return startsWith([0x4D, 0x54, 0x68, 0x64]);
+  }
+  return true;
+}
+
 class AudioPreview extends StatefulWidget {
   const AudioPreview({required this.asset, super.key});
 
@@ -1606,6 +3036,7 @@ class _AudioPreviewState extends State<AudioPreview> {
   Duration position = Duration.zero;
   Duration duration = Duration.zero;
   PlayerState state = PlayerState.stopped;
+  String? unplayableReason;
 
   @override
   void initState() {
@@ -1633,6 +3064,7 @@ class _AudioPreviewState extends State<AudioPreview> {
         position = Duration.zero;
         duration = Duration.zero;
         state = PlayerState.stopped;
+        unplayableReason = null;
       });
     }
   }
@@ -1651,15 +3083,47 @@ class _AudioPreviewState extends State<AudioPreview> {
       await player.pause();
       return;
     }
-    if (isZipVirtualPath(widget.asset.path)) {
-      final bytes = await readZipVirtualAssetBytesByPath(widget.asset.path);
-      if (bytes == null || bytes.isEmpty) {
+
+    try {
+      if (isZipVirtualPath(widget.asset.path)) {
+        final bytes = await readZipVirtualAssetBytesByPath(widget.asset.path);
+        if (bytes == null || bytes.isEmpty) {
+          _reportUnplayable('This archive entry could not be read.');
+          return;
+        }
+        if (!looksLikePlayableAudio(bytes, widget.asset.ext)) {
+          _reportUnplayable(
+            'This file does not contain ${widget.asset.ext.toUpperCase()} '
+            'audio data, so it cannot be played.',
+          );
+          return;
+        }
+        await player.play(BytesSource(bytes));
         return;
       }
-      await player.play(BytesSource(bytes));
-      return;
+
+      final file = File(widget.asset.path);
+      if (!file.existsSync()) {
+        _reportUnplayable('The file is no longer at this path.');
+        return;
+      }
+      final header = await file.openRead(0, 32).expand((c) => c).toList();
+      if (!looksLikePlayableAudio(header, widget.asset.ext)) {
+        _reportUnplayable(
+          'This file does not contain ${widget.asset.ext.toUpperCase()} '
+          'audio data, so it cannot be played.',
+        );
+        return;
+      }
+      await player.play(DeviceFileSource(widget.asset.path));
+    } catch (error) {
+      _reportUnplayable('Playback failed: $error');
     }
-    await player.play(DeviceFileSource(widget.asset.path));
+  }
+
+  void _reportUnplayable(String message) {
+    if (!mounted) return;
+    setState(() => unplayableReason = message);
   }
 
   String asClock(Duration value) {
@@ -1707,6 +3171,15 @@ class _AudioPreviewState extends State<AudioPreview> {
             ),
           ),
           const SizedBox(height: 12),
+          if (unplayableReason != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: Text(
+                unplayableReason!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Color(0xffb3261e)),
+              ),
+            ),
           FilledButton.icon(
             onPressed: playPause,
             icon: Icon(
@@ -1723,10 +3196,16 @@ class _AudioPreviewState extends State<AudioPreview> {
 }
 
 class ModelPreview extends StatefulWidget {
-  const ModelPreview({required this.asset, required this.allAssets, super.key});
+  const ModelPreview({
+    required this.asset,
+    required this.allAssets,
+    required this.catalogRevision,
+    super.key,
+  });
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
 
   @override
   State<ModelPreview> createState() => _ModelPreviewState();
@@ -1741,13 +3220,38 @@ class _ModelPreviewState extends State<ModelPreview> {
   int checkerSquareSize = 16;
   String? uvSetOverride;
   LightingMode lightingMode = LightingMode.corner;
+  bool cullBackFaces = true;
 
-  Future<MeshModel> _loadCurrentMesh() {
-    return loadMesh(
+  /// A texture the user picked by hand, overriding whatever resolved.
+  String? chosenTexturePath;
+  bool useBaseTexture = true;
+  bool useNormalMaps = true;
+  bool useEmissiveMaps = true;
+  bool useSpecular = true;
+  bool interacting = false;
+  Timer? _interactionTimer;
+
+  /// Marks the camera as moving, and settles shortly after the last change so
+  /// the view can re-render sharp.
+  void _touchInteraction() {
+    if (!interacting) setState(() => interacting = true);
+    _interactionTimer?.cancel();
+    _interactionTimer = Timer(const Duration(milliseconds: 180), () {
+      if (mounted) setState(() => interacting = false);
+    });
+  }
+
+  Future<MeshModel> _loadCurrentMesh() async {
+    final mesh = await MeshLoadCache.load(
       widget.asset,
       allAssets: widget.allAssets,
       fallbackCheckerSquareSize: checkerSquareSize,
     );
+    final chosen = chosenTexturePath;
+    if (chosen == null) return mesh;
+    // Not cached: the cache is keyed on the file, and this is the user's
+    // choice rather than anything the file said.
+    return applyChosenTexture(mesh, chosen);
   }
 
   @override
@@ -1757,15 +3261,23 @@ class _ModelPreviewState extends State<ModelPreview> {
   }
 
   @override
+  void dispose() {
+    _interactionTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   void didUpdateWidget(covariant ModelPreview oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.asset.path != widget.asset.path ||
-        oldWidget.allAssets.length != widget.allAssets.length) {
+    if (oldWidget.asset.id != widget.asset.id ||
+        oldWidget.catalogRevision != widget.catalogRevision) {
       meshFuture = _loadCurrentMesh();
       yaw = -0.6;
       pitch = 0.35;
       zoom = 1;
       uvSetOverride = null;
+      // A texture chosen for one model means nothing for the next.
+      chosenTexturePath = null;
     }
   }
 
@@ -1794,86 +3306,175 @@ class _ModelPreviewState extends State<ModelPreview> {
               );
             }
             final mesh = snapshot.data!;
-            return Stack(
+            if (mesh.isAnimationOnly) {
+              return AnimationClipPreview(
+                mesh: mesh,
+                allAssets: widget.allAssets,
+              );
+            }
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Listener(
-                  onPointerSignal: (event) {
-                    if (event is PointerScrollEvent) {
-                      setState(() {
-                        zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
-                            .clamp(.35, 4)
-                            .toDouble();
-                      });
-                    }
-                  },
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onPanUpdate: (details) {
-                      setState(() {
-                        yaw += details.delta.dx * .01;
-                        pitch = (pitch + details.delta.dy * .01)
-                            .clamp(-1.45, 1.45)
-                            .toDouble();
-                      });
-                    },
-                    child: CustomPaint(
-                      painter: MeshPainter(
-                        mesh: mesh,
-                        yaw: yaw,
-                        pitch: pitch,
-                        zoom: zoom,
-                        renderMode: renderMode,
-                        uvSetOverride: uvSetOverride,
-                        lightingMode: lightingMode,
+                // The controls used to float over the model, which put
+                // them exactly where you want to look. A real bar above
+                // the viewport costs a little height and covers nothing.
+                ModelToolbarBar(
+                  children: [
+                    if (mesh.skin != null)
+                      ValueListenableBuilder<String?>(
+                        valueListenable: AnimationCharacter.instance.path,
+                        builder: (context, chosen, _) =>
+                            AnimationCharacterButton(
+                              isChosen: chosen == widget.asset.path,
+                              onPressed: () => AnimationCharacter.instance.set(
+                                chosen == widget.asset.path
+                                    ? null
+                                    : widget.asset.path,
+                              ),
+                            ),
                       ),
-                      child: Align(
-                        alignment: Alignment.bottomLeft,
-                        child: Container(
-                          margin: const EdgeInsets.all(12),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .86),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(
-                            '${mesh.name} · ${mesh.vertices.length} verts · ${mesh.faces.length} faces',
-                          ),
+                    SegmentedButton<RenderMode>(
+                      segments: const [
+                        ButtonSegment(
+                          value: RenderMode.textured,
+                          label: Text('Textured'),
                         ),
-                      ),
+                        ButtonSegment(
+                          value: RenderMode.solid,
+                          label: Text('Solid'),
+                        ),
+                        ButtonSegment(
+                          value: RenderMode.wireframe,
+                          label: Text('Wireframe'),
+                        ),
+                      ],
+                      selected: {renderMode},
+                      onSelectionChanged: (selection) {
+                        if (selection.isEmpty) return;
+                        setState(() => renderMode = selection.first);
+                      },
                     ),
-                  ),
-                ),
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      SegmentedButton<RenderMode>(
-                        segments: const [
-                          ButtonSegment(
-                            value: RenderMode.textured,
-                            label: Text('Textured'),
-                          ),
-                          ButtonSegment(
-                            value: RenderMode.solid,
-                            label: Text('Solid'),
-                          ),
-                          ButtonSegment(
-                            value: RenderMode.wireframe,
-                            label: Text('Wireframe'),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Light'),
+                          const SizedBox(width: 8),
+                          DropdownButtonHideUnderline(
+                            child: DropdownButton<LightingMode>(
+                              value: lightingMode,
+                              isDense: true,
+                              items: const [
+                                DropdownMenuItem(
+                                  value: LightingMode.corner,
+                                  child: Text('Corner'),
+                                ),
+                                DropdownMenuItem(
+                                  value: LightingMode.top,
+                                  child: Text('Top'),
+                                ),
+                                DropdownMenuItem(
+                                  value: LightingMode.unlit,
+                                  child: Text('Unlit'),
+                                ),
+                              ],
+                              onChanged: (next) {
+                                if (next == null) return;
+                                setState(() => lightingMode = next);
+                              },
+                            ),
                           ),
                         ],
-                        selected: {renderMode},
-                        onSelectionChanged: (selection) {
-                          if (selection.isEmpty) return;
-                          setState(() => renderMode = selection.first);
-                        },
                       ),
-                      const SizedBox(height: 8),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 2,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Hide back faces'),
+                          Switch(
+                            value: cullBackFaces,
+                            onChanged: (next) =>
+                                setState(() => cullBackFaces = next),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // Only shown when there is a normal map to apply: an
+                    // inert control invites the question "why is nothing
+                    // happening".
+                    if (renderMode == RenderMode.textured) ...[
+                      TexturePickerButton(
+                        candidates: findNearbyTextures(
+                          widget.asset,
+                          widget.allAssets,
+                        ),
+                        chosenPath: chosenTexturePath,
+                        onChosen: (path) => setState(() {
+                          chosenTexturePath = path;
+                          meshFuture = _loadCurrentMesh();
+                        }),
+                      ),
+                      ShadingChannelPanel(
+                        channels: [
+                          if (mesh.materials.any(
+                            (material) => material.texturePixels != null,
+                          ))
+                            ShadingChannel(
+                              label: 'Base texture',
+                              value: useBaseTexture,
+                              onChanged: (next) =>
+                                  setState(() => useBaseTexture = next),
+                            ),
+                          if (mesh.materials.any(
+                            (material) => material.hasNormalMap,
+                          ))
+                            ShadingChannel(
+                              label: 'Normal map',
+                              value: useNormalMaps,
+                              onChanged: (next) =>
+                                  setState(() => useNormalMaps = next),
+                            ),
+                          if (mesh.materials.any(
+                            (material) => material.hasEmissiveMap,
+                          ))
+                            ShadingChannel(
+                              label: 'Emissive',
+                              value: useEmissiveMaps,
+                              onChanged: (next) =>
+                                  setState(() => useEmissiveMaps = next),
+                            ),
+                          if (mesh.materials.any(
+                            (material) => material.specularFactor > 0,
+                          ))
+                            ShadingChannel(
+                              label: 'Specular',
+                              value: useSpecular,
+                              onChanged: (next) =>
+                                  setState(() => useSpecular = next),
+                            ),
+                        ],
+                      ),
+                    ],
+                    if (mesh.availableUvSets.length > 1) ...[
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 10,
@@ -1887,118 +3488,30 @@ class _ModelPreviewState extends State<ModelPreview> {
                         child: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            const Text('Light'),
+                            const Text('UV set'),
                             const SizedBox(width: 8),
                             DropdownButtonHideUnderline(
-                              child: DropdownButton<LightingMode>(
-                                value: lightingMode,
+                              child: DropdownButton<String>(
+                                value: uvSetOverride ?? '',
                                 isDense: true,
-                                items: const [
-                                  DropdownMenuItem(
-                                    value: LightingMode.corner,
-                                    child: Text('Corner'),
+                                items: [
+                                  const DropdownMenuItem(
+                                    value: '',
+                                    child: Text('Material default'),
                                   ),
-                                  DropdownMenuItem(
-                                    value: LightingMode.top,
-                                    child: Text('Top'),
-                                  ),
-                                  DropdownMenuItem(
-                                    value: LightingMode.unlit,
-                                    child: Text('Unlit'),
+                                  ...mesh.availableUvSets.map(
+                                    (name) => DropdownMenuItem(
+                                      value: name,
+                                      child: Text(name),
+                                    ),
                                   ),
                                 ],
                                 onChanged: (next) {
-                                  if (next == null) return;
-                                  setState(() => lightingMode = next);
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      if (mesh.availableUvSets.length > 1) ...[
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .9),
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(color: Colors.black12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text('UV set'),
-                              const SizedBox(width: 8),
-                              DropdownButtonHideUnderline(
-                                child: DropdownButton<String>(
-                                  value: uvSetOverride ?? '',
-                                  isDense: true,
-                                  items: [
-                                    const DropdownMenuItem(
-                                      value: '',
-                                      child: Text('Material default'),
-                                    ),
-                                    ...mesh.availableUvSets.map(
-                                      (name) => DropdownMenuItem(
-                                        value: name,
-                                        child: Text(name),
-                                      ),
-                                    ),
-                                  ],
-                                  onChanged: (next) {
-                                    setState(() {
-                                      uvSetOverride = switch (next) {
-                                        null || '' => null,
-                                        _ => next,
-                                      };
-                                    });
-                                  },
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 6,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: .9),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.black12),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Text('Fallback'),
-                            const SizedBox(width: 8),
-                            DropdownButtonHideUnderline(
-                              child: DropdownButton<int>(
-                                value: checkerSquareSize,
-                                isDense: true,
-                                items: const [4, 8, 16, 32, 64]
-                                    .map(
-                                      (size) => DropdownMenuItem<int>(
-                                        value: size,
-                                        child: Text('${size}px square'),
-                                      ),
-                                    )
-                                    .toList(),
-                                onChanged: (next) {
-                                  if (next == null ||
-                                      next == checkerSquareSize) {
-                                    return;
-                                  }
                                   setState(() {
-                                    checkerSquareSize = next;
-                                    meshFuture = _loadCurrentMesh();
+                                    uvSetOverride = switch (next) {
+                                      null || '' => null,
+                                      _ => next,
+                                    };
                                   });
                                 },
                               ),
@@ -2007,6 +3520,145 @@ class _ModelPreviewState extends State<ModelPreview> {
                         ),
                       ),
                     ],
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: .9),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.black12),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Fallback'),
+                          const SizedBox(width: 8),
+                          DropdownButtonHideUnderline(
+                            child: DropdownButton<int>(
+                              value: checkerSquareSize,
+                              isDense: true,
+                              items: const [4, 8, 16, 32, 64]
+                                  .map(
+                                    (size) => DropdownMenuItem<int>(
+                                      value: size,
+                                      child: Text('${size}px square'),
+                                    ),
+                                  )
+                                  .toList(),
+                              onChanged: (next) {
+                                if (next == null || next == checkerSquareSize) {
+                                  return;
+                                }
+                                setState(() {
+                                  checkerSquareSize = next;
+                                  meshFuture = _loadCurrentMesh();
+                                });
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                Expanded(
+                  child: Listener(
+                    onPointerSignal: (event) {
+                      if (event is PointerScrollEvent) {
+                        _touchInteraction();
+                        setState(() {
+                          zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
+                              .clamp(.35, 4)
+                              .toDouble();
+                        });
+                      }
+                    },
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onPanUpdate: (details) {
+                        _touchInteraction();
+                        setState(() {
+                          yaw += details.delta.dx * .01;
+                          pitch = (pitch + details.delta.dy * .01)
+                              .clamp(-1.45, 1.45)
+                              .toDouble();
+                        });
+                      },
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            // Wireframe is lines only, where per-pixel depth
+                            // buys nothing; everything filled goes through the
+                            // rasteriser so interpenetrating and coplanar faces
+                            // resolve correctly.
+                            child: renderMode == RenderMode.wireframe
+                                ? CustomPaint(
+                                    painter: MeshPainter(
+                                      mesh: mesh,
+                                      yaw: yaw,
+                                      pitch: pitch,
+                                      zoom: zoom,
+                                      renderMode: renderMode,
+                                      uvSetOverride: uvSetOverride,
+                                      lightingMode: lightingMode,
+                                      cullBackFaces: cullBackFaces,
+                                      // Wireframe draws no surface, so the
+                                      // shading channels do not apply to it.
+                                      useNormalMaps: useNormalMaps,
+                                    ),
+                                  )
+                                : RasterModelView(
+                                    mesh: mesh,
+                                    yaw: yaw,
+                                    pitch: pitch,
+                                    zoom: zoom,
+                                    renderMode: renderMode,
+                                    lightingMode: lightingMode,
+                                    cullBackFaces: cullBackFaces,
+                                    useBaseTexture: useBaseTexture,
+                                    useNormalMaps: useNormalMaps,
+                                    useEmissiveMaps: useEmissiveMaps,
+                                    useSpecular: useSpecular,
+                                    uvSetOverride: uvSetOverride,
+                                    interacting: interacting,
+                                  ),
+                          ),
+                          Align(
+                            alignment: Alignment.bottomLeft,
+                            child: Container(
+                              margin: const EdgeInsets.all(12),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: .86),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Builder(
+                                builder: (context) {
+                                  final total = mesh.faces.length;
+                                  final capped = total > maxRenderedFaces;
+                                  final summary =
+                                      '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
+                                  if (!capped) return Text(summary);
+                                  return Text(
+                                    '$summary · face cap: showing '
+                                    '$maxRenderedFaces nearest',
+                                    style: const TextStyle(
+                                      color: Color(0xffb3540a),
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ],
@@ -2018,6 +3670,1359 @@ class _ModelPreviewState extends State<ModelPreview> {
   }
 }
 
+/// Shown for an FBX that carries a skeleton and curves but no geometry. There
+/// is nothing to draw, so report what the file actually holds instead of
+/// showing an import error.
+/// Draws one pose of a rig: a line from every bone to its parent.
+///
+/// The bounds come from the whole clip rather than the current frame, so the
+/// figure does not breathe in and out as it plays.
+class SkeletonPainter extends CustomPainter {
+  SkeletonPainter({
+    required this.skeleton,
+    required this.frame,
+    required this.yaw,
+  });
+
+  final SkeletonAnimation skeleton;
+  final int frame;
+
+  /// Rotation about the vertical axis, in radians.
+  final double yaw;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (frame < 0 || frame >= skeleton.frameCount) return;
+    final positions = skeleton.positions[frame];
+    final bounds = skeleton.bounds;
+
+    final spanX = math.max(bounds.maxX - bounds.minX, 0.001);
+    final spanY = math.max(bounds.maxY - bounds.minY, 0.001);
+    // Depth rotates into x, so reserve the wider of the two for the scale.
+    final scale =
+        math.min(size.width / math.max(spanX, spanY), size.height / spanY) *
+        0.82;
+    final centerX = (bounds.minX + bounds.maxX) / 2;
+    final centerY = (bounds.minY + bounds.maxY) / 2;
+    final sinYaw = math.sin(yaw);
+    final cosYaw = math.cos(yaw);
+
+    Offset project(int bone) {
+      final base = bone * 12;
+      final x = positions[base + 9] - centerX;
+      final y = positions[base + 10] - centerY;
+      final z = positions[base + 11];
+      final rotated = x * cosYaw + z * sinYaw;
+      return Offset(
+        size.width / 2 + rotated * scale,
+        size.height / 2 - y * scale,
+      );
+    }
+
+    final bonePaint = Paint()
+      ..color = const Color(0xff2f3a4a)
+      ..strokeWidth = 2
+      ..strokeCap = StrokeCap.round;
+    final jointPaint = Paint()..color = const Color(0xff4c7fd4);
+
+    for (var i = 0; i < skeleton.bones.length; i += 1) {
+      final parent = skeleton.bones[i].parent;
+      final point = project(i);
+      if (parent >= 0 && parent < skeleton.bones.length) {
+        canvas.drawLine(project(parent), point, bonePaint);
+      }
+      canvas.drawCircle(point, 2.2, jointPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant SkeletonPainter oldDelegate) =>
+      oldDelegate.frame != frame ||
+      oldDelegate.yaw != yaw ||
+      !identical(oldDelegate.skeleton, skeleton);
+}
+
+/// Plays a clip's rig: drag to turn, scrub to a frame, or let it run.
+class SkeletonPlayer extends StatefulWidget {
+  const SkeletonPlayer({
+    required this.skeleton,
+    this.characterPath,
+    this.allAssets = const [],
+    super.key,
+  });
+
+  final SkeletonAnimation skeleton;
+
+  /// The model to play this clip on. Null falls back to the stick figure.
+  final String? characterPath;
+  final List<AssetItem> allAssets;
+
+  @override
+  State<SkeletonPlayer> createState() => _SkeletonPlayerState();
+}
+
+class _SkeletonPlayerState extends State<SkeletonPlayer>
+    with SingleTickerProviderStateMixin {
+  late final Ticker _ticker;
+  Duration _elapsed = Duration.zero;
+  bool _playing = true;
+  double _yaw = 0.4;
+  MeshModel? _character;
+  String? _characterError;
+  RasterScene? _restScene;
+  Float32List? _posedPositions;
+
+  /// The character's scene with this frame's positions written into it.
+  ///
+  /// Both the scene and the position buffer are built once and reused: the
+  /// triangle and material tables do not change as a clip plays, and
+  /// reallocating them every frame is what made playback stutter.
+  RasterScene _poseScene(
+    MeshModel character,
+    SkeletonAnimation clip,
+    int frame,
+  ) {
+    final scene = _restScene ??= RasterScene.fromMesh(character);
+    final buffer = _posedPositions ??= Float32List(
+      character.vertices.length * 3,
+    );
+    poseSkinnedPositions(
+      character: character,
+      clip: clip,
+      frame: frame,
+      out: buffer,
+    );
+    return scene.withPositions(buffer);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = createTicker((elapsed) {
+      if (!_playing) return;
+      setState(() => _elapsed = elapsed);
+    })..start();
+    _loadCharacter();
+  }
+
+  @override
+  void didUpdateWidget(covariant SkeletonPlayer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.characterPath != widget.characterPath) {
+      _character = null;
+      _characterError = null;
+      _restScene = null;
+      _posedPositions = null;
+      _loadCharacter();
+    }
+  }
+
+  Future<void> _loadCharacter() async {
+    final path = widget.characterPath;
+    if (path == null) return;
+    AssetItem? asset;
+    for (final candidate in widget.allAssets) {
+      if (candidate.path == path) {
+        asset = candidate;
+        break;
+      }
+    }
+    if (asset == null) {
+      setState(
+        () => _characterError =
+            'The chosen character is not in the '
+            'catalog any more.',
+      );
+      return;
+    }
+    try {
+      final mesh = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
+      if (!mounted) return;
+      setState(() {
+        _character = mesh.skin == null ? null : mesh;
+        _characterError = mesh.skin == null
+            ? '${asset!.name} has no skin weights, so a clip cannot move it.'
+            : null;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _characterError = 'Could not load the character: $error');
+    }
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
+  }
+
+  int get _frame {
+    final count = widget.skeleton.frameCount;
+    if (count <= 1) return 0;
+    final rate = widget.skeleton.frameRate <= 0
+        ? 30.0
+        : widget.skeleton.frameRate;
+    // Loop: a locomotion clip is meant to be watched repeatedly.
+    return ((_elapsed.inMicroseconds / 1e6) * rate).floor() % count;
+  }
+
+  /// Parks playback on one frame. Scrubbing implies pausing.
+  void _seek(int frame) {
+    final rate = widget.skeleton.frameRate <= 0
+        ? 30.0
+        : widget.skeleton.frameRate;
+    setState(() {
+      _playing = false;
+      _elapsed = Duration(microseconds: (frame / rate * 1e6).round());
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final skeleton = widget.skeleton;
+    final frame = _frame;
+    final character = _character;
+    return Column(
+      children: [
+        if (_characterError != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              _characterError!,
+              style: const TextStyle(fontSize: 12, color: Color(0xffb3261e)),
+            ),
+          ),
+        Expanded(
+          child: GestureDetector(
+            onHorizontalDragUpdate: (details) =>
+                setState(() => _yaw += details.delta.dx * 0.01),
+            child: character == null
+                ? CustomPaint(
+                    painter: SkeletonPainter(
+                      skeleton: skeleton,
+                      frame: frame,
+                      yaw: _yaw,
+                    ),
+                    child: const SizedBox.expand(),
+                  )
+                : RasterModelView(
+                    mesh: character,
+                    sceneOverride: _poseScene(character, skeleton, frame),
+                    sceneRevision: frame,
+                    yaw: _yaw,
+                    pitch: 0,
+                    zoom: 1,
+                    renderMode: RenderMode.textured,
+                    lightingMode: LightingMode.corner,
+                    cullBackFaces: false,
+                    useBaseTexture: true,
+                    useNormalMaps: true,
+                    useEmissiveMaps: true,
+                    useSpecular: true,
+                    // Every frame is a new mesh, so never wait on an isolate
+                    // round trip for a sharp one.
+                    interacting: true,
+                  ),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Row(
+            children: [
+              IconButton(
+                tooltip: _playing ? 'Pause' : 'Play',
+                icon: Icon(_playing ? Icons.pause : Icons.play_arrow),
+                onPressed: () => setState(() {
+                  if (_playing) {
+                    _playing = false;
+                  } else {
+                    // Resume from where the scrub left off rather than
+                    // jumping back to whatever the ticker has counted to.
+                    _playing = true;
+                  }
+                }),
+              ),
+              Expanded(
+                child: Slider(
+                  value: frame.toDouble(),
+                  max: math.max(1, skeleton.frameCount - 1).toDouble(),
+                  divisions: math.max(1, skeleton.frameCount - 1),
+                  label: 'Frame $frame',
+                  onChanged: (value) => _seek(value.round()),
+                ),
+              ),
+              SizedBox(
+                width: 96,
+                child: Text(
+                  '${frame + 1} / ${skeleton.frameCount}',
+                  textAlign: TextAlign.right,
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class AnimationClipPreview extends StatelessWidget {
+  const AnimationClipPreview({
+    required this.mesh,
+    this.allAssets = const [],
+    super.key,
+  });
+
+  final MeshModel mesh;
+
+  /// Needed to find the chosen character, which lives elsewhere in the catalog.
+  final List<AssetItem> allAssets;
+
+  String get _duration {
+    if (mesh.durationSeconds <= 0) return 'unknown';
+    return '${mesh.durationSeconds.toStringAsFixed(2)}s';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final skeleton = mesh.skeleton;
+    if (skeleton != null) {
+      return Column(
+        children: [
+          Expanded(
+            child: ValueListenableBuilder<String?>(
+              valueListenable: AnimationCharacter.instance.path,
+              builder: (context, characterPath, _) => SkeletonPlayer(
+                skeleton: skeleton,
+                characterPath: characterPath,
+                allAssets: allAssets,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Text(
+              '${skeleton.bones.length} bones · $_duration · '
+              '${mesh.animationNames.join(", ")}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ),
+        ],
+      );
+    }
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.directions_run, size: 56, color: Colors.black54),
+            const SizedBox(height: 12),
+            const Text(
+              'Animation clip',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'This FBX contains animation and skeleton data, with no mesh to '
+              'draw.',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.black.withValues(alpha: .6)),
+            ),
+            const SizedBox(height: 16),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: .8),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.black12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DetailRow(
+                      label: 'Takes',
+                      value: mesh.animationStacks.toString(),
+                    ),
+                    DetailRow(label: 'Bones', value: mesh.boneCount.toString()),
+                    DetailRow(label: 'Length', value: _duration),
+                    if (mesh.animationNames.isNotEmpty)
+                      DetailRow(
+                        label: 'Clip names',
+                        value: mesh.animationNames.join(', '),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Playback is not implemented yet.',
+              style: TextStyle(color: Colors.black.withValues(alpha: .45)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Turns a [RasterResult] into an image the widget layer can draw.
+Future<ui.Image> imageFromRaster(RasterResult raster) {
+  final completer = Completer<ui.Image>();
+  ui.decodeImageFromPixels(
+    raster.pixels,
+    raster.width,
+    raster.height,
+    ui.PixelFormat.rgba8888,
+    completer.complete,
+  );
+  return completer.future;
+}
+
+/// Shows a mesh rendered by the depth-buffered rasteriser.
+///
+/// Rasterising costs tens of milliseconds, so while the camera is moving this
+/// renders at half resolution and sharpens once you stop. The previous frame
+/// stays on screen in the meantime rather than flashing empty.
+class RasterModelView extends StatefulWidget {
+  const RasterModelView({
+    required this.mesh,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    required this.useBaseTexture,
+    required this.useNormalMaps,
+    required this.useEmissiveMaps,
+    required this.useSpecular,
+    required this.interacting,
+    this.sceneOverride,
+    this.sceneRevision,
+    this.uvSetOverride,
+    super.key,
+  });
+
+  final MeshModel mesh;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool useBaseTexture;
+  final bool useNormalMaps;
+  final bool useEmissiveMaps;
+  final bool useSpecular;
+
+  /// True while the user is dragging or zooming.
+  final bool interacting;
+  final String? uvSetOverride;
+
+  /// A prebuilt scene to draw instead of flattening [mesh].
+  ///
+  /// Animation supplies this: only the vertex positions change per frame, and
+  /// rebuilding the triangle and material tables 30 times a second is most of
+  /// the cost of playback.
+  final RasterScene? sceneOverride;
+
+  /// Changes when [sceneOverride] holds different positions, so the frame
+  /// cache can tell one pose from the next.
+  final Object? sceneRevision;
+
+  @override
+  State<RasterModelView> createState() => _RasterModelViewState();
+}
+
+class _RasterModelViewState extends State<RasterModelView> {
+  ui.Image? _image;
+  RasterScene? _scene;
+  String? _sceneKey;
+  String? _renderedKey;
+  bool _rendering = false;
+  Size _lastSize = Size.zero;
+
+  @override
+  void dispose() {
+    _image?.dispose();
+    super.dispose();
+  }
+
+  String _keyFor(Size size, double scale) => [
+    identityHashCode(widget.mesh),
+    widget.yaw.toStringAsFixed(4),
+    widget.pitch.toStringAsFixed(4),
+    widget.zoom.toStringAsFixed(4),
+    widget.renderMode.name,
+    widget.lightingMode.name,
+    widget.cullBackFaces,
+    widget.useBaseTexture,
+    widget.useNormalMaps,
+    widget.useEmissiveMaps,
+    widget.useSpecular,
+    widget.sceneRevision ?? '',
+    widget.uvSetOverride ?? '',
+    size.width.round(),
+    size.height.round(),
+    scale,
+  ].join('|');
+
+  Future<void> _render(Size size) async {
+    if (_rendering || size.isEmpty) return;
+    // Coarse while the camera moves, sharp once it settles.
+    final scale = widget.interacting ? 0.5 : 1.0;
+    final key = _keyFor(size, scale);
+    if (key == _renderedKey) return;
+
+    _rendering = true;
+    try {
+      final width = math.max(1, (size.width * scale).round());
+      final height = math.max(1, (size.height * scale).round());
+
+      // Flattening the mesh is the expensive part of setup, so keep it per
+      // mesh rather than per frame. Animation hands us a scene it already
+      // holds, whose positions it swaps in place.
+      final override = widget.sceneOverride;
+      if (override == null) {
+        final sceneKey =
+            '${identityHashCode(widget.mesh)}|'
+            '${widget.uvSetOverride ?? ''}';
+        if (_scene == null || _sceneKey != sceneKey) {
+          _scene = RasterScene.fromMesh(
+            widget.mesh,
+            uvSetOverride: widget.uvSetOverride,
+          );
+          _sceneKey = sceneKey;
+        }
+      }
+
+      final request = RasterRequest(
+        scene: override ?? _scene!,
+        yaw: widget.yaw,
+        pitch: widget.pitch,
+        zoom: widget.zoom,
+        width: width,
+        height: height,
+        renderMode: widget.renderMode,
+        lightingMode: widget.lightingMode,
+        cullBackFaces: widget.cullBackFaces,
+        useBaseTexture: widget.useBaseTexture,
+        useNormalMaps: widget.useNormalMaps,
+        useEmissiveMaps: widget.useEmissiveMaps,
+        useSpecular: widget.useSpecular,
+      );
+
+      // Coarse frames are small and wanted immediately; spending an isolate
+      // hop on them would add more latency than it saves. The sharp frame is
+      // the one that would stall the window, so that one goes to a worker.
+      final raster = widget.interacting
+          ? rasterizeScene(request)
+          : await rasterizeSceneInIsolate(request);
+      final image = await imageFromRaster(raster);
+      if (!mounted) {
+        image.dispose();
+        return;
+      }
+      setState(() {
+        _image?.dispose();
+        _image = image;
+        _renderedKey = key;
+      });
+    } finally {
+      _rendering = false;
+    }
+    // The camera may have moved on while this frame was in flight, and a
+    // coarse frame has to be followed by a sharp one once movement stops.
+    if (mounted &&
+        _keyFor(size, widget.interacting ? 0.5 : 1.0) != _renderedKey) {
+      unawaited(Future.microtask(() => _render(size)));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final size = Size(constraints.maxWidth, constraints.maxHeight);
+        _lastSize = size;
+        WidgetsBinding.instance.addPostFrameCallback((_) => _render(_lastSize));
+
+        final image = _image;
+        if (image == null) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        return RawImage(
+          image: image,
+          width: size.width,
+          height: size.height,
+          fit: BoxFit.fill,
+          // A half-resolution frame stretched to fit reads better smoothed.
+          filterQuality: FilterQuality.low,
+        );
+      },
+    );
+  }
+}
+
+/// A software rasteriser with a depth buffer.
+///
+/// The canvas painter sorts whole faces by depth and draws them back to front.
+/// That cannot resolve geometry that interpenetrates or sits coplanar — window
+/// frames flush with a wall, roof details flush with a roof — because the
+/// answer differs *within* a face. Those cases showed up as notches and stray
+/// slivers along polygon edges. Depth per pixel is the only thing that fixes
+/// it, so this walks the triangles itself and keeps a z value per pixel.
+///
+/// It also buys two things the canvas path could not do: perspective-correct
+/// texture sampling, and per-pixel normal mapping.
+class RasterResult {
+  const RasterResult({
+    required this.pixels,
+    required this.width,
+    required this.height,
+    required this.drawnFaces,
+    required this.totalFaces,
+  });
+
+  /// RGBA, row major, ready for [ui.decodeImageFromPixels].
+  final Uint8List pixels;
+  final int width;
+  final int height;
+  final int drawnFaces;
+  final int totalFaces;
+
+  bool get capped => drawnFaces < totalFaces;
+}
+
+/// Rasterises [mesh] into an RGBA buffer.
+///
+/// Pure and synchronous so it can run on a worker isolate; nothing here touches
+/// `dart:ui`.
+/// A mesh flattened into plain data a worker isolate can be handed.
+///
+/// [MeshModel] holds a `ui.Image` per material, which cannot cross an isolate
+/// boundary. The rasteriser never needed it -- it samples the CPU-side pixel
+/// buffers -- so this carries only what shading actually reads, with per-face
+/// lookups (material, UV set, vertex tint) resolved up front.
+class RasterScene {
+  const RasterScene({
+    required this.positions,
+    required this.triangleIndices,
+    required this.triangleMaterial,
+    required this.triangleUvs,
+    required this.triangleHasUv,
+    required this.triangleTint,
+    required this.materials,
+    required this.totalTriangles,
+  });
+
+  /// x, y, z per vertex.
+  final Float32List positions;
+
+  /// The same scene with different vertex positions.
+  ///
+  /// Animation replaces the positions 30 times a second and nothing else:
+  /// rebuilding the triangle indices, UVs and material table each frame walks
+  /// every face and reallocates about a megabyte, which is most of the cost of
+  /// a frame. The buffers here are shared, not copied.
+  RasterScene withPositions(Float32List replacement) => RasterScene(
+    positions: replacement,
+    triangleIndices: triangleIndices,
+    triangleMaterial: triangleMaterial,
+    triangleTint: triangleTint,
+    triangleUvs: triangleUvs,
+    triangleHasUv: triangleHasUv,
+    materials: materials,
+    totalTriangles: totalTriangles,
+  );
+
+  /// Three vertex indices per triangle.
+  final Int32List triangleIndices;
+  final Int32List triangleMaterial;
+
+  /// Six values per triangle: u, v for each corner.
+  final Float32List triangleUvs;
+  final Uint8List triangleHasUv;
+
+  /// Packed 0xRRGGBB vertex tint per triangle, or -1 for none.
+  final Int32List triangleTint;
+
+  final List<RasterMaterial> materials;
+  final int totalTriangles;
+
+  static RasterScene fromMesh(MeshModel mesh, {String? uvSetOverride}) {
+    final triangles = <int>[];
+    final triMaterial = <int>[];
+    final triUvs = <double>[];
+    final triHasUv = <int>[];
+    final triTint = <int>[];
+
+    for (final face in mesh.faces) {
+      final indices = face.indices;
+      if (indices.length < 3) continue;
+      var valid = true;
+      for (final index in indices) {
+        if (index < 0 || index >= mesh.vertices.length) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) continue;
+
+      final material =
+          (face.materialIndex >= 0 &&
+              face.materialIndex < mesh.materials.length)
+          ? mesh.materials[face.materialIndex]
+          : null;
+      final uvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
+      final hasUv = uvs.length == 3;
+      final tint = mesh.averageFaceVertexColor(face);
+      final packedTint = tint == null
+          ? -1
+          : (((tint.r * 255).round() & 0xff) << 16) |
+                (((tint.g * 255).round() & 0xff) << 8) |
+                ((tint.b * 255).round() & 0xff);
+
+      // Fan triangulation: an OBJ face may be a polygon.
+      for (var i = 1; i + 1 < indices.length; i += 1) {
+        triangles.addAll([indices[0], indices[i], indices[i + 1]]);
+        triMaterial.add(face.materialIndex);
+        triTint.add(packedTint);
+        if (hasUv && i == 1) {
+          triUvs.addAll([
+            uvs[0].x,
+            uvs[0].y,
+            uvs[1].x,
+            uvs[1].y,
+            uvs[2].x,
+            uvs[2].y,
+          ]);
+          triHasUv.add(1);
+        } else {
+          // Only the first triangle of a polygon carries the face's UVs;
+          // beyond that there is nothing meaningful to assign.
+          triUvs.addAll([0, 0, 0, 0, 0, 0]);
+          triHasUv.add(hasUv && indices.length == 3 ? 1 : 0);
+        }
+      }
+    }
+
+    final positions = Float32List(mesh.vertices.length * 3);
+    for (var i = 0; i < mesh.vertices.length; i += 1) {
+      positions[i * 3] = mesh.vertices[i].x;
+      positions[i * 3 + 1] = mesh.vertices[i].y;
+      positions[i * 3 + 2] = mesh.vertices[i].z;
+    }
+
+    return RasterScene(
+      positions: positions,
+      triangleIndices: Int32List.fromList(triangles),
+      triangleMaterial: Int32List.fromList(triMaterial),
+      triangleUvs: Float32List.fromList(triUvs),
+      triangleHasUv: Uint8List.fromList(triHasUv),
+      triangleTint: Int32List.fromList(triTint),
+      materials: [
+        for (var i = 0; i < mesh.materials.length; i += 1)
+          RasterMaterial.from(mesh, i),
+      ],
+      totalTriangles: triMaterial.length,
+    );
+  }
+}
+
+class RasterMaterial {
+  const RasterMaterial({
+    required this.baseArgbTextured,
+    required this.baseArgbFlat,
+    required this.opacity,
+    required this.texturePixels,
+    required this.textureWidth,
+    required this.textureHeight,
+    required this.normalPixels,
+    required this.normalWidth,
+    required this.normalHeight,
+    required this.emissivePixels,
+    required this.emissiveWidth,
+    required this.emissiveHeight,
+    required this.emissiveFactor,
+    required this.specularFactor,
+    required this.roughness,
+    required this.texturesMissing,
+  });
+
+  factory RasterMaterial.from(MeshModel mesh, int index) {
+    final material = mesh.materials[index];
+    int pack(Color color) =>
+        (((color.r * 255).round() & 0xff) << 16) |
+        (((color.g * 255).round() & 0xff) << 8) |
+        ((color.b * 255).round() & 0xff);
+    return RasterMaterial(
+      baseArgbTextured: pack(mesh.colorForMaterial(index, textured: true)),
+      baseArgbFlat: pack(mesh.colorForMaterial(index, textured: false)),
+      opacity: mesh.opacityForMaterial(index),
+      texturePixels: material.texturePixels,
+      textureWidth: material.textureWidth,
+      textureHeight: material.textureHeight,
+      normalPixels: material.normalPixels,
+      normalWidth: material.normalWidth,
+      normalHeight: material.normalHeight,
+      emissivePixels: material.emissivePixels,
+      emissiveWidth: material.emissiveWidth,
+      emissiveHeight: material.emissiveHeight,
+      emissiveFactor: material.emissiveFactor,
+      specularFactor: material.specularFactor,
+      roughness: material.roughness,
+      texturesMissing: material.texturesMissing,
+    );
+  }
+
+  final int baseArgbTextured;
+  final int baseArgbFlat;
+  final double opacity;
+  final Uint8List? texturePixels;
+  final int textureWidth;
+  final int textureHeight;
+  final Uint8List? normalPixels;
+  final int normalWidth;
+  final int normalHeight;
+  final Uint8List? emissivePixels;
+  final int emissiveWidth;
+  final int emissiveHeight;
+  final double emissiveFactor;
+  final double specularFactor;
+  final double roughness;
+  final bool texturesMissing;
+
+  bool get hasNormalMap => normalPixels != null && normalWidth > 0;
+  bool get hasEmissiveMap => emissivePixels != null && emissiveWidth > 0;
+
+  /// Emissive texel at (u, v) packed 0xRRGGBB, or null.
+  int? sampleEmissive(double u, double v) {
+    final pixels = emissivePixels;
+    if (pixels == null || emissiveWidth <= 0 || emissiveHeight <= 0) {
+      return null;
+    }
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    final x = (fu * (emissiveWidth - 1)).toInt();
+    final y = (fv * (emissiveHeight - 1)).toInt();
+    final index = (y * emissiveWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return (pixels[index] << 16) | (pixels[index + 1] << 8) | pixels[index + 2];
+  }
+
+  Vec3? sampleNormal(double u, double v) {
+    final pixels = normalPixels;
+    if (pixels == null || normalWidth <= 0 || normalHeight <= 0) return null;
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    final x = (fu * (normalWidth - 1)).toInt();
+    final y = (fv * (normalHeight - 1)).toInt();
+    final index = (y * normalWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return Vec3(
+      pixels[index] / 127.5 - 1.0,
+      pixels[index + 1] / 127.5 - 1.0,
+      pixels[index + 2] / 127.5 - 1.0,
+    );
+  }
+}
+
+/// Rasterises [mesh]. Convenience wrapper: flattens to a [RasterScene] and
+/// renders it.
+RasterResult rasterizeMesh({
+  required MeshModel mesh,
+  required double yaw,
+  required double pitch,
+  required double zoom,
+  required int width,
+  required int height,
+  required RenderMode renderMode,
+  required LightingMode lightingMode,
+  required bool cullBackFaces,
+  bool useBaseTexture = true,
+  bool useNormalMaps = true,
+  bool useEmissiveMaps = true,
+  bool useSpecular = true,
+  String? uvSetOverride,
+  int backgroundArgb = 0xffe9edf3,
+  int maxFaces = maxRenderedFaces,
+}) {
+  return rasterizeScene(
+    RasterRequest(
+      scene: RasterScene.fromMesh(mesh, uvSetOverride: uvSetOverride),
+      yaw: yaw,
+      pitch: pitch,
+      zoom: zoom,
+      width: width,
+      height: height,
+      renderMode: renderMode,
+      lightingMode: lightingMode,
+      cullBackFaces: cullBackFaces,
+      useBaseTexture: useBaseTexture,
+      useNormalMaps: useNormalMaps,
+      useEmissiveMaps: useEmissiveMaps,
+      useSpecular: useSpecular,
+      backgroundArgb: backgroundArgb,
+      maxFaces: maxFaces,
+    ),
+  );
+}
+
+/// Everything one frame needs, in a single sendable object.
+class RasterRequest {
+  const RasterRequest({
+    required this.scene,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.width,
+    required this.height,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    this.useBaseTexture = true,
+    this.useNormalMaps = true,
+    this.useEmissiveMaps = true,
+    this.useSpecular = true,
+    this.backgroundArgb = 0xffe9edf3,
+    this.maxFaces = maxRenderedFaces,
+  });
+
+  final RasterScene scene;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final int width;
+  final int height;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+
+  /// The shading channels, each switchable on its own.
+  ///
+  /// Turning one off is how you find out what it was contributing: a model
+  /// that looks wrong with normal maps on and right with them off has a bad
+  /// tangent frame, not a bad texture.
+  final bool useBaseTexture;
+  final bool useNormalMaps;
+  final bool useEmissiveMaps;
+  final bool useSpecular;
+  final int backgroundArgb;
+  final int maxFaces;
+}
+
+/// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
+/// worker isolate; see [rasterizeSceneInIsolate].
+RasterResult rasterizeScene(RasterRequest request) {
+  final scene = request.scene;
+  final width = request.width;
+  final height = request.height;
+  final pixels = Uint8List(width * height * 4);
+  final depth = Float32List(width * height);
+
+  final bgR = (request.backgroundArgb >> 16) & 0xff;
+  final bgG = (request.backgroundArgb >> 8) & 0xff;
+  final bgB = request.backgroundArgb & 0xff;
+  final bgA = (request.backgroundArgb >> 24) & 0xff;
+  for (var i = 0; i < pixels.length; i += 4) {
+    pixels[i] = bgR;
+    pixels[i + 1] = bgG;
+    pixels[i + 2] = bgB;
+    pixels[i + 3] = bgA;
+  }
+  // Larger is nearer, so the buffer starts at "infinitely far".
+  depth.fillRange(0, depth.length, -double.infinity);
+
+  final vertexCount = scene.positions.length ~/ 3;
+  final screenX = Float32List(vertexCount);
+  final screenY = Float32List(vertexCount);
+  final invW = Float32List(vertexCount);
+  final viewX = Float32List(vertexCount);
+  final viewY = Float32List(vertexCount);
+  final viewZ = Float32List(vertexCount);
+
+  final centerX = width / 2;
+  final centerY = height / 2;
+  final scale = math.min(width, height) * .38 * request.zoom;
+  final sy = math.sin(request.yaw);
+  final cy = math.cos(request.yaw);
+  final sx = math.sin(request.pitch);
+  final cx = math.cos(request.pitch);
+
+  for (var i = 0; i < vertexCount; i += 1) {
+    final vx = scene.positions[i * 3];
+    final vy = scene.positions[i * 3 + 1];
+    final vz = scene.positions[i * 3 + 2];
+    final x1 = vx * cy + vz * sy;
+    final z1 = -vx * sy + vz * cy;
+    final y1 = vy * cx - z1 * sx;
+    final z2 = vy * sx + z1 * cx;
+    final perspective = 2.8 / (2.8 + z2);
+    viewX[i] = x1;
+    viewY[i] = y1;
+    viewZ[i] = z2;
+    invW[i] = perspective;
+    screenX[i] = centerX + x1 * scale * perspective;
+    screenY[i] = centerY - y1 * scale * perspective;
+  }
+
+  final triangleCount = scene.totalTriangles;
+  var order = List<int>.generate(triangleCount, (i) => i);
+  if (request.maxFaces >= 0 && order.length > request.maxFaces) {
+    // Order no longer matters for correctness, but a budget still does: keep
+    // the nearest triangles when a mesh is enormous.
+    final nearest = Float32List(triangleCount);
+    for (var i = 0; i < triangleCount; i += 1) {
+      final a = scene.triangleIndices[i * 3];
+      final b = scene.triangleIndices[i * 3 + 1];
+      final c = scene.triangleIndices[i * 3 + 2];
+      nearest[i] = math.max(invW[a], math.max(invW[b], invW[c]));
+    }
+    order.sort((a, b) => nearest[b].compareTo(nearest[a]));
+    order = order.sublist(0, request.maxFaces);
+  }
+
+  final (lx, ly, lz) = request.lightingMode == LightingMode.top
+      ? (0.0, 1.0, 0.0)
+      : (-0.45, 0.75, -0.5);
+  final lightDirection = Vec3(lx, ly, lz);
+  final textured = request.renderMode == RenderMode.textured;
+
+  var drawn = 0;
+  for (final triangleIndex in order) {
+    final i0 = scene.triangleIndices[triangleIndex * 3];
+    final i1 = scene.triangleIndices[triangleIndex * 3 + 1];
+    final i2 = scene.triangleIndices[triangleIndex * 3 + 2];
+
+    final x0 = screenX[i0], y0 = screenY[i0];
+    final x1 = screenX[i1], y1 = screenY[i1];
+    final x2 = screenX[i2], y2 = screenY[i2];
+
+    final area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area == 0) continue;
+    if (request.cullBackFaces && area < 0) continue;
+    drawn += 1;
+
+    final materialIndex = scene.triangleMaterial[triangleIndex];
+    final material =
+        (materialIndex >= 0 && materialIndex < scene.materials.length)
+        ? scene.materials[materialIndex]
+        : null;
+    final hasUvs = scene.triangleHasUv[triangleIndex] == 1;
+    final uvBase = triangleIndex * 6;
+    final uvs = hasUvs
+        ? <Vec2>[
+            Vec2(scene.triangleUvs[uvBase], scene.triangleUvs[uvBase + 1]),
+            Vec2(scene.triangleUvs[uvBase + 2], scene.triangleUvs[uvBase + 3]),
+            Vec2(scene.triangleUvs[uvBase + 4], scene.triangleUvs[uvBase + 5]),
+          ]
+        : const <Vec2>[];
+
+    final geometricNormal = _rasterFaceNormal(viewX, viewY, viewZ, i0, i1, i2);
+    final viewTriangle = [
+      Vec3(viewX[i0], viewY[i0], viewZ[i0]),
+      Vec3(viewX[i1], viewY[i1], viewZ[i1]),
+      Vec3(viewX[i2], viewY[i2], viewZ[i2]),
+    ];
+    final faceLight = request.lightingMode == LightingMode.unlit
+        ? 1.0
+        : faceDiffuseWithNormalMap(
+            geometricNormal: geometricNormal,
+            lightDirection: lightDirection,
+            viewPositions: viewTriangle,
+            uvs: uvs,
+          );
+
+    final perPixelNormals =
+        request.useNormalMaps &&
+        request.lightingMode != LightingMode.unlit &&
+        hasUvs &&
+        material != null &&
+        material.hasNormalMap &&
+        !isDegenerateUvTriangle(uvs);
+
+    final baseArgb = material == null
+        ? 0xb4b4b4
+        : (textured ? material.baseArgbTextured : material.baseArgbFlat);
+    final opacity = material?.opacity ?? 1.0;
+    final packedTint = scene.triangleTint[triangleIndex];
+
+    var minX = math.min(x0, math.min(x1, x2)).floor();
+    var maxX = math.max(x0, math.max(x1, x2)).ceil();
+    var minY = math.min(y0, math.min(y1, y2)).floor();
+    var maxY = math.max(y0, math.max(y1, y2)).ceil();
+    if (minX < 0) minX = 0;
+    if (minY < 0) minY = 0;
+    if (maxX > width - 1) maxX = width - 1;
+    if (maxY > height - 1) maxY = height - 1;
+    if (minX > maxX || minY > maxY) continue;
+
+    final invArea = 1.0 / area;
+    final w0 = invW[i0], w1 = invW[i1], w2 = invW[i2];
+
+    // Everything constant across the face, hoisted: doing this per pixel cost
+    // more than the shading itself.
+    final flatR = (baseArgb >> 16) & 0xff;
+    final flatG = (baseArgb >> 8) & 0xff;
+    final flatB = baseArgb & 0xff;
+    final tinted = packedTint >= 0;
+    final tintRFixed = tinted ? ((packedTint >> 16) & 0xff) : 256;
+    final tintGFixed = tinted ? ((packedTint >> 8) & 0xff) : 256;
+    final tintBFixed = tinted ? (packedTint & 0xff) : 256;
+    final opaque = opacity >= 0.999;
+    final inverseOpacity = 1 - opacity;
+    final lightFixed = (faceLight * 256).toInt();
+
+    // Blinn-Phong specular. The view direction is fixed (the camera looks
+    // down +z), so the half vector is constant per face and only the normal
+    // varies -- cheap enough to afford per pixel when a normal map is active.
+    final specularStrength =
+        textured &&
+            request.useSpecular &&
+            request.lightingMode != LightingMode.unlit
+        ? (material?.specularFactor ?? 0).clamp(0.0, 1.0)
+        : 0.0;
+    final shininess = material == null
+        ? 8.0
+        : 4 + (1 - material.roughness.clamp(0.0, 1.0)) * 120;
+    final emissivePixels = textured && request.useEmissiveMaps
+        ? material?.emissivePixels
+        : null;
+    final emissiveFactor = material?.emissiveFactor ?? 0;
+    final emissiveWidth = material?.emissiveWidth ?? 0;
+    // Exporters routinely leave the factor at 0 while still assigning an
+    // emissive texture. Honouring that literally would hide every emissive map
+    // in the library, so a map with no factor renders at full strength.
+    final emissiveScale = emissiveFactor <= 0
+        ? 1.0
+        : emissiveFactor.clamp(0.0, 4.0);
+
+    final texPixels = textured && request.useBaseTexture && hasUvs
+        ? material?.texturePixels
+        : null;
+    final texWidth = material?.textureWidth ?? 0;
+    final texMaxX = texWidth - 1;
+    final texMaxY = (material?.textureHeight ?? 0) - 1;
+
+    final u0w = hasUvs ? uvs[0].x * w0 : 0.0;
+    final v0w = hasUvs ? uvs[0].y * w0 : 0.0;
+    final u1w = hasUvs ? uvs[1].x * w1 : 0.0;
+    final v1w = hasUvs ? uvs[1].y * w1 : 0.0;
+    final u2w = hasUvs ? uvs[2].x * w2 : 0.0;
+    final v2w = hasUvs ? uvs[2].y * w2 : 0.0;
+
+    // Barycentric weights are affine in screen space, so step them rather than
+    // recomputing two edge functions per pixel.
+    final b0dx = (y1 - y2) * invArea;
+    final b1dx = (y2 - y0) * invArea;
+    final b0dy = (x2 - x1) * invArea;
+    final b1dy = (x0 - x2) * invArea;
+
+    final startX = minX + 0.5;
+    final startY = minY + 0.5;
+    var rowB0 =
+        ((x1 - startX) * (y2 - startY) - (x2 - startX) * (y1 - startY)) *
+        invArea;
+    var rowB1 =
+        ((x2 - startX) * (y0 - startY) - (x0 - startX) * (y2 - startY)) *
+        invArea;
+
+    for (var py = minY; py <= maxY; py += 1) {
+      var b0 = rowB0;
+      var b1 = rowB1;
+      var offset = py * width + minX;
+      for (var px = minX; px <= maxX; px += 1, offset += 1) {
+        final b2 = 1.0 - b0 - b1;
+        if (b0 >= 0 && b1 >= 0 && b2 >= 0) {
+          final pixelInvW = b0 * w0 + b1 * w1 + b2 * w2;
+          if (pixelInvW > depth[offset]) {
+            int r = flatR, g = flatG, b = flatB;
+            double u = 0, v = 0;
+            if (texPixels != null || perPixelNormals) {
+              u = (b0 * u0w + b1 * u1w + b2 * u2w) / pixelInvW;
+              v = (b0 * v0w + b1 * v1w + b2 * v2w) / pixelInvW;
+            }
+            if (texPixels != null) {
+              var fu = u - u.floorToDouble();
+              var fv = v - v.floorToDouble();
+              if (fu < 0) fu += 1;
+              if (fv < 0) fv += 1;
+              final texelIndex =
+                  (((fv * texMaxY).toInt() * texWidth) +
+                      (fu * texMaxX).toInt()) *
+                  4;
+              if (texelIndex >= 0 && texelIndex + 2 < texPixels.length) {
+                r = texPixels[texelIndex];
+                g = texPixels[texelIndex + 1];
+                b = texPixels[texelIndex + 2];
+              }
+            }
+            if (tinted) {
+              r = (r * tintRFixed) >> 8;
+              g = (g * tintGFixed) >> 8;
+              b = (b * tintBFixed) >> 8;
+            }
+
+            var shade = lightFixed;
+            Vec3? pixelNormal;
+            if (perPixelNormals) {
+              final sampled = material.sampleNormal(u, v);
+              if (sampled != null) {
+                pixelNormal = sampled;
+                shade =
+                    (faceDiffuseWithNormalMap(
+                              geometricNormal: geometricNormal,
+                              lightDirection: lightDirection,
+                              viewPositions: viewTriangle,
+                              uvs: uvs,
+                              sampledNormal: sampled,
+                            ) *
+                            256)
+                        .toInt();
+              }
+            }
+
+            r = (r * shade) >> 8;
+            g = (g * shade) >> 8;
+            b = (b * shade) >> 8;
+
+            if (specularStrength > 0) {
+              final highlight = _specularTerm(
+                normal: pixelNormal ?? geometricNormal,
+                lightDirection: lightDirection,
+                shininess: shininess,
+              );
+              if (highlight > 0) {
+                final add = (highlight * specularStrength * 255).toInt();
+                r += add;
+                g += add;
+                b += add;
+              }
+            }
+
+            if (emissivePixels != null && emissiveWidth > 0) {
+              final emissive = material!.sampleEmissive(u, v);
+              if (emissive != null) {
+                // Additive: an emissive surface is lit by itself, so it does
+                // not go dark when the geometric light misses it.
+                r += (((emissive >> 16) & 0xff) * emissiveScale).toInt();
+                g += (((emissive >> 8) & 0xff) * emissiveScale).toInt();
+                b += ((emissive & 0xff) * emissiveScale).toInt();
+              }
+            }
+
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+
+            final target = offset * 4;
+            if (opaque) {
+              pixels[target] = r;
+              pixels[target + 1] = g;
+              pixels[target + 2] = b;
+              pixels[target + 3] = 255;
+            } else {
+              // Translucent faces blend against whatever is already there.
+              // Without sorting that is approximate: the price of correct
+              // opaque depth.
+              pixels[target] = (r * opacity + pixels[target] * inverseOpacity)
+                  .toInt();
+              pixels[target + 1] =
+                  (g * opacity + pixels[target + 1] * inverseOpacity).toInt();
+              pixels[target + 2] =
+                  (b * opacity + pixels[target + 2] * inverseOpacity).toInt();
+              pixels[target + 3] = 255;
+            }
+            depth[offset] = pixelInvW;
+          }
+        }
+        b0 += b0dx;
+        b1 += b1dx;
+      }
+      rowB0 += b0dy;
+      rowB1 += b1dy;
+    }
+  }
+
+  return RasterResult(
+    pixels: pixels,
+    width: width,
+    height: height,
+    drawnFaces: drawn,
+    totalFaces: triangleCount,
+  );
+}
+
+/// Renders a frame on a worker isolate, so a full-resolution frame does not
+/// stall the window.
+Future<RasterResult> rasterizeSceneInIsolate(RasterRequest request) {
+  return Isolate.run(() => rasterizeScene(request));
+}
+
+/// Blinn-Phong highlight for a normal under a light.
+///
+/// The camera looks down +z here, so the view direction is constant and the
+/// half vector needs no per-pixel camera maths.
+double _specularTerm({
+  required Vec3 normal,
+  required Vec3 lightDirection,
+  required double shininess,
+}) {
+  final lightLength = math.sqrt(
+    lightDirection.x * lightDirection.x +
+        lightDirection.y * lightDirection.y +
+        lightDirection.z * lightDirection.z,
+  );
+  final normalLength = math.sqrt(
+    normal.x * normal.x + normal.y * normal.y + normal.z * normal.z,
+  );
+  if (lightLength < 1e-9 || normalLength < 1e-9) return 0;
+
+  // View direction towards the camera, plus the light, normalised.
+  final hx = lightDirection.x / lightLength;
+  final hy = lightDirection.y / lightLength;
+  final hz = lightDirection.z / lightLength - 1;
+  final halfLength = math.sqrt(hx * hx + hy * hy + hz * hz);
+  if (halfLength < 1e-9) return 0;
+
+  final cosine =
+      ((normal.x * hx + normal.y * hy + normal.z * hz) /
+              (normalLength * halfLength))
+          .abs();
+  return math.pow(cosine, shininess).toDouble();
+}
+
+Vec3 _rasterFaceNormal(
+  Float32List viewX,
+  Float32List viewY,
+  Float32List viewZ,
+  int i0,
+  int i1,
+  int i2,
+) {
+  final ux = viewX[i1] - viewX[i0];
+  final uy = viewY[i1] - viewY[i0];
+  final uz = viewZ[i1] - viewZ[i0];
+  final vx = viewX[i2] - viewX[i0];
+  final vy = viewY[i2] - viewY[i0];
+  final vz = viewZ[i2] - viewZ[i0];
+  return Vec3(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+}
+
 class MeshPainter extends CustomPainter {
   MeshPainter({
     required this.mesh,
@@ -2026,6 +5031,8 @@ class MeshPainter extends CustomPainter {
     required this.zoom,
     required this.renderMode,
     required this.lightingMode,
+    required this.cullBackFaces,
+    this.useNormalMaps = true,
     this.uvSetOverride,
   });
 
@@ -2036,6 +5043,8 @@ class MeshPainter extends CustomPainter {
   final RenderMode renderMode;
   final LightingMode lightingMode;
   final String? uvSetOverride;
+  final bool cullBackFaces;
+  final bool useNormalMaps;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -2065,6 +5074,32 @@ class MeshPainter extends CustomPainter {
     }
 
     final facePaint = Paint()..style = PaintingStyle.fill;
+
+    // Flat palette faces are the bulk of this kind of content, and they all
+    // draw the same way: one triangle, one colour. Collect runs of them and
+    // issue a single drawVertices instead of a path per face. The batch is
+    // flushed whenever a differently-drawn face comes up, so the painter's
+    // back-to-front order still holds.
+    final batchPositions = <double>[];
+    final batchColors = <int>[];
+    final batchPaint = Paint()
+      ..style = PaintingStyle.fill
+      // Interior edges of a shared mesh line up exactly; antialiasing them
+      // leaves visible seams between triangles.
+      ..isAntiAlias = false;
+
+    void flushFlatBatch() {
+      if (batchPositions.isEmpty) return;
+      final vertices = ui.Vertices.raw(
+        ui.VertexMode.triangles,
+        Float32List.fromList(batchPositions),
+        colors: Int32List.fromList(batchColors),
+      );
+      canvas.drawVertices(vertices, BlendMode.dst, batchPaint);
+      batchPositions.clear();
+      batchColors.clear();
+    }
+
     final edgePaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1
@@ -2072,21 +5107,102 @@ class MeshPainter extends CustomPainter {
     final drawEdges =
         renderMode == RenderMode.wireframe || renderMode == RenderMode.solid;
 
-    final faces = mesh.faces.toList()
-      ..sort(
-        (a, b) => _faceDepth(projected, b).compareTo(_faceDepth(projected, a)),
-      );
-    final step = math.max(1, (faces.length / 14000).ceil());
-    for (var index = 0; index < faces.length; index += step) {
+    // Depth once per face, not once per comparison: the old comparator
+    // recomputed both sides on every compare.
+    final faces = mesh.faces;
+    final depths = List<double>.filled(faces.length, 0);
+    final visible = List<bool>.filled(faces.length, false);
+    for (var index = 0; index < faces.length; index += 1) {
       final face = faces[index];
       if (face.indices.any((i) => i < 0 || i >= projected.length)) continue;
+      depths[index] = _faceDepth(projected, face);
+      if (cullBackFaces && face.indices.length >= 3) {
+        final p0 = projected[face.indices[0]];
+        final p1 = projected[face.indices[1]];
+        final p2 = projected[face.indices[2]];
+        if (isBackFacingTriangle(p0.x, p0.y, p1.x, p1.y, p2.x, p2.y)) {
+          continue;
+        }
+      }
+      visible[index] = true;
+    }
+
+    final order = selectRenderedFaceOrder(
+      depths: depths,
+      visible: visible,
+      budget: maxRenderedFaces,
+    );
+
+    for (final faceIndex in order) {
+      final face = faces[faceIndex];
       final material =
           (face.materialIndex >= 0 &&
               face.materialIndex < mesh.materials.length)
           ? mesh.materials[face.materialIndex]
           : null;
       final textureUvs = face.uvsFor(uvSetOverride ?? material?.uvSet);
-      final light = _faceLight(viewVertices, face, lightingMode);
+      final light = _faceLight(
+        viewVertices,
+        face,
+        lightingMode,
+        material: material,
+        uvs: textureUvs,
+        useNormalMap: useNormalMaps,
+      );
+      // Synty-style palette models map an entire face to one texel, which
+      // makes the UV triangle degenerate. The textured path bails out on that
+      // (its inverse transform does not exist), so those faces used to render
+      // as the bare base colour -- half of every model, unpainted. Sample the
+      // texel and fill instead: same result, far cheaper.
+      final flatTexel =
+          renderMode == RenderMode.textured &&
+              material != null &&
+              textureUvs.length == 3 &&
+              isDegenerateUvTriangle(textureUvs)
+          // If the readback failed, the average texture colour still beats
+          // showing the untextured base.
+          ? (material.sampleTexture(textureUvs[0]) ?? material.textureColor)
+          : null;
+
+      if (flatTexel != null) {
+        var faceColor = flatTexel;
+        final vertexTint = mesh.averageFaceVertexColor(face);
+        if (vertexTint != null) {
+          faceColor = _multiplyColor(faceColor, vertexTint);
+        }
+        faceColor = _shadeColor(faceColor, light);
+        final shaded = faceColor.withValues(
+          alpha: mesh.opacityForMaterial(face.materialIndex),
+        );
+
+        if (face.indices.length == 3 && !drawEdges) {
+          final p0 = projected[face.indices[0]];
+          final p1 = projected[face.indices[1]];
+          final p2 = projected[face.indices[2]];
+          batchPositions.addAll([p0.x, p0.y, p1.x, p1.y, p2.x, p2.y]);
+          final argb = shaded.toARGB32();
+          batchColors.addAll([argb, argb, argb]);
+          continue;
+        }
+
+        flushFlatBatch();
+        final path = Path();
+        final first = projected[face.indices.first];
+        path.moveTo(first.x, first.y);
+        for (final vertexIndex in face.indices.skip(1)) {
+          final point = projected[vertexIndex];
+          path.lineTo(point.x, point.y);
+        }
+        path.close();
+        facePaint.color = shaded;
+        canvas.drawPath(path, facePaint);
+        if (drawEdges) canvas.drawPath(path, edgePaint);
+        continue;
+      }
+
+      // Anything drawn another way has to wait for the batch to land first.
+      flushFlatBatch();
+
       if (renderMode == RenderMode.textured &&
           material?.textureImage != null &&
           textureUvs.length == 3) {
@@ -2169,9 +5285,12 @@ class MeshPainter extends CustomPainter {
           faceColor = _multiplyColor(faceColor, vertexTint);
         }
         faceColor = _shadeColor(faceColor, light);
+        // Opaque unless the material itself asks for transparency. The old
+        // blanket .92 in textured mode let interior geometry bleed through
+        // solid walls, which reads as a broken asset.
         final fillAlpha = renderMode == RenderMode.solid
             ? 1.0
-            : (renderMode == RenderMode.textured ? .92 : 1.0) * materialOpacity;
+            : materialOpacity;
         facePaint.color = faceColor.withValues(alpha: fillAlpha);
         canvas.drawPath(path, facePaint);
       }
@@ -2179,6 +5298,7 @@ class MeshPainter extends CustomPainter {
         canvas.drawPath(path, edgePaint);
       }
     }
+    flushFlatBatch();
   }
 
   static bool _isApproximatelyWhite(Color color) {
@@ -2217,8 +5337,11 @@ class MeshPainter extends CustomPainter {
   static double _faceLight(
     List<Vec3> vertices,
     MeshFace face,
-    LightingMode mode,
-  ) {
+    LightingMode mode, {
+    MeshMaterial? material,
+    List<Vec2> uvs = const [],
+    bool useNormalMap = true,
+  }) {
     if (mode == LightingMode.unlit || face.indices.length < 3) return 1;
     final a = vertices[face.indices[0]];
     final b = vertices[face.indices[1]];
@@ -2238,10 +5361,23 @@ class MeshPainter extends CustomPainter {
     final (lx, ly, lz) = mode == LightingMode.top
         ? (0.0, 1.0, 0.0)
         : (-0.45, 0.75, -0.5);
-    final lightLength = math.sqrt(lx * lx + ly * ly + lz * lz);
-    final diffuse =
-        ((nx * lx + ny * ly + nz * lz) / (normalLength * lightLength)).abs();
-    return 0.42 + diffuse * 0.58;
+
+    final sampled = useNormalMap && material != null && material.hasNormalMap
+        ? material.sampleNormal(
+            Vec2(
+              (uvs[0].x + uvs[1].x + uvs[2].x) / 3,
+              (uvs[0].y + uvs[1].y + uvs[2].y) / 3,
+            ),
+          )
+        : null;
+
+    return faceDiffuseWithNormalMap(
+      geometricNormal: Vec3(nx, ny, nz),
+      lightDirection: Vec3(lx, ly, lz),
+      viewPositions: [a, b, c],
+      uvs: uvs,
+      sampledNormal: uvs.length == 3 ? sampled : null,
+    );
   }
 
   static void _drawTexturedTriangle(
@@ -2340,8 +5476,202 @@ class MeshPainter extends CustomPainter {
         oldDelegate.zoom != zoom ||
         oldDelegate.renderMode != renderMode ||
         oldDelegate.lightingMode != lightingMode ||
+        oldDelegate.cullBackFaces != cullBackFaces ||
+        oldDelegate.useNormalMaps != useNormalMaps ||
         oldDelegate.uvSetOverride != uvSetOverride;
   }
+}
+
+/// Upper bound on triangles drawn per frame. When a mesh exceeds it the
+/// viewer draws the nearest [maxRenderedFaces] and says so in the overlay --
+/// it must never quietly drop geometry in an inspection tool.
+const maxRenderedFaces = 14000;
+
+/// Diffuse term for a face, optionally perturbed by a normal map.
+///
+/// Shading here is per face, not per pixel: this renderer draws a triangle at a
+/// time, so a normal map can tilt a whole face but cannot add detail inside it.
+/// Faces pinned to a single texel (the palette case) have no UV gradient and
+/// therefore no tangent frame, so they keep their geometric normal.
+double faceDiffuseWithNormalMap({
+  required Vec3 geometricNormal,
+  required Vec3 lightDirection,
+  required List<Vec3> viewPositions,
+  required List<Vec2> uvs,
+  Vec3? sampledNormal,
+}) {
+  Vec3 normal = geometricNormal;
+
+  if (sampledNormal != null && uvs.length == 3 && viewPositions.length == 3) {
+    // Tangent from the triangle's position and UV derivatives.
+    final e1 = Vec3(
+      viewPositions[1].x - viewPositions[0].x,
+      viewPositions[1].y - viewPositions[0].y,
+      viewPositions[1].z - viewPositions[0].z,
+    );
+    final e2 = Vec3(
+      viewPositions[2].x - viewPositions[0].x,
+      viewPositions[2].y - viewPositions[0].y,
+      viewPositions[2].z - viewPositions[0].z,
+    );
+    final du1 = uvs[1].x - uvs[0].x;
+    final dv1 = uvs[1].y - uvs[0].y;
+    final du2 = uvs[2].x - uvs[0].x;
+    final dv2 = uvs[2].y - uvs[0].y;
+    final determinant = du1 * dv2 - du2 * dv1;
+
+    if (determinant.abs() > 1e-9) {
+      final inverse = 1.0 / determinant;
+      final tangent = Vec3(
+        (e1.x * dv2 - e2.x * dv1) * inverse,
+        (e1.y * dv2 - e2.y * dv1) * inverse,
+        (e1.z * dv2 - e2.z * dv1) * inverse,
+      );
+      final bitangent = Vec3(
+        (e2.x * du1 - e1.x * du2) * inverse,
+        (e2.y * du1 - e1.y * du2) * inverse,
+        (e2.z * du1 - e1.z * du2) * inverse,
+      );
+
+      Vec3 unit(Vec3 v) {
+        final length = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        if (length < 1e-9) return v;
+        return Vec3(v.x / length, v.y / length, v.z / length);
+      }
+
+      final t = unit(tangent);
+      final b = unit(bitangent);
+      final n = unit(geometricNormal);
+      final perturbed = Vec3(
+        t.x * sampledNormal.x + b.x * sampledNormal.y + n.x * sampledNormal.z,
+        t.y * sampledNormal.x + b.y * sampledNormal.y + n.y * sampledNormal.z,
+        t.z * sampledNormal.x + b.z * sampledNormal.y + n.z * sampledNormal.z,
+      );
+      normal = unit(perturbed);
+    }
+  }
+
+  final normalLength = math.sqrt(
+    normal.x * normal.x + normal.y * normal.y + normal.z * normal.z,
+  );
+  final lightLength = math.sqrt(
+    lightDirection.x * lightDirection.x +
+        lightDirection.y * lightDirection.y +
+        lightDirection.z * lightDirection.z,
+  );
+  if (normalLength < 1e-9 || lightLength < 1e-9) return 1;
+
+  final diffuse =
+      ((normal.x * lightDirection.x +
+                  normal.y * lightDirection.y +
+                  normal.z * lightDirection.z) /
+              (normalLength * lightLength))
+          .abs();
+  return 0.42 + diffuse * 0.58;
+}
+
+/// Whether a face's three UV corners land on (effectively) one texel.
+///
+/// True for flat-colour palette faces, which is most of a Synty model. Such a
+/// triangle has no invertible UV-to-screen transform, so it cannot be drawn by
+/// sampling across the triangle; it has to be filled with the single colour.
+bool isDegenerateUvTriangle(List<Vec2> uvs, {double epsilon = 1e-6}) {
+  if (uvs.length < 3) return true;
+  final area =
+      (uvs[1].x - uvs[0].x) * (uvs[2].y - uvs[0].y) -
+      (uvs[2].x - uvs[0].x) * (uvs[1].y - uvs[0].y);
+  return area.abs() < epsilon;
+}
+
+/// Screen-space signed area of a projected triangle.
+///
+/// Convention: an outward-facing surface of a solid projects to a *positive*
+/// signed area under this renderer's Y-flipping projection, so a negative area
+/// means the triangle is turned away from the camera.
+///
+/// Do not re-derive this from a single plane fixture: a lone two-sided triangle
+/// tells you nothing about which side is "out", and getting this backwards
+/// culls the outside of every closed model and shows you its interior.
+/// test/renderer_geometry_test.dart pins it against a cube whose winding is
+/// derived from outward geometric normals.
+double triangleSignedArea(
+  double ax,
+  double ay,
+  double bx,
+  double by,
+  double cx,
+  double cy,
+) {
+  return (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+}
+
+bool isBackFacingTriangle(
+  double ax,
+  double ay,
+  double bx,
+  double by,
+  double cx,
+  double cy,
+) {
+  return triangleSignedArea(ax, ay, bx, by, cx, cy) < 0;
+}
+
+/// Chooses which faces to draw and in what order: back-to-front over the
+/// visible set, capped to [budget] by dropping the farthest faces. Depth-
+/// priority beats the index stride this replaced, which sampled the mesh
+/// uniformly and left holes everywhere.
+List<int> selectRenderedFaceOrder({
+  required List<double> depths,
+  required List<bool> visible,
+  required int budget,
+}) {
+  final order = <int>[];
+  for (var index = 0; index < depths.length; index += 1) {
+    if (visible[index]) order.add(index);
+  }
+  // Larger depth is farther from the camera, so descending is back-to-front.
+  order.sort((a, b) => depths[b].compareTo(depths[a]));
+  if (budget >= 0 && order.length > budget) {
+    return order.sublist(order.length - budget);
+  }
+  return order;
+}
+
+enum AssetSortMode { path, name, size, modified, type }
+
+extension AssetSortModeLabel on AssetSortMode {
+  String get label => switch (this) {
+    AssetSortMode.path => 'Path',
+    AssetSortMode.name => 'Name',
+    AssetSortMode.size => 'Size',
+    AssetSortMode.modified => 'Modified',
+    AssetSortMode.type => 'Type',
+  };
+}
+
+/// Sorts a copy of [assets]. Ties always fall back to the relative path so the
+/// order is total and does not wobble between rebuilds.
+List<AssetItem> sortAssets(List<AssetItem> assets, AssetSortMode mode) {
+  int byPath(AssetItem a, AssetItem b) =>
+      a.relativePath.toLowerCase().compareTo(b.relativePath.toLowerCase());
+
+  final sorted = [...assets];
+  sorted.sort((a, b) {
+    final primary = switch (mode) {
+      AssetSortMode.path => 0,
+      AssetSortMode.name => a.name.toLowerCase().compareTo(
+        b.name.toLowerCase(),
+      ),
+      // Largest first: when sorting by size you are usually hunting for the
+      // heavy assets.
+      AssetSortMode.size => b.size.compareTo(a.size),
+      AssetSortMode.modified => b.modified.compareTo(a.modified),
+      AssetSortMode.type => a.effectiveType.compareTo(b.effectiveType),
+    };
+    if (primary != 0) return primary;
+    return byPath(a, b);
+  });
+  return sorted;
 }
 
 enum RenderMode { textured, solid, wireframe }
@@ -2396,12 +5726,14 @@ class AssetDetailsPanel extends StatelessWidget {
   const AssetDetailsPanel({
     required this.item,
     required this.allAssets,
+    required this.catalogRevision,
     required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem item;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
   @override
@@ -2421,32 +5753,27 @@ class AssetDetailsPanel extends StatelessWidget {
               style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 6),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    item.path,
-                    style: const TextStyle(color: Colors.black54),
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'Copy asset path',
-                  icon: const Icon(Icons.content_copy, size: 18),
-                  onPressed: () async {
-                    await Clipboard.setData(ClipboardData(text: item.path));
-                    if (!context.mounted) return;
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Asset path copied.')),
-                    );
-                  },
-                ),
-              ],
+            CopyablePathText(
+              path: item.path,
+              style: const TextStyle(color: Colors.black54),
             ),
             const SizedBox(height: 14),
-            DetailRow(label: 'Type', value: '${item.type} / ${item.ext}'),
+            DetailRow(
+              label: 'Type',
+              value: '${item.effectiveType} / ${item.ext}',
+            ),
             DetailRow(label: 'Source', value: item.sourceName),
+            DetailRow(
+              label: 'Folder',
+              value: isZipVirtualPath(item.path)
+                  ? item.relativePath
+                  : parentPath(item.path),
+              isPath: true,
+              // The details panel is narrow and these paths are long. Two
+              // lines cut a zip entry path down to something unreadable;
+              // four fits the ones that actually occur.
+              pathMaxLines: 4,
+            ),
             DetailRow(label: 'Size', value: formatBytes(item.size)),
             DetailRow(
               label: 'Modified',
@@ -2465,6 +5792,7 @@ class AssetDetailsPanel extends StatelessWidget {
               ModelTextureDiagnostics(
                 asset: item,
                 allAssets: allAssets,
+                catalogRevision: catalogRevision,
                 onActivateAsset: onActivateAsset,
               ),
             ],
@@ -2475,11 +5803,127 @@ class AssetDetailsPanel extends StatelessWidget {
   }
 }
 
+/// A path that may not fit its column: shows the full value on hover and
+/// offers a one-click copy, so a truncated path is still usable.
+class CopyablePathText extends StatelessWidget {
+  const CopyablePathText({
+    required this.path,
+    this.maxLines = 2,
+    this.style,
+    super.key,
+  });
+
+  final String path;
+  final int maxLines;
+  final TextStyle? style;
+
+  /// Trims from the *front* until the text fits.
+  ///
+  /// Two long paths under the same root differ at the end, so cutting the tail
+  /// renders them identical on screen -- which is exactly what the source
+  /// folder list used to do.
+  String fitPathToWidth(String value, double width, TextStyle? textStyle) {
+    bool fits(String candidate) {
+      final painter = TextPainter(
+        text: TextSpan(text: candidate, style: textStyle),
+        maxLines: maxLines,
+        textDirection: TextDirection.ltr,
+      )..layout(maxWidth: width);
+      return !painter.didExceedMaxLines;
+    }
+
+    if (width <= 0 || width.isInfinite || fits(value)) return value;
+    // A path tail has no spaces, so without a break opportunity it cannot wrap
+    // and only one line's worth survives however many lines are allowed.
+
+    // Binary search for the shortest head that has to go.
+    var low = 0;
+    var high = value.length;
+    while (low < high) {
+      final mid = (low + high) ~/ 2;
+      if (fits(breakableAtSeparators('...${value.substring(mid)}'))) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    // Prefer cutting at a folder boundary: "...\FBX\wall.fbx" reads better
+    // than "...BX\wall.fbx".
+    final separator = value.indexOf(RegExp(r'[\\/]'), low);
+    if (separator >= 0 &&
+        fits(breakableAtSeparators('...${value.substring(separator)}'))) {
+      return '...${value.substring(separator)}';
+    }
+    return '...${value.substring(low)}';
+  }
+
+  /// Inserts zero-width spaces after path separators so a long path can wrap
+  /// at folder boundaries instead of being stuck on one line.
+  static String breakableAtSeparators(String value) =>
+      value.replaceAllMapped(RegExp(r'[\\/]'), (match) => '${match[0]}\u200b');
+
+  @override
+  Widget build(BuildContext context) {
+    final effectiveStyle = style ?? DefaultTextStyle.of(context).style;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: Tooltip(
+            message: path,
+            waitDuration: const Duration(milliseconds: 400),
+            child: LayoutBuilder(
+              builder: (context, constraints) => Text(
+                breakableAtSeparators(
+                  fitPathToWidth(path, constraints.maxWidth, effectiveStyle),
+                ),
+                maxLines: maxLines,
+                overflow: TextOverflow.ellipsis,
+                style: style,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 4),
+        IconButton(
+          tooltip: 'Copy full path',
+          icon: const Icon(Icons.content_copy, size: 16),
+          visualDensity: VisualDensity.compact,
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+          padding: EdgeInsets.zero,
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: path));
+            if (!context.mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Copied: $path'),
+                duration: const Duration(seconds: 2),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
 class DetailRow extends StatelessWidget {
-  const DetailRow({required this.label, required this.value, super.key});
+  const DetailRow({
+    required this.label,
+    required this.value,
+    this.isPath = false,
+    this.pathMaxLines = 2,
+    super.key,
+  });
 
   final String label;
   final String value;
+
+  /// Render the value as a hoverable, copyable path.
+  final bool isPath;
+
+  /// How many lines a path may use before it is trimmed from the front.
+  final int pathMaxLines;
 
   @override
   Widget build(BuildContext context) {
@@ -2498,61 +5942,120 @@ class DetailRow extends StatelessWidget {
               ),
             ),
           ),
-          Expanded(child: Text(value)),
+          Expanded(
+            child: isPath
+                ? CopyablePathText(path: value, maxLines: pathMaxLines)
+                : Text(value),
+          ),
         ],
       ),
     );
   }
 }
 
-class ModelTextureDiagnostics extends StatelessWidget {
+class ModelTextureDiagnostics extends StatefulWidget {
   const ModelTextureDiagnostics({
     required this.asset,
     required this.allAssets,
+    required this.catalogRevision,
     required this.onActivateAsset,
     super.key,
   });
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+  final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
   @override
+  State<ModelTextureDiagnostics> createState() =>
+      _ModelTextureDiagnosticsState();
+}
+
+class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
+  // Held in state, never built inline: creating this future in build() made
+  // every unrelated rebuild re-run the FBX importer.
+  Future<List<TextureDiscoveryEntry>>? referencesFuture;
+  Future<MeshModel>? meshFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    referencesFuture = _loadReferences();
+    meshFuture = _loadMesh();
+  }
+
+  @override
+  void didUpdateWidget(covariant ModelTextureDiagnostics oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.asset.id != widget.asset.id ||
+        oldWidget.catalogRevision != widget.catalogRevision) {
+      referencesFuture = _loadReferences();
+      meshFuture = _loadMesh();
+    }
+  }
+
+  Future<List<TextureDiscoveryEntry>>? _loadReferences() {
+    if (widget.asset.ext != 'fbx') return null;
+    return loadModelTextureReferenceEntries(widget.asset, widget.allAssets);
+  }
+
+  /// The mesh itself, so the panel can tell "this material is a flat colour"
+  /// apart from "this model's textures are missing". Shares the cached import.
+  Future<MeshModel>? _loadMesh() {
+    if (!_previewableModelExts.contains(widget.asset.ext)) return null;
+    return MeshLoadCache.load(widget.asset, allAssets: widget.allAssets);
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final asset = widget.asset;
+    final allAssets = widget.allAssets;
+    final onActivateAsset = widget.onActivateAsset;
     final nearby = findNearbyTextures(asset, allAssets);
-    if (asset.ext == 'fbx') {
-      return FutureBuilder<List<TextureDiscoveryEntry>>(
-        future: loadModelTextureReferenceEntries(asset, allAssets),
-        builder: (context, snapshot) {
-          final referenced = snapshot.data ?? const <TextureDiscoveryEntry>[];
-          final pathKeys = referenced
-              .where((entry) => entry.copyPath.isNotEmpty)
-              .map((entry) => normalizePathKey(entry.copyPath))
-              .toSet();
-          final nearbyEntries = nearby
-              .where(
-                (texture) => !pathKeys.contains(normalizePathKey(texture.path)),
-              )
-              .map(
-                (texture) => TextureDiscoveryEntry(
-                  label: texture.relativePath,
-                  copyPath: texture.path,
-                  jumpAsset: texture,
-                ),
-              )
-              .toList();
-          final combined = [...referenced, ...nearbyEntries];
-          return TextureDiscoveryBox(
-            title: snapshot.connectionState == ConnectionState.done
-                ? 'Texture discovery'
-                : 'Texture discovery...',
-            message: combined.isEmpty
-                ? 'No FBX texture references or nearby scanned textures found. The material may be embedded, procedural, or untextured.'
-                : '${referenced.length} FBX references · ${nearby.length} nearby scanned candidates.',
-            entries: combined,
-            onActivateAsset: onActivateAsset,
-          );
-        },
+    if (_previewableModelExts.contains(asset.ext)) {
+      return FutureBuilder<MeshModel>(
+        future: meshFuture,
+        builder: (context, meshSnapshot) =>
+            FutureBuilder<List<TextureDiscoveryEntry>>(
+              future: referencesFuture,
+              builder: (context, snapshot) {
+                final referenced =
+                    snapshot.data ?? const <TextureDiscoveryEntry>[];
+                final pathKeys = referenced
+                    .where((entry) => entry.copyPath.isNotEmpty)
+                    .map((entry) => normalizePathKey(entry.copyPath))
+                    .toSet();
+                final nearbyEntries = nearby
+                    .where(
+                      (texture) =>
+                          !pathKeys.contains(normalizePathKey(texture.path)),
+                    )
+                    .map(
+                      (texture) => TextureDiscoveryEntry(
+                        label: texture.relativePath,
+                        copyPath: texture.path,
+                        jumpAsset: texture,
+                      ),
+                    )
+                    .toList();
+                final combined = [...referenced, ...nearbyEntries];
+                return TextureDiscoveryBox(
+                  title: snapshot.connectionState == ConnectionState.done
+                      ? 'Texture discovery'
+                      : 'Texture discovery...',
+                  message: combined.isEmpty
+                      ? 'No texture references and no nearby candidates.'
+                      : '${referenced.length} model references · '
+                            '${nearby.length} nearby scanned candidates.',
+                  entries: combined,
+                  onActivateAsset: onActivateAsset,
+                  mesh: snapshot.connectionState == ConnectionState.done
+                      ? meshSnapshot.data
+                      : null,
+                );
+              },
+            ),
       );
     }
     return TextureDiscoveryBox(
@@ -2574,16 +6077,361 @@ class ModelTextureDiagnostics extends StatelessWidget {
   }
 }
 
+/// A texture reference, with the file name kept readable.
+///
+/// These are long -- a zip entry path runs to a hundred characters -- and the
+/// panel is narrow, so a single ellipsised line showed the folders and cut off
+/// the one part that identifies the file. The name goes on its own line and
+/// the folders sit under it, dimmed, wrapping if there is room.
+class TextureEntryLabel extends StatelessWidget {
+  const TextureEntryLabel({
+    required this.label,
+    required this.linked,
+    super.key,
+  });
+
+  final String label;
+
+  /// Whether this points at an asset the panel can jump to.
+  final bool linked;
+
+  @override
+  Widget build(BuildContext context) {
+    final (folder, name) = splitTextureLabel(label);
+    final linkColor = Theme.of(context).colorScheme.primary;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontWeight: FontWeight.w600,
+            color: linked ? linkColor : Colors.black87,
+            decoration: linked ? TextDecoration.underline : TextDecoration.none,
+          ),
+        ),
+        if (folder.isNotEmpty)
+          Text(
+            folder,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11, color: Colors.black45),
+          ),
+      ],
+    );
+  }
+}
+
+/// Splits a texture reference into (folders, file name).
+///
+/// Handles the arrow form the resolver writes ("asked -> found") by keeping
+/// the resolved side, and the trailing marker it adds ("(missing)") by leaving
+/// it on the name, where it is the point.
+(String, String) splitTextureLabel(String label) {
+  var value = label.trim();
+  final arrow = value.lastIndexOf(' -> ');
+  if (arrow >= 0) value = value.substring(arrow + 4).trim();
+  final separator = value.lastIndexOf(RegExp(r'[\\/]'));
+  if (separator < 0) return ('', value);
+  return (value.substring(0, separator), value.substring(separator + 1));
+}
+
 class TextureDiscoveryEntry {
   const TextureDiscoveryEntry({
     required this.label,
     required this.copyPath,
+    this.resolved = true,
     this.jumpAsset,
   });
 
   final String label;
   final String copyPath;
+
+  /// Whether the reference points at a texture that actually exists. Callers
+  /// must read this rather than parsing [label], which is display text.
+  final bool resolved;
   final AssetItem? jumpAsset;
+}
+
+/// Model formats the preview can import and therefore introspect.
+///
+/// OBJ is here because the parser now keeps `vt` and `usemtl`; before that it
+/// produced geometry with no texture information, so there was nothing for the
+/// discovery panel to say about one.
+const _previewableModelExts = {'fbx', 'obj'};
+
+/// One material, with its resolved texture shown rather than described.
+///
+/// "Is this model textured?" is a question a swatch answers instantly, and a
+/// list of paths does not: a model can resolve its atlas correctly and still
+/// look grey, because that is the part of the atlas it uses.
+/// The one-line status under a material's swatch.
+///
+/// "flat colour" and "asked for a texture and did not get one" look identical
+/// on screen but mean opposite things: the first is how a collision hull is
+/// supposed to look, the second is a broken link worth chasing.
+String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
+  final extras = <String>[
+    if (material.hasNormalMap) 'normal map',
+    if (material.hasEmissiveMap) 'emissive map',
+  ];
+  final suffix = extras.isEmpty ? '' : ', ${extras.join(', ')}';
+
+  if (width != null && height != null) {
+    final embedded = material.hasEmbeddedTexture ? ' (embedded)' : '';
+    return 'textured ${width}x$height$embedded$suffix';
+  }
+  if (material.texturesMissing) {
+    final count = material.textures.length;
+    final noun = count == 1 ? 'texture' : 'textures';
+    return 'missing: asks for $count $noun, none found$suffix';
+  }
+  return 'flat colour, no texture$suffix';
+}
+
+/// Picks a texture for a model by hand, from what was scanned beside it.
+///
+/// Automatic resolution covers the models that say what they want. This covers
+/// the ones that do not: an OBJ with no `mtllib`, or a model whose pack is
+/// missing. The candidates are the same nearby textures the discovery panel
+/// lists, so the answer is already on screen -- this applies one.
+class TexturePickerButton extends StatelessWidget {
+  const TexturePickerButton({
+    required this.candidates,
+    required this.chosenPath,
+    required this.onChosen,
+    super.key,
+  });
+
+  final List<AssetItem> candidates;
+  final String? chosenPath;
+
+  /// Null clears the choice and goes back to whatever resolved on its own.
+  final ValueChanged<String?> onChosen;
+
+  @override
+  Widget build(BuildContext context) {
+    if (candidates.isEmpty) return const SizedBox.shrink();
+    final chosen = chosenPath;
+    final chosenName = chosen == null
+        ? null
+        : candidates
+              .where((asset) => asset.path == chosen)
+              .map((asset) => asset.name)
+              .firstOrNull;
+
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 260),
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: .9),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(
+            child: Text(
+              chosenName == null ? 'Texture: auto' : 'Texture: $chosenName',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                color: chosenName == null ? Colors.black54 : Colors.black87,
+              ),
+            ),
+          ),
+          PopupMenuButton<String?>(
+            tooltip: 'Apply a scanned texture to this model',
+            icon: const Icon(Icons.texture, size: 18),
+            onSelected: onChosen,
+            itemBuilder: (context) => [
+              const PopupMenuItem<String?>(
+                value: null,
+                child: Text('Auto (whatever the model asks for)'),
+              ),
+              const PopupMenuDivider(),
+              for (final asset in candidates.take(40))
+                PopupMenuItem<String?>(
+                  value: asset.path,
+                  child: Text(
+                    asset.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Makes this model the one animation clips are played on.
+///
+/// Only offered for a model that actually carries skin weights: a prop has
+/// nothing for a clip to move, and offering it would just fail later.
+class AnimationCharacterButton extends StatelessWidget {
+  const AnimationCharacterButton({
+    required this.isChosen,
+    required this.onPressed,
+    super.key,
+  });
+
+  final bool isChosen;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return FilledButton.tonalIcon(
+      onPressed: onPressed,
+      icon: Icon(isChosen ? Icons.person : Icons.person_outline, size: 18),
+      label: Text(isChosen ? 'Animation character' : 'Use for animations'),
+    );
+  }
+}
+
+/// The strip of controls above the 3D viewport.
+///
+/// These used to float over the model in the top-right corner, which is where
+/// a model's head usually is. Wrapping keeps every control reachable at any
+/// panel width instead of running off the edge.
+class ModelToolbarBar extends StatelessWidget {
+  const ModelToolbarBar({required this.children, super.key});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0xfff4f6fa),
+        border: Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: children,
+      ),
+    );
+  }
+}
+
+/// One switchable shading channel.
+class ShadingChannel {
+  const ShadingChannel({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String label;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+}
+
+/// The per-channel switches over the 3D preview.
+///
+/// Only channels the model actually carries are listed, so the panel is empty
+/// for a flat-colour collision hull and four rows deep for a full PBR-ish
+/// material. Switching one off answers "what is this channel doing?", which
+/// staring at the combined result cannot.
+class ShadingChannelPanel extends StatelessWidget {
+  const ShadingChannelPanel({required this.channels, super.key});
+
+  final List<ShadingChannel> channels;
+
+  @override
+  Widget build(BuildContext context) {
+    if (channels.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: .9),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          for (final channel in channels)
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(channel.label),
+                Switch(value: channel.value, onChanged: channel.onChanged),
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class MaterialSummaryRow extends StatelessWidget {
+  const MaterialSummaryRow({required this.material, super.key});
+
+  final MeshMaterial material;
+
+  @override
+  Widget build(BuildContext context) {
+    final image = material.textureImage;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: material.color,
+              border: Border.all(color: Colors.black26),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: image == null
+                ? null
+                : RawImage(image: image, fit: BoxFit.cover),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  material.name.isEmpty ? '(unnamed material)' : material.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12.5),
+                ),
+                Text(
+                  materialSummaryLine(
+                    material,
+                    width: image?.width,
+                    height: image?.height,
+                  ),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: image == null && material.texturesMissing
+                        ? const Color(0xffb3261e)
+                        : Colors.black54,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class TextureDiscoveryBox extends StatelessWidget {
@@ -2592,12 +6440,39 @@ class TextureDiscoveryBox extends StatelessWidget {
     required this.message,
     required this.entries,
     required this.onActivateAsset,
+    this.mesh,
     super.key,
   });
+
+  /// Present once the model has been read, so the box can show what the
+  /// material actually is instead of only listing paths.
+  final MeshModel? mesh;
 
   final String title;
   final String message;
   final List<TextureDiscoveryEntry> entries;
+
+  /// A model whose materials carry no texture at all is not a problem to be
+  /// solved -- Synty collision hulls, for instance, are a flat colour. Saying
+  /// so beats implying something is missing.
+  /// Every material asked for textures and none of them resolved.
+  ///
+  /// Distinct from [_isDeliberatelyUntextured]: this model is meant to be
+  /// textured and the links are broken.
+  bool get _allTextureLinksBroken =>
+      mesh != null &&
+      mesh!.materials.isNotEmpty &&
+      mesh!.materials.every((material) => material.texturesMissing);
+
+  bool get _isDeliberatelyUntextured =>
+      mesh != null &&
+      mesh!.materials.isNotEmpty &&
+      mesh!.materials.every(
+        (material) =>
+            material.textures.isEmpty &&
+            material.resolvedTextures.isEmpty &&
+            !material.hasEmbeddedTexture,
+      );
   final ValueChanged<AssetItem> onActivateAsset;
 
   String _copyablePath(String value) {
@@ -2627,7 +6502,28 @@ class TextureDiscoveryBox extends StatelessWidget {
           children: [
             Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 6),
-            Text(message, style: const TextStyle(color: Colors.black54)),
+            Text(
+              _allTextureLinksBroken
+                  ? 'This model is meant to be textured, but none of the '
+                        'images its materials name could be found. It is '
+                        'rendering as flat colour because the links are '
+                        'broken, not because it has no textures.'
+                  : _isDeliberatelyUntextured
+                  ? 'This model has no textures: its material is a flat '
+                        'colour. Collision hulls and blockout meshes normally '
+                        'look like this.'
+                  : message,
+              style: TextStyle(
+                color: _allTextureLinksBroken
+                    ? const Color(0xffb3261e)
+                    : Colors.black54,
+              ),
+            ),
+            if (mesh != null && mesh!.materials.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              for (final material in mesh!.materials.take(4))
+                MaterialSummaryRow(material: material),
+            ],
             const SizedBox(height: 8),
             for (final entry in entries.take(10))
               Row(
@@ -2639,18 +6535,9 @@ class TextureDiscoveryBox extends StatelessWidget {
                           : () => onActivateAsset(entry.jumpAsset!),
                       child: Padding(
                         padding: const EdgeInsets.symmetric(vertical: 6),
-                        child: Text(
-                          entry.label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: entry.jumpAsset == null
-                                ? Colors.black87
-                                : Theme.of(context).colorScheme.primary,
-                            decoration: entry.jumpAsset == null
-                                ? TextDecoration.none
-                                : TextDecoration.underline,
-                          ),
+                        child: TextureEntryLabel(
+                          label: entry.label,
+                          linked: entry.jumpAsset != null,
                         ),
                       ),
                     ),
@@ -2693,19 +6580,18 @@ Future<List<String>> loadModelTextureReferences(
   return entries.map((entry) => entry.label).toList();
 }
 
+/// Number of texture-reference scans started. Test visibility only: the
+/// diagnostics panel must not restart one per rebuild.
+int textureReferenceScanCount = 0;
+
 Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   AssetItem asset,
   List<AssetItem> allAssets,
 ) async {
-  if (asset.ext != 'fbx') return const [];
-  final mesh = await importFbxWithUfbx(
-    asset.path,
-    asset.name,
-    inputBytes: isZipVirtualPath(asset.path)
-        ? await readZipVirtualAssetBytesByPath(asset.path)
-        : null,
-    allAssets: allAssets,
-  );
+  if (!_previewableModelExts.contains(asset.ext)) return const [];
+  textureReferenceScanCount += 1;
+  // Shares the import with the 3D preview instead of spawning a second helper.
+  final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
   return mesh.allTexturePaths.map((path) {
     final resolved = resolveTextureReference(
       asset.path,
@@ -2731,6 +6617,7 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
         }
       }
     }
+    // The label is built from `exists`; nothing may parse it back out.
     late final String label;
     if (resolved == null || resolved == path) {
       label = '$path ${exists ? "(found)" : "(missing)"}';
@@ -2740,14 +6627,144 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
     return TextureDiscoveryEntry(
       label: label,
       copyPath: existingPath,
+      resolved: exists,
       jumpAsset: jumpAsset,
     );
   }).toList();
 }
 
+/// The one place asset ids are built.
+///
+/// Identity is *where an asset is*, never what it currently contains. Ids used
+/// to embed size and modified time, so editing a file changed its id and it
+/// silently dropped out of saved projects and lost its ignore flag.
+///
+/// Rules:
+///  - separators normalised to `/`
+///  - lowercased, because the app is Windows-first and its paths are
+///    case-insensitive (a Linux port would need to revisit this)
+///  - [relativePath] is relative to [sourceRoot] and must NOT carry the
+///    `sourceName/` display prefix, which duplicates the source root
+///  - readable, not hashed: these strings show up in the database and in bug
+///    reports, and a debuggable id is worth more than a short one
+///
+/// ZIP entries pass a relative path of the form `pack.zip!/Textures/wall.png`.
+String buildAssetId({
+  required String sourceRoot,
+  required String relativePath,
+}) {
+  String normalize(String value) =>
+      value.trim().replaceAll('\\', '/').toLowerCase();
+  return 'asset:v2:${normalize(sourceRoot)}|${normalize(relativePath)}';
+}
+
+/// Strips the `sourceName/` display prefix that [AssetItem.relativePath]
+/// carries, so stored rows can be mapped back to an id.
+String assetIdRelativePathFromStored({
+  required String relativePath,
+  required String sourceName,
+}) {
+  final prefix = '$sourceName/';
+  final normalized = relativePath.replaceAll('\\', '/');
+  if (normalized.toLowerCase().startsWith(prefix.toLowerCase())) {
+    return normalized.substring(prefix.length);
+  }
+  return normalized;
+}
+
 String normalizePathKey(String value) {
   return value.trim().toLowerCase().replaceAll('/', '\\');
 }
+
+// Shared by the texture scoring paths, which run per candidate per material.
+// Rebuilding these inside the scorers dominated relink cost.
+final _extensionPattern = RegExp(r'\.[^.]+$');
+final _nonAlphanumericPattern = RegExp(r'[^a-z0-9]+');
+final _texturePrefixPattern = RegExp(r'^(?:t|tx|tex|texture)_');
+
+/// The marker a download folder adds to a second copy of a file.
+///
+/// Deliberately narrow: a trailing `_01` is part of the name, so only a
+/// number set off by a space or parentheses counts, plus a literal `copy`.
+final _duplicateCopyPattern = RegExp(
+  r'(?:[ ]+[(]?[0-9]{1,2}[)]?|[ _-]*copy)+$',
+);
+
+/// Texture names that mean the same thing rarely spell it the same way.
+///
+/// A model may ask for `PolygonApocalypse_Texture_01_A 1` while its own pack
+/// ships `T_PolygonApocalypse_01`: an exporter prefix, a dropped variant
+/// letter, and a duplicate-copy suffix Windows added on the way through a
+/// download folder. Stripping that noise is what lets the two be compared.
+String stripTextureNameNoise(String base) {
+  var value = base.toLowerCase().trim();
+  value = value.replaceFirst(_texturePrefixPattern, '');
+  value = value.replaceFirst(_duplicateCopyPattern, '');
+  return value.trim();
+}
+
+/// The parts of a texture name that actually distinguish it.
+///
+/// Single characters and the word "texture" are dropped: a variant letter and
+/// a word that appears in most of the library identify nothing on their own.
+/// Numbers are kept, but callers must not treat a shared number as evidence --
+/// a pack is full of `_01`.
+List<String> textureNameTokens(String base) {
+  const generic = {'texture', 'textures', 'tex', 'mat', 'material', 'diffuse'};
+  return [
+    for (final token in stripTextureNameNoise(
+      base,
+    ).split(_nonAlphanumericPattern))
+      if (token.length > 1 && !generic.contains(token)) token,
+  ];
+}
+
+/// Whether a token carries identity rather than just position in a set.
+bool _isDistinctiveToken(String token) =>
+    token.length >= 4 && !RegExp(r'^[0-9]+$').hasMatch(token);
+
+/// Words that name which *channel* a texture is, not what it depicts.
+const _textureChannelWords = {
+  'emissive',
+  'emission',
+  'glow',
+  'normal',
+  'normals',
+  'bump',
+  'specular',
+  'spec',
+  'gloss',
+  'roughness',
+  'metallic',
+  'metalness',
+  'occlusion',
+  'opacity',
+  'alpha',
+  'height',
+  'displacement',
+};
+
+/// The channel a texture name declares itself to be, or the empty string.
+String textureChannelWord(String base) {
+  for (final token in textureNameTokens(base)) {
+    if (_textureChannelWords.contains(token)) return token;
+  }
+  return '';
+}
+
+/// Whether two texture names describe the same channel.
+///
+/// `PolygonApocalypse_Emissive_01` and `PolygonApocalypse_01` share every
+/// distinctive word they have, so word overlap alone would bind an emissive
+/// slot to the base atlas -- and an emissive map added at full strength over
+/// its own base colour washes a model out to grey. A name that declares a
+/// channel may only match one that declares the same channel, and a name that
+/// declares none may only match another that declares none.
+bool textureChannelsAgree(String requestedBase, String candidateBase) =>
+    textureChannelWord(requestedBase) == textureChannelWord(candidateBase);
+
+final _pathSeparatorPattern = RegExp(r'[\\/]');
+final _paletteTailPattern = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*');
 
 String? resolveTextureReference(
   String modelPath,
@@ -2817,6 +6834,62 @@ String? resolveTextureReference(
   return fallback;
 }
 
+/// Directory names from a texture reference that could identify the pack it
+/// belongs to.
+///
+/// Generic folders carry no identity: half the packs in a library have a
+/// `Textures` folder, so matching on that would relink across unrelated packs.
+Set<String> texturePackHints(String texturePath) {
+  const generic = {
+    'textures',
+    'texture',
+    'misc',
+    'materials',
+    'material',
+    'sourcefiles',
+    'source files',
+    'assets',
+    'content',
+    'maps',
+  };
+  final segments = texturePath
+      .replaceAll('\\', '/')
+      .split('/')
+      .map((segment) => segment.trim().toLowerCase())
+      .toList();
+  if (segments.isNotEmpty) segments.removeLast(); // the file name itself
+  return segments
+      .where(
+        (segment) =>
+            segment.isNotEmpty &&
+            segment != '.' &&
+            segment != '..' &&
+            !generic.contains(segment),
+      )
+      .toSet();
+}
+
+/// Whether [candidatePath] may satisfy a reference that points outside its own
+/// archive.
+///
+/// Synty source files routinely reference a sibling pack, so refusing to leave
+/// the archive leaves those models untextured. Crossing needs strong evidence:
+/// the file names match exactly, and the reference names a folder that also
+/// appears in the candidate's path. Without the second test, a texture called
+/// `Texture_01_A.png` would match the same name in a dozen unrelated packs.
+bool canRelinkAcrossContainers({
+  required String texturePath,
+  required String candidatePath,
+  required String requestedBase,
+  required String candidateBase,
+}) {
+  if (requestedBase != candidateBase) return false;
+  final hints = texturePackHints(texturePath);
+  if (hints.isEmpty) return false;
+  final candidateLower = candidatePath.toLowerCase().replaceAll('\\', '/');
+  return hints.any((hint) => candidateLower.contains(hint));
+}
+
 String? findDeterministicTextureRelink(
   String modelPath,
   String texturePath,
@@ -2825,7 +6898,7 @@ String? findDeterministicTextureRelink(
   if (allAssets.isEmpty) return null;
   final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
   final zipModel = parseZipVirtualPath(modelPath);
-  final sourceCandidates = allAssets.where((asset) {
+  bool sameContainer(AssetItem asset) {
     if (!textureExts.contains(asset.ext)) return false;
     if (zipModel != null) {
       final zipCandidate = parseZipVirtualPath(asset.path);
@@ -2836,18 +6909,19 @@ String? findDeterministicTextureRelink(
     if (isZipVirtualPath(asset.path)) return false;
     final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
     return modelPathLower.startsWith(sourceLower);
-  }).toList();
-  if (sourceCandidates.isEmpty) return null;
+  }
+
+  final sourceCandidates = allAssets.where(sameContainer).toList();
 
   final requestedBase = texturePath
-      .split(RegExp(r'[\\/]'))
+      .split(_pathSeparatorPattern)
       .last
       .toLowerCase()
-      .replaceAll(RegExp(r'\.[^.]+$'), '');
+      .replaceAll(_extensionPattern, '');
   if (requestedBase.isEmpty) return null;
 
   String normalize(String value) {
-    return value.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '');
+    return value.toLowerCase().replaceAll(_nonAlphanumericPattern, '');
   }
 
   final requestedNormalized = normalize(requestedBase);
@@ -2856,7 +6930,7 @@ String? findDeterministicTextureRelink(
       : requestedBase;
 
   String paletteTail(String value) {
-    final match = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*').firstMatch(value);
+    final match = _paletteTailPattern.firstMatch(value);
     if (match == null) return '';
     return normalize(value.substring(match.start));
   }
@@ -2864,7 +6938,7 @@ String? findDeterministicTextureRelink(
   final requestedPaletteTail = paletteTail(requestedBase);
 
   int score(AssetItem asset) {
-    final base = asset.name.toLowerCase().replaceAll(RegExp(r'\.[^.]+$'), '');
+    final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
     final normalized = normalize(base);
     var value = 0;
     if (base == requestedBase) value += 120;
@@ -2890,8 +6964,22 @@ String? findDeterministicTextureRelink(
       value += 80;
     }
 
+    // Nothing above matched by name. Inside one container the art is one
+    // consistent set, so shared distinctive words are real evidence -- but a
+    // shared number alone is not, or every `_01` in the pack would match.
+    if (value == 0 && textureChannelsAgree(requestedBase, base)) {
+      final requestedTokens = textureNameTokens(requestedBase).toSet();
+      final candidateTokens = textureNameTokens(base).toSet();
+      final shared = requestedTokens.intersection(candidateTokens);
+      if (shared.any(_isDistinctiveToken)) {
+        value += 70 + math.min(30, (shared.length - 1) * 20);
+      }
+    }
+
     final dirLower = parentPath(asset.path).toLowerCase().replaceAll('\\', '/');
     if (dirLower.contains('/textures')) value += 20;
+    // Synty demo packs keep their atlas in Demo_Textures, not Textures.
+    if (dirLower.contains('textures')) value += 5;
 
     final modelDirLower = parentPath(
       modelPath,
@@ -2900,11 +6988,47 @@ String? findDeterministicTextureRelink(
     return value;
   }
 
-  sourceCandidates.sort((a, b) => score(b).compareTo(score(a)));
-  final best = sourceCandidates.first;
-  final bestScore = score(best);
-  if (bestScore < 80) return null;
-  return best.path;
+  // Score once per candidate, then break ties on the normalized path so the
+  // winner cannot depend on catalog order or on List.sort being stable
+  // (it is not).
+  final scored =
+      [
+        for (final asset in sourceCandidates)
+          (asset: asset, score: score(asset)),
+      ]..sort((a, b) {
+        final byScore = b.score.compareTo(a.score);
+        if (byScore != 0) return byScore;
+        return normalizePathKey(
+          a.asset.path,
+        ).compareTo(normalizePathKey(b.asset.path));
+      });
+
+  // May be empty: the model's own archive need not contain any texture.
+  if (scored.isNotEmpty && scored.first.score >= 80) {
+    return scored.first.asset.path;
+  }
+
+  // Nothing good enough beside the model. The reference may legitimately point
+  // at another pack, so try that, on the stricter rules above.
+  final crossContainer =
+      [
+        for (final asset in allAssets)
+          if (textureExts.contains(asset.ext) && !sameContainer(asset))
+            if (canRelinkAcrossContainers(
+              texturePath: texturePath,
+              candidatePath: asset.path,
+              requestedBase: requestedBase,
+              candidateBase: asset.name.toLowerCase().replaceAll(
+                _extensionPattern,
+                '',
+              ),
+            ))
+              asset,
+      ]..sort(
+        (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+      );
+  if (crossContainer.isNotEmpty) return crossContainer.first.path;
+  return null;
 }
 
 String? findFallbackTexture(
@@ -2921,6 +7045,12 @@ String? findFallbackTexture(
   final sourceTokens = tokenSet(texturePath);
   if (sourceTokens.isEmpty) return null;
 
+  final textureBase = texturePath
+      .split(_pathSeparatorPattern)
+      .last
+      .toLowerCase()
+      .replaceAll(_extensionPattern, '');
+
   int score(AssetItem asset) {
     final assetTokens = tokenSet(asset.name);
     var value = sourceTokens.intersection(assetTokens).length * 10;
@@ -2931,28 +7061,34 @@ String? findFallbackTexture(
       value += 10;
     }
     if (dir == modelDir) value += 6;
-    final textureBase = texturePath
-        .split(RegExp(r'[\\/]'))
-        .last
-        .toLowerCase()
-        .replaceAll(RegExp(r'\.[^.]+$'), '');
     final assetBase = asset.name.toLowerCase().replaceAll(
-      RegExp(r'\.[^.]+$'),
+      _extensionPattern,
       '',
     );
     if (textureBase == assetBase) value += 25;
     return value;
   }
 
-  supported.sort((a, b) => score(b).compareTo(score(a)));
-  return score(supported.first) > 0 ? supported.first.path : null;
+  // Same decorate-sort-undecorate and tie-break as the deterministic relink.
+  final scored =
+      [for (final asset in supported) (asset: asset, score: score(asset))]
+        ..sort((a, b) {
+          final byScore = b.score.compareTo(a.score);
+          if (byScore != 0) return byScore;
+          return normalizePathKey(
+            a.asset.path,
+          ).compareTo(normalizePathKey(b.asset.path));
+        });
+
+  final best = scored.first;
+  return best.score > 0 ? best.asset.path : null;
 }
 
 Set<String> tokenSet(String value) {
   return value
       .toLowerCase()
-      .replaceAll(RegExp(r'\.[^.]+$'), '')
-      .split(RegExp(r'[^a-z0-9]+'))
+      .replaceAll(_extensionPattern, '')
+      .split(_nonAlphanumericPattern)
       .where(
         (token) =>
             token.length > 2 && token != 'texture' && token != 'textures',
@@ -3062,6 +7198,116 @@ Future<ui.Image> decodeImage(Uint8List bytes) {
       });
 }
 
+/// A scan running on a worker isolate.
+///
+/// Scanning walks a directory tree, stats every file and inflates every ZIP it
+/// finds. On the UI isolate that froze the window for as long as the scan took,
+/// with no way to stop it. Here it runs elsewhere and can be abandoned.
+class ScanHandle {
+  ScanHandle._(this._isolate, this._port, this._completer);
+
+  final Isolate _isolate;
+  final ReceivePort _port;
+  final Completer<ScanResult> _completer;
+
+  /// Completes with the scan, or with [ScanCancelledException] if abandoned.
+  Future<ScanResult> get result => _completer.future;
+
+  var _cancelled = false;
+  bool get cancelled => _cancelled;
+
+  /// Abandons the scan. The worker only reads the filesystem and returns a
+  /// list, so there is nothing half-written to clean up.
+  ///
+  /// The waiting future is settled here rather than left to the port: closing
+  /// the port silences the listener, so anyone awaiting the result would hang
+  /// forever instead of learning the scan was stopped.
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    _isolate.kill(priority: Isolate.immediate);
+    if (!_completer.isCompleted) {
+      _completer.completeError(const ScanCancelledException());
+    }
+    _port.close();
+  }
+}
+
+class ScanCancelledException implements Exception {
+  const ScanCancelledException();
+  @override
+  String toString() => 'Scan cancelled';
+}
+
+class ScanBootstrap {
+  const ScanBootstrap(this.sendPort, this.rootPath);
+  final SendPort sendPort;
+  final String rootPath;
+}
+
+/// Worker entry point. Top-level by necessity: isolates are spawned by
+/// function reference, and a closure here would capture its surroundings.
+Future<void> scanWorkerEntry(ScanBootstrap bootstrap) async {
+  try {
+    final result = await scanAssetFolder(
+      bootstrap.rootPath,
+      onStatus: bootstrap.sendPort.send,
+    );
+    bootstrap.sendPort.send(result);
+  } catch (error) {
+    bootstrap.sendPort.send('scan failed: $error');
+  }
+}
+
+/// Starts a scan on a worker isolate, reporting progress as it goes.
+Future<ScanHandle> startFolderScan(
+  String rootPath, {
+  required void Function(ScanStatus status) onStatus,
+}) async {
+  final port = ReceivePort();
+  final completer = Completer<ScanResult>();
+
+  // A caller that cancels without awaiting the result should not produce an
+  // unhandled async error. Real awaiters still see the exception; this only
+  // stops an abandoned future from being reported as unhandled.
+  completer.future.then((_) {}, onError: (Object _) {});
+
+  // One listener only: a ReceivePort allows a single subscription, and the
+  // isolate's exit notification arrives on this same port as a null.
+  port.listen((message) {
+    if (message is ScanStatus) {
+      onStatus(message);
+      return;
+    }
+    if (message is ScanResult) {
+      if (!completer.isCompleted) completer.complete(message);
+      port.close();
+      return;
+    }
+    if (message == null) {
+      // The worker exited without a result: killed, or it died.
+      if (!completer.isCompleted) {
+        completer.completeError(const ScanCancelledException());
+      }
+      port.close();
+      return;
+    }
+    if (!completer.isCompleted) {
+      completer.completeError(StateError(message.toString()));
+    }
+    port.close();
+  });
+
+  final isolate = await Isolate.spawn(
+    scanWorkerEntry,
+    ScanBootstrap(port.sendPort, rootPath),
+    onExit: port.sendPort,
+    errorsAreFatal: true,
+  );
+
+  return ScanHandle._(isolate, port, completer);
+}
+
 Future<ScanResult> scanAssetFolder(
   String rootPath, {
   required ValueChanged<ScanStatus> onStatus,
@@ -3101,6 +7347,10 @@ Future<ScanResult> scanAssetFolder(
       skippedUnsupported += 1;
       continue;
     }
+    if (isAppleDoubleName(entity.uri.pathSegments.last)) {
+      skippedUnsupported += 1;
+      continue;
+    }
     if (ext == 'obj' && await isLikelyBinaryObj(entity)) {
       skippedBinaryObj += 1;
       continue;
@@ -3110,7 +7360,7 @@ Future<ScanResult> scanAssetFolder(
     final relativePath = relativeTo(entity.path, rootPath);
     assets.add(
       AssetItem(
-        id: '${entity.path}:${stat.size}:${stat.modified.millisecondsSinceEpoch}',
+        id: buildAssetId(sourceRoot: rootPath, relativePath: relativePath),
         name: entity.uri.pathSegments.last,
         path: entity.path,
         relativePath: '$sourceName/$relativePath',
@@ -3205,10 +7455,17 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       }
 
       final name = entryPath.split('/').last;
+      if (isAppleDoubleName(name)) {
+        skippedUnsupported += 1;
+        continue;
+      }
       final relativePath = '$sourceName/$zipRelative!/$entryPath';
       assets.add(
         AssetItem(
-          id: 'zip:${normalizePathKey(zipPath)}::$entryPath:${entry.size}:${zipModified.millisecondsSinceEpoch}',
+          id: buildAssetId(
+            sourceRoot: rootPath,
+            relativePath: '$zipRelative!/$entryPath',
+          ),
           name: name,
           path: buildZipVirtualPath(zipPath, entryPath),
           relativePath: relativePath,
@@ -3239,6 +7496,24 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
     );
   }
 }
+
+/// Images that live in a texture folder are textures in practice: Synty and
+/// most other packs put them under `Textures/`, and 1,925 of the 2,104 images
+/// in the reference catalog sit there. The authoritative signal is being
+/// referenced by a model, which is only known once that model has been read.
+final _textureFolderPattern = RegExp(
+  r'(^|[\\/])(textures?|materials?)([\\/]|$)',
+  caseSensitive: false,
+);
+
+bool looksLikeTextureLocation(String relativePath) =>
+    _textureFolderPattern.hasMatch(relativePath.replaceAll('\\', '/'));
+
+/// AppleDouble sidecars: macOS writes a `._name` stub beside the real file
+/// (and a `__MACOSX/` mirror inside archives) holding resource-fork metadata.
+/// They carry the extension of the file they shadow but none of its content,
+/// so a 268-byte "mp3" reaches the audio plugin and takes the process down.
+bool isAppleDoubleName(String fileName) => fileName.startsWith('._');
 
 bool hasIgnoredArchiveFolder(String archiveEntryPath) {
   final parts = archiveEntryPath.replaceAll('\\', '/').split('/');
@@ -3428,40 +7703,163 @@ bool isLikelyBinaryObjBytes(List<int> bytes) {
   return suspicious / total > .08;
 }
 
-Future<int> copyAssetsToTarget(List<AssetItem> selected, String target) async {
-  var copied = 0;
+enum CopyOutcome { copied, renamed, skippedMissingSource, failed }
+
+class CopyResultEntry {
+  const CopyResultEntry({
+    required this.asset,
+    required this.outcome,
+    this.destinationPath,
+    this.detail,
+  });
+
+  final AssetItem asset;
+  final CopyOutcome outcome;
+  final String? destinationPath;
+
+  /// Reason for a skip, or the error text for a failure.
+  final String? detail;
+}
+
+class CopyReport {
+  const CopyReport(this.entries);
+
+  final List<CopyResultEntry> entries;
+
+  int _countOf(CopyOutcome outcome) =>
+      entries.where((entry) => entry.outcome == outcome).length;
+
+  /// Files actually written, including the ones written under a new name.
+  int get copiedCount =>
+      _countOf(CopyOutcome.copied) + _countOf(CopyOutcome.renamed);
+  int get renamedCount => _countOf(CopyOutcome.renamed);
+  int get skippedCount => _countOf(CopyOutcome.skippedMissingSource);
+  int get failedCount => _countOf(CopyOutcome.failed);
+
+  String get summaryLine {
+    final parts = <String>['$copiedCount copied'];
+    if (renamedCount > 0) {
+      parts.add('$renamedCount renamed to avoid overwrite');
+    }
+    if (skippedCount > 0) {
+      parts.add('$skippedCount skipped (source missing)');
+    }
+    if (failedCount > 0) {
+      parts.add('$failedCount failed');
+    }
+    return parts.join(' · ');
+  }
+}
+
+/// Returns [desiredPath] if it is free, otherwise the same path with an
+/// incrementing ` (n)` suffix inserted before the extension. Mirrors the
+/// Windows Explorer convention so renamed output reads as familiar.
+String resolveNonCollidingPath(String desiredPath) {
+  if (!File(desiredPath).existsSync() && !Directory(desiredPath).existsSync()) {
+    return desiredPath;
+  }
+
+  final separatorIndex = desiredPath.lastIndexOf(RegExp(r'[\\/]'));
+  final directory = separatorIndex < 0
+      ? ''
+      : desiredPath.substring(0, separatorIndex + 1);
+  final fileName = desiredPath.substring(separatorIndex + 1);
+
+  // A leading dot belongs to the name (.gitignore), not to an extension.
+  final dotIndex = fileName.lastIndexOf('.');
+  final hasExtension = dotIndex > 0;
+  final stem = hasExtension ? fileName.substring(0, dotIndex) : fileName;
+  final extension = hasExtension ? fileName.substring(dotIndex) : '';
+
+  for (var suffix = 2; ; suffix += 1) {
+    final candidate = '$directory$stem ($suffix)$extension';
+    if (!File(candidate).existsSync() && !Directory(candidate).existsSync()) {
+      return candidate;
+    }
+  }
+}
+
+Future<CopyReport> copyAssetsToTarget(
+  List<AssetItem> selected,
+  String target,
+) async {
+  final entries = <CopyResultEntry>[];
   final destinationRoot = Directory(target);
   if (!destinationRoot.existsSync()) {
     destinationRoot.createSync(recursive: true);
   }
 
   for (final asset in selected) {
-    if (isZipVirtualPath(asset.path)) {
-      final bytes = await readZipVirtualAssetBytesByPath(asset.path);
-      if (bytes == null || bytes.isEmpty) {
+    try {
+      if (isZipVirtualPath(asset.path)) {
+        final bytes = await readZipVirtualAssetBytesByPath(asset.path);
+        if (bytes == null || bytes.isEmpty) {
+          entries.add(
+            CopyResultEntry(
+              asset: asset,
+              outcome: CopyOutcome.skippedMissingSource,
+              detail: 'ZIP entry could not be read.',
+            ),
+          );
+          continue;
+        }
+        final zipParts = parseZipVirtualPath(asset.path);
+        final relativeOutput = safeZipEntryRelativePath(
+          zipParts?.entryPath ?? asset.name,
+          fallbackName: asset.name,
+        );
+        final desired =
+            '$target${Platform.pathSeparator}${relativeOutput.replaceAll('/', Platform.pathSeparator)}';
+        File(desired).parent.createSync(recursive: true);
+        final resolved = resolveNonCollidingPath(desired);
+        await File(resolved).writeAsBytes(bytes, flush: true);
+        entries.add(
+          CopyResultEntry(
+            asset: asset,
+            outcome: resolved == desired
+                ? CopyOutcome.copied
+                : CopyOutcome.renamed,
+            destinationPath: resolved,
+          ),
+        );
         continue;
       }
-      final zipParts = parseZipVirtualPath(asset.path);
-      final relativeOutput = safeZipEntryRelativePath(
-        zipParts?.entryPath ?? asset.name,
-        fallbackName: asset.name,
+
+      final source = File(asset.path);
+      if (!source.existsSync()) {
+        entries.add(
+          CopyResultEntry(
+            asset: asset,
+            outcome: CopyOutcome.skippedMissingSource,
+            detail: 'Source file no longer exists.',
+          ),
+        );
+        continue;
+      }
+      final desired = '$target${Platform.pathSeparator}${asset.name}';
+      final resolved = resolveNonCollidingPath(desired);
+      await source.copy(resolved);
+      entries.add(
+        CopyResultEntry(
+          asset: asset,
+          outcome: resolved == desired
+              ? CopyOutcome.copied
+              : CopyOutcome.renamed,
+          destinationPath: resolved,
+        ),
       );
-      final destination = File(
-        '$target${Platform.pathSeparator}${relativeOutput.replaceAll('/', Platform.pathSeparator)}',
+    } catch (error) {
+      // One unwritable file must not end the batch.
+      entries.add(
+        CopyResultEntry(
+          asset: asset,
+          outcome: CopyOutcome.failed,
+          detail: error.toString(),
+        ),
       );
-      destination.parent.createSync(recursive: true);
-      await destination.writeAsBytes(bytes, flush: true);
-      copied += 1;
-      continue;
     }
-    final destination = File('$target${Platform.pathSeparator}${asset.name}');
-    if (!File(asset.path).existsSync()) {
-      continue;
-    }
-    await File(asset.path).copy(destination.path);
-    copied += 1;
   }
-  return copied;
+  return CopyReport(entries);
 }
 
 String safeZipEntryRelativePath(
@@ -3538,6 +7936,20 @@ List<String> inferTags(
   return {type, ext, ...words.take(8)}.toList();
 }
 
+/// Whether two assets live in the same archive, or under the same scan root.
+///
+/// The bound on "nearby": inside one pack the art is one set, across packs it
+/// is a coincidence of naming.
+bool _shareARoot(AssetItem a, AssetItem b) {
+  final zipA = parseZipVirtualPath(a.path);
+  final zipB = parseZipVirtualPath(b.path);
+  if (zipA != null || zipB != null) {
+    if (zipA == null || zipB == null) return false;
+    return normalizePathKey(zipA.zipPath) == normalizePathKey(zipB.zipPath);
+  }
+  return normalizePathKey(a.sourceRoot) == normalizePathKey(b.sourceRoot);
+}
+
 List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
   final modelDir = parentPath(model.path);
   final modelParent = parentPath(modelDir);
@@ -3559,6 +7971,16 @@ List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
     if (textureDir == '$modelGrandParent${Platform.pathSeparator}Textures') {
       return true;
     }
+
+    // Any folder whose name says "texture", anywhere under the same root.
+    // Matching the literal folder `Textures` missed `Demo_Textures`, which is
+    // where the Synty animation pack keeps the only atlas its character has --
+    // so the picker offered nothing for exactly the model that needed it.
+    final directoryName = textureDir.split(RegExp(r'[\\/]')).last.toLowerCase();
+    if (directoryName.contains('texture') && _shareARoot(model, asset)) {
+      return true;
+    }
+
     final lowerPath = asset.path.toLowerCase().replaceAll('\\', '/');
     if (lowerPath.contains('/textures/')) {
       final textureTokens = asset.name
@@ -3578,6 +8000,251 @@ String parentPath(String path) {
   final index = normalized.lastIndexOf(separator);
   if (index <= 0) return normalized;
   return normalized.substring(0, index);
+}
+
+/// One unit of classification work: FBX assets that all live in the same
+/// container, so a worker isolate opens that archive once for the whole chunk.
+class FbxClassifyChunk {
+  const FbxClassifyChunk({
+    required this.helperPath,
+    required this.containerPath,
+    required this.assetIds,
+    required this.assetPaths,
+  });
+
+  final String helperPath;
+
+  /// The `.zip` these assets live in, or null for loose files on disk.
+  final String? containerPath;
+  final List<String> assetIds;
+  final List<String> assetPaths;
+
+  int get length => assetIds.length;
+}
+
+/// Classifies a chunk of FBX files. Runs in a worker isolate: reading and
+/// inflating archive entries is real CPU work, and doing it on the UI isolate
+/// is what made classification stutter.
+///
+/// Must stay a top-level function taking only sendable data.
+Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
+  final kinds = <String, String>{};
+
+  Archive? archive;
+  if (chunk.containerPath != null) {
+    try {
+      final file = File(chunk.containerPath!);
+      if (file.existsSync() &&
+          await file.length() <= maxZipIntrospectionBytes) {
+        // Opened once for the whole chunk; entries inflate individually.
+        archive = ZipDecoder().decodeBytes(
+          await file.readAsBytes(),
+          verify: false,
+        );
+      }
+    } catch (_) {
+      archive = null;
+    }
+  }
+
+  for (var index = 0; index < chunk.assetIds.length; index += 1) {
+    final assetId = chunk.assetIds[index];
+    final assetPath = chunk.assetPaths[index];
+    try {
+      Uint8List? bytes;
+      if (isZipVirtualPath(assetPath)) {
+        final parsed = parseZipVirtualPath(assetPath);
+        final entry = archive != null && parsed != null
+            ? archive.findFile(parsed.entryPath)
+            : null;
+        if (entry == null || !entry.isFile) {
+          kinds[assetId] = 'unreadable';
+          continue;
+        }
+        bytes = entry.content;
+      }
+
+      final result = await runMeshImporter(
+        chunk.helperPath,
+        assetPath,
+        inputBytes: bytes,
+        probeOnly: true,
+      );
+      if (result.exitCode != 0) {
+        kinds[assetId] = 'unreadable';
+        continue;
+      }
+      final json = jsonDecode(result.stdout) as Map<String, dynamic>;
+      kinds[assetId] = json['kind'] == 'animation' ? 'animation' : 'mesh';
+    } catch (_) {
+      kinds[assetId] = 'unreadable';
+    }
+  }
+  return kinds;
+}
+
+/// Hands a chunk to a worker isolate.
+///
+/// Must stay top-level. Building this closure inside a State method captures
+/// the enclosing `this`, which drags the whole widget tree into the isolate
+/// message and fails with "object is unsendable".
+Future<Map<String, String>> runFbxClassifyChunk(FbxClassifyChunk chunk) {
+  return Isolate.run(() => classifyFbxChunk(chunk));
+}
+
+/// Splits pending work into per-container chunks.
+///
+/// Grouping by container matters: a chunk spanning three archives would make
+/// its worker open all three.
+List<FbxClassifyChunk> buildFbxClassifyChunks({
+  required List<AssetItem> assets,
+  required String helperPath,
+  int chunkSize = fbxClassifyChunkSize,
+}) {
+  final byContainer = <String?, List<AssetItem>>{};
+  for (final asset in assets) {
+    final container = isZipVirtualPath(asset.path)
+        ? parseZipVirtualPath(asset.path)?.zipPath
+        : null;
+    (byContainer[container] ??= <AssetItem>[]).add(asset);
+  }
+
+  final chunks = <FbxClassifyChunk>[];
+  for (final entry in byContainer.entries) {
+    for (var start = 0; start < entry.value.length; start += chunkSize) {
+      final slice = entry.value.sublist(
+        start,
+        math.min(start + chunkSize, entry.value.length),
+      );
+      chunks.add(
+        FbxClassifyChunk(
+          helperPath: helperPath,
+          containerPath: entry.key,
+          assetIds: [for (final asset in slice) asset.id],
+          assetPaths: [for (final asset in slice) asset.path],
+        ),
+      );
+    }
+  }
+  return chunks;
+}
+
+/// Asks the importer only what an FBX contains, skipping geometry extraction
+/// and the JSON payload. Roughly 4x faster than a full import and returns tens
+/// of bytes instead of megabytes, which is what makes classifying a whole
+/// catalog viable.
+///
+/// Returns 'mesh', 'animation', or 'unreadable'.
+Future<String> probeFbxContentKind(AssetItem asset) async {
+  if (asset.ext != 'fbx') return 'mesh';
+  final helper = meshImporterPath();
+  if (!File(helper).existsSync()) return 'unreadable';
+  try {
+    final bytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : null;
+    if (isZipVirtualPath(asset.path) && (bytes == null || bytes.isEmpty)) {
+      return 'unreadable';
+    }
+    final result = await runMeshImporter(
+      helper,
+      asset.path,
+      inputBytes: bytes,
+      probeOnly: true,
+    );
+    if (result.exitCode != 0) return 'unreadable';
+    final json = jsonDecode(result.stdout) as Map<String, dynamic>;
+    return json['kind'] == 'animation' ? 'animation' : 'mesh';
+  } catch (_) {
+    return 'unreadable';
+  }
+}
+
+/// Shares one in-flight mesh import between everything that needs it.
+///
+/// Both the 3D preview and the texture diagnostics panel want the same parsed
+/// mesh, and every widget rebuild used to launch its own importer subprocess.
+/// Caching the [Future] (not the value) means widgets asking during the same
+/// frame join one import instead of racing several.
+class MeshLoadCache {
+  MeshLoadCache._();
+
+  static const maxEntries = 8;
+  static final _entries = <String, Future<MeshModel>>{};
+
+  /// Number of imports actually started. Test visibility only.
+  static int importCount = 0;
+
+  static String _keyFor(AssetItem asset, int fallbackCheckerSquareSize) =>
+      '${asset.id}|$fallbackCheckerSquareSize';
+
+  static Future<MeshModel> load(
+    AssetItem asset, {
+    List<AssetItem> allAssets = const [],
+    int fallbackCheckerSquareSize = 16,
+  }) {
+    final key = _keyFor(asset, fallbackCheckerSquareSize);
+    final cached = _entries.remove(key);
+    if (cached != null) {
+      // Reinsert to promote for LRU eviction.
+      _entries[key] = cached;
+      return cached;
+    }
+
+    importCount += 1;
+    final future = loadMesh(
+      asset,
+      allAssets: allAssets,
+      fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+    );
+    _entries[key] = future;
+    // Do not keep a failure cached forever; the next selection should retry.
+    // Consumers still receive the error - this listener only stops it being
+    // reported as unhandled.
+    future.then<void>(
+      (_) {},
+      onError: (Object _) {
+        _entries.remove(key);
+      },
+    );
+
+    while (_entries.length > maxEntries) {
+      _entries.remove(_entries.keys.first);
+    }
+    return future;
+  }
+
+  /// Call when the catalog changes: relink results depend on its contents.
+  static void clear() {
+    _entries.clear();
+  }
+}
+
+/// Puts one chosen image on every material of a mesh.
+///
+/// The last resort when automatic resolution has nothing to work with: an OBJ
+/// that names no material at all, or a model whose pack is not in the library.
+/// The UVs are the model's own, so a correct atlas lands correctly; a wrong
+/// one is obvious at a glance, which is the point of choosing by hand.
+Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
+  final bytes = await readAssetBytes(texturePath);
+  if (bytes == null || bytes.isEmpty) return mesh;
+  final image = await decodeImage(bytes);
+  Uint8List? pixels;
+  try {
+    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+    pixels = data?.buffer.asUint8List();
+  } catch (error) {
+    fbxLog('Chosen texture readback failed: $error');
+  }
+
+  final materials = mesh.materials.isEmpty
+      ? [const MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
+      : mesh.materials;
+  return mesh.withMaterials([
+    for (final material in materials)
+      material.withBaseTexture(path: texturePath, image: image, pixels: pixels),
+  ]);
 }
 
 Future<MeshModel> loadMesh(
@@ -3665,22 +8332,24 @@ class MeshImporterResult {
   final String stderr;
 }
 
+/// The helper always emits UTF-8. Both branches below must decode it as such:
+/// `Process.run` would otherwise fall back to `systemEncoding` (the Windows
+/// ANSI codepage), which mangles non-ASCII material names and texture paths.
 Future<MeshImporterResult> runMeshImporter(
   String helper,
   String sourcePath, {
   Uint8List? inputBytes,
+  bool probeOnly = false,
 }) async {
-  if (inputBytes == null) {
-    final processResult = await Process.run(helper, [sourcePath]);
-    return MeshImporterResult(
-      exitCode: processResult.exitCode,
-      stdout: processResult.stdout as String? ?? '',
-      stderr: processResult.stderr as String? ?? '',
-    );
+  final arguments = <String>[
+    if (inputBytes != null) '--stdin',
+    if (probeOnly) '--probe',
+    sourcePath,
+  ];
+  final process = await Process.start(helper, arguments);
+  if (inputBytes != null) {
+    process.stdin.add(inputBytes);
   }
-
-  final process = await Process.start(helper, ['--stdin', sourcePath]);
-  process.stdin.add(inputBytes);
   await process.stdin.close();
   final stdoutBytes = await process.stdout.expand((chunk) => chunk).toList();
   final stderrBytes = await process.stderr.expand((chunk) => chunk).toList();
@@ -3699,6 +8368,26 @@ Future<MeshModel> meshModelFromImporterJson(
   List<AssetItem> allAssets = const [],
   int fallbackCheckerSquareSize = 16,
 }) async {
+  if (json['kind'] == 'animation') {
+    final names = ((json['animationNames'] as List<dynamic>?) ?? const [])
+        .map((value) => value.toString())
+        .where((value) => value.trim().isNotEmpty)
+        .toList();
+    return MeshModel(
+      name: name,
+      vertices: const [],
+      faces: const [],
+      kind: FbxContentKind.animation,
+      animationStacks: (json['animationStacks'] as num?)?.toInt() ?? 0,
+      skeleton: SkeletonAnimation.fromJson(
+        json['skeleton'] as Map<String, dynamic>?,
+      ),
+      boneCount: (json['bones'] as num?)?.toInt() ?? 0,
+      durationSeconds: (json['durationSeconds'] as num?)?.toDouble() ?? 0,
+      animationNames: names,
+    );
+  }
+
   final vertices = (json['vertices'] as List<dynamic>).map((item) {
     final values = item as List<dynamic>;
     return Vec3(
@@ -3761,6 +8450,10 @@ Future<MeshModel> meshModelFromImporterJson(
       namedUvsByFace[faceIndex],
     );
   }).toList();
+  final skin = SkinBinding.fromJson(json['skin'] as Map<String, dynamic>?);
+  final restSkeleton = SkeletonAnimation.fromJson(
+    json['skeleton'] as Map<String, dynamic>?,
+  );
   final vertexColors = ((json['vertexColors'] as List<dynamic>?) ?? const [])
       .map((item) {
         final values = item as List<dynamic>;
@@ -3773,6 +8466,13 @@ Future<MeshModel> meshModelFromImporterJson(
         return Color.fromARGB(a, r, g, b);
       })
       .toList();
+  if (vertexColorSetIsUnusable(vertexColors)) {
+    fbxLog(
+      'Discarding ${vertexColors.length} vertex colors for $name: the whole '
+      'set is black or fully transparent, which would render the mesh black.',
+    );
+    vertexColors.clear();
+  }
   final nonWhiteVertexColors = vertexColors.where((color) {
     final r = (color.r * 255).round().clamp(0, 255);
     final g = (color.g * 255).round().clamp(0, 255);
@@ -3848,6 +8548,87 @@ Future<MeshModel> meshModelFromImporterJson(
       }
     }
     textureImage ??= await firstTextureImage(resolvedTextures);
+
+    // Read the texture back once so single-texel faces can be filled directly.
+    Uint8List? texturePixels;
+    if (textureImage != null) {
+      try {
+        final data = await textureImage.toByteData(
+          format: ui.ImageByteFormat.rawRgba,
+        );
+        texturePixels = data?.buffer.asUint8List();
+      } catch (error) {
+        fbxLog('Texture readback failed: $error');
+      }
+    }
+
+    // Normal map: resolved through the same pipeline as the base texture, and
+    // read back to CPU because shading here is computed per face, not on the
+    // GPU.
+    final normalRef = (material['normalTexture'] as String?)?.trim() ?? '';
+    Uint8List? normalPixels;
+    var normalWidth = 0;
+    var normalHeight = 0;
+    if (normalRef.isNotEmpty) {
+      final resolvedNormal = resolveTextureReference(
+        modelPath,
+        normalRef,
+        allAssets: allAssets,
+        allowFallbackLookup: false,
+      );
+      if (resolvedNormal != null) {
+        try {
+          final normalImage = await firstTextureImage([resolvedNormal]);
+          if (normalImage != null) {
+            final data = await normalImage.toByteData(
+              format: ui.ImageByteFormat.rawRgba,
+            );
+            normalPixels = data?.buffer.asUint8List();
+            normalWidth = normalImage.width;
+            normalHeight = normalImage.height;
+            fbxLog(
+              'Normal map for ${(material['name'] as String?) ?? 'Material'}: '
+              '$resolvedNormal (${normalWidth}x$normalHeight)',
+            );
+          }
+        } catch (error) {
+          fbxLog('Normal map decode failed: $error');
+        }
+      } else {
+        fbxLog('Normal map referenced but not resolved: $normalRef');
+      }
+    }
+
+    // Emissive: same resolution path, sampled additively so lit signage and
+    // screens are not flattened to their base colour.
+    final emissiveRef = (material['emissiveTexture'] as String?)?.trim() ?? '';
+    Uint8List? emissivePixels;
+    var emissiveWidth = 0;
+    var emissiveHeight = 0;
+    if (emissiveRef.isNotEmpty) {
+      final resolvedEmissive = resolveTextureReference(
+        modelPath,
+        emissiveRef,
+        allAssets: allAssets,
+        allowFallbackLookup: false,
+      );
+      if (resolvedEmissive != null) {
+        try {
+          final emissiveImage = await firstTextureImage([resolvedEmissive]);
+          if (emissiveImage != null) {
+            final data = await emissiveImage.toByteData(
+              format: ui.ImageByteFormat.rawRgba,
+            );
+            emissivePixels = data?.buffer.asUint8List();
+            emissiveWidth = emissiveImage.width;
+            emissiveHeight = emissiveImage.height;
+          }
+        } catch (error) {
+          fbxLog('Emissive decode failed: $error');
+        }
+      }
+    }
+
     materials.add(
       MeshMaterial(
         name: (material['name'] as String?) ?? 'Material',
@@ -3861,6 +8642,17 @@ Future<MeshModel> meshModelFromImporterJson(
         resolvedTextures: resolvedTextures,
         textureColor: textureColor,
         textureImage: textureImage,
+        texturePixels: texturePixels,
+        normalTexture: normalRef,
+        emissiveTexture: emissiveRef,
+        emissivePixels: emissivePixels,
+        emissiveWidth: emissiveWidth,
+        emissiveHeight: emissiveHeight,
+        normalPixels: normalPixels,
+        normalWidth: normalWidth,
+        normalHeight: normalHeight,
+        textureWidth: textureImage?.width ?? 0,
+        textureHeight: textureImage?.height ?? 0,
         opacity: opacity,
         roughness: roughness,
         metalness: metalness,
@@ -3997,6 +8789,8 @@ Future<MeshModel> meshModelFromImporterJson(
     materials: materials,
     textureFiles: textureFiles,
     vertexColors: vertexColors,
+    skin: skin,
+    skeleton: restSkeleton,
   );
 }
 
@@ -4157,9 +8951,30 @@ String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
   return selected;
 }
 
+/// Parses an OBJ, including the parts the first version threw away.
+///
+/// `vt` lines and the `v/vt/vn` corner references were being dropped, so an
+/// OBJ could never be textured no matter what else resolved -- a Synty barn
+/// carries 12k texture coordinates and arrived with none. `usemtl` splits the
+/// mesh into materials and `mtllib` records the sidecar so the texture
+/// resolver can chase it; an OBJ that names neither still parses, it just gets
+/// one unnamed material.
 MeshModel parseObjMesh(String text, String name) {
   final vertices = <Vec3>[];
+  final texCoords = <Vec2>[];
   final faces = <MeshFace>[];
+  final materialNames = <String>[];
+  final materialLibraries = <String>[];
+  var currentMaterial = 0;
+
+  int? resolveIndex(String token, int count) {
+    final raw = int.tryParse(token);
+    if (raw == null || raw == 0) return null;
+    // OBJ indices are 1-based, and negative counts back from the current end.
+    final index = raw < 0 ? count + raw : raw - 1;
+    return index >= 0 && index < count ? index : null;
+  }
+
   for (final rawLine in text.split(RegExp(r'\r?\n'))) {
     final line = rawLine.trim();
     if (line.startsWith('v ')) {
@@ -4173,29 +8988,651 @@ MeshModel parseObjMesh(String text, String name) {
           ),
         );
       }
+    } else if (line.startsWith('vt ')) {
+      final parts = line.split(RegExp(r'\s+'));
+      if (parts.length >= 3) {
+        // OBJ's V axis points up; the sampler's points down.
+        texCoords.add(
+          Vec2(
+            double.tryParse(parts[1]) ?? 0,
+            1 - (double.tryParse(parts[2]) ?? 0),
+          ),
+        );
+      }
+    } else if (line.startsWith('mtllib ')) {
+      final library = line.substring(7).trim();
+      if (library.isNotEmpty && !materialLibraries.contains(library)) {
+        materialLibraries.add(library);
+      }
+    } else if (line.startsWith('usemtl ')) {
+      final material = line.substring(7).trim();
+      final existing = materialNames.indexOf(material);
+      if (existing >= 0) {
+        currentMaterial = existing;
+      } else {
+        materialNames.add(material);
+        currentMaterial = materialNames.length - 1;
+      }
     } else if (line.startsWith('f ')) {
       final indices = <int>[];
+      final uvs = <Vec2?>[];
       for (final token in line.substring(2).trim().split(RegExp(r'\s+'))) {
-        final rawIndex = int.tryParse(token.split('/').first);
-        if (rawIndex == null) continue;
-        indices.add(rawIndex < 0 ? vertices.length + rawIndex : rawIndex - 1);
+        final fields = token.split('/');
+        final vertexIndex = resolveIndex(fields.first, vertices.length);
+        if (vertexIndex == null) continue;
+        indices.add(vertexIndex);
+        // The middle field is the texture coordinate; "v//vn" leaves it empty.
+        final uvIndex = fields.length > 1 && fields[1].isNotEmpty
+            ? resolveIndex(fields[1], texCoords.length)
+            : null;
+        uvs.add(uvIndex == null ? null : texCoords[uvIndex]);
       }
-      _addTriangulatedFace(indices, faces);
+      _addTriangulatedFace(indices, faces, uvs: uvs, material: currentMaterial);
     }
   }
   if (vertices.isEmpty || faces.isEmpty) {
     throw const FormatException('No OBJ geometry found.');
   }
-  return MeshModel.normalized(name: name, vertices: vertices, faces: faces);
+
+  final materials = [
+    for (final materialName in materialNames)
+      MeshMaterial(
+        name: materialName,
+        color: const Color(0xffb9c2cc),
+        textures: const [],
+      ),
+  ];
+  return MeshModel.normalized(
+    name: name,
+    vertices: vertices,
+    faces: faces,
+    materials: materials.isEmpty
+        ? const [MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
+        : materials,
+    textureFiles: materialLibraries,
+  );
 }
 
-void _addTriangulatedFace(List<int> indices, List<MeshFace> faces) {
-  final clean = indices.where((index) => index >= 0).toList();
-  if (clean.length < 3) return;
-  for (var i = 1; i < clean.length - 1; i += 1) {
-    faces.add(MeshFace([clean[0], clean[i], clean[i + 1]]));
+void _addTriangulatedFace(
+  List<int> indices,
+  List<MeshFace> faces, {
+  List<Vec2?> uvs = const [],
+  int material = 0,
+}) {
+  if (indices.length < 3) return;
+  // A fan from the first corner. The UVs have to be fanned the same way, and
+  // a partly-textured polygon contributes none rather than a mix.
+  for (var i = 1; i < indices.length - 1; i += 1) {
+    final corners = [0, i, i + 1];
+    final faceUvs = <Vec2>[];
+    if (uvs.length == indices.length) {
+      for (final corner in corners) {
+        final uv = uvs[corner];
+        if (uv == null) {
+          faceUvs.clear();
+          break;
+        }
+        faceUvs.add(uv);
+      }
+    }
+    faces.add(
+      MeshFace(
+        [indices[0], indices[i], indices[i + 1]],
+        material,
+        faceUvs.length == 3 ? faceUvs : const [],
+      ),
+    );
   }
 }
+
+/// How much of a vertex-colour set must be black before it is discarded.
+const unusableVertexColorFraction = 0.9;
+
+/// Whether a vertex-colour set should be thrown away rather than applied.
+///
+/// Vertex colours multiply the shaded surface, so a set that is essentially
+/// all black renders the mesh black however well its textures resolved. No
+/// asset means that: it is what an exporter writes for a colour layer nothing
+/// ever filled in.
+///
+/// A threshold rather than an exact test, because `PolygonSyntyCharacter.fbx`
+/// ships 14,688 vertex colours of which 14,628 are black and exactly 60 are
+/// white -- and those 60 strays were enough to defeat an all-or-nothing rule
+/// while leaving 99.6% of the model rendering black.
+///
+/// Black *parts* of a model are real art. A model that is almost entirely
+/// black is not, and drawing it black helps nobody.
+bool vertexColorSetIsUnusable(List<Color> colors) {
+  if (colors.isEmpty) return false;
+  var black = 0;
+  for (final color in colors) {
+    final isBlack =
+        (color.r * 255).round() <= 2 &&
+        (color.g * 255).round() <= 2 &&
+        (color.b * 255).round() <= 2;
+    // Fully transparent is the same kind of artifact.
+    if (isBlack || (color.a * 255).round() <= 2) black += 1;
+  }
+  return black >= colors.length * unusableVertexColorFraction;
+}
+
+/// Settings key for the model clips are played on.
+const animationCharacterKey = 'animation.character.path';
+
+/// The model animation clips are played on, and the clip preview's fallback.
+///
+/// Held here rather than threaded through the widget tree because a clip and
+/// the character it plays on are selected in completely different places: you
+/// pick the character once from a model's own preview, then click clips.
+class AnimationCharacter {
+  AnimationCharacter._();
+
+  static final AnimationCharacter instance = AnimationCharacter._();
+
+  /// Notifies when the choice changes, so an open clip preview re-poses.
+  final ValueNotifier<String?> path = ValueNotifier<String?>(null);
+
+  Future<void> load() async {
+    try {
+      path.value = await AssetAtlasDatabase.instance.readSetting(
+        animationCharacterKey,
+      );
+    } catch (error) {
+      // A missing settings row is not worth failing startup over.
+      fbxLog('Could not read the animation character: $error');
+    }
+  }
+
+  Future<void> set(String? assetPath) async {
+    path.value = assetPath;
+    try {
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterKey,
+        assetPath,
+      );
+    } catch (error) {
+      fbxLog('Could not save the animation character: $error');
+    }
+  }
+}
+
+/// How a mesh's vertices follow a rig.
+///
+/// Emitted once with the character; a clip supplies only the bone matrices, so
+/// posing is a weighted matrix blend per vertex and nothing else.
+class SkinBinding {
+  const SkinBinding({
+    required this.boneNames,
+    required this.bindInverse,
+    required this.influences,
+    required this.vertexSkin,
+    this.bonePaths = const [],
+    this.normalizeCenter = const Vec3(0, 0, 0),
+    this.normalizeScale = 1,
+  });
+
+  /// Reads the `skin` object the importer emits. Null when absent or unusable.
+  static SkinBinding? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final boneList = (json['bones'] as List<dynamic>?) ?? const [];
+    if (boneList.isEmpty) return null;
+
+    final names = <String>[];
+    final paths = <String>[];
+    final bind = Float32List(boneList.length * 12);
+    for (var i = 0; i < boneList.length; i += 1) {
+      final bone = boneList[i] as Map<String, dynamic>;
+      names.add((bone['name'] ?? '').toString());
+      paths.add((bone['path'] ?? '').toString());
+      final matrix = (bone['bindInverse'] as List<dynamic>?) ?? const [];
+      if (matrix.length != 12) return null;
+      for (var j = 0; j < 12; j += 1) {
+        bind[i * 12 + j] = (matrix[j] as num).toDouble();
+      }
+    }
+
+    final rawInfluences = (json['vertices'] as List<dynamic>?) ?? const [];
+    final influences = Float32List(rawInfluences.length);
+    for (var i = 0; i < rawInfluences.length; i += 1) {
+      influences[i] = (rawInfluences[i] as num).toDouble();
+    }
+
+    final rawVertexSkin = (json['vertexSkin'] as List<dynamic>?) ?? const [];
+    final vertexSkin = Int32List(rawVertexSkin.length);
+    for (var i = 0; i < rawVertexSkin.length; i += 1) {
+      vertexSkin[i] = (rawVertexSkin[i] as num).toInt();
+    }
+    if (vertexSkin.isEmpty || influences.isEmpty) return null;
+
+    final center = (json['normalizeCenter'] as List<dynamic>?) ?? const [];
+    return SkinBinding(
+      boneNames: names,
+      bonePaths: paths,
+      bindInverse: bind,
+      influences: influences,
+      vertexSkin: vertexSkin,
+      normalizeCenter: center.length == 3
+          ? Vec3(
+              (center[0] as num).toDouble(),
+              (center[1] as num).toDouble(),
+              (center[2] as num).toDouble(),
+            )
+          : const Vec3(0, 0, 0),
+      normalizeScale: (json['normalizeScale'] as num?)?.toDouble() ?? 1,
+    );
+  }
+
+  final List<String> boneNames;
+
+  /// Each bone's chain from the root, parallel to [boneNames].
+  final List<String> bonePaths;
+
+  /// The framing transform the importer applied to the vertices.
+  ///
+  /// Every mesh is recentred and rescaled into a unit box so the viewer can
+  /// frame it, but the bind matrices are written against the file's own
+  /// coordinates. The importer folds the inverse into [bindInverse], so a
+  /// posed vertex comes out in file coordinates and has to be put back:
+  /// `(p - normalizeCenter) * normalizeScale`. Skipping that step left a
+  /// character's mesh 0.89m from its skeleton, which tore it apart.
+  final Vec3 normalizeCenter;
+  final double normalizeScale;
+
+  /// Per bone, a column-major 3x4 taking a mesh vertex into bone space at the
+  /// bind pose. The mesh's own geometry-to-world is already folded in, so it
+  /// applies to the vertices as imported.
+  final Float32List bindInverse;
+
+  /// Four (bone, weight) pairs per skinned vertex, zero-weight padded.
+  final Float32List influences;
+
+  /// Per mesh vertex, an index into [influences] blocks, or -1.
+  final Int32List vertexSkin;
+}
+
+/// Applies `matrix` (column-major 3x4) to a point.
+Vec3 transformByMatrix(Float32List matrix, int offset, Vec3 point) {
+  return Vec3(
+    matrix[offset] * point.x +
+        matrix[offset + 3] * point.y +
+        matrix[offset + 6] * point.z +
+        matrix[offset + 9],
+    matrix[offset + 1] * point.x +
+        matrix[offset + 4] * point.y +
+        matrix[offset + 7] * point.z +
+        matrix[offset + 10],
+    matrix[offset + 2] * point.x +
+        matrix[offset + 5] * point.y +
+        matrix[offset + 8] * point.z +
+        matrix[offset + 11],
+  );
+}
+
+/// Multiplies two column-major 3x4 matrices into `out` at `outOffset`.
+void multiplyMatrices(
+  Float32List a,
+  int aOffset,
+  Float32List b,
+  int bOffset,
+  Float32List out,
+  int outOffset,
+) {
+  for (var column = 0; column < 4; column += 1) {
+    final bx = b[bOffset + column * 3];
+    final by = b[bOffset + column * 3 + 1];
+    final bz = b[bOffset + column * 3 + 2];
+    // The fourth column is a point, so it picks up the translation; the first
+    // three are directions and do not.
+    final translate = column == 3 ? 1.0 : 0.0;
+    for (var row = 0; row < 3; row += 1) {
+      out[outOffset + column * 3 + row] =
+          a[aOffset + row] * bx +
+          a[aOffset + 3 + row] * by +
+          a[aOffset + 6 + row] * bz +
+          a[aOffset + 9 + row] * translate;
+    }
+  }
+}
+
+/// Poses a character's vertices into a packed buffer.
+///
+/// The buffer form exists because animation calls this every frame: returning
+/// a `List<Vec3>` allocates one object per vertex, and at 14,688 vertices and
+/// 30fps that is half a million short-lived objects a second.
+///
+/// [out] must hold `character.vertices.length * 3` floats; it is returned for
+/// convenience so callers can keep one buffer alive across frames.
+Float32List poseSkinnedPositions({
+  required MeshModel character,
+  required SkeletonAnimation clip,
+  required int frame,
+  required Float32List out,
+}) {
+  final vertices = character.vertices;
+  final skin = character.skin;
+  if (skin == null || frame < 0 || frame >= clip.frameCount) {
+    for (var v = 0; v < vertices.length; v += 1) {
+      out[v * 3] = vertices[v].x;
+      out[v * 3 + 1] = vertices[v].y;
+      out[v * 3 + 2] = vertices[v].z;
+    }
+    return out;
+  }
+
+  final boneCount = skin.boneNames.length;
+  final skinMatrices = Float32List(boneCount * 12);
+  final usable = List<bool>.filled(boneCount, false);
+  final clipFrame = clip.positions[frame];
+  for (var i = 0; i < boneCount; i += 1) {
+    final clipBone = clip.indexOfBone(
+      skin.boneNames[i],
+      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+    );
+    if (clipBone < 0) continue;
+    multiplyMatrices(
+      clipFrame,
+      clipBone * 12,
+      skin.bindInverse,
+      i * 12,
+      skinMatrices,
+      i * 12,
+    );
+    usable[i] = true;
+  }
+
+  for (var v = 0; v < vertices.length; v += 1) {
+    final vertex = vertices[v];
+    final block = v < skin.vertexSkin.length ? skin.vertexSkin[v] : -1;
+    var x = 0.0;
+    var y = 0.0;
+    var z = 0.0;
+    var total = 0.0;
+    if (block >= 0) {
+      for (var k = 0; k < 4; k += 1) {
+        final base = block * 8 + k * 2;
+        if (base + 1 >= skin.influences.length) break;
+        final weight = skin.influences[base + 1];
+        if (weight <= 0) continue;
+        final bone = skin.influences[base].toInt();
+        if (bone < 0 || bone >= boneCount || !usable[bone]) continue;
+        final offset = bone * 12;
+        x +=
+            (skinMatrices[offset] * vertex.x +
+                skinMatrices[offset + 3] * vertex.y +
+                skinMatrices[offset + 6] * vertex.z +
+                skinMatrices[offset + 9]) *
+            weight;
+        y +=
+            (skinMatrices[offset + 1] * vertex.x +
+                skinMatrices[offset + 4] * vertex.y +
+                skinMatrices[offset + 7] * vertex.z +
+                skinMatrices[offset + 10]) *
+            weight;
+        z +=
+            (skinMatrices[offset + 2] * vertex.x +
+                skinMatrices[offset + 5] * vertex.y +
+                skinMatrices[offset + 8] * vertex.z +
+                skinMatrices[offset + 11]) *
+            weight;
+        total += weight;
+      }
+    }
+    // A vertex with no usable influence keeps its bind position; collapsing it
+    // to the origin would drag a spike across the model.
+    if (total > 0) {
+      // Back into the viewer's framing; see SkinBinding.normalizeCenter.
+      out[v * 3] = (x / total - skin.normalizeCenter.x) * skin.normalizeScale;
+      out[v * 3 + 1] =
+          (y / total - skin.normalizeCenter.y) * skin.normalizeScale;
+      out[v * 3 + 2] =
+          (z / total - skin.normalizeCenter.z) * skin.normalizeScale;
+    } else {
+      out[v * 3] = vertex.x;
+      out[v * 3 + 1] = vertex.y;
+      out[v * 3 + 2] = vertex.z;
+    }
+  }
+  return out;
+}
+
+/// Poses a character's vertices with one frame of a clip.
+///
+/// The join is by bone name, which is exact for Synty rigs. A bone the clip
+/// does not have contributes nothing, and a vertex left with no influence at
+/// all keeps its bind position rather than collapsing to the origin.
+List<Vec3> poseSkinnedVertices({
+  required MeshModel character,
+  required SkeletonAnimation clip,
+  required int frame,
+}) {
+  final skin = character.skin;
+  if (skin == null || frame < 0 || frame >= clip.frameCount) {
+    return character.vertices;
+  }
+
+  final boneCount = skin.boneNames.length;
+  final skinMatrices = Float32List(boneCount * 12);
+  final usable = List<bool>.filled(boneCount, false);
+  final clipFrame = clip.positions[frame];
+  for (var i = 0; i < boneCount; i += 1) {
+    final clipBone = clip.indexOfBone(
+      skin.boneNames[i],
+      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+    );
+    if (clipBone < 0) continue;
+    multiplyMatrices(
+      clipFrame,
+      clipBone * 12,
+      skin.bindInverse,
+      i * 12,
+      skinMatrices,
+      i * 12,
+    );
+    usable[i] = true;
+  }
+
+  final posed = <Vec3>[];
+  for (var v = 0; v < character.vertices.length; v += 1) {
+    final vertex = character.vertices[v];
+    final block = v < skin.vertexSkin.length ? skin.vertexSkin[v] : -1;
+    if (block < 0) {
+      posed.add(vertex);
+      continue;
+    }
+    var x = 0.0;
+    var y = 0.0;
+    var z = 0.0;
+    var total = 0.0;
+    for (var k = 0; k < 4; k += 1) {
+      final base = block * 8 + k * 2;
+      if (base + 1 >= skin.influences.length) break;
+      final weight = skin.influences[base + 1];
+      if (weight <= 0) continue;
+      final bone = skin.influences[base].toInt();
+      if (bone < 0 || bone >= boneCount || !usable[bone]) continue;
+      final moved = transformByMatrix(skinMatrices, bone * 12, vertex);
+      x += moved.x * weight;
+      y += moved.y * weight;
+      z += moved.z * weight;
+      total += weight;
+    }
+    posed.add(
+      total > 0
+          ? Vec3(
+              (x / total - skin.normalizeCenter.x) * skin.normalizeScale,
+              (y / total - skin.normalizeCenter.y) * skin.normalizeScale,
+              (z / total - skin.normalizeCenter.z) * skin.normalizeScale,
+            )
+          : vertex,
+    );
+  }
+  return posed;
+}
+
+/// One bone of a rig: a name, and where it hangs.
+class SkeletonBone {
+  const SkeletonBone({
+    required this.name,
+    required this.parent,
+    this.path = '',
+  });
+
+  final String name;
+
+  /// The chain from the root, "Hips/Spine_01/Clavicle_L/...".
+  ///
+  /// Bone names repeat within a rig -- both hands carry a `Finger_03` -- so
+  /// the path is the reliable key when joining two rigs.
+  final String path;
+
+  /// Index into the owning [SkeletonAnimation.bones], or -1 for a root.
+  final int parent;
+}
+
+/// Strips the suffix the importer adds to distinguish same-named bones.
+///
+/// These rigs name both hands' bones identically -- `IndexFinger_01` appears
+/// under `Hand_L` and `Hand_R` -- and ufbx renames whichever it meets second
+/// to `IndexFinger_01_1`. Which one that is depends on node order, and node
+/// order differs between a character file and a clip file: one file's
+/// `Hand_R/IndexFinger_01_1` is the other's `Hand_R/IndexFinger_01`.
+///
+/// Only a single trailing digit is removed. Synty's own numbering is
+/// two digits (`Spine_01`, `IndexFinger_02`), so it survives, while the
+/// importer's `_1` does not. The parent chain still separates left from
+/// right, which is the whole reason paths beat names here.
+String normalizeBonePath(String path) {
+  if (path.isEmpty) return path;
+  return path
+      .split('/')
+      .map((segment) {
+        final match = RegExp(r'^(.*[^_])_[0-9]$').firstMatch(segment);
+        return match == null ? segment : match.group(1)!;
+      })
+      .join('/');
+}
+
+/// A rig and the motion sampled onto it.
+///
+/// Positions only, in world space, one sample per frame. That is everything a
+/// stick-figure preview draws, and it means no curve evaluation or parent
+/// composition happens in Dart -- ufbx did both when the file was imported.
+class SkeletonAnimation {
+  const SkeletonAnimation({
+    required this.bones,
+    required this.positions,
+    required this.frameRate,
+  });
+
+  /// Reads the `skeleton` object the importer emits. Null when absent.
+  static SkeletonAnimation? fromJson(Map<String, dynamic>? json) {
+    if (json == null) return null;
+    final boneList = (json['bones'] as List<dynamic>?) ?? const [];
+    if (boneList.isEmpty) return null;
+
+    final bones = [
+      for (final entry in boneList)
+        SkeletonBone(
+          name: ((entry as Map<String, dynamic>)['name'] ?? '').toString(),
+          parent: (entry['parent'] as num?)?.toInt() ?? -1,
+          path: (entry['path'] ?? '').toString(),
+        ),
+    ];
+
+    final frameList = (json['frames'] as List<dynamic>?) ?? const [];
+    final stride = bones.length * ((json['stride'] as num?)?.toInt() ?? 12);
+    final positions = <Float32List>[];
+    for (final frame in frameList) {
+      final values = frame as List<dynamic>;
+      // A frame that does not match the bone count cannot be indexed safely.
+      if (values.length != stride) continue;
+      final packed = Float32List(stride);
+      for (var i = 0; i < stride; i += 1) {
+        packed[i] = (values[i] as num).toDouble();
+      }
+      positions.add(packed);
+    }
+    if (positions.isEmpty) return null;
+
+    return SkeletonAnimation(
+      bones: bones,
+      positions: positions,
+      frameRate: (json['frameRate'] as num?)?.toDouble() ?? 30,
+    );
+  }
+
+  final List<SkeletonBone> bones;
+
+  /// One entry per frame, each `bones.length * 12` floats: a column-major
+  /// 3x4 world matrix per bone. The last three are the bone's position, which
+  /// is all the stick-figure view reads.
+  final List<Float32List> positions;
+  final double frameRate;
+
+  int get frameCount => positions.length;
+
+  /// The world position of one bone in one frame.
+  ({double x, double y, double z}) bonePosition(int frame, int bone) {
+    final values = positions[frame];
+    final base = bone * 12;
+    return (x: values[base + 9], y: values[base + 10], z: values[base + 11]);
+  }
+
+  /// The bone of this rig with the given name, or -1.
+  ///
+  /// Names are how a clip and a character are joined: Synty rigs share them
+  /// exactly, so no mapping table is needed.
+  int indexOfBone(String name, {String? path}) {
+    if (path != null && path.isNotEmpty) {
+      for (var i = 0; i < bones.length; i += 1) {
+        if (bones[i].path == path) return i;
+      }
+      // The same rig can be numbered differently in two files, so compare
+      // again with the importer's duplicate suffixes removed.
+      final wanted = normalizeBonePath(path);
+      for (var i = 0; i < bones.length; i += 1) {
+        if (normalizeBonePath(bones[i].path) == wanted) return i;
+      }
+    }
+    // Last resort. A bare name is ambiguous in these rigs -- both hands carry
+    // an `IndexFinger_01` -- so this can pick the wrong side, and only runs
+    // when neither path form matched.
+    for (var i = 0; i < bones.length; i += 1) {
+      if (bones[i].name == name) return i;
+    }
+    return -1;
+  }
+
+  /// The frame nearest a time in seconds, clamped to the clip.
+  int frameAt(double seconds) {
+    if (frameCount <= 1 || frameRate <= 0) return 0;
+    final index = (seconds * frameRate).round();
+    return index.clamp(0, frameCount - 1);
+  }
+
+  /// The axis-aligned bounds of every frame, so the view does not rescale as
+  /// the clip plays.
+  ({double minX, double maxX, double minY, double maxY}) get bounds {
+    var minX = double.infinity;
+    var maxX = -double.infinity;
+    var minY = double.infinity;
+    var maxY = -double.infinity;
+    for (final frame in positions) {
+      for (var i = 0; i + 11 < frame.length; i += 12) {
+        minX = math.min(minX, frame[i + 9]);
+        maxX = math.max(maxX, frame[i + 9]);
+        minY = math.min(minY, frame[i + 10]);
+        maxY = math.max(maxY, frame[i + 10]);
+      }
+    }
+    if (!minX.isFinite) return (minX: 0, maxX: 1, minY: 0, maxY: 1);
+    return (minX: minX, maxX: maxX, minY: minY, maxY: maxY);
+  }
+}
+
+/// What an FBX turned out to contain. A file with a skeleton and curves but no
+/// geometry is a legitimate asset, not an import failure.
+enum FbxContentKind { mesh, animation }
 
 class MeshModel {
   MeshModel({
@@ -4205,13 +9642,25 @@ class MeshModel {
     this.materials = const [],
     this.textureFiles = const [],
     this.vertexColors = const [],
+    this.kind = FbxContentKind.mesh,
+    this.animationStacks = 0,
+    this.skeleton,
+    this.skin,
+    this.boneCount = 0,
+    this.durationSeconds = 0,
+    this.animationNames = const [],
   });
+
+  /// True when the file carries animation or skeleton data and nothing to draw.
+  bool get isAnimationOnly => kind == FbxContentKind.animation;
 
   factory MeshModel.normalized({
     required String name,
     required List<Vec3> vertices,
     required List<MeshFace> faces,
     List<Color> vertexColors = const [],
+    List<MeshMaterial> materials = const [],
+    List<String> textureFiles = const [],
   }) {
     var minX = double.infinity;
     var minY = double.infinity;
@@ -4251,14 +9700,62 @@ class MeshModel {
           .toList(),
       faces: faces,
       vertexColors: vertexColors,
+      materials: materials,
+      textureFiles: textureFiles,
     );
   }
+
+  /// The rig and its sampled motion, when the file carries one.
+  final SkeletonAnimation? skeleton;
+
+  /// How this mesh's vertices follow that rig, when it is skinned.
+  final SkinBinding? skin;
+
+  /// This mesh with different vertex positions. Everything else is shared,
+  /// so posing a character per frame does not rebuild its materials.
+  MeshModel withVertices(List<Vec3> replacements) => MeshModel(
+    name: name,
+    vertices: replacements,
+    faces: faces,
+    materials: materials,
+    textureFiles: textureFiles,
+    vertexColors: vertexColors,
+    kind: kind,
+    animationStacks: animationStacks,
+    skeleton: skeleton,
+    skin: skin,
+    boneCount: boneCount,
+    durationSeconds: durationSeconds,
+    animationNames: animationNames,
+  );
+
+  /// This mesh with its materials replaced. Geometry is untouched.
+  MeshModel withMaterials(List<MeshMaterial> replacements) => MeshModel(
+    name: name,
+    vertices: vertices,
+    faces: faces,
+    materials: replacements,
+    textureFiles: textureFiles,
+    vertexColors: vertexColors,
+    kind: kind,
+    animationStacks: animationStacks,
+    skeleton: skeleton,
+    skin: skin,
+    boneCount: boneCount,
+    durationSeconds: durationSeconds,
+    animationNames: animationNames,
+  );
 
   final String name;
   final List<Vec3> vertices;
   final List<MeshFace> faces;
   final List<MeshMaterial> materials;
   final List<String> textureFiles;
+  final FbxContentKind kind;
+  final int animationStacks;
+  final int boneCount;
+  final double durationSeconds;
+  final List<String> animationNames;
   final List<Color> vertexColors;
 
   List<String> get availableUvSets {
@@ -4372,6 +9869,17 @@ class MeshMaterial {
     this.resolvedTextures = const [],
     this.textureColor,
     this.textureImage,
+    this.texturePixels,
+    this.textureWidth = 0,
+    this.textureHeight = 0,
+    this.normalTexture = '',
+    this.normalPixels,
+    this.normalWidth = 0,
+    this.normalHeight = 0,
+    this.emissiveTexture = '',
+    this.emissivePixels,
+    this.emissiveWidth = 0,
+    this.emissiveHeight = 0,
     this.opacity = 1.0,
     this.roughness = 0.7,
     this.metalness = 0.0,
@@ -4384,12 +9892,175 @@ class MeshMaterial {
     this.hasEmbeddedTexture = false,
   });
 
+  /// This material with a different base texture, everything else kept.
+  ///
+  /// Used when the user picks a texture by hand: a model whose materials name
+  /// nothing (an OBJ with no `mtllib`) or name a file that is not in the
+  /// library still has UVs, so a chosen atlas maps onto it correctly.
+  MeshMaterial withBaseTexture({
+    required String path,
+    required ui.Image image,
+    required Uint8List? pixels,
+  }) {
+    return MeshMaterial(
+      name: name,
+      color: color,
+      textures: textures,
+      resolvedTextures: [path],
+      textureColor: textureColor,
+      textureImage: image,
+      texturePixels: pixels,
+      textureWidth: image.width,
+      textureHeight: image.height,
+      normalTexture: normalTexture,
+      normalPixels: normalPixels,
+      normalWidth: normalWidth,
+      normalHeight: normalHeight,
+      emissiveTexture: emissiveTexture,
+      emissivePixels: emissivePixels,
+      emissiveWidth: emissiveWidth,
+      emissiveHeight: emissiveHeight,
+      opacity: opacity,
+      roughness: roughness,
+      metalness: metalness,
+      specularFactor: specularFactor,
+      emissiveFactor: emissiveFactor,
+      emissiveColor: emissiveColor,
+      shaderType: shaderType,
+      shadingModel: shadingModel,
+      uvSet: uvSet,
+      hasEmbeddedTexture: hasEmbeddedTexture,
+    );
+  }
+
   final String name;
   final Color color;
   final List<String> textures;
   final List<String> resolvedTextures;
   final Color? textureColor;
   final ui.Image? textureImage;
+
+  /// Raw RGBA of [textureImage], kept so a single texel can be read without
+  /// going through the GPU. Synty-style models map a whole face to one texel,
+  /// and those faces are drawn as a flat fill rather than a texture draw.
+  final Uint8List? texturePixels;
+  final int textureWidth;
+  final int textureHeight;
+
+  /// The normal map this material asked for, and its pixels once resolved.
+  final String normalTexture;
+  final Uint8List? normalPixels;
+  final int normalWidth;
+  final int normalHeight;
+
+  bool get hasNormalMap => normalPixels != null && normalWidth > 0;
+
+  /// Emissive map: light the material gives off, added after shading.
+  final String emissiveTexture;
+  final Uint8List? emissivePixels;
+  final int emissiveWidth;
+  final int emissiveHeight;
+
+  bool get hasEmissiveMap => emissivePixels != null && emissiveWidth > 0;
+
+  /// True when the material named textures and none of them could be found.
+  /// Such a model renders as flat base colour, which reads as broken rather
+  /// than as "the textures are elsewhere".
+  bool get texturesMissing => textures.isNotEmpty && resolvedTextures.isEmpty;
+
+  /// Emissive texel at (u, v) packed 0xRRGGBB, or null.
+  int? sampleEmissiveRgb(double u, double v) {
+    final pixels = emissivePixels;
+    if (pixels == null || emissiveWidth <= 0 || emissiveHeight <= 0) {
+      return null;
+    }
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    final x = (fu * (emissiveWidth - 1)).toInt();
+    final y = (fv * (emissiveHeight - 1)).toInt();
+    final index = (y * emissiveWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return (pixels[index] << 16) | (pixels[index + 1] << 8) | pixels[index + 2];
+  }
+
+  /// Tangent-space normal at [uv], decoded from the usual RGB encoding where
+  /// (0.5, 0.5, 1.0) means "straight out of the surface".
+  Vec3? sampleNormal(Vec2 uv) {
+    final pixels = normalPixels;
+    if (pixels == null || normalWidth <= 0 || normalHeight <= 0) return null;
+    double wrap(double value) {
+      final fraction = value - value.floorToDouble();
+      return fraction < 0 ? fraction + 1 : fraction;
+    }
+
+    final x = (wrap(uv.x) * (normalWidth - 1)).round().clamp(
+      0,
+      normalWidth - 1,
+    );
+    final y = (wrap(uv.y) * (normalHeight - 1)).round().clamp(
+      0,
+      normalHeight - 1,
+    );
+    final index = (y * normalWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return Vec3(
+      pixels[index] / 127.5 - 1.0,
+      pixels[index + 1] / 127.5 - 1.0,
+      pixels[index + 2] / 127.5 - 1.0,
+    );
+  }
+
+  /// Texel at (u, v) packed as 0xRRGGBB, or null when there is nothing to
+  /// sample. Used by the rasteriser's inner loop, where allocating a [Color]
+  /// per pixel would cost more than the shading.
+  int? sampleTextureRgb(double u, double v) {
+    final pixels = texturePixels;
+    if (pixels == null || textureWidth <= 0 || textureHeight <= 0) return null;
+    var fu = u - u.floorToDouble();
+    var fv = v - v.floorToDouble();
+    if (fu < 0) fu += 1;
+    if (fv < 0) fv += 1;
+    var x = (fu * (textureWidth - 1)).round();
+    var y = (fv * (textureHeight - 1)).round();
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > textureWidth - 1) x = textureWidth - 1;
+    if (y > textureHeight - 1) y = textureHeight - 1;
+    final index = (y * textureWidth + x) * 4;
+    if (index + 2 >= pixels.length) return null;
+    return (pixels[index] << 16) | (pixels[index + 1] << 8) | pixels[index + 2];
+  }
+
+  /// The colour at [uv], or null when there is nothing to sample.
+  Color? sampleTexture(Vec2 uv) {
+    final pixels = texturePixels;
+    if (pixels == null || textureWidth <= 0 || textureHeight <= 0) return null;
+    // UVs outside 0..1 wrap, which is what a tiling material expects.
+    double wrap(double value) {
+      final fraction = value - value.floorToDouble();
+      return fraction < 0 ? fraction + 1 : fraction;
+    }
+
+    final x = (wrap(uv.x) * (textureWidth - 1)).round().clamp(
+      0,
+      textureWidth - 1,
+    );
+    final y = (wrap(uv.y) * (textureHeight - 1)).round().clamp(
+      0,
+      textureHeight - 1,
+    );
+    final index = (y * textureWidth + x) * 4;
+    if (index + 3 >= pixels.length) return null;
+    return Color.fromARGB(
+      pixels[index + 3],
+      pixels[index],
+      pixels[index + 1],
+      pixels[index + 2],
+    );
+  }
+
   final double opacity;
   final double roughness;
   final double metalness;
@@ -4455,6 +10126,8 @@ class AssetItem {
     required this.modified,
     required this.tags,
     this.ignored = false,
+    this.modelKind,
+    this.referencedByModel = false,
   });
 
   final String id;
@@ -4469,6 +10142,33 @@ class AssetItem {
   final DateTime modified;
   final List<String> tags;
   bool ignored;
+
+  /// For model assets: what the file actually turned out to contain, once
+  /// something has looked. Null means not classified yet -- classifying an FBX
+  /// costs an importer run, so it happens lazily and is persisted.
+  String? modelKind;
+
+  /// Set once some model has been read and found to use this image. Persisted,
+  /// because it is only learned by importing a model.
+  bool referencedByModel;
+
+  /// The type to show and filter by. An FBX holding only a skeleton and curves
+  /// is an animation, not a model, but only a parse can tell you that.
+  String get effectiveType {
+    if (modelKind == 'animation') return 'animation';
+    if (type == 'image' &&
+        (referencedByModel || looksLikeTextureLocation(relativePath))) {
+      return 'texture';
+    }
+    return type;
+  }
+
+  String? _searchText;
+
+  /// Name, path and tags folded to lowercase once, on first use. Search
+  /// used to lowercase all three for every asset on every keystroke.
+  String get searchText => _searchText ??=
+      '$name\u0000$relativePath\u0000${tags.join(' ')}'.toLowerCase();
 }
 
 class ScanResult {
@@ -4503,17 +10203,74 @@ class AssetAtlasDatabase {
   static final instance = AssetAtlasDatabase._();
   Database? _db;
 
-  Future<void> initialize() async {
+  /// Schema history:
+  ///   v1 - initial catalog, sources, projects, membership
+  ///   v2 - indexes on the columns the app filters and joins by
+  ///   v3 - asset ids rebuilt from source root + relative path, so editing a
+  ///        file no longer orphans it from projects and ignore flags
+  ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
+  ///   v5 - referenced_by_model, images a model was found to use
+  static const schemaVersion = 6;
+
+  /// Indexes are created identically by [_createSchema] and by the v2 upgrade
+  /// so a fresh install and an upgraded install converge; see
+  /// test/database_test.dart, which asserts they match.
+  static const _indexStatements = [
+    'CREATE INDEX IF NOT EXISTS idx_catalog_assets_source_root '
+        'ON catalog_assets(source_root)',
+    'CREATE INDEX IF NOT EXISTS idx_catalog_assets_type '
+        'ON catalog_assets(type)',
+    'CREATE INDEX IF NOT EXISTS idx_project_assets_project '
+        'ON project_assets(project_id)',
+  ];
+
+  /// [databasePath] is a test seam; production passes nothing and the database
+  /// lives in the app support directory.
+  Future<void> initialize({String? databasePath}) async {
     if (_db != null) return;
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
-    final supportDir = await getApplicationSupportDirectory();
-    final dbPath =
-        '${supportDir.path}${Platform.pathSeparator}asset_atlas_native.db';
+    final String dbPath;
+    if (databasePath != null) {
+      dbPath = databasePath;
+    } else {
+      final supportDir = await getApplicationSupportDirectory();
+      dbPath =
+          '${supportDir.path}${Platform.pathSeparator}asset_atlas_native.db';
+    }
     _db = await databaseFactory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
-        version: 1,
+        version: schemaVersion,
+        onUpgrade: (db, oldVersion, newVersion) async {
+          if (oldVersion < 2) {
+            for (final statement in _indexStatements) {
+              await db.execute(statement);
+            }
+          }
+          if (oldVersion < 3) {
+            await _migrateAssetIdsToV3(db);
+          }
+          if (oldVersion < 4) {
+            await db.execute(
+              'ALTER TABLE catalog_assets ADD COLUMN model_kind TEXT',
+            );
+          }
+          if (oldVersion < 5) {
+            await db.execute(
+              'ALTER TABLE catalog_assets '
+              'ADD COLUMN referenced_by_model INTEGER NOT NULL DEFAULT 0',
+            );
+          }
+          if (oldVersion < 6) {
+            await db.execute('''
+            CREATE TABLE settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+            ''');
+          }
+        },
         onCreate: (db, _) async {
           await db.execute('''
             CREATE TABLE catalog_assets (
@@ -4528,7 +10285,9 @@ class AssetAtlasDatabase {
               size INTEGER NOT NULL,
               modified_ms INTEGER NOT NULL,
               tags_json TEXT NOT NULL,
-              ignored INTEGER NOT NULL DEFAULT 0
+              ignored INTEGER NOT NULL DEFAULT 0,
+              model_kind TEXT,
+              referenced_by_model INTEGER NOT NULL DEFAULT 0
             )
           ''');
           await db.execute('''
@@ -4551,9 +10310,44 @@ class AssetAtlasDatabase {
               PRIMARY KEY (project_id, asset_id)
             )
           ''');
+          await db.execute('''
+            CREATE TABLE settings (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            )
+          ''');
+          for (final statement in _indexStatements) {
+            await db.execute(statement);
+          }
         },
       ),
     );
+  }
+
+  /// Reads one setting, or null when it was never written.
+  Future<String?> readSetting(String key) async {
+    await initialize();
+    final rows = await _db!.query(
+      'settings',
+      where: 'key = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return rows.first['value'] as String?;
+  }
+
+  /// Writes one setting. A null value clears it.
+  Future<void> writeSetting(String key, String? value) async {
+    await initialize();
+    if (value == null) {
+      await _db!.delete('settings', where: 'key = ?', whereArgs: [key]);
+      return;
+    }
+    await _db!.insert('settings', {
+      'key': key,
+      'value': value,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   Future<PersistedCatalog> loadCatalog() async {
@@ -4578,14 +10372,137 @@ class AssetAtlasDatabase {
         tags: ((jsonDecode(row['tags_json'] as String) as List<dynamic>)
             .cast<String>()),
         ignored: (row['ignored'] as int) == 1,
+        modelKind: row['model_kind'] as String?,
+        referencedByModel: (row['referenced_by_model'] as int? ?? 0) == 1,
       );
     }).toList();
     final sourceRoots = sourceRows
         .map((row) => row['root_path'] as String)
         .toSet();
+
+    // Catalogs scanned before AppleDouble filtering existed still hold these
+    // sidecars, and one of them crashed the audio plugin. Drop them here too
+    // rather than waiting for a full re-scan.
+    final stale = assets
+        .where(
+          (asset) =>
+              isAppleDoubleName(asset.name) ||
+              asset.relativePath.toLowerCase().contains('__macosx/'),
+        )
+        .toList();
+    if (stale.isNotEmpty) {
+      assets.removeWhere(stale.contains);
+      unawaited(
+        deleteAssetsByIds([for (final asset in stale) asset.id]).catchError((
+          Object error,
+        ) {
+          fbxLog('Could not drop AppleDouble rows: $error');
+        }),
+      );
+      fbxLog('Dropped ${stale.length} AppleDouble entries from the catalog.');
+    }
+
     return PersistedCatalog(assets: assets, sourceRoots: sourceRoots);
   }
 
+  /// Rebuilds every asset id in the content-independent v2 format and
+  /// remaps project membership onto the new ids.
+  ///
+  /// Runs inside sqflite's upgrade transaction, so catalog_assets and
+  /// project_assets cannot end up disagreeing: either both are rewritten or
+  /// neither is. Membership rows whose asset is already gone are dropped and
+  /// counted rather than left dangling.
+  static Future<void> _migrateAssetIdsToV3(Database db) async {
+    final rows = await db.query(
+      'catalog_assets',
+      columns: ['id', 'source_root', 'source_name', 'relative_path'],
+    );
+
+    final newIdByOldId = <String, String>{};
+    final claimedNewIds = <String>{};
+    var droppedDuplicates = 0;
+
+    for (final row in rows) {
+      final oldId = row['id'] as String;
+      final newId = buildAssetId(
+        sourceRoot: row['source_root'] as String,
+        relativePath: assetIdRelativePathFromStored(
+          relativePath: row['relative_path'] as String,
+          sourceName: row['source_name'] as String,
+        ),
+      );
+      if (!claimedNewIds.add(newId)) {
+        // Two rows describing the same place: keep the first, drop the rest.
+        await db.delete('catalog_assets', where: 'id = ?', whereArgs: [oldId]);
+        droppedDuplicates += 1;
+        continue;
+      }
+      newIdByOldId[oldId] = newId;
+    }
+
+    // Batched: a real catalog is tens of thousands of rows, and one statement
+    // per row turned this into a visible freeze on first launch.
+    final updates = db.batch();
+    for (final entry in newIdByOldId.entries) {
+      if (entry.key == entry.value) continue;
+      updates.rawUpdate('UPDATE catalog_assets SET id = ? WHERE id = ?', [
+        entry.value,
+        entry.key,
+      ]);
+    }
+    await updates.commit(noResult: true);
+
+    final membership = await db.query('project_assets');
+    await db.delete('project_assets');
+    var droppedMembership = 0;
+    final inserts = db.batch();
+    for (final row in membership) {
+      final mapped = newIdByOldId[row['asset_id'] as String];
+      if (mapped == null) {
+        droppedMembership += 1;
+        continue;
+      }
+      inserts.insert('project_assets', {
+        'project_id': row['project_id'],
+        'asset_id': mapped,
+      }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
+    await inserts.commit(noResult: true);
+
+    fbxLog(
+      'Migrated ${newIdByOldId.length} asset ids to v3 '
+      '(dropped $droppedDuplicates duplicate assets, '
+      '$droppedMembership orphaned membership rows).',
+    );
+  }
+
+  /// Releases the handle so a later [initialize] can open a different file.
+  /// Used by tests, which each need their own database.
+  Future<void> close() async {
+    final db = _db;
+    _db = null;
+    await db?.close();
+  }
+
+  Map<String, Object?> _rowFor(AssetItem asset) => {
+    'id': asset.id,
+    'name': asset.name,
+    'path': asset.path,
+    'relative_path': asset.relativePath,
+    'source_root': asset.sourceRoot,
+    'source_name': asset.sourceName,
+    'ext': asset.ext,
+    'type': asset.type,
+    'size': asset.size,
+    'modified_ms': asset.modified.millisecondsSinceEpoch,
+    'tags_json': jsonEncode(asset.tags),
+    'ignored': asset.ignored ? 1 : 0,
+    'model_kind': asset.modelKind,
+    'referenced_by_model': asset.referencedByModel ? 1 : 0,
+  };
+
+  /// Full replace. Only correct after a scan, where the catalog really did
+  /// change wholesale - never for a single-field edit.
   Future<void> saveCatalog({
     required List<AssetItem> assets,
     required List<String> sourceRoots,
@@ -4595,25 +10512,143 @@ class AssetAtlasDatabase {
     await db.transaction((txn) async {
       await txn.delete('catalog_assets');
       await txn.delete('catalog_sources');
+      final batch = txn.batch();
       for (final rootPath in sourceRoots) {
-        await txn.insert('catalog_sources', {'root_path': rootPath});
+        batch.insert('catalog_sources', {'root_path': rootPath});
       }
       for (final asset in assets) {
-        await txn.insert('catalog_assets', {
-          'id': asset.id,
-          'name': asset.name,
-          'path': asset.path,
-          'relative_path': asset.relativePath,
-          'source_root': asset.sourceRoot,
-          'source_name': asset.sourceName,
-          'ext': asset.ext,
-          'type': asset.type,
-          'size': asset.size,
-          'modified_ms': asset.modified.millisecondsSinceEpoch,
-          'tags_json': jsonEncode(asset.tags),
-          'ignored': asset.ignored ? 1 : 0,
-        });
+        batch.insert(
+          'catalog_assets',
+          _rowFor(asset),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
       }
+      // noResult: collecting per-row results for a 100k-row catalog allocates
+      // a list nobody reads.
+      await batch.commit(noResult: true);
+    });
+  }
+
+  /// One row, one statement. Toggling an ignore flag used to delete and
+  /// reinsert the entire catalog.
+  Future<void> updateAssetIgnored({
+    required String assetId,
+    required bool ignored,
+  }) async {
+    await initialize();
+    await _db!.update(
+      'catalog_assets',
+      {'ignored': ignored ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [assetId],
+    );
+  }
+
+  Future<void> updateAssetModelKind({
+    required String assetId,
+    required String modelKind,
+  }) async {
+    await initialize();
+    await _db!.update(
+      'catalog_assets',
+      {'model_kind': modelKind},
+      where: 'id = ?',
+      whereArgs: [assetId],
+    );
+  }
+
+  /// Writes a chunk of classifications in one transaction. Doing this per
+  /// asset meant tens of thousands of separate writes.
+  Future<void> updateAssetModelKinds(Map<String, String> kindByAssetId) async {
+    if (kindByAssetId.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final entry in kindByAssetId.entries) {
+        batch.update(
+          'catalog_assets',
+          {'model_kind': entry.value},
+          where: 'id = ?',
+          whereArgs: [entry.key],
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  /// Records that a model uses these images, so they read as textures rather
+  /// than as ordinary pictures.
+  Future<void> markAssetsReferencedByModel(List<String> assetIds) async {
+    if (assetIds.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in assetIds) {
+        batch.update(
+          'catalog_assets',
+          {'referenced_by_model': 1},
+          where: 'id = ?',
+          whereArgs: [id],
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  Future<void> deleteAssetsByIds(List<String> assetIds) async {
+    if (assetIds.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final id in assetIds) {
+        batch.delete('catalog_assets', where: 'id = ?', whereArgs: [id]);
+        batch.delete('project_assets', where: 'asset_id = ?', whereArgs: [id]);
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  Future<void> upsertAssets(List<AssetItem> assets) async {
+    if (assets.isEmpty) return;
+    await initialize();
+    await _db!.transaction((txn) async {
+      final batch = txn.batch();
+      for (final asset in assets) {
+        batch.insert(
+          'catalog_assets',
+          _rowFor(asset),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      await batch.commit(noResult: true);
+    });
+  }
+
+  Future<void> deleteAssetsForSourceRoot(String rootPath) async {
+    await initialize();
+    await _db!.transaction((txn) async {
+      await txn.delete(
+        'catalog_assets',
+        where: 'source_root = ?',
+        whereArgs: [rootPath],
+      );
+      await txn.delete(
+        'catalog_sources',
+        where: 'root_path = ?',
+        whereArgs: [rootPath],
+      );
+    });
+  }
+
+  Future<void> replaceSourceRoots(List<String> rootPaths) async {
+    await initialize();
+    await _db!.transaction((txn) async {
+      await txn.delete('catalog_sources');
+      final batch = txn.batch();
+      for (final rootPath in rootPaths) {
+        batch.insert('catalog_sources', {'root_path': rootPath});
+      }
+      await batch.commit(noResult: true);
     });
   }
 
@@ -4753,3 +10788,4 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+

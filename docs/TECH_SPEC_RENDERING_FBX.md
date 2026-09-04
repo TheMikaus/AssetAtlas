@@ -30,6 +30,57 @@ Resolution order for referenced textures:
 
 If no usable texture exists, fallback material logic applies (including checker fallback in eligible cases).
 
+## Flat Palette Faces
+
+Palette-atlas content (Synty and similar) maps an entire face to one texel, so
+the face's UV triangle has zero area. These are detected and filled with the
+sampled texel colour rather than drawn through the affine texture path, which
+cannot invert a degenerate transform. Consecutive flat faces are batched into a
+single `drawVertices` call with per-vertex colours.
+
+This is not an optimisation detail: before it existed, every such face rendered
+as the material's untextured base colour, which is most of a low-poly model.
+
+## Normal Maps
+
+The importer emits each material's normal map separately (`normalTexture`), and
+it is resolved and read back to CPU like the base texture. Shading applies it
+per face: a tangent frame is built from the triangle's position and UV
+derivatives, the sampled tangent-space normal is rotated into view space, and
+the diffuse term uses that instead of the geometric normal.
+
+Two honest limits:
+
+- This is per face, not per pixel. A normal map can tilt a whole triangle; it
+  cannot add detail inside one. Per-pixel would need a fragment shader.
+- Faces pinned to a single texel (the palette case) have no UV gradient, so
+  there is no tangent frame and they keep their geometric normal.
+
+The viewer only offers the toggle when the model actually carries a normal map.
+Note that palette-atlas packs such as Synty ship none: a 60-model sample of the
+reference catalog found zero.
+
+## Depth Buffer
+
+Filled rendering goes through `rasterizeMesh`, a software rasteriser with a
+per-pixel depth buffer, rather than through the canvas painter.
+
+Sorting whole faces and painting back to front cannot resolve geometry whose
+depth order changes *within* a face: interpenetrating surfaces, and the
+coplanar detail that low-poly packs are full of (window frames flush with a
+wall, vents flush with a roof). Those appeared as notches, steps and stray
+slivers along polygon edges. The rasteriser also gives perspective-correct
+texture sampling and per-pixel normal mapping, neither of which the
+triangle-at-a-time canvas path could do.
+
+Wireframe still uses the canvas painter: it draws lines, where per-pixel depth
+buys nothing.
+
+The cost is CPU fill rate. Measured at 900x700 on this content: ~40ms for a
+4,180-face building, ~79ms for a 227-face one (large triangles, so fill-rate
+bound rather than triangle bound). The preview renders at half resolution while
+the camera is moving and re-renders sharp ~180ms after it stops.
+
 ## Rendering Modes
 
 - `Textured`

@@ -55,6 +55,8 @@ struct MaterialInfo {
   int shader_type;
   std::string shading_model;
   std::vector<std::string> textures;
+  std::string normal_texture;
+  std::string emissive_texture;
   std::string uv_set;
   std::vector<uint8_t> embedded_texture;
 };
@@ -75,7 +77,16 @@ static void print_json_string(const char* text) {
       case '\n': printf("\\n"); break;
       case '\r': printf("\\r"); break;
       case '\t': printf("\\t"); break;
-      default: putchar(*p); break;
+      default:
+        // Control bytes are illegal raw in JSON. Bytes >= 0x80 must pass
+        // through untouched: they are UTF-8 continuation bytes and escaping
+        // them individually would corrupt the text.
+        if (static_cast<unsigned char>(*p) < 0x20) {
+          printf("\\u%04x", static_cast<unsigned char>(*p));
+        } else {
+          putchar(*p);
+        }
+        break;
     }
   }
   putchar('"');
@@ -84,6 +95,158 @@ static void print_json_string(const char* text) {
 static std::string string_from_ufbx(ufbx_string value) {
   if (!value.data || value.length == 0) return std::string();
   return std::string(value.data, value.length);
+}
+
+// A bone's path from the root, as "Hips/Spine_01/Clavicle_L/...".
+//
+// Bone *names* are not unique in these rigs: the left and right hands both
+// carry `Finger_03`, and ufbx disambiguates the second one it meets as
+// `Finger_03_1`. Which hand gets the suffix depends on node order, and that
+// order differs between a character file and a clip file -- so joining two
+// rigs on the bare name silently swapped left and right fingers. The chain
+// down from the root does not have that problem.
+static std::string bone_path(const ufbx_node* node) {
+  std::string path;
+  for (const ufbx_node* n = node; n && !n->is_root; n = n->parent) {
+    std::string name = string_from_ufbx(n->name);
+    path = path.empty() ? name : name + "/" + path;
+  }
+  return path;
+}
+
+// How many poses to sample out of a clip.
+//
+// A preview only has to read as motion, and every frame costs a full scene
+// evaluation plus 3 floats per bone in the JSON. 30 per second up to 120 keeps
+// a two-second locomotion clip whole and bounds a long one.
+static const double kSkeletonSampleRate = 30.0;
+static const size_t kMaxSkeletonFrames = 120;
+
+// Emits the skeleton and its motion: the bone hierarchy once, then the world
+// position of every bone at each sampled time.
+//
+// Positions rather than transforms because that is all a stick-figure preview
+// draws -- a line from each bone to its parent. ufbx evaluates the whole
+// hierarchy, so no curve interpolation or parent composition happens here.
+static void print_skeleton(ufbx_scene* scene, double duration) {
+  std::vector<ufbx_node*> bones;
+  for (size_t i = 0; i < scene->nodes.count; ++i) {
+    ufbx_node* node = scene->nodes.data[i];
+    if (!node || node->is_root) continue;
+    if (node->bone || node->attrib_type == UFBX_ELEMENT_BONE) {
+      bones.push_back(node);
+    }
+  }
+  // A rig exported without bone attributes still has the hierarchy; fall back
+  // to every non-root node so such a file is not silently empty.
+  if (bones.empty()) {
+    for (size_t i = 0; i < scene->nodes.count; ++i) {
+      ufbx_node* node = scene->nodes.data[i];
+      if (node && !node->is_root) bones.push_back(node);
+    }
+  }
+
+  printf(",\"skeleton\":{\"bones\":[");
+  for (size_t i = 0; i < bones.size(); ++i) {
+    if (i) putchar(0x2C);
+    printf("{\"name\":");
+    print_json_string(string_from_ufbx(bones[i]->name).c_str());
+    printf(",\"path\":");
+    print_json_string(bone_path(bones[i]).c_str());
+    // Index into this same list, or -1 for a root. Resolved here because the
+    // consumer would otherwise have to match names a second time.
+    int parent_index = -1;
+    const ufbx_node* parent = bones[i]->parent;
+    if (parent) {
+      for (size_t j = 0; j < bones.size(); ++j) {
+        if (bones[j] == parent) {
+          parent_index = (int)j;
+          break;
+        }
+      }
+    }
+    printf(",\"parent\":%d}", parent_index);
+  }
+  printf("]");
+
+  size_t frame_count = 1;
+  if (duration > 0.0) {
+    frame_count = (size_t)(duration * kSkeletonSampleRate) + 1;
+    if (frame_count > kMaxSkeletonFrames) frame_count = kMaxSkeletonFrames;
+    if (frame_count < 2) frame_count = 2;
+  }
+
+  const ufbx_anim* anim = scene->anim;
+  double time_begin = 0.0;
+  if (scene->anim_stacks.count > 0 && scene->anim_stacks.data[0]) {
+    time_begin = scene->anim_stacks.data[0]->time_begin;
+  }
+
+  printf(",\"frameRate\":%.6g", frame_count > 1 && duration > 0.0
+    ? (double)(frame_count - 1) / duration
+    : kSkeletonSampleRate);
+  printf(",\"stride\":12");
+
+  // The rig's own rest pose, unevaluated.
+  //
+  // A clip and a character are different files whose rigs need not be posed
+  // the same way at rest, so a clip's absolute bone transforms cannot be
+  // applied to a character directly -- doing that threw the arms over the
+  // head. What transfers is the motion *relative* to each rig's own rest, and
+  // this is the half of that the clip has to supply.
+  printf(",\"rest\":[");
+  for (size_t i = 0; i < bones.size(); ++i) {
+    const ufbx_matrix m = bones[i]->node_to_world;
+    if (i) putchar(0x2C);
+    printf("%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+      m.cols[0].x, m.cols[0].y, m.cols[0].z,
+      m.cols[1].x, m.cols[1].y, m.cols[1].z,
+      m.cols[2].x, m.cols[2].y, m.cols[2].z,
+      m.cols[3].x, m.cols[3].y, m.cols[3].z);
+  }
+  printf("]");
+
+  printf(",\"frames\":[");
+  for (size_t frame = 0; frame < frame_count; ++frame) {
+    const double t = frame_count > 1
+      ? time_begin + duration * ((double)frame / (double)(frame_count - 1))
+      : time_begin;
+    if (frame) putchar(0x2C);
+    putchar(0x5B);
+    ufbx_error eval_error;
+    ufbx_scene* posed = ufbx_evaluate_scene(scene, anim, t, NULL, &eval_error);
+    for (size_t i = 0; i < bones.size(); ++i) {
+      ufbx_node* node = bones[i];
+      if (posed && node->element_id < posed->elements.count) {
+        ufbx_element* element = posed->elements.data[node->element_id];
+        if (element && element->type == UFBX_ELEMENT_NODE) {
+          node = (ufbx_node*)element;
+        }
+      }
+      // Column-major 3x4: the three basis columns then the translation.
+      // The translation is the bone's world position, which is all the
+      // stick-figure view reads.
+      const ufbx_matrix m = node->node_to_world;
+      if (i) putchar(0x2C);
+      printf("%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+        m.cols[0].x, m.cols[0].y, m.cols[0].z,
+        m.cols[1].x, m.cols[1].y, m.cols[1].z,
+        m.cols[2].x, m.cols[2].y, m.cols[2].z,
+        m.cols[3].x, m.cols[3].y, m.cols[3].z);
+    }
+    if (posed) ufbx_free_scene(posed);
+    putchar(0x5D);
+  }
+  printf("]}");
+}
+
+static bool debug_spaces_enabled() {
+  size_t len = 0;
+  char* value = nullptr;
+  if (_dupenv_s(&value, &len, "ASSET_ATLAS_DEBUG_SPACES") != 0) return false;
+  const bool on = value != nullptr;
+  free(value);
+  return on;
 }
 
 static std::string texture_path(ufbx_texture* texture) {
@@ -148,12 +311,25 @@ int main(int argc, char** argv) {
   }
 
   bool read_from_stdin = false;
+  bool probe_only = false;
   std::string input_label;
-  if (std::string(argv[1]) == "--stdin") {
-    read_from_stdin = true;
-    input_label = argc >= 3 ? argv[2] : "<stdin>";
-  } else {
-    input_label = argv[1];
+  const char* file_argument = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--stdin") {
+      read_from_stdin = true;
+    } else if (arg == "--probe") {
+      // Classification only: skip geometry extraction and the JSON
+      // payload, which dominate cost when sweeping a whole catalog.
+      probe_only = true;
+    } else if (!file_argument) {
+      file_argument = argv[i];
+    }
+  }
+  input_label = file_argument ? file_argument : "<stdin>";
+  if (!read_from_stdin && !file_argument) {
+    fprintf(stderr, "Usage: asset_atlas_mesh_importer [--probe] <model.fbx> | --stdin [--probe] <label>\n");
+    return 2;
   }
 
   ufbx_load_opts opts = {};
@@ -161,6 +337,12 @@ int main(int argc, char** argv) {
   opts.target_axes.up = UFBX_COORDINATE_AXIS_POSITIVE_Y;
   opts.target_axes.front = UFBX_COORDINATE_AXIS_POSITIVE_Z;
   opts.target_unit_meters = 1.0f;
+  // Bake the unit conversion into the geometry rather than into a root
+  // transform. The default leaves mesh vertices in the file's own units while
+  // the skin cluster bind matrices come back converted, so a character's
+  // vertices sat at 0.88 while its bone origins sat at 166 -- the same rig,
+  // a hundred times apart.
+  opts.space_conversion = UFBX_SPACE_CONVERSION_MODIFY_GEOMETRY;
 
   ufbx_error error;
   ufbx_scene* scene = nullptr;
@@ -188,11 +370,42 @@ int main(int argc, char** argv) {
     }
     scene = ufbx_load_memory(input_bytes.data(), input_bytes.size(), &opts, &error);
   } else {
-    scene = ufbx_load_file(argv[1], &opts, &error);
+    scene = ufbx_load_file(file_argument, &opts, &error);
   }
   if (!scene) {
     fprintf(stderr, "ufbx failed: %s\n", error.description.data ? error.description.data : "unknown error");
     return 1;
+  }
+
+  if (probe_only) {
+    size_t total_faces = 0;
+    for (size_t i = 0; i < scene->meshes.count; ++i) {
+      const ufbx_mesh* mesh = scene->meshes.data[i];
+      if (mesh) total_faces += mesh->num_faces;
+    }
+    if (total_faces == 0 &&
+        (scene->anim_stacks.count > 0 || scene->bones.count > 0)) {
+      double duration = 0.0;
+      for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+        const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+        if (!stack) continue;
+        const double length = stack->time_end - stack->time_begin;
+        if (length > duration) duration = length;
+      }
+      printf("{\"kind\":\"animation\",\"animationStacks\":%zu", scene->anim_stacks.count);
+      printf(",\"bones\":%zu", scene->bones.count);
+      printf(",\"durationSeconds\":%.6g}", duration);
+      ufbx_free_scene(scene);
+      return 0;
+    }
+    if (total_faces == 0) {
+      fprintf(stderr, "No renderable mesh geometry found.\n");
+      ufbx_free_scene(scene);
+      return 1;
+    }
+    printf("{\"kind\":\"mesh\",\"faces\":%zu}", total_faces);
+    ufbx_free_scene(scene);
+    return 0;
   }
 
   std::vector<Vec3> vertices;
@@ -284,6 +497,19 @@ int main(int argc, char** argv) {
     add_texture_path(info.textures, material->fbx.diffuse_color.texture);
     add_texture_path(info.textures, material->pbr.normal_map.texture);
     add_texture_path(info.textures, material->fbx.normal_map.texture);
+    // Named separately as well: the renderer has to know which of a
+    // material's textures is the normal map, not just that one exists.
+    {
+      ufbx_texture* normal_texture = material->pbr.normal_map.texture;
+      if (!normal_texture) normal_texture = material->fbx.normal_map.texture;
+      if (!normal_texture) normal_texture = material->fbx.bump.texture;
+      if (normal_texture) info.normal_texture = texture_path(normal_texture);
+    }
+    {
+      ufbx_texture* emissive_texture = material->pbr.emission_color.texture;
+      if (!emissive_texture) emissive_texture = material->fbx.emission_color.texture;
+      if (emissive_texture) info.emissive_texture = texture_path(emissive_texture);
+    }
     add_texture_path(info.textures, material->pbr.emission_color.texture);
     add_texture_path(info.textures, material->fbx.emission_color.texture);
     add_texture_path(info.textures, material->pbr.opacity.texture);
@@ -317,8 +543,93 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Skin data, gathered across every mesh in the file.
+  //
+  // `skin_bone_names` is the join key: a clip and a character are separate
+  // files, and the Synty rigs use identical bone names, so a name is what
+  // connects an animated bone to the vertices it moves.
+  std::vector<std::string> skin_bone_names;
+  std::vector<std::string> skin_bone_paths;
+  // `geometry_to_bone` composed with the inverse of the mesh's own
+  // geometry-to-world, because the vertices emitted below are already in world
+  // space. Without that second term a posed character lands in the wrong place.
+  std::vector<ufbx_matrix> skin_bind_inverse;
+  // Four influences per vertex as (bone, weight); zero-weight padded. Four is
+  // what game rigs use and what Synty's export carries.
+  std::vector<std::array<double, 8>> skin_vertices;
+  // Per emitted vertex, an index into `skin_vertices`, or -1.
+  std::vector<int> vertex_skin;
+
+  auto skin_bone_index = [&](ufbx_skin_cluster* cluster,
+                             const ufbx_matrix* geometry_to_world) -> int {
+    if (!cluster || !cluster->bone_node) return -1;
+    const std::string name = string_from_ufbx(cluster->bone_node->name);
+    const std::string path = bone_path(cluster->bone_node);
+    for (size_t i = 0; i < skin_bone_paths.size(); ++i) {
+      if (skin_bone_paths[i] == path) return (int)i;
+    }
+    // `geometry_to_bone` maps the mesh's own geometry space to the bone. The
+    // vertices below are emitted in world space, so the inverse of the mesh's
+    // geometry-to-world has to come first -- a Synty character's geometry is
+    // centred on the origin while its skeleton stands on the ground, and
+    // without this term the two are 0.88m apart.
+    ufbx_matrix bind = cluster->geometry_to_bone;
+    if (geometry_to_world) {
+      const ufbx_matrix world_to_geometry = ufbx_matrix_invert(geometry_to_world);
+      bind = ufbx_matrix_mul(&bind, &world_to_geometry);
+    }
+    skin_bone_names.push_back(name);
+    skin_bone_paths.push_back(path);
+    skin_bind_inverse.push_back(bind);
+    return (int)skin_bone_names.size() - 1;
+  };
+
   auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world) {
     if (!mesh || mesh->num_faces == 0) return;
+    if (debug_spaces_enabled()) {
+      if (geometry_to_world) {
+        const ufbx_matrix& g = *geometry_to_world;
+        fprintf(stderr, "geometry_to_world translation (%.4f,%.4f,%.4f) scale x %.4f\n",
+          g.cols[3].x, g.cols[3].y, g.cols[3].z, g.cols[0].x);
+      } else {
+        fprintf(stderr, "geometry_to_world: none\n");
+      }
+      double lo = 1e30, hi = -1e30;
+      for (size_t v = 0; v < mesh->num_vertices; ++v) {
+        const ufbx_vec3 p = mesh->vertices.data[v];
+        if (p.y < lo) lo = p.y;
+        if (p.y > hi) hi = p.y;
+      }
+      fprintf(stderr, "raw mesh y %.4f..%.4f, skin deformers %zu\n",
+        lo, hi, mesh->skin_deformers.count);
+    }
+
+    // Build this mesh's vertex influence table before walking its faces, so a
+    // corner only has to look up its vertex.
+    ufbx_skin_deformer* skin = mesh->skin_deformers.count > 0
+      ? mesh->skin_deformers.data[0]
+      : NULL;
+    const size_t skin_base = skin_vertices.size();
+    if (skin) {
+      for (size_t v = 0; v < mesh->num_vertices; ++v) {
+        std::array<double, 8> influences = {0, 0, 0, 0, 0, 0, 0, 0};
+        if (v < skin->vertices.count) {
+          const ufbx_skin_vertex sv = skin->vertices.data[v];
+          const size_t take = sv.num_weights < 4 ? sv.num_weights : 4;
+          for (size_t w = 0; w < take; ++w) {
+            const ufbx_skin_weight weight = skin->weights.data[sv.weight_begin + w];
+            ufbx_skin_cluster* cluster = weight.cluster_index < skin->clusters.count
+              ? skin->clusters.data[weight.cluster_index]
+              : NULL;
+            const int bone = skin_bone_index(cluster, geometry_to_world);
+            if (bone < 0) continue;
+            influences[w * 2 + 0] = (double)bone;
+            influences[w * 2 + 1] = weight.weight;
+          }
+        }
+        skin_vertices.push_back(influences);
+      }
+    }
 
     std::vector<unsigned int> tri_indices(mesh->max_face_triangles * 3);
     for (size_t face_index = 0; face_index < mesh->num_faces; ++face_index) {
@@ -345,6 +656,12 @@ int main(int argc, char** argv) {
             p = ufbx_transform_position(geometry_to_world, p);
           }
           vertices.push_back({p.x, p.y, p.z});
+          if (skin && vertex_index < mesh->vertex_indices.count) {
+            vertex_skin.push_back(
+              (int)(skin_base + mesh->vertex_indices.data[vertex_index]));
+          } else {
+            vertex_skin.push_back(-1);
+          }
           Vec4 color = {1.0, 1.0, 1.0, 1.0};
           if (mesh->vertex_color.exists) {
             ufbx_vec4 c = ufbx_get_vertex_vec4(&mesh->vertex_color, vertex_index);
@@ -404,14 +721,34 @@ int main(int argc, char** argv) {
 
   if (vertices.empty() || faces.empty()) {
     if (scene->anim_stacks.count > 0 || scene->bones.count > 0) {
-      fprintf(
-        stderr,
-        "FBX contains animation or skeleton data but no renderable mesh geometry. "
-        "Animation-only preview is not implemented yet.\n"
-      );
-    } else {
-      fprintf(stderr, "No renderable mesh geometry found.\n");
+      // Animation-only content is a legitimate result, not a failure.
+      // Report it as such so the catalog can classify the asset instead
+      // of showing an import error.
+      double duration = 0.0;
+      for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+        const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+        if (!stack) continue;
+        const double length = stack->time_end - stack->time_begin;
+        if (length > duration) duration = length;
+      }
+      printf("{\"kind\":\"animation\",\"name\":");
+      print_json_string(input_label.c_str());
+      printf(",\"animationStacks\":%zu", scene->anim_stacks.count);
+      printf(",\"bones\":%zu", scene->bones.count);
+      printf(",\"durationSeconds\":%.6g", duration);
+      printf(",\"animationNames\":[");
+      for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+        const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+        if (i) putchar(0x2C);
+        print_json_string(stack ? string_from_ufbx(stack->name).c_str() : "");
+      }
+      printf("]");
+      print_skeleton(scene, duration);
+      printf("}");
+      ufbx_free_scene(scene);
+      return 0;
     }
+    fprintf(stderr, "No renderable mesh geometry found.\n");
     ufbx_free_scene(scene);
     return 1;
   }
@@ -435,7 +772,30 @@ int main(int argc, char** argv) {
     v.z = (v.z - center.z) * scale;
   }
 
-  printf("{\"name\":");
+  // The vertices above have just been recentred and rescaled to fit the
+  // viewer's unit box, but the bind matrices were built against the file's
+  // own coordinates. Left alone the two disagree -- a character whose mesh
+  // ends up centred on the origin while its skeleton still stands on the
+  // ground, which tears the model apart when a clip poses it.
+  //
+  // Fold the inverse of that normalisation into each bind matrix, so it maps
+  // the *emitted* vertices into bone space. The consumer applies the forward
+  // normalisation again after skinning; `normalizeCenter` and
+  // `normalizeScale` below are what it needs to do that.
+  if (!skin_bind_inverse.empty()) {
+    ufbx_matrix denormalize = ufbx_identity_matrix;
+    denormalize.cols[0].x = 1.0 / scale;
+    denormalize.cols[1].y = 1.0 / scale;
+    denormalize.cols[2].z = 1.0 / scale;
+    denormalize.cols[3].x = center.x;
+    denormalize.cols[3].y = center.y;
+    denormalize.cols[3].z = center.z;
+    for (ufbx_matrix& bind : skin_bind_inverse) {
+      bind = ufbx_matrix_mul(&bind, &denormalize);
+    }
+  }
+
+  printf("{\"kind\":\"mesh\",\"name\":");
   print_json_string(input_label.c_str());
   printf(",\"vertices\":[");
   for (size_t i = 0; i < vertices.size(); ++i) {
@@ -471,6 +831,10 @@ int main(int argc, char** argv) {
     printf(",\"shaderType\":%d", material.shader_type);
     printf(",\"shadingModel\":");
     print_json_string(material.shading_model.c_str());
+    printf(",\"emissiveTexture\":");
+    print_json_string(material.emissive_texture.c_str());
+    printf(",\"normalTexture\":");
+    print_json_string(material.normal_texture.c_str());
     printf(",\"uvSet\":");
     print_json_string(material.uv_set.c_str());
     printf(",\"embeddedTextureBase64\":");
@@ -482,7 +846,45 @@ int main(int argc, char** argv) {
     }
     printf("]}");
   }
-  printf("],\"uvSets\":[");
+  if (!skin_bone_names.empty()) {
+    printf("],\"skin\":{\"bones\":[");
+    for (size_t i = 0; i < skin_bone_names.size(); ++i) {
+      if (i) putchar(0x2C);
+      printf("{\"name\":");
+      print_json_string(skin_bone_names[i].c_str());
+      printf(",\"path\":");
+      print_json_string(skin_bone_paths[i].c_str());
+      const ufbx_matrix m = skin_bind_inverse[i];
+      printf(",\"bindInverse\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]}",
+        m.cols[0].x, m.cols[0].y, m.cols[0].z,
+        m.cols[1].x, m.cols[1].y, m.cols[1].z,
+        m.cols[2].x, m.cols[2].y, m.cols[2].z,
+        m.cols[3].x, m.cols[3].y, m.cols[3].z);
+    }
+    printf("],\"vertices\":[");
+    for (size_t i = 0; i < skin_vertices.size(); ++i) {
+      if (i) putchar(0x2C);
+      const std::array<double, 8>& w = skin_vertices[i];
+      printf("%d,%.5g,%d,%.5g,%d,%.5g,%d,%.5g",
+        (int)w[0], w[1], (int)w[2], w[3],
+        (int)w[4], w[5], (int)w[6], w[7]);
+    }
+    printf("],\"normalizeCenter\":[%.9g,%.9g,%.9g],\"normalizeScale\":%.9g",
+      center.x, center.y, center.z, scale);
+    printf(",\"vertexSkin\":[");
+    for (size_t i = 0; i < vertex_skin.size(); ++i) {
+      if (i) putchar(0x2C);
+      printf("%d", vertex_skin[i]);
+    }
+    printf("]}");
+    // A skinned mesh needs its own rest pose too: it is the reference a clip's
+    // motion is applied against, and without it there is nothing to check the
+    // skinning maths against.
+    print_skeleton(scene, 0.0);
+    printf(",\"uvSets\":[");
+  } else {
+    printf("],\"uvSets\":[");
+  }
   for (size_t uv_set_index = 0; uv_set_index < uv_set_names.size(); ++uv_set_index) {
     if (uv_set_index) putchar(',');
     printf("{\"name\":");

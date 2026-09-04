@@ -79,8 +79,9 @@ void main() {
       }
     });
 
-    final copied = await copyAssetsToTarget(selected, target.path);
-    expect(copied, selected.length);
+    final report = await copyAssetsToTarget(selected, target.path);
+    expect(report.copiedCount, selected.length);
+    expect(report.failedCount, 0);
     expect(
       File(
         '${target.path}${Platform.pathSeparator}textures${Platform.pathSeparator}albedo.png',

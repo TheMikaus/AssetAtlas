@@ -3,6 +3,12 @@
 Assessed against `work/asset_atlas_native` at version 1.1.0+4, commit `e31504d`.
 Baseline verified before writing: `flutter analyze` → *No issues found*; `flutter test` → *9 passing, ~2s*.
 
+> **Status:** sections 1 and 2 have since been worked through — see the status column in
+> [`docs/tasks/README.md`](tasks/README.md). Everything below is kept as written, because it
+> is the record of *why* each change was made. Still open: 2.5 (scanning on the UI isolate),
+> 2.6 (filter allocation and the side effect in `filteredAssets`), all of section 3, and the
+> `drawVertices` batching split out as TASK-10.
+
 The app works, and the hard part — a real FBX pipeline with texture relinking — is done and is
 genuinely the valuable asset here. What follows is where it will hurt as the catalog grows past a
 toy corpus, ordered by how much damage each item does.
