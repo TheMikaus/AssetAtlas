@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: work/asset_atlas_native
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Pinned to the version the project is developed against
+          # (flutter --version on the maintainer machine, Dart 3.12.2 —
+          # pubspec.yaml requires sdk ^3.12.2). Bump deliberately.
+          flutter-version: '3.44.4'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - run: flutter analyze
+
+      # Must run before the tests: test/native_fbx_importer_test.dart looks for
+      # build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe and
+      # SKIPS ITSELF (reporting green) when it is absent. Building here is what
+      # makes the native FBX coverage real.
+      - run: flutter build windows --release
+
+      - run: flutter test

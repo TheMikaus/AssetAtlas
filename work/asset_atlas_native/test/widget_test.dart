@@ -15,7 +15,7 @@ void main() {
     await tester.pumpWidget(const AssetAtlasApp(enablePersistence: false));
     await tester.pumpAndSettle();
 
-    expect(find.text('Asset Atlas Native · v1.1.0'), findsOneWidget);
+    expect(find.text('Asset Atlas Native · v$appVersion'), findsOneWidget);
     expect(find.text('Scan folder'), findsOneWidget);
     await tester.scrollUntilVisible(
       find.text('Hide ZIP contents'),

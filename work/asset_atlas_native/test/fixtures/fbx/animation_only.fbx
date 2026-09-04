@@ -1,0 +1,91 @@
+; FBX 7.4.0 project file
+; Hand-authored fixture: a skeleton and one animation take, with no geometry.
+; Covers the "animation clip" classification path, so no third-party asset
+; needs to be committed to exercise it.
+FBXHeaderExtension:  {
+    FBXHeaderVersion: 1003
+    FBXVersion: 7400
+}
+GlobalSettings:  {
+    Version: 1000
+    Properties70:  {
+        P: "UpAxis", "int", "Integer", "",1
+        P: "UpAxisSign", "int", "Integer", "",1
+        P: "FrontAxis", "int", "Integer", "",2
+        P: "FrontAxisSign", "int", "Integer", "",1
+        P: "CoordAxis", "int", "Integer", "",0
+        P: "CoordAxisSign", "int", "Integer", "",1
+        P: "UnitScaleFactor", "double", "Number", "",100
+        P: "TimeSpanStart", "KTime", "Time", "",0
+        P: "TimeSpanStop", "KTime", "Time", "",46186158000
+    }
+}
+Objects:  {
+    NodeAttribute: 100, "NodeAttribute::RootBone", "LimbNode" {
+        TypeFlags: "Skeleton"
+    }
+    NodeAttribute: 101, "NodeAttribute::ChildBone", "LimbNode" {
+        TypeFlags: "Skeleton"
+    }
+    Model: 200, "Model::RootBone", "LimbNode" {
+        Version: 232
+        Properties70:  {
+            P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+        }
+        Shading: T
+        Culling: "CullingOff"
+    }
+    Model: 201, "Model::ChildBone", "LimbNode" {
+        Version: 232
+        Properties70:  {
+            P: "Lcl Translation", "Lcl Translation", "", "A",0,10,0
+        }
+        Shading: T
+        Culling: "CullingOff"
+    }
+    AnimationStack: 300, "AnimStack::Idle_Standing", "" {
+        Properties70:  {
+            P: "LocalStart", "KTime", "Time", "",0
+            P: "LocalStop", "KTime", "Time", "",46186158000
+            P: "ReferenceStart", "KTime", "Time", "",0
+            P: "ReferenceStop", "KTime", "Time", "",46186158000
+        }
+    }
+    AnimationLayer: 400, "AnimLayer::BaseLayer", "" {
+    }
+    AnimationCurveNode: 500, "AnimCurveNode::T", "" {
+        Properties70:  {
+            P: "d|X", "Number", "", "A",0
+            P: "d|Y", "Number", "", "A",10
+            P: "d|Z", "Number", "", "A",0
+        }
+    }
+    AnimationCurve: 600, "AnimCurve::", "" {
+        Default: 10
+        KeyVer: 4009
+        KeyTime: *2 {
+            a: 0,46186158000
+        }
+        KeyValueFloat: *2 {
+            a: 10,14
+        }
+        KeyAttrFlags: *1 {
+            a: 24836
+        }
+        KeyAttrDataFloat: *4 {
+            a: 0,0,218434821,0
+        }
+        KeyAttrRefCount: *1 {
+            a: 2
+        }
+    }
+}
+Connections:  {
+    C: "OO",100,200
+    C: "OO",101,201
+    C: "OO",201,200
+    C: "OO",200,0
+    C: "OO",400,300
+    C: "OO",500,400
+    C: "OP",600,500,"d|Y"
+}
