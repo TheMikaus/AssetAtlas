@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.12';
+const appVersion = '1.10.13';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -6339,6 +6339,65 @@ Future<void> revealAssetInExplorer(AssetItem asset) async {
 /// The path separator Explorer insists on, kept out of string literals so a
 /// patching script cannot mangle it.
 final chr92 = String.fromCharCode(92);
+
+/// The skeleton a model or clip is built on.
+///
+/// Not derivable from the file name. `SK_` is Unreal's skeletal-mesh prefix
+/// and Synty puts it on Polygon-rigged characters, `SM_Chr_Captain_Male_01`
+/// turns out to be skinned, and the Sidekick rig is the Unreal mannequin with
+/// extra bones. The bones are unambiguous where every naming convention here
+/// is not.
+enum RigFamily {
+  /// Synty's own rig: `Root/Hips/Spine_01/UpperLeg_R`, around 50 bones.
+  polygon,
+
+  /// The Unreal mannequin plus Sidekick's attachment and IK bones.
+  sidekick,
+
+  /// The plain Unreal mannequin: `root/pelvis/spine_01/thigh_l`.
+  unreal,
+
+  /// A prop, or a mesh with no skeleton at all.
+  none,
+}
+
+extension RigFamilyLabel on RigFamily {
+  String get label => switch (this) {
+    RigFamily.polygon => 'Polygon',
+    RigFamily.sidekick => 'Sidekick',
+    RigFamily.unreal => 'Unreal',
+    RigFamily.none => 'No rig',
+  };
+}
+
+/// Classifies a rig from the marker bones the importer's probe reported.
+///
+/// Order matters: Sidekick carries every mannequin bone as well as its own, so
+/// it has to be checked first or it reads as plain Unreal.
+RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
+  final present = markers.toSet();
+  if (present.any(
+    (m) => m == 'hipAttachFront' || m == 'hipAttach_l' || m == 'hipAttach_r',
+  )) {
+    return RigFamily.sidekick;
+  }
+  if (present.contains('pelvis') || present.contains('thigh_l')) {
+    return RigFamily.unreal;
+  }
+  if (present.contains('Hips') || present.contains('UpperLeg_R')) {
+    return RigFamily.polygon;
+  }
+  return RigFamily.none;
+}
+
+/// Whether a clip can drive a model without retargeting between skeletons.
+///
+/// Two files of the same family share bone names, which is what posing needs.
+/// Across families they share none, so no amount of correction helps.
+bool rigFamiliesCompatible(RigFamily a, RigFamily b) {
+  if (a == RigFamily.none || b == RigFamily.none) return false;
+  return a == b;
+}
 
 /// Whether an asset matches a search box that treats spaces as "and".
 ///
