@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.6';
+const appVersion = '1.10.7';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3769,6 +3769,31 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   double _yaw = 0.4;
   MeshModel? _character;
   String? _characterError;
+  RasterScene? _restScene;
+  Float32List? _posedPositions;
+
+  /// The character's scene with this frame's positions written into it.
+  ///
+  /// Both the scene and the position buffer are built once and reused: the
+  /// triangle and material tables do not change as a clip plays, and
+  /// reallocating them every frame is what made playback stutter.
+  RasterScene _poseScene(
+    MeshModel character,
+    SkeletonAnimation clip,
+    int frame,
+  ) {
+    final scene = _restScene ??= RasterScene.fromMesh(character);
+    final buffer = _posedPositions ??= Float32List(
+      character.vertices.length * 3,
+    );
+    poseSkinnedPositions(
+      character: character,
+      clip: clip,
+      frame: frame,
+      out: buffer,
+    );
+    return scene.withPositions(buffer);
+  }
 
   @override
   void initState() {
@@ -3786,6 +3811,8 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     if (oldWidget.characterPath != widget.characterPath) {
       _character = null;
       _characterError = null;
+      _restScene = null;
+      _posedPositions = null;
       _loadCharacter();
     }
   }
@@ -3879,13 +3906,9 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
                     child: const SizedBox.expand(),
                   )
                 : RasterModelView(
-                    mesh: character.withVertices(
-                      poseSkinnedVertices(
-                        character: character,
-                        clip: skeleton,
-                        frame: frame,
-                      ),
-                    ),
+                    mesh: character,
+                    sceneOverride: _poseScene(character, skeleton, frame),
+                    sceneRevision: frame,
                     yaw: _yaw,
                     pitch: 0,
                     zoom: 1,
@@ -4083,6 +4106,8 @@ class RasterModelView extends StatefulWidget {
     required this.useEmissiveMaps,
     required this.useSpecular,
     required this.interacting,
+    this.sceneOverride,
+    this.sceneRevision,
     this.uvSetOverride,
     super.key,
   });
@@ -4102,6 +4127,17 @@ class RasterModelView extends StatefulWidget {
   /// True while the user is dragging or zooming.
   final bool interacting;
   final String? uvSetOverride;
+
+  /// A prebuilt scene to draw instead of flattening [mesh].
+  ///
+  /// Animation supplies this: only the vertex positions change per frame, and
+  /// rebuilding the triangle and material tables 30 times a second is most of
+  /// the cost of playback.
+  final RasterScene? sceneOverride;
+
+  /// Changes when [sceneOverride] holds different positions, so the frame
+  /// cache can tell one pose from the next.
+  final Object? sceneRevision;
 
   @override
   State<RasterModelView> createState() => _RasterModelViewState();
@@ -4133,6 +4169,7 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.useNormalMaps,
     widget.useEmissiveMaps,
     widget.useSpecular,
+    widget.sceneRevision ?? '',
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -4152,20 +4189,24 @@ class _RasterModelViewState extends State<RasterModelView> {
       final height = math.max(1, (size.height * scale).round());
 
       // Flattening the mesh is the expensive part of setup, so keep it per
-      // mesh rather than per frame.
-      final sceneKey =
-          '${identityHashCode(widget.mesh)}|'
-          '${widget.uvSetOverride ?? ''}';
-      if (_scene == null || _sceneKey != sceneKey) {
-        _scene = RasterScene.fromMesh(
-          widget.mesh,
-          uvSetOverride: widget.uvSetOverride,
-        );
-        _sceneKey = sceneKey;
+      // mesh rather than per frame. Animation hands us a scene it already
+      // holds, whose positions it swaps in place.
+      final override = widget.sceneOverride;
+      if (override == null) {
+        final sceneKey =
+            '${identityHashCode(widget.mesh)}|'
+            '${widget.uvSetOverride ?? ''}';
+        if (_scene == null || _sceneKey != sceneKey) {
+          _scene = RasterScene.fromMesh(
+            widget.mesh,
+            uvSetOverride: widget.uvSetOverride,
+          );
+          _sceneKey = sceneKey;
+        }
       }
 
       final request = RasterRequest(
-        scene: _scene!,
+        scene: override ?? _scene!,
         yaw: widget.yaw,
         pitch: widget.pitch,
         zoom: widget.zoom,
@@ -4286,6 +4327,23 @@ class RasterScene {
 
   /// x, y, z per vertex.
   final Float32List positions;
+
+  /// The same scene with different vertex positions.
+  ///
+  /// Animation replaces the positions 30 times a second and nothing else:
+  /// rebuilding the triangle indices, UVs and material table each frame walks
+  /// every face and reallocates about a megabyte, which is most of the cost of
+  /// a frame. The buffers here are shared, not copied.
+  RasterScene withPositions(Float32List replacement) => RasterScene(
+    positions: replacement,
+    triangleIndices: triangleIndices,
+    triangleMaterial: triangleMaterial,
+    triangleTint: triangleTint,
+    triangleUvs: triangleUvs,
+    triangleHasUv: triangleHasUv,
+    materials: materials,
+    totalTriangles: totalTriangles,
+  );
 
   /// Three vertex indices per triangle.
   final Int32List triangleIndices;
@@ -9027,30 +9085,35 @@ void _addTriangulatedFace(
   }
 }
 
+/// How much of a vertex-colour set must be black before it is discarded.
+const unusableVertexColorFraction = 0.9;
+
 /// Whether a vertex-colour set should be thrown away rather than applied.
 ///
-/// Vertex colours multiply the shaded surface, so a set that is entirely black
-/// -- or entirely transparent -- renders the whole mesh black however well its
-/// textures resolved. No asset means that. It is what an exporter writes when
-/// it emits a colour layer nothing ever filled in:
-/// `PolygonSyntyCharacter.fbx` ships 14,688 vertex colours of (0, 0, 0, 0).
+/// Vertex colours multiply the shaded surface, so a set that is essentially
+/// all black renders the mesh black however well its textures resolved. No
+/// asset means that: it is what an exporter writes for a colour layer nothing
+/// ever filled in.
 ///
-/// Deliberately all-or-nothing. Genuinely black *parts* of a model are real
-/// art; a uniformly black set is not.
+/// A threshold rather than an exact test, because `PolygonSyntyCharacter.fbx`
+/// ships 14,688 vertex colours of which 14,628 are black and exactly 60 are
+/// white -- and those 60 strays were enough to defeat an all-or-nothing rule
+/// while leaving 99.6% of the model rendering black.
+///
+/// Black *parts* of a model are real art. A model that is almost entirely
+/// black is not, and drawing it black helps nobody.
 bool vertexColorSetIsUnusable(List<Color> colors) {
   if (colors.isEmpty) return false;
-  var allBlack = true;
-  var allTransparent = true;
+  var black = 0;
   for (final color in colors) {
-    if ((color.r * 255).round() > 2 ||
-        (color.g * 255).round() > 2 ||
-        (color.b * 255).round() > 2) {
-      allBlack = false;
-    }
-    if ((color.a * 255).round() > 2) allTransparent = false;
-    if (!allBlack && !allTransparent) return false;
+    final isBlack =
+        (color.r * 255).round() <= 2 &&
+        (color.g * 255).round() <= 2 &&
+        (color.b * 255).round() <= 2;
+    // Fully transparent is the same kind of artifact.
+    if (isBlack || (color.a * 255).round() <= 2) black += 1;
   }
-  return true;
+  return black >= colors.length * unusableVertexColorFraction;
 }
 
 /// Settings key for the model clips are played on.
@@ -9103,6 +9166,7 @@ class SkinBinding {
     required this.bindInverse,
     required this.influences,
     required this.vertexSkin,
+    this.bonePaths = const [],
   });
 
   /// Reads the `skin` object the importer emits. Null when absent or unusable.
@@ -9112,10 +9176,12 @@ class SkinBinding {
     if (boneList.isEmpty) return null;
 
     final names = <String>[];
+    final paths = <String>[];
     final bind = Float32List(boneList.length * 12);
     for (var i = 0; i < boneList.length; i += 1) {
       final bone = boneList[i] as Map<String, dynamic>;
       names.add((bone['name'] ?? '').toString());
+      paths.add((bone['path'] ?? '').toString());
       final matrix = (bone['bindInverse'] as List<dynamic>?) ?? const [];
       if (matrix.length != 12) return null;
       for (var j = 0; j < 12; j += 1) {
@@ -9138,6 +9204,7 @@ class SkinBinding {
 
     return SkinBinding(
       boneNames: names,
+      bonePaths: paths,
       bindInverse: bind,
       influences: influences,
       vertexSkin: vertexSkin,
@@ -9145,6 +9212,9 @@ class SkinBinding {
   }
 
   final List<String> boneNames;
+
+  /// Each bone's chain from the root, parallel to [boneNames].
+  final List<String> bonePaths;
 
   /// Per bone, a column-major 3x4 taking a mesh vertex into bone space at the
   /// bind pose. The mesh's own geometry-to-world is already folded in, so it
@@ -9202,6 +9272,104 @@ void multiplyMatrices(
   }
 }
 
+/// Poses a character's vertices into a packed buffer.
+///
+/// The buffer form exists because animation calls this every frame: returning
+/// a `List<Vec3>` allocates one object per vertex, and at 14,688 vertices and
+/// 30fps that is half a million short-lived objects a second.
+///
+/// [out] must hold `character.vertices.length * 3` floats; it is returned for
+/// convenience so callers can keep one buffer alive across frames.
+Float32List poseSkinnedPositions({
+  required MeshModel character,
+  required SkeletonAnimation clip,
+  required int frame,
+  required Float32List out,
+}) {
+  final vertices = character.vertices;
+  final skin = character.skin;
+  if (skin == null || frame < 0 || frame >= clip.frameCount) {
+    for (var v = 0; v < vertices.length; v += 1) {
+      out[v * 3] = vertices[v].x;
+      out[v * 3 + 1] = vertices[v].y;
+      out[v * 3 + 2] = vertices[v].z;
+    }
+    return out;
+  }
+
+  final boneCount = skin.boneNames.length;
+  final skinMatrices = Float32List(boneCount * 12);
+  final usable = List<bool>.filled(boneCount, false);
+  final clipFrame = clip.positions[frame];
+  for (var i = 0; i < boneCount; i += 1) {
+    final clipBone = clip.indexOfBone(
+      skin.boneNames[i],
+      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+    );
+    if (clipBone < 0) continue;
+    multiplyMatrices(
+      clipFrame,
+      clipBone * 12,
+      skin.bindInverse,
+      i * 12,
+      skinMatrices,
+      i * 12,
+    );
+    usable[i] = true;
+  }
+
+  for (var v = 0; v < vertices.length; v += 1) {
+    final vertex = vertices[v];
+    final block = v < skin.vertexSkin.length ? skin.vertexSkin[v] : -1;
+    var x = 0.0;
+    var y = 0.0;
+    var z = 0.0;
+    var total = 0.0;
+    if (block >= 0) {
+      for (var k = 0; k < 4; k += 1) {
+        final base = block * 8 + k * 2;
+        if (base + 1 >= skin.influences.length) break;
+        final weight = skin.influences[base + 1];
+        if (weight <= 0) continue;
+        final bone = skin.influences[base].toInt();
+        if (bone < 0 || bone >= boneCount || !usable[bone]) continue;
+        final offset = bone * 12;
+        x +=
+            (skinMatrices[offset] * vertex.x +
+                skinMatrices[offset + 3] * vertex.y +
+                skinMatrices[offset + 6] * vertex.z +
+                skinMatrices[offset + 9]) *
+            weight;
+        y +=
+            (skinMatrices[offset + 1] * vertex.x +
+                skinMatrices[offset + 4] * vertex.y +
+                skinMatrices[offset + 7] * vertex.z +
+                skinMatrices[offset + 10]) *
+            weight;
+        z +=
+            (skinMatrices[offset + 2] * vertex.x +
+                skinMatrices[offset + 5] * vertex.y +
+                skinMatrices[offset + 8] * vertex.z +
+                skinMatrices[offset + 11]) *
+            weight;
+        total += weight;
+      }
+    }
+    // A vertex with no usable influence keeps its bind position; collapsing it
+    // to the origin would drag a spike across the model.
+    if (total > 0) {
+      out[v * 3] = x / total;
+      out[v * 3 + 1] = y / total;
+      out[v * 3 + 2] = z / total;
+    } else {
+      out[v * 3] = vertex.x;
+      out[v * 3 + 1] = vertex.y;
+      out[v * 3 + 2] = vertex.z;
+    }
+  }
+  return out;
+}
+
 /// Poses a character's vertices with one frame of a clip.
 ///
 /// The join is by bone name, which is exact for Synty rigs. A bone the clip
@@ -9222,7 +9390,10 @@ List<Vec3> poseSkinnedVertices({
   final usable = List<bool>.filled(boneCount, false);
   final clipFrame = clip.positions[frame];
   for (var i = 0; i < boneCount; i += 1) {
-    final clipBone = clip.indexOfBone(skin.boneNames[i]);
+    final clipBone = clip.indexOfBone(
+      skin.boneNames[i],
+      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+    );
     if (clipBone < 0) continue;
     multiplyMatrices(
       clipFrame,
@@ -9267,9 +9438,19 @@ List<Vec3> poseSkinnedVertices({
 
 /// One bone of a rig: a name, and where it hangs.
 class SkeletonBone {
-  const SkeletonBone({required this.name, required this.parent});
+  const SkeletonBone({
+    required this.name,
+    required this.parent,
+    this.path = '',
+  });
 
   final String name;
+
+  /// The chain from the root, "Hips/Spine_01/Clavicle_L/...".
+  ///
+  /// Bone names repeat within a rig -- both hands carry a `Finger_03` -- so
+  /// the path is the reliable key when joining two rigs.
+  final String path;
 
   /// Index into the owning [SkeletonAnimation.bones], or -1 for a root.
   final int parent;
@@ -9298,6 +9479,7 @@ class SkeletonAnimation {
         SkeletonBone(
           name: ((entry as Map<String, dynamic>)['name'] ?? '').toString(),
           parent: (entry['parent'] as num?)?.toInt() ?? -1,
+          path: (entry['path'] ?? '').toString(),
         ),
     ];
 
@@ -9344,7 +9526,12 @@ class SkeletonAnimation {
   ///
   /// Names are how a clip and a character are joined: Synty rigs share them
   /// exactly, so no mapping table is needed.
-  int indexOfBone(String name) {
+  int indexOfBone(String name, {String? path}) {
+    if (path != null && path.isNotEmpty) {
+      for (var i = 0; i < bones.length; i += 1) {
+        if (bones[i].path == path) return i;
+      }
+    }
     for (var i = 0; i < bones.length; i += 1) {
       if (bones[i].name == name) return i;
     }
