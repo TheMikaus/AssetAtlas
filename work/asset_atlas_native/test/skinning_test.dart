@@ -482,4 +482,107 @@ void main() {
       );
     });
   });
+  group('invertMatrix', () {
+    test('inverting a translation negates it', () {
+      final out = Float32List(12);
+      expect(invertMatrix(_matrix(ty: 5), 0, out, 0), isTrue);
+      expect(out[10], -5);
+    });
+
+    test('a matrix times its inverse is the identity', () {
+      final inverse = Float32List(12);
+      final product = Float32List(12);
+      final m = _matrix(sx: 2, sy: 4, sz: 0.5, tx: 3, ty: -1, tz: 7);
+      expect(invertMatrix(m, 0, inverse, 0), isTrue);
+      multiplyMatrices(m, 0, inverse, 0, product, 0);
+      for (var i = 0; i < 9; i += 1) {
+        expect(product[i], closeTo(i % 4 == 0 ? 1 : 0, 1e-5));
+      }
+      for (var i = 9; i < 12; i += 1) {
+        expect(product[i], closeTo(0, 1e-5));
+      }
+    });
+
+    test('a singular matrix is refused rather than producing nonsense', () {
+      final out = Float32List(12);
+      expect(invertMatrix(_matrix(sx: 0), 0, out, 0), isFalse);
+    });
+  });
+
+  group('RetargetPlan', () {
+    SkeletonAnimation rig(List<double> hips, {String name = 'Hips'}) =>
+        SkeletonAnimation.fromJson({
+          'bones': [
+            {'name': 'Root', 'parent': -1, 'path': 'Root'},
+            {'name': name, 'parent': 0, 'path': 'Root/$name'},
+          ],
+          'stride': 12,
+          'frameRate': 30.0,
+          'rest': [..._matrix(), ...hips],
+          'frames': [
+            [..._matrix(), ...hips],
+          ],
+        })!;
+
+    test('a character at the clip rest comes back at its bind', () {
+      final characterRest = rig(_matrix(ty: 2).toList());
+      final clip = rig(_matrix(ty: 2).toList());
+      final plan = RetargetPlan.build(characterRest: characterRest, clip: clip);
+      expect(plan, isNotNull);
+
+      final world = Float32List(2 * 12);
+      plan!.worldForFrame(clip, 0, world);
+      // Bone 1 must land back on its bind translation.
+      expect(world[12 + 10], closeTo(2, 1e-5));
+    });
+
+    test('a rig with no rest pose cannot be planned against', () {
+      final clip = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'frames': [_matrix().toList()],
+      })!;
+      expect(
+        RetargetPlan.build(characterRest: clip, clip: clip),
+        isNull,
+        reason: 'without a rest pose there is nothing to correct against',
+      );
+    });
+  });
+
+  group('rigAxisDifference', () {
+    test('a rig compared with itself is zero', () {
+      final r = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': _matrix().toList(),
+        'frames': [_matrix().toList()],
+      })!;
+      expect(rigAxisDifference(r, r), closeTo(0, 1e-6));
+    });
+
+    test('a bone turned a quarter turn reads as ninety degrees', () {
+      Map<String, dynamic> rig(List<double> rest) => {
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': rest,
+        'frames': [rest],
+      };
+      // x axis along +x, versus x axis along +y.
+      final a = SkeletonAnimation.fromJson(rig(_matrix().toList()))!;
+      final b = SkeletonAnimation.fromJson(
+        rig([0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0]),
+      )!;
+      expect(rigAxisDifference(a, b), closeTo(90, 0.01));
+    });
+  });
 }

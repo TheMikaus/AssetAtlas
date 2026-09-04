@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.9';
+const appVersion = '1.10.10';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3310,6 +3310,7 @@ class _ModelPreviewState extends State<ModelPreview> {
               return AnimationClipPreview(
                 mesh: mesh,
                 allAssets: widget.allAssets,
+                clipPath: widget.asset.path,
               );
             }
             return Column(
@@ -3748,6 +3749,7 @@ class SkeletonPlayer extends StatefulWidget {
     required this.skeleton,
     this.characterPath,
     this.allAssets = const [],
+    this.clipPath = '',
     super.key,
   });
 
@@ -3756,6 +3758,7 @@ class SkeletonPlayer extends StatefulWidget {
   /// The model to play this clip on. Null falls back to the stick figure.
   final String? characterPath;
   final List<AssetItem> allAssets;
+  final String clipPath;
 
   @override
   State<SkeletonPlayer> createState() => _SkeletonPlayerState();
@@ -3771,6 +3774,9 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   String? _characterError;
   RasterScene? _restScene;
   Float32List? _posedPositions;
+  RetargetPlan? _plan;
+  Float32List? _boneWorld;
+  String? _retargetNote;
 
   /// The character's scene with this frame's positions written into it.
   ///
@@ -3791,6 +3797,8 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       clip: clip,
       frame: frame,
       out: buffer,
+      plan: _plan,
+      boneWorld: _boneWorld,
     );
     return scene.withPositions(buffer);
   }
@@ -3813,8 +3821,59 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       _characterError = null;
       _restScene = null;
       _posedPositions = null;
+      _plan = null;
+      _boneWorld = null;
+      _retargetNote = null;
       _loadCharacter();
     }
+  }
+
+  /// Works out how to drive this character with this clip.
+  ///
+  /// Rigs that agree are posed by the clip directly. Rigs that do not are
+  /// retargeted through a reference character shipped beside the clip; without
+  /// one there is nothing to correct against, so the character stays in its
+  /// bind pose rather than being torn apart.
+  Future<void> _buildPlan(MeshModel character) async {
+    final rest = character.skeleton;
+    if (rest == null) return;
+    final difference = rigAxisDifference(rest, widget.skeleton);
+    if (difference <= maxDirectPoseAngle) {
+      _plan = null;
+      _boneWorld = null;
+      _retargetNote = null;
+      return;
+    }
+
+    SkeletonAnimation? reference;
+    final referenceAsset = findClipReferenceCharacter(
+      widget.clipPath,
+      widget.allAssets,
+    );
+    if (referenceAsset != null) {
+      try {
+        final referenceMesh = await MeshLoadCache.load(
+          referenceAsset,
+          allAssets: widget.allAssets,
+        );
+        reference = referenceMesh.skeleton;
+      } catch (error) {
+        fbxLog('Could not load the reference rig: $error');
+      }
+    }
+
+    _plan = RetargetPlan.build(
+      characterRest: rest,
+      clip: widget.skeleton,
+      sourceReference: reference,
+    );
+    _boneWorld = Float32List(rest.bones.length * 12);
+    _retargetNote = reference == null
+        ? 'This rig sits ${difference.round()}° from the clip and no '
+              'reference character was found beside it, so only its own bind '
+              'pose can be shown.'
+        : 'Retargeted through ${referenceAsset!.name}: this rig sits '
+              '${difference.round()}° from the clip.';
   }
 
   Future<void> _loadCharacter() async {
@@ -3838,11 +3897,19 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     try {
       final mesh = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
       if (!mounted) return;
+      if (mesh.skin == null) {
+        setState(() {
+          _character = null;
+          _characterError =
+              '${asset!.name} has no skin weights, so a clip cannot move it.';
+        });
+        return;
+      }
+      await _buildPlan(mesh);
+      if (!mounted) return;
       setState(() {
-        _character = mesh.skin == null ? null : mesh;
-        _characterError = mesh.skin == null
-            ? '${asset!.name} has no skin weights, so a clip cannot move it.'
-            : null;
+        _character = mesh;
+        _characterError = null;
       });
     } catch (error) {
       if (!mounted) return;
@@ -3884,6 +3951,14 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     final character = _character;
     return Column(
       children: [
+        if (_retargetNote != null && _characterError == null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              _retargetNote!,
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ),
         if (_characterError != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -3971,6 +4046,7 @@ class AnimationClipPreview extends StatelessWidget {
   const AnimationClipPreview({
     required this.mesh,
     this.allAssets = const [],
+    this.clipPath = '',
     super.key,
   });
 
@@ -3978,6 +4054,9 @@ class AnimationClipPreview extends StatelessWidget {
 
   /// Needed to find the chosen character, which lives elsewhere in the catalog.
   final List<AssetItem> allAssets;
+
+  /// Where this clip came from, so its reference rig can be found beside it.
+  final String clipPath;
 
   String get _duration {
     if (mesh.durationSeconds <= 0) return 'unknown';
@@ -3997,6 +4076,7 @@ class AnimationClipPreview extends StatelessWidget {
                 skeleton: skeleton,
                 characterPath: characterPath,
                 allAssets: allAssets,
+                clipPath: clipPath,
               ),
             ),
           ),
@@ -9268,6 +9348,49 @@ Vec3 transformByMatrix(Float32List matrix, int offset, Vec3 point) {
   );
 }
 
+/// Inverts a column-major 3x4 affine matrix into `out` at `outOffset`.
+///
+/// Returns false and leaves `out` untouched when the matrix is singular,
+/// which a degenerate bone can be.
+bool invertMatrix(Float32List a, int aOffset, Float32List out, int outOffset) {
+  final m00 = a[aOffset], m01 = a[aOffset + 1], m02 = a[aOffset + 2];
+  final m10 = a[aOffset + 3], m11 = a[aOffset + 4], m12 = a[aOffset + 5];
+  final m20 = a[aOffset + 6], m21 = a[aOffset + 7], m22 = a[aOffset + 8];
+  final tx = a[aOffset + 9], ty = a[aOffset + 10], tz = a[aOffset + 11];
+
+  // Columns are the basis vectors, so the determinant is their triple product.
+  final det =
+      m00 * (m11 * m22 - m12 * m21) -
+      m10 * (m01 * m22 - m02 * m21) +
+      m20 * (m01 * m12 - m02 * m11);
+  if (det.abs() < 1e-12) return false;
+  final inv = 1.0 / det;
+
+  final i00 = (m11 * m22 - m12 * m21) * inv;
+  final i01 = (m02 * m21 - m01 * m22) * inv;
+  final i02 = (m01 * m12 - m02 * m11) * inv;
+  final i10 = (m12 * m20 - m10 * m22) * inv;
+  final i11 = (m00 * m22 - m02 * m20) * inv;
+  final i12 = (m02 * m10 - m00 * m12) * inv;
+  final i20 = (m10 * m21 - m11 * m20) * inv;
+  final i21 = (m01 * m20 - m00 * m21) * inv;
+  final i22 = (m00 * m11 - m01 * m10) * inv;
+
+  out[outOffset] = i00;
+  out[outOffset + 1] = i01;
+  out[outOffset + 2] = i02;
+  out[outOffset + 3] = i10;
+  out[outOffset + 4] = i11;
+  out[outOffset + 5] = i12;
+  out[outOffset + 6] = i20;
+  out[outOffset + 7] = i21;
+  out[outOffset + 8] = i22;
+  out[outOffset + 9] = -(i00 * tx + i10 * ty + i20 * tz);
+  out[outOffset + 10] = -(i01 * tx + i11 * ty + i21 * tz);
+  out[outOffset + 11] = -(i02 * tx + i12 * ty + i22 * tz);
+  return true;
+}
+
 /// Multiplies two column-major 3x4 matrices into `out` at `outOffset`.
 void multiplyMatrices(
   Float32List a,
@@ -9294,6 +9417,282 @@ void multiplyMatrices(
   }
 }
 
+/// A character shipped alongside a clip, to use as its reference pose.
+///
+/// Retargeting needs to know what the clip's rig looks like in the same
+/// physical pose the character is bound in -- both T-posed, in practice. A
+/// clip file cannot supply that: its own rest pose is wherever the animator
+/// left the rig, which for a locomotion pack is a standing idle.
+///
+/// An animation pack ships a character on its own rig for exactly this reason,
+/// so the reference is looked for beside the clip, in the same archive. Nothing
+/// found means no retargeting, and a character whose rig already matches is
+/// unaffected either way.
+AssetItem? findClipReferenceCharacter(
+  String clipPath,
+  List<AssetItem> allAssets,
+) {
+  final clipZip = parseZipVirtualPath(clipPath);
+  final clipRoot = clipZip == null ? parentPath(clipPath) : null;
+
+  final candidates = <AssetItem>[];
+  for (final asset in allAssets) {
+    if (asset.ext != 'fbx') continue;
+    if (normalizePathKey(asset.path) == normalizePathKey(clipPath)) continue;
+    final lower = asset.path.toLowerCase().replaceAll(r'\', '/');
+    if (!lower.contains('/character')) continue;
+
+    if (clipZip != null) {
+      final zip = parseZipVirtualPath(asset.path);
+      if (zip == null ||
+          normalizePathKey(zip.zipPath) != normalizePathKey(clipZip.zipPath)) {
+        continue;
+      }
+    } else if (clipRoot == null || !asset.path.startsWith(clipRoot)) {
+      continue;
+    }
+    candidates.add(asset);
+  }
+  if (candidates.isEmpty) return null;
+  // Deterministic: the answer must not depend on scan order.
+  candidates.sort(
+    (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+  );
+  return candidates.first;
+}
+
+/// Transfers a clip's pose onto a character whose rig holds its bones at
+/// different angles.
+///
+/// Two Synty rigs can share every bone name, every parent and the whole
+/// hierarchy and still be incompatible: the newer character packs re-oriented
+/// the joint axes, so `Hand_L` points 169 degrees away from where the older
+/// animation rig puts it. Applying a clip's bone transforms directly to such a
+/// character tears the mesh apart.
+///
+/// The fix is to work in each bone's *local* frame and go through a reference
+/// pose. For every bone, `correction` is the constant that takes the reference
+/// rig's local frame to the character's own bind:
+///
+///     correction = inverse(referenceLocal) * characterBindLocal
+///     characterLocal(t) = clipLocal(t) * correction
+///
+/// At the reference pose the correction cancels and the character stands in
+/// its bind, which is what makes this safe: a rig it cannot interpret comes
+/// out unposed rather than mangled.
+///
+/// [sourceReference] is the clip rig's own rest pose unless a better one is
+/// supplied. A reference in the same *physical* pose as the character's bind
+/// (both T-posed, say) makes the character adopt the clip's pose; the clip's
+/// own rest, which for a locomotion pack is a standing idle, makes it perform
+/// the clip's motion starting from its bind.
+class RetargetPlan {
+  RetargetPlan._(
+    this._correction,
+    this._clipBone,
+    this._clipParents,
+    this._parent,
+    this._order,
+  );
+
+  /// Builds the plan once for a character and clip; it does not change frame
+  /// to frame, and computing it per frame would dominate playback.
+  ///
+  /// Returns null when the character carries no rest pose to correct against.
+  static RetargetPlan? build({
+    required SkeletonAnimation characterRest,
+    required SkeletonAnimation clip,
+    SkeletonAnimation? sourceReference,
+  }) {
+    final bind = characterRest.rest ?? characterRest.positions.firstOrNull;
+    if (bind == null) return null;
+    // The reference may be a different rig from the clip -- that is the point
+    // of supplying one -- so it carries its own bone list to look up in.
+    final referenceRig = sourceReference ?? clip;
+    final reference = referenceRig.rest;
+    if (reference == null) return null;
+
+    final bones = characterRest.bones;
+    final count = bones.length;
+    final parent = Int32List(count);
+    final clipBone = Int32List(count);
+    final correction = Float32List(count * 12);
+
+    // Parents before children, so a bone's world transform is ready when its
+    // children need it.
+    final order = Int32List(count);
+    var filled = 0;
+    final placed = List<bool>.filled(count, false);
+    void visit(int index) {
+      if (placed[index]) return;
+      final up = bones[index].parent;
+      if (up >= 0 && up < count) visit(up);
+      placed[index] = true;
+      order[filled++] = index;
+    }
+
+    for (var i = 0; i < count; i += 1) {
+      visit(i);
+    }
+
+    final scratch = Float32List(24);
+    for (var i = 0; i < count; i += 1) {
+      parent[i] = bones[i].parent;
+      clipBone[i] = clip.indexOfBone(bones[i].name, path: bones[i].path);
+
+      // Both frames reduced to parent-relative, which is where a rotation
+      // means the same thing in either rig.
+      _localOf(bind, i, parent[i], scratch, 0);
+      final k = clipBone[i];
+      if (k < 0) {
+        // Nothing drives this bone; leave it at its bind.
+        for (var j = 0; j < 12; j += 1) {
+          correction[i * 12 + j] = scratch[j];
+        }
+        continue;
+      }
+      final r = identical(referenceRig, clip)
+          ? k
+          : referenceRig.indexOfBone(bones[i].name, path: bones[i].path);
+      if (r < 0) {
+        for (var j = 0; j < 12; j += 1) {
+          correction[i * 12 + j] = scratch[j];
+        }
+        continue;
+      }
+      _localOf(reference, r, referenceRig.bones[r].parent, scratch, 12);
+
+      final inverse = Float32List(12);
+      if (!invertMatrix(scratch, 12, inverse, 0)) {
+        for (var j = 0; j < 12; j += 1) {
+          correction[i * 12 + j] = scratch[j];
+        }
+        continue;
+      }
+      multiplyMatrices(inverse, 0, scratch, 0, correction, i * 12);
+    }
+
+    final clipParents = Int32List(clip.bones.length);
+    for (var i = 0; i < clip.bones.length; i += 1) {
+      clipParents[i] = clip.bones[i].parent;
+    }
+    return RetargetPlan._(correction, clipBone, clipParents, parent, order);
+  }
+
+  final Float32List _correction;
+  final Int32List _clipBone;
+  final Int32List _clipParents;
+  final Int32List _parent;
+  final Int32List _order;
+
+  int get boneCount => _clipBone.length;
+
+  /// The character's bone world transforms for one frame of the clip.
+  Float32List worldForFrame(
+    SkeletonAnimation clip,
+    int frame,
+    Float32List out,
+  ) {
+    if (frame < 0 || frame >= clip.frameCount) return out;
+    final frameData = clip.positions[frame];
+    final local = Float32List(12);
+    final scratch = Float32List(12);
+
+    for (final index in _order) {
+      final k = _clipBone[index];
+      if (k < 0) {
+        for (var j = 0; j < 12; j += 1) {
+          local[j] = _correction[index * 12 + j];
+        }
+      } else {
+        _localOf(frameData, k, _clipParents[k], scratch, 0);
+        multiplyMatrices(scratch, 0, _correction, index * 12, local, 0);
+      }
+
+      final up = _parent[index];
+      if (up < 0 || up >= boneCount) {
+        for (var j = 0; j < 12; j += 1) {
+          out[index * 12 + j] = local[j];
+        }
+      } else {
+        multiplyMatrices(out, up * 12, local, 0, out, index * 12);
+      }
+    }
+    return out;
+  }
+}
+
+/// Reduces a world transform to its parent-relative form.
+void _localOf(
+  Float32List world,
+  int bone,
+  int parent,
+  Float32List out,
+  int outOffset,
+) {
+  if (parent < 0) {
+    for (var j = 0; j < 12; j += 1) {
+      out[outOffset + j] = world[bone * 12 + j];
+    }
+    return;
+  }
+  final inverse = Float32List(12);
+  if (!invertMatrix(world, parent * 12, inverse, 0)) {
+    for (var j = 0; j < 12; j += 1) {
+      out[outOffset + j] = world[bone * 12 + j];
+    }
+    return;
+  }
+  multiplyMatrices(inverse, 0, world, bone * 12, out, outOffset);
+}
+
+/// Above this many degrees apart, a clip's bone transforms cannot be applied
+/// to a character directly.
+///
+/// The older Synty character rig sits about 19 degrees from the animation rig
+/// and poses correctly; the newer packs sit at 89 and tear apart. Forty is
+/// clear of both.
+const maxDirectPoseAngle = 40.0;
+
+/// How far apart two rigs hold the same bones, in degrees.
+///
+/// Near zero means the clip's transforms can be used directly. The older Synty
+/// character rig sits about 26 degrees from the animation rig; the newer packs
+/// sit at 89, which is what tore the mesh apart when posed directly.
+double rigAxisDifference(
+  SkeletonAnimation characterRest,
+  SkeletonAnimation clip,
+) {
+  final bind = characterRest.rest ?? characterRest.positions.firstOrNull;
+  final reference = clip.rest;
+  if (bind == null || reference == null) return 0;
+
+  final angles = <double>[];
+  for (var i = 0; i < characterRest.bones.length; i += 1) {
+    final bone = characterRest.bones[i];
+    final k = clip.indexOfBone(bone.name, path: bone.path);
+    if (k < 0) continue;
+    // The x column of each frame, compared as directions.
+    var ax = bind[i * 12], ay = bind[i * 12 + 1], az = bind[i * 12 + 2];
+    var bx = reference[k * 12], by = reference[k * 12 + 1];
+    var bz = reference[k * 12 + 2];
+    final la = math.sqrt(ax * ax + ay * ay + az * az);
+    final lb = math.sqrt(bx * bx + by * by + bz * bz);
+    if (la < 1e-9 || lb < 1e-9) continue;
+    ax /= la;
+    ay /= la;
+    az /= la;
+    bx /= lb;
+    by /= lb;
+    bz /= lb;
+    final dot = (ax * bx + ay * by + az * bz).clamp(-1.0, 1.0);
+    angles.add(math.acos(dot) * 180 / math.pi);
+  }
+  if (angles.isEmpty) return 0;
+  angles.sort();
+  return angles[angles.length ~/ 2];
+}
+
 /// Poses a character's vertices into a packed buffer.
 ///
 /// The buffer form exists because animation calls this every frame: returning
@@ -9307,6 +9706,8 @@ Float32List poseSkinnedPositions({
   required SkeletonAnimation clip,
   required int frame,
   required Float32List out,
+  RetargetPlan? plan,
+  Float32List? boneWorld,
 }) {
   final vertices = character.vertices;
   final skin = character.skin;
@@ -9322,22 +9723,47 @@ Float32List poseSkinnedPositions({
   final boneCount = skin.boneNames.length;
   final skinMatrices = Float32List(boneCount * 12);
   final usable = List<bool>.filled(boneCount, false);
-  final clipFrame = clip.positions[frame];
-  for (var i = 0; i < boneCount; i += 1) {
-    final clipBone = clip.indexOfBone(
-      skin.boneNames[i],
-      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
-    );
-    if (clipBone < 0) continue;
-    multiplyMatrices(
-      clipFrame,
-      clipBone * 12,
-      skin.bindInverse,
-      i * 12,
-      skinMatrices,
-      i * 12,
-    );
-    usable[i] = true;
+
+  // Two ways to get a bone's animated transform. A retarget plan corrects for
+  // rigs that hold their bones at different angles; without one the clip's
+  // transforms are used directly, which is right only when both rigs agree.
+  final rest = character.skeleton;
+  if (plan != null && boneWorld != null && rest != null) {
+    plan.worldForFrame(clip, frame, boneWorld);
+    for (var i = 0; i < boneCount; i += 1) {
+      final bone = rest.indexOfBone(
+        skin.boneNames[i],
+        path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+      );
+      if (bone < 0) continue;
+      multiplyMatrices(
+        boneWorld,
+        bone * 12,
+        skin.bindInverse,
+        i * 12,
+        skinMatrices,
+        i * 12,
+      );
+      usable[i] = true;
+    }
+  } else {
+    final clipFrame = clip.positions[frame];
+    for (var i = 0; i < boneCount; i += 1) {
+      final clipBone = clip.indexOfBone(
+        skin.boneNames[i],
+        path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+      );
+      if (clipBone < 0) continue;
+      multiplyMatrices(
+        clipFrame,
+        clipBone * 12,
+        skin.bindInverse,
+        i * 12,
+        skinMatrices,
+        i * 12,
+      );
+      usable[i] = true;
+    }
   }
 
   for (var v = 0; v < vertices.length; v += 1) {
@@ -9397,76 +9823,31 @@ Float32List poseSkinnedPositions({
 
 /// Poses a character's vertices with one frame of a clip.
 ///
-/// The join is by bone name, which is exact for Synty rigs. A bone the clip
-/// does not have contributes nothing, and a vertex left with no influence at
-/// all keeps its bind position rather than collapsing to the origin.
+/// Convenience wrapper over [poseSkinnedPositions] for callers that want a
+/// vertex list rather than a packed buffer; playback uses the buffer form.
 List<Vec3> poseSkinnedVertices({
   required MeshModel character,
   required SkeletonAnimation clip,
   required int frame,
+  RetargetPlan? plan,
 }) {
-  final skin = character.skin;
-  if (skin == null || frame < 0 || frame >= clip.frameCount) {
+  if (character.skin == null || frame < 0 || frame >= clip.frameCount) {
     return character.vertices;
   }
-
-  final boneCount = skin.boneNames.length;
-  final skinMatrices = Float32List(boneCount * 12);
-  final usable = List<bool>.filled(boneCount, false);
-  final clipFrame = clip.positions[frame];
-  for (var i = 0; i < boneCount; i += 1) {
-    final clipBone = clip.indexOfBone(
-      skin.boneNames[i],
-      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
-    );
-    if (clipBone < 0) continue;
-    multiplyMatrices(
-      clipFrame,
-      clipBone * 12,
-      skin.bindInverse,
-      i * 12,
-      skinMatrices,
-      i * 12,
-    );
-    usable[i] = true;
-  }
-
-  final posed = <Vec3>[];
-  for (var v = 0; v < character.vertices.length; v += 1) {
-    final vertex = character.vertices[v];
-    final block = v < skin.vertexSkin.length ? skin.vertexSkin[v] : -1;
-    if (block < 0) {
-      posed.add(vertex);
-      continue;
-    }
-    var x = 0.0;
-    var y = 0.0;
-    var z = 0.0;
-    var total = 0.0;
-    for (var k = 0; k < 4; k += 1) {
-      final base = block * 8 + k * 2;
-      if (base + 1 >= skin.influences.length) break;
-      final weight = skin.influences[base + 1];
-      if (weight <= 0) continue;
-      final bone = skin.influences[base].toInt();
-      if (bone < 0 || bone >= boneCount || !usable[bone]) continue;
-      final moved = transformByMatrix(skinMatrices, bone * 12, vertex);
-      x += moved.x * weight;
-      y += moved.y * weight;
-      z += moved.z * weight;
-      total += weight;
-    }
-    posed.add(
-      total > 0
-          ? Vec3(
-              (x / total - skin.normalizeCenter.x) * skin.normalizeScale,
-              (y / total - skin.normalizeCenter.y) * skin.normalizeScale,
-              (z / total - skin.normalizeCenter.z) * skin.normalizeScale,
-            )
-          : vertex,
-    );
-  }
-  return posed;
+  final packed = poseSkinnedPositions(
+    character: character,
+    clip: clip,
+    frame: frame,
+    out: Float32List(character.vertices.length * 3),
+    plan: plan,
+    boneWorld: plan == null
+        ? null
+        : Float32List((character.skeleton?.bones.length ?? 0) * 12),
+  );
+  return [
+    for (var v = 0; v < character.vertices.length; v += 1)
+      Vec3(packed[v * 3], packed[v * 3 + 1], packed[v * 3 + 2]),
+  ];
 }
 
 /// One bone of a rig: a name, and where it hangs.
@@ -9522,6 +9903,7 @@ class SkeletonAnimation {
     required this.bones,
     required this.positions,
     required this.frameRate,
+    this.rest,
   });
 
   /// Reads the `skeleton` object the importer emits. Null when absent.
@@ -9554,10 +9936,20 @@ class SkeletonAnimation {
     }
     if (positions.isEmpty) return null;
 
+    final restValues = (json['rest'] as List<dynamic>?) ?? const [];
+    Float32List? rest;
+    if (restValues.length == stride) {
+      rest = Float32List(stride);
+      for (var i = 0; i < stride; i += 1) {
+        rest[i] = (restValues[i] as num).toDouble();
+      }
+    }
+
     return SkeletonAnimation(
       bones: bones,
       positions: positions,
       frameRate: (json['frameRate'] as num?)?.toDouble() ?? 30,
+      rest: rest,
     );
   }
 
@@ -9568,6 +9960,13 @@ class SkeletonAnimation {
   /// is all the stick-figure view reads.
   final List<Float32List> positions;
   final double frameRate;
+
+  /// The rig's own rest pose, unevaluated, as `bones.length * 12` floats.
+  ///
+  /// Two rigs can share every bone name and still hold those bones at
+  /// different angles. Transferring a pose between them needs each rig's own
+  /// rest as the reference, which is what this is.
+  final Float32List? rest;
 
   int get frameCount => positions.length;
 
