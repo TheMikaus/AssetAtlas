@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.7';
+const appVersion = '1.10.9';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -9167,6 +9167,8 @@ class SkinBinding {
     required this.influences,
     required this.vertexSkin,
     this.bonePaths = const [],
+    this.normalizeCenter = const Vec3(0, 0, 0),
+    this.normalizeScale = 1,
   });
 
   /// Reads the `skin` object the importer emits. Null when absent or unusable.
@@ -9202,12 +9204,21 @@ class SkinBinding {
     }
     if (vertexSkin.isEmpty || influences.isEmpty) return null;
 
+    final center = (json['normalizeCenter'] as List<dynamic>?) ?? const [];
     return SkinBinding(
       boneNames: names,
       bonePaths: paths,
       bindInverse: bind,
       influences: influences,
       vertexSkin: vertexSkin,
+      normalizeCenter: center.length == 3
+          ? Vec3(
+              (center[0] as num).toDouble(),
+              (center[1] as num).toDouble(),
+              (center[2] as num).toDouble(),
+            )
+          : const Vec3(0, 0, 0),
+      normalizeScale: (json['normalizeScale'] as num?)?.toDouble() ?? 1,
     );
   }
 
@@ -9215,6 +9226,17 @@ class SkinBinding {
 
   /// Each bone's chain from the root, parallel to [boneNames].
   final List<String> bonePaths;
+
+  /// The framing transform the importer applied to the vertices.
+  ///
+  /// Every mesh is recentred and rescaled into a unit box so the viewer can
+  /// frame it, but the bind matrices are written against the file's own
+  /// coordinates. The importer folds the inverse into [bindInverse], so a
+  /// posed vertex comes out in file coordinates and has to be put back:
+  /// `(p - normalizeCenter) * normalizeScale`. Skipping that step left a
+  /// character's mesh 0.89m from its skeleton, which tore it apart.
+  final Vec3 normalizeCenter;
+  final double normalizeScale;
 
   /// Per bone, a column-major 3x4 taking a mesh vertex into bone space at the
   /// bind pose. The mesh's own geometry-to-world is already folded in, so it
@@ -9358,9 +9380,12 @@ Float32List poseSkinnedPositions({
     // A vertex with no usable influence keeps its bind position; collapsing it
     // to the origin would drag a spike across the model.
     if (total > 0) {
-      out[v * 3] = x / total;
-      out[v * 3 + 1] = y / total;
-      out[v * 3 + 2] = z / total;
+      // Back into the viewer's framing; see SkinBinding.normalizeCenter.
+      out[v * 3] = (x / total - skin.normalizeCenter.x) * skin.normalizeScale;
+      out[v * 3 + 1] =
+          (y / total - skin.normalizeCenter.y) * skin.normalizeScale;
+      out[v * 3 + 2] =
+          (z / total - skin.normalizeCenter.z) * skin.normalizeScale;
     } else {
       out[v * 3] = vertex.x;
       out[v * 3 + 1] = vertex.y;
@@ -9431,7 +9456,15 @@ List<Vec3> poseSkinnedVertices({
       z += moved.z * weight;
       total += weight;
     }
-    posed.add(total > 0 ? Vec3(x / total, y / total, z / total) : vertex);
+    posed.add(
+      total > 0
+          ? Vec3(
+              (x / total - skin.normalizeCenter.x) * skin.normalizeScale,
+              (y / total - skin.normalizeCenter.y) * skin.normalizeScale,
+              (z / total - skin.normalizeCenter.z) * skin.normalizeScale,
+            )
+          : vertex,
+    );
   }
   return posed;
 }
@@ -9454,6 +9487,29 @@ class SkeletonBone {
 
   /// Index into the owning [SkeletonAnimation.bones], or -1 for a root.
   final int parent;
+}
+
+/// Strips the suffix the importer adds to distinguish same-named bones.
+///
+/// These rigs name both hands' bones identically -- `IndexFinger_01` appears
+/// under `Hand_L` and `Hand_R` -- and ufbx renames whichever it meets second
+/// to `IndexFinger_01_1`. Which one that is depends on node order, and node
+/// order differs between a character file and a clip file: one file's
+/// `Hand_R/IndexFinger_01_1` is the other's `Hand_R/IndexFinger_01`.
+///
+/// Only a single trailing digit is removed. Synty's own numbering is
+/// two digits (`Spine_01`, `IndexFinger_02`), so it survives, while the
+/// importer's `_1` does not. The parent chain still separates left from
+/// right, which is the whole reason paths beat names here.
+String normalizeBonePath(String path) {
+  if (path.isEmpty) return path;
+  return path
+      .split('/')
+      .map((segment) {
+        final match = RegExp(r'^(.*[^_])_[0-9]$').firstMatch(segment);
+        return match == null ? segment : match.group(1)!;
+      })
+      .join('/');
 }
 
 /// A rig and the motion sampled onto it.
@@ -9531,7 +9587,16 @@ class SkeletonAnimation {
       for (var i = 0; i < bones.length; i += 1) {
         if (bones[i].path == path) return i;
       }
+      // The same rig can be numbered differently in two files, so compare
+      // again with the importer's duplicate suffixes removed.
+      final wanted = normalizeBonePath(path);
+      for (var i = 0; i < bones.length; i += 1) {
+        if (normalizeBonePath(bones[i].path) == wanted) return i;
+      }
     }
+    // Last resort. A bare name is ambiguous in these rigs -- both hands carry
+    // an `IndexFinger_01` -- so this can pick the wrong side, and only runs
+    // when neither path form matched.
     for (var i = 0; i < bones.length; i += 1) {
       if (bones[i].name == name) return i;
     }

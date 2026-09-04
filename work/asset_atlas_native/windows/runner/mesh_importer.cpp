@@ -240,6 +240,15 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
   printf("]}");
 }
 
+static bool debug_spaces_enabled() {
+  size_t len = 0;
+  char* value = nullptr;
+  if (_dupenv_s(&value, &len, "ASSET_ATLAS_DEBUG_SPACES") != 0) return false;
+  const bool on = value != nullptr;
+  free(value);
+  return on;
+}
+
 static std::string texture_path(ufbx_texture* texture) {
   if (!texture) return std::string();
   std::string path = string_from_ufbx(texture->filename);
@@ -577,6 +586,23 @@ int main(int argc, char** argv) {
 
   auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world) {
     if (!mesh || mesh->num_faces == 0) return;
+    if (debug_spaces_enabled()) {
+      if (geometry_to_world) {
+        const ufbx_matrix& g = *geometry_to_world;
+        fprintf(stderr, "geometry_to_world translation (%.4f,%.4f,%.4f) scale x %.4f\n",
+          g.cols[3].x, g.cols[3].y, g.cols[3].z, g.cols[0].x);
+      } else {
+        fprintf(stderr, "geometry_to_world: none\n");
+      }
+      double lo = 1e30, hi = -1e30;
+      for (size_t v = 0; v < mesh->num_vertices; ++v) {
+        const ufbx_vec3 p = mesh->vertices.data[v];
+        if (p.y < lo) lo = p.y;
+        if (p.y > hi) hi = p.y;
+      }
+      fprintf(stderr, "raw mesh y %.4f..%.4f, skin deformers %zu\n",
+        lo, hi, mesh->skin_deformers.count);
+    }
 
     // Build this mesh's vertex influence table before walking its faces, so a
     // corner only has to look up its vertex.
@@ -746,6 +772,29 @@ int main(int argc, char** argv) {
     v.z = (v.z - center.z) * scale;
   }
 
+  // The vertices above have just been recentred and rescaled to fit the
+  // viewer's unit box, but the bind matrices were built against the file's
+  // own coordinates. Left alone the two disagree -- a character whose mesh
+  // ends up centred on the origin while its skeleton still stands on the
+  // ground, which tears the model apart when a clip poses it.
+  //
+  // Fold the inverse of that normalisation into each bind matrix, so it maps
+  // the *emitted* vertices into bone space. The consumer applies the forward
+  // normalisation again after skinning; `normalizeCenter` and
+  // `normalizeScale` below are what it needs to do that.
+  if (!skin_bind_inverse.empty()) {
+    ufbx_matrix denormalize = ufbx_identity_matrix;
+    denormalize.cols[0].x = 1.0 / scale;
+    denormalize.cols[1].y = 1.0 / scale;
+    denormalize.cols[2].z = 1.0 / scale;
+    denormalize.cols[3].x = center.x;
+    denormalize.cols[3].y = center.y;
+    denormalize.cols[3].z = center.z;
+    for (ufbx_matrix& bind : skin_bind_inverse) {
+      bind = ufbx_matrix_mul(&bind, &denormalize);
+    }
+  }
+
   printf("{\"kind\":\"mesh\",\"name\":");
   print_json_string(input_label.c_str());
   printf(",\"vertices\":[");
@@ -820,7 +869,9 @@ int main(int argc, char** argv) {
         (int)w[0], w[1], (int)w[2], w[3],
         (int)w[4], w[5], (int)w[6], w[7]);
     }
-    printf("],\"vertexSkin\":[");
+    printf("],\"normalizeCenter\":[%.9g,%.9g,%.9g],\"normalizeScale\":%.9g",
+      center.x, center.y, center.z, scale);
+    printf(",\"vertexSkin\":[");
     for (size_t i = 0; i < vertex_skin.size(); ++i) {
       if (i) putchar(0x2C);
       printf("%d", vertex_skin[i]);

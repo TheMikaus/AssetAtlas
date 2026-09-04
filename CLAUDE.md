@@ -100,7 +100,17 @@ A frame is `bones * 12` floats — a column-major 3x4 world matrix per bone, who
 
 The join between a clip and a character is the **bone name**: the Synty rig is `Root / Hips / Spine_01..03 / Clavicle_L,R / Hand_L,R / IndexFinger_01..04 / Thumb_01..` and the character files use the same names, so no mapping table is needed. A bone the clip lacks contributes nothing and the vertex keeps its bind position rather than collapsing to the origin.
 
-The check that matters is the **identity test**: posing a character with its own rest skeleton must reproduce its vertices. It does, to 7e-6. Any future change to the matrix conventions should be validated that way before trusting a screenshot.
+**The framing transform is part of the skin contract.** The importer recentres and rescales every mesh into a unit box so the viewer can frame it (`normalizeCenter` / `normalizeScale`), and that happens *after* the bind matrices are built. The importer folds the inverse into `bindInverse`, and the consumer must apply the forward transform again after blending. Skipping it leaves a character's mesh 0.89m from its own skeleton, which tears it apart — and it looks exactly like a bad rig, so it was blamed on retargeting for a long time. `test/skinning_test.dart` pins it.
+
+Two checks that matter, in order:
+1. **Identity test** — posing a character with its own rest skeleton must reproduce its vertices (7e-6 here). This validates the matrix conventions and units.
+2. **Extent test** — a posed character must be the same height as its bind pose. The identity test passes even when the framing transform is missing; only the extent test catches that. If a posed character is *taller* than its bind, suspect the framing, not the rig.
+
+**Bone matching** is by path from the root, normalised through `normalizeBonePath`. These rigs give both hands the same bone names (`IndexFinger_01` under `Hand_L` and `Hand_R`) and ufbx renames whichever it meets second to `IndexFinger_01_1` — and node order differs between files, so one file's `Hand_R/IndexFinger_01_1` is another's `Hand_R/IndexFinger_01`. Only a single trailing digit is stripped, so Synty's own two-digit numbering (`Spine_01`) survives. Matching on the bare name silently binds a right hand to a left one, so it remains only as a last resort.
+
+There is no standalone skeleton asset in these packs. Every `SK_Chr_*.fbx` (1,551 of them across the library) embeds its own copy of the rig and its own skin weights, so a character is matched to a clip directly with no shared avatar in between.
+
+Diagnostics: set `ASSET_ATLAS_DEBUG_SPACES=1` and the importer prints each mesh's raw extent and geometry-to-world on stderr. That is what finally showed the mesh standing at y 0..1.79 while the emitted vertices sat at ±0.88.
 
 `AnimationCharacter` (settings key `animation.character.path`, schema v6 `settings` table) holds the model clips play on; `AnimationCharacterButton` sets it, and only appears for a mesh that actually has skin weights.
 
