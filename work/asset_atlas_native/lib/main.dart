@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.14';
+const appVersion = '1.10.15';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -423,7 +423,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
         return false;
       }
       if (hideZipAssets && isZipVirtualPath(asset.path)) return false;
-      if (typeFilter == 'animation') {
+      if (typeFilter == 'character') {
+        // Needs the same probe as the animation filter, for the same reason:
+        // only a parse can say whether a mesh has bones.
+        if (asset.type == 'model' && asset.ext == 'fbx') {
+          if (asset.rigFamily == null) {
+            _scheduleModelKindClassification([asset]);
+            return false;
+          }
+        }
+        if (!assetIsCharacterModel(asset)) return false;
+      } else if (typeFilter == 'animation') {
         // Only a parse can tell an animation clip from a mesh, so ask for one
         // and leave the asset out of the list until the answer arrives.
         if (asset.type == 'model' && asset.ext == 'fbx') {
@@ -1309,6 +1319,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
           .where((asset) => asset.effectiveType == 'texture')
           .length,
       'model': assets.where((asset) => asset.effectiveType == 'model').length,
+      'character': assets.where(assetIsCharacterModel).length,
       'animation': assets
           .where((asset) => asset.effectiveType == 'animation')
           .length,
@@ -2022,23 +2033,30 @@ class FilterPanel extends StatelessWidget {
               'image',
               'texture',
               'model',
+              'character',
               'animation',
               'audio',
             ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: Tooltip(
-                  message: type == 'animation' && unclassifiedFbxCount > 0
+                  message:
+                      (type == 'animation' || type == 'character') &&
+                          unclassifiedFbxCount > 0
                       ? '$unclassifiedFbxCount FBX files have not been read '
                             'yet. Pick this filter to classify them.'
+                      : type == 'character'
+                      ? 'Models with a skeleton, read from the bones rather '
+                            'than the file name.'
                       : '',
                   child: ChoiceChip(
                     selected: typeFilter == type,
                     // "(0)" would claim there are no animation clips when in
                     // fact nothing has looked yet.
                     label: Text(
-                      type == 'animation' && unclassifiedFbxCount > 0
-                          ? 'ANIMATION (${counts[type] ?? 0}+)'
+                      (type == 'animation' || type == 'character') &&
+                              unclassifiedFbxCount > 0
+                          ? '${type.toUpperCase()} (${counts[type] ?? 0}+)'
                           : '${type.toUpperCase()} (${counts[type] ?? 0})',
                     ),
                     onSelected: (_) => onTypeChanged(type),
@@ -2073,6 +2091,19 @@ class FilterPanel extends StatelessWidget {
                     _ => rigFamilyByName(option).label,
                   }),
                   onSelected: (_) => onRigFilterChanged(option),
+                ),
+              ),
+            if (characterRig != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2, bottom: 6),
+                child: ChoiceChip(
+                  selected:
+                      typeFilter == 'animation' && rigFilter == 'compatible',
+                  label: const Text('Only animations for my character'),
+                  onSelected: (_) {
+                    onTypeChanged('animation');
+                    onRigFilterChanged('compatible');
+                  },
                 ),
               ),
             const SizedBox(height: 10),
@@ -3330,6 +3361,7 @@ class _ModelPreviewState extends State<ModelPreview> {
 
   /// A texture the user picked by hand, overriding whatever resolved.
   String? chosenTexturePath;
+  bool showVariantGrid = false;
   bool useBaseTexture = true;
   bool useNormalMaps = true;
   bool useEmissiveMaps = true;
@@ -3427,6 +3459,14 @@ class _ModelPreviewState extends State<ModelPreview> {
                 // the viewport costs a little height and covers nothing.
                 ModelToolbarBar(
                   children: [
+                    if (mesh.materials.length > 1)
+                      FilterChip(
+                        avatar: const Icon(Icons.grid_view, size: 16),
+                        label: Text('Variants (${mesh.materials.length})'),
+                        selected: showVariantGrid,
+                        onSelected: (next) =>
+                            setState(() => showVariantGrid = next),
+                      ),
                     if (mesh.skin != null)
                       ValueListenableBuilder<String?>(
                         valueListenable: AnimationCharacter.instance.path,
@@ -3701,7 +3741,19 @@ class _ModelPreviewState extends State<ModelPreview> {
                             // buys nothing; everything filled goes through the
                             // rasteriser so interpenetrating and coplanar faces
                             // resolve correctly.
-                            child: renderMode == RenderMode.wireframe
+                            child: showVariantGrid
+                                ? MaterialVariantGrid(
+                                    mesh: mesh,
+                                    yaw: yaw,
+                                    pitch: pitch,
+                                    zoom: zoom,
+                                    renderMode: renderMode,
+                                    lightingMode: lightingMode,
+                                    cullBackFaces: cullBackFaces,
+                                    interacting: interacting,
+                                    uvSetOverride: uvSetOverride,
+                                  )
+                                : renderMode == RenderMode.wireframe
                                 ? CustomPaint(
                                     painter: MeshPainter(
                                       mesh: mesh,
@@ -4328,6 +4380,7 @@ class RasterModelView extends StatefulWidget {
     required this.interacting,
     this.sceneOverride,
     this.sceneRevision,
+    this.visibleMaterial = -1,
     this.uvSetOverride,
     super.key,
   });
@@ -4358,6 +4411,9 @@ class RasterModelView extends StatefulWidget {
   /// Changes when [sceneOverride] holds different positions, so the frame
   /// cache can tell one pose from the next.
   final Object? sceneRevision;
+
+  /// Restrict drawing to one material; negative draws all of them.
+  final int visibleMaterial;
 
   @override
   State<RasterModelView> createState() => _RasterModelViewState();
@@ -4390,6 +4446,7 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.useEmissiveMaps,
     widget.useSpecular,
     widget.sceneRevision ?? '',
+    widget.visibleMaterial,
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -4435,6 +4492,7 @@ class _RasterModelViewState extends State<RasterModelView> {
         renderMode: widget.renderMode,
         lightingMode: widget.lightingMode,
         cullBackFaces: widget.cullBackFaces,
+        visibleMaterial: widget.visibleMaterial,
         useBaseTexture: widget.useBaseTexture,
         useNormalMaps: widget.useNormalMaps,
         useEmissiveMaps: widget.useEmissiveMaps,
@@ -4780,6 +4838,7 @@ RasterResult rasterizeMesh({
   String? uvSetOverride,
   int backgroundArgb = 0xffe9edf3,
   int maxFaces = maxRenderedFaces,
+  int visibleMaterial = -1,
 }) {
   return rasterizeScene(
     RasterRequest(
@@ -4798,6 +4857,7 @@ RasterResult rasterizeMesh({
       useSpecular: useSpecular,
       backgroundArgb: backgroundArgb,
       maxFaces: maxFaces,
+      visibleMaterial: visibleMaterial,
     ),
   );
 }
@@ -4820,6 +4880,7 @@ class RasterRequest {
     this.useSpecular = true,
     this.backgroundArgb = 0xffe9edf3,
     this.maxFaces = maxRenderedFaces,
+    this.visibleMaterial = -1,
   });
 
   final RasterScene scene;
@@ -4843,6 +4904,15 @@ class RasterRequest {
   final bool useSpecular;
   final int backgroundArgb;
   final int maxFaces;
+
+  /// Draw only the triangles using this material, or every one when negative.
+  ///
+  /// Some packs stack every variant of a character in one file, sharing the
+  /// geometry and differing only by material -- `SimplePeople3.fbx` has 12 of
+  /// them in the same place. Drawn together they fight for the same pixels at
+  /// exactly the same depth, which no depth buffer can settle. Drawn one at a
+  /// time they are twelve characters.
+  final int visibleMaterial;
 }
 
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
@@ -4935,9 +5005,14 @@ RasterResult rasterizeScene(RasterRequest request) {
     final area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
     if (area == 0) continue;
     if (request.cullBackFaces && area < 0) continue;
-    drawn += 1;
 
     final materialIndex = scene.triangleMaterial[triangleIndex];
+    if (request.visibleMaterial >= 0 &&
+        materialIndex != request.visibleMaterial) {
+      continue;
+    }
+    drawn += 1;
+
     final material =
         (materialIndex >= 0 && materialIndex < scene.materials.length)
         ? scene.materials[materialIndex]
@@ -6401,6 +6476,17 @@ Future<void> revealAssetInExplorer(AssetItem asset) async {
 /// patching script cannot mangle it.
 final chr92 = String.fromCharCode(92);
 
+/// Whether an asset is a model with a skeleton in it.
+///
+/// The useful sense of "character": a rigged mesh, as opposed to a prop, a
+/// building, or a clip with no geometry. Read from the bones, so a static mesh
+/// named `SK_Chr_Attach_Helmet_01` is correctly not one.
+bool assetIsCharacterModel(AssetItem asset) {
+  if (asset.effectiveType != 'model') return false;
+  final rig = asset.rigFamily;
+  return rig != null && rig != RigFamily.none.name;
+}
+
 /// Whether an asset passes the rig filter.
 ///
 /// `all` passes everything. `compatible` keeps only files built on the same
@@ -6669,6 +6755,105 @@ class AnimationCharacterButton extends StatelessWidget {
       onPressed: onPressed,
       icon: Icon(isChosen ? Icons.person : Icons.person_outline, size: 18),
       label: Text(isChosen ? 'Animation character' : 'Use for animations'),
+    );
+  }
+}
+
+/// Shows a model once per material, side by side.
+///
+/// Two quite different problems have the same answer. A pack may give one
+/// model several interchangeable looks, and you want to see them together
+/// rather than cycling. And some files stack every variant of a character on
+/// the same geometry -- `SimplePeople3.fbx` holds twelve, differing only by
+/// material -- which drawn together fight for identical pixels at identical
+/// depth and read as a mess of z-fighting. Drawn one per cell they are twelve
+/// characters.
+class MaterialVariantGrid extends StatelessWidget {
+  const MaterialVariantGrid({
+    required this.mesh,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    required this.interacting,
+    this.uvSetOverride,
+    super.key,
+  });
+
+  final MeshModel mesh;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool interacting;
+  final String? uvSetOverride;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = mesh.materials.length;
+    if (count <= 1) {
+      return const Center(
+        child: Text(
+          'This model has one material, so there is nothing to compare.',
+          style: TextStyle(color: Colors.black54),
+        ),
+      );
+    }
+
+    // As square as the count allows, so cells stay large.
+    final columns = math.max(1, math.sqrt(count).ceil());
+    return GridView.builder(
+      padding: const EdgeInsets.all(8),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: columns,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+      ),
+      itemCount: count,
+      itemBuilder: (context, index) {
+        final material = mesh.materials[index];
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            border: Border.all(color: Colors.black12),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Column(
+            children: [
+              Expanded(
+                child: RasterModelView(
+                  mesh: mesh,
+                  yaw: yaw,
+                  pitch: pitch,
+                  zoom: zoom,
+                  renderMode: renderMode,
+                  lightingMode: lightingMode,
+                  cullBackFaces: cullBackFaces,
+                  useBaseTexture: true,
+                  useNormalMaps: true,
+                  useEmissiveMaps: true,
+                  useSpecular: true,
+                  interacting: interacting,
+                  uvSetOverride: uvSetOverride,
+                  visibleMaterial: index,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                child: Text(
+                  material.name.isEmpty ? 'Material $index' : material.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
