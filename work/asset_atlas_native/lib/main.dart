@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.17';
+const appVersion = '1.10.18';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -4039,6 +4039,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     for (final candidate in findClipReferenceCharacters(
       widget.clipPath,
       widget.allAssets,
+      clipRig: rigFamilyOfSkeleton(widget.skeleton),
     )) {
       try {
         final candidateMesh = await MeshLoadCache.load(
@@ -4047,6 +4048,11 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
         );
         final candidateRig = candidateMesh.skeleton;
         if (candidateRig == null) continue;
+        // The last word on what a file is belongs to the file. A clip has a
+        // skeleton and would score a perfect bone overlap, but its rest pose
+        // is wherever the animator left it, so correcting against one leaves
+        // the character standing in its bind. Only a bound character has skin.
+        if (candidateMesh.skin == null) continue;
         final shared = rigBoneOverlap(candidateRig, widget.skeleton);
         if (shared > bestOverlap) {
           bestOverlap = shared;
@@ -6604,6 +6610,14 @@ RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
   }
   return RigFamily.none;
 }
+
+/// The family a loaded skeleton belongs to, read from its own bone names.
+///
+/// The catalog's `rig_family` column comes from the importer's `--probe`, but a
+/// clip loaded for playback already carries its bones in memory, so its family
+/// can be named without going back to the file.
+RigFamily rigFamilyOfSkeleton(SkeletonAnimation skeleton) =>
+    rigFamilyFromMarkers(skeleton.bones.map((bone) => bone.name));
 
 /// Whether a clip can drive a model without retargeting between skeletons.
 ///
@@ -10032,42 +10046,117 @@ void multiplyMatrices(
 /// An animation pack ships a character on its own rig for exactly this reason,
 /// so references are looked for beside the clip, in the same archive. There
 /// can be more than one: the base locomotion pack ships clips for two rig
-/// families side by side, `Animations/Polygon` and `Animations/Sidekick`, with
-/// `PolygonSyntyCharacter` and `SidekickSyntyCharacter` to match. Picking the
-/// wrong one corrects against a rig the clip was never authored for, which
-/// mangles the result as thoroughly as no correction at all -- so the caller
-/// measures each against the clip rather than guessing from the name.
+/// families side by side with a character for each. Picking the wrong one
+/// corrects against a rig the clip was never authored for, which mangles the
+/// result as thoroughly as no correction at all -- so the caller measures each
+/// against the clip rather than guessing from the name.
+///
+/// Nothing here reads a folder name. This used to require `/character` in the
+/// path, which is a convention of two packs rather than a fact about files;
+/// what a file *is* comes from the importer instead. A clip cannot be its own
+/// reference (`modelKind`), and a rig of a different family cannot either
+/// (`rigFamily`, from the marker bones). Both are content, and both are
+/// permissive when unknown: a file the catalog has not probed yet is offered
+/// rather than hidden, because hiding it would assert something not known.
 List<AssetItem> findClipReferenceCharacters(
   String clipPath,
-  List<AssetItem> allAssets,
-) {
-  final clipZip = parseZipVirtualPath(clipPath);
-  final clipRoot = clipZip == null ? parentPath(clipPath) : null;
+  List<AssetItem> allAssets, {
+  RigFamily? clipRig,
+}) {
+  AssetItem? clipAsset;
+  for (final asset in allAssets) {
+    if (normalizePathKey(asset.path) == normalizePathKey(clipPath)) {
+      clipAsset = asset;
+      break;
+    }
+  }
+  final clipContainer = clipAsset == null
+      ? assetContainerKeyOf(path: clipPath, sourceRoot: parentPath(clipPath))
+      : assetContainerKey(clipAsset);
 
   final candidates = <AssetItem>[];
   for (final asset in allAssets) {
     if (asset.ext != 'fbx') continue;
     if (normalizePathKey(asset.path) == normalizePathKey(clipPath)) continue;
-    final lower = asset.path.toLowerCase().replaceAll(r'\', '/');
-    if (!lower.contains('/character')) continue;
-
-    if (clipZip != null) {
-      final zip = parseZipVirtualPath(asset.path);
-      if (zip == null ||
-          normalizePathKey(zip.zipPath) != normalizePathKey(clipZip.zipPath)) {
-        continue;
-      }
-    } else if (clipRoot == null || !asset.path.startsWith(clipRoot)) {
+    if (assetContainerKey(asset) != clipContainer) continue;
+    // A clip has no mesh and no bind pose, so it cannot stand in for one.
+    if (asset.modelKind == 'animation') continue;
+    if (clipRig != null &&
+        clipRig != RigFamily.none &&
+        asset.rigFamily != null &&
+        rigFamilyByName(asset.rigFamily) != clipRig) {
       continue;
     }
     candidates.add(asset);
   }
-  // Deterministic order: the caller measures each, and ties must not depend
-  // on scan order.
-  candidates.sort(
+
+  // If the catalog knows of a rigged character here, those are the answer and
+  // the rest are noise. Falling back to unprobed files only when it does not
+  // matters on a cold catalog: an animation pack holds two characters and
+  // seven hundred clips, and until the clips are classified they are
+  // indistinguishable by anything but their contents. Ranked in, they would
+  // have filled the list before the alphabet reached the characters.
+  final known = candidates
+      .where((asset) => _referenceRank(asset) == 0)
+      .toList();
+  final chosen = known.isNotEmpty
+      ? known
+      : candidates.where((asset) => _referenceRank(asset) == 1).toList();
+
+  // By path, so ties do not depend on scan order.
+  chosen.sort(
     (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
   );
-  return candidates;
+  return chosen.length > maxReferenceCandidates
+      ? chosen.sublist(0, maxReferenceCandidates)
+      : chosen;
+}
+
+/// The separator [normalizePathKey] leaves behind, whatever went in.
+const pathKeySeparator = '\\';
+
+/// The archive or pack folder a file belongs to.
+///
+/// Two files share a container when they came out of the same zip, or out of
+/// the same top-level folder under a scanned source root. That folder is what
+/// a downloaded pack unzips to, so it is the loose-file counterpart of an
+/// archive -- and the unit a clip's reference character has to be found in.
+/// Scoping loose files to the clip's own directory instead put a pack's
+/// animation folder and its character folder in different worlds, so a
+/// reference that was found inside a zip went missing once the same pack was
+/// unpacked on disk.
+String assetContainerKey(AssetItem asset) =>
+    assetContainerKeyOf(path: asset.path, sourceRoot: asset.sourceRoot);
+
+/// [assetContainerKey] for a path with no catalog entry to read a root from.
+String assetContainerKeyOf({required String path, required String sourceRoot}) {
+  final zip = parseZipVirtualPath(path);
+  if (zip != null) return normalizePathKey(zip.zipPath);
+
+  final root = normalizePathKey(sourceRoot);
+  final full = normalizePathKey(path);
+  if (root.isEmpty || !full.startsWith(root)) return full;
+
+  final rest = full
+      .substring(root.length)
+      .split(pathKeySeparator)
+      .where((segment) => segment.isNotEmpty);
+  // A file sitting directly in the source root has no pack folder of its own.
+  if (rest.length <= 1) return root;
+  return '$root$pathKeySeparator${rest.first}';
+}
+
+/// How many candidate references are worth importing to measure.
+///
+/// Each one is a full FBX import. An animation pack holds two characters and
+/// hundreds of clips, so the real list is short; the cap only bounds a pack
+/// laid out in some way not seen here.
+const maxReferenceCandidates = 12;
+
+/// Sorts a known character rig ahead of an unprobed file ahead of a prop.
+int _referenceRank(AssetItem asset) {
+  if (asset.rigFamily == null) return 1;
+  return rigFamilyByName(asset.rigFamily) == RigFamily.none ? 2 : 0;
 }
 
 /// Transfers a clip's pose onto a character whose rig holds its bones at
@@ -11990,5 +12079,6 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
