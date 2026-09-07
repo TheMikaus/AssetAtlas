@@ -8,7 +8,8 @@ const _root = r'C:\Packs\CityPack';
 final _separator = Platform.pathSeparator;
 
 AssetItem _asset(String relativePath, {String sourceRoot = _root}) {
-  final path = '$sourceRoot$_separator${relativePath.replaceAll('/', _separator)}';
+  final path =
+      '$sourceRoot$_separator${relativePath.replaceAll('/', _separator)}';
   final name = relativePath.split('/').last;
   return AssetItem(
     id: 'test:$path',
@@ -178,7 +179,10 @@ void main() {
     test('a reference naming another pack finds it', () {
       const packA = r'C:\Packs\ANIMATION_Base.zip';
       const packB = r'C:\Packs\PolygonApocalypse_SourceFiles.zip';
-      final modelInA = buildZipVirtualPath(packA, 'Demo_Models/SM_Obstacle.fbx');
+      final modelInA = buildZipVirtualPath(
+        packA,
+        'Demo_Models/SM_Obstacle.fbx',
+      );
       final atlasInB = _zipAsset(
         packB,
         'PolygonApocalypse/Textures/PolygonApocalypse_Texture_01_A.png',
@@ -197,7 +201,10 @@ void main() {
     test('the file name still has to match exactly', () {
       const packA = r'C:\Packs\ANIMATION_Base.zip';
       const packB = r'C:\Packs\PolygonApocalypse_SourceFiles.zip';
-      final modelInA = buildZipVirtualPath(packA, 'Demo_Models/SM_Obstacle.fbx');
+      final modelInA = buildZipVirtualPath(
+        packA,
+        'Demo_Models/SM_Obstacle.fbx',
+      );
       final other = _zipAsset(
         packB,
         'PolygonApocalypse/Textures/PolygonApocalypse_Texture_02_B.png',
@@ -216,7 +223,10 @@ void main() {
     test('a texture beside the model still wins', () {
       const packA = r'C:\Packs\ANIMATION_Base.zip';
       const packB = r'C:\Packs\PolygonApocalypse_SourceFiles.zip';
-      final modelInA = buildZipVirtualPath(packA, 'Demo_Models/SM_Obstacle.fbx');
+      final modelInA = buildZipVirtualPath(
+        packA,
+        'Demo_Models/SM_Obstacle.fbx',
+      );
       final localAtlas = _zipAsset(
         packA,
         'Textures/PolygonApocalypse_Texture_01_A.png',
@@ -263,6 +273,60 @@ void main() {
       expect(forward, isNotNull);
       expect(forward, reversed);
       expect(forward, left.path);
+    });
+  });
+  group('the candidate cache does not leak between models', () {
+    // The partition is memoised per model, so a second model must not be
+    // answered from the first one's candidates.
+    test('two models in different packs get their own answers', () {
+      const packA = r'C:\Packs\pack_a.zip';
+      const packB = r'C:\Packs\pack_b.zip';
+      final modelA = buildZipVirtualPath(packA, 'Models/SM_Wall_01.fbx');
+      final modelB = buildZipVirtualPath(packB, 'Models/SM_Wall_01.fbx');
+      final textureA = _zipAsset(packA, 'Textures/Wall_01.png');
+      final textureB = _zipAsset(packB, 'Textures/Wall_01.png');
+      final assets = [textureA, textureB];
+
+      for (var round = 0; round < 3; round += 1) {
+        expect(
+          findDeterministicTextureRelink(modelA, 'Wall_01.psd', assets),
+          textureA.path,
+        );
+        expect(
+          findDeterministicTextureRelink(modelB, 'Wall_01.psd', assets),
+          textureB.path,
+        );
+      }
+    });
+
+    test('a changed catalog is not answered from the old one', () {
+      const pack = r'C:\Packs\pack_a.zip';
+      final model = buildZipVirtualPath(pack, 'Models/SM_Wall_01.fbx');
+      final texture = _zipAsset(pack, 'Textures/Wall_01.png');
+
+      expect(
+        findDeterministicTextureRelink(model, 'Wall_01.psd', [texture]),
+        texture.path,
+      );
+      expect(
+        findDeterministicTextureRelink(model, 'Wall_01.psd', <AssetItem>[]),
+        isNull,
+      );
+      expect(
+        findDeterministicTextureRelink(model, 'Wall_01.psd', [texture]),
+        texture.path,
+      );
+    });
+
+    test('repeated calls for one model agree', () {
+      const pack = r'C:\Packs\pack_a.zip';
+      final model = buildZipVirtualPath(pack, 'Models/SM_Wall_01.fbx');
+      final texture = _zipAsset(pack, 'Textures/Wall_01.png');
+      final answers = {
+        for (var i = 0; i < 5; i += 1)
+          findDeterministicTextureRelink(model, 'Wall_01.psd', [texture]),
+      };
+      expect(answers, hasLength(1));
     });
   });
 }

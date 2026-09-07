@@ -13,6 +13,8 @@
 // character must not change height.
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:asset_atlas_native/main.dart';
@@ -23,6 +25,12 @@ const _packName = 'ANIMATION_Base_Locomotion_SourceFiles_v3.zip';
 const _characterEntry = 'SourceFiles/Character/PolygonSyntyCharacter.fbx';
 const _clipEntry =
     'SourceFiles/Animations/Polygon/Feminine/Idle/A_Idle_Standing_Femn.fbx';
+const _sidekickClipEntry =
+    'SourceFiles/Animations/Sidekick/Feminine/Idles/'
+    'A_MOD_BL_Idle_Standing_Femn.fbx';
+const _sidekickReference = 'SourceFiles/Character/SidekickSyntyCharacter.fbx';
+const _royalePack = 'POLYGON_BattleRoyale_Source_Files_v4 (1).zip';
+const _royaleCharacter = 'Source Files/Characters/SK_Chr_MilitaryMale_01.fbx';
 
 String? get _packPath {
   final root = Platform.environment[_corpusVariable];
@@ -148,6 +156,178 @@ void main() {
         if (d > moved) moved = d;
       }
       expect(moved, greaterThan(0.0005));
+    });
+  }, skip: skipReason);
+  group('rig families do not mix', () {
+    // The pack ships clips for two skeletons side by side. They share 52 and
+    // 121 bones respectively and not one name between them, so a clip from one
+    // family cannot drive a character from the other -- and must be reported
+    // as such rather than quietly producing a bind pose.
+    late SkeletonAnimation polygonClip;
+    late SkeletonAnimation sidekickClip;
+    late MeshModel polygonReference;
+    late MeshModel sidekickReference;
+
+    setUpAll(() async {
+      if (pack == null) return;
+      polygonClip = SkeletonAnimation.fromJson(
+        (await _import(pack, _clipEntry))['skeleton'] as Map<String, dynamic>?,
+      )!;
+      sidekickClip = SkeletonAnimation.fromJson(
+        (await _import(pack, _sidekickClipEntry))['skeleton']
+            as Map<String, dynamic>?,
+      )!;
+      polygonReference = await meshModelFromImporterJson(
+        await _import(pack, _characterEntry),
+        modelPath: buildZipVirtualPath(pack, _characterEntry),
+        name: 'PolygonSyntyCharacter.fbx',
+      );
+      sidekickReference = await meshModelFromImporterJson(
+        await _import(pack, _sidekickReference),
+        modelPath: buildZipVirtualPath(pack, _sidekickReference),
+        name: 'SidekickSyntyCharacter.fbx',
+      );
+    });
+
+    test('each reference shares every bone with its own family', () {
+      expect(
+        rigBoneOverlap(polygonReference.skeleton!, polygonClip),
+        polygonReference.skeleton!.bones.length,
+      );
+      expect(
+        rigBoneOverlap(sidekickReference.skeleton!, sidekickClip),
+        sidekickReference.skeleton!.bones.length,
+      );
+    });
+
+    test('and none at all with the other', () {
+      expect(rigBoneOverlap(sidekickReference.skeleton!, polygonClip), 0);
+      expect(rigBoneOverlap(polygonReference.skeleton!, sidekickClip), 0);
+    });
+
+    test('an unrelated rig is infinitely far, not perfectly aligned', () {
+      // Zero shared bones used to score 0 degrees, which read as a flawless
+      // match and made the wrong reference win.
+      expect(
+        rigAxisDifference(sidekickReference.skeleton!, polygonClip),
+        double.infinity,
+      );
+      expect(
+        rigAxisDifference(polygonReference.skeleton!, polygonClip),
+        lessThan(90),
+      );
+    });
+  }, skip: skipReason);
+
+  group('a character whose joints point elsewhere', () {
+    late MeshModel character;
+    late SkeletonAnimation clip;
+    late MeshModel reference;
+
+    setUpAll(() async {
+      if (pack == null) return;
+      final royale =
+          '${File(pack).parent.path}${Platform.pathSeparator}$_royalePack';
+      character = await meshModelFromImporterJson(
+        await _import(royale, _royaleCharacter),
+        modelPath: buildZipVirtualPath(royale, _royaleCharacter),
+        name: 'SK_Chr_MilitaryMale_01.fbx',
+      );
+      clip = SkeletonAnimation.fromJson(
+        (await _import(pack, _clipEntry))['skeleton'] as Map<String, dynamic>?,
+      )!;
+      reference = await meshModelFromImporterJson(
+        await _import(pack, _characterEntry),
+        modelPath: buildZipVirtualPath(pack, _characterEntry),
+        name: 'PolygonSyntyCharacter.fbx',
+      );
+    });
+
+    test('shares the clip rig but not its joint angles', () {
+      expect(rigBoneOverlap(character.skeleton!, clip), greaterThan(40));
+      expect(
+        rigAxisDifference(character.skeleton!, clip),
+        greaterThan(maxDirectPoseAngle),
+        reason: 'this is what makes direct posing invalid',
+      );
+    });
+
+    test('posing it directly wrecks it', () {
+      final bind = _extent(character.vertices);
+      final posed = _extent(
+        poseSkinnedVertices(character: character, clip: clip, frame: 10),
+      );
+      expect(
+        posed.width,
+        lessThan(bind.width * 0.6),
+        reason: 'the mesh collapses inward: this is the bug being guarded',
+      );
+    });
+
+    // Height alone does not catch a mangled retarget: the spine can stay the
+    // right length while the shoulders halve and the fingers stretch by half
+    // again. Every bone is measured instead.
+    test('retargeting leaves every bone its own length', () {
+      final rest = character.skeleton!;
+      final plan = RetargetPlan.build(
+        characterRest: rest,
+        clip: clip,
+        sourceReference: reference.skeleton,
+      )!;
+
+      double lengthOf(Float32List world, int bone, int parent) {
+        final dx = world[bone * 12 + 9] - world[parent * 12 + 9];
+        final dy = world[bone * 12 + 10] - world[parent * 12 + 10];
+        final dz = world[bone * 12 + 11] - world[parent * 12 + 11];
+        return math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+
+      final bind = rest.rest!;
+      for (final frame in [0, clip.frameCount ~/ 2]) {
+        final world = plan.worldForFrame(
+          clip,
+          frame,
+          Float32List(rest.bones.length * 12),
+        );
+        for (var i = 0; i < rest.bones.length; i += 1) {
+          final up = rest.bones[i].parent;
+          if (up < 0) continue;
+          final was = lengthOf(bind, i, up);
+          if (was < 1e-4) continue;
+          expect(
+            lengthOf(world, i, up),
+            closeTo(was, was * 0.02),
+            reason:
+                '${rest.bones[i].name} changed length on frame $frame, which '
+                'is what tore this character apart',
+          );
+        }
+      }
+    });
+
+    test('retargeting through the reference keeps it intact', () {
+      final plan = RetargetPlan.build(
+        characterRest: character.skeleton!,
+        clip: clip,
+        sourceReference: reference.skeleton,
+      );
+      expect(plan, isNotNull);
+
+      final bind = _extent(character.vertices);
+      final posed = _extent(
+        poseSkinnedVertices(
+          character: character,
+          clip: clip,
+          frame: 10,
+          plan: plan,
+        ),
+      );
+      expect(posed.height, closeTo(bind.height, bind.height * 0.05));
+      expect(
+        posed.width,
+        lessThan(bind.width * 0.5),
+        reason: 'a T-pose adopting a standing idle brings its arms in',
+      );
     });
   }, skip: skipReason);
 }
