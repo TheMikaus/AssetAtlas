@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.16';
+const appVersion = '1.10.17';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -10097,15 +10097,25 @@ List<AssetItem> findClipReferenceCharacters(
 /// the clip's motion starting from its bind.
 class RetargetPlan {
   RetargetPlan._(
-    this._correction,
+    this._rotation,
+    this._deltaToBind,
+    this._bindOffset,
+    this._referenceOffset,
+    this._bindLocal,
     this._clipBone,
     this._clipParents,
     this._parent,
     this._order,
+    this._motionScale,
   );
 
   /// Builds the plan once for a character and clip; it does not change frame
   /// to frame, and computing it per frame would dominate playback.
+  ///
+  /// Two things are carried over from the clip and nothing else: how far each
+  /// bone has turned in the world since the reference's rest, and how far it
+  /// has slid from its reference offset. The character keeps its own bone
+  /// lengths, because they are its proportions, not the animator's.
   ///
   /// Returns null when the character carries no rest pose to correct against.
   static RetargetPlan? build({
@@ -10125,7 +10135,11 @@ class RetargetPlan {
     final count = bones.length;
     final parent = Int32List(count);
     final clipBone = Int32List(count);
-    final correction = Float32List(count * 12);
+    final rotation = Float32List(count * 9);
+    final deltaToBind = Float32List(count * 9);
+    final bindOffset = Float32List(count * 3);
+    final referenceOffset = Float32List(count * 3);
+    final bindLocal = Float32List(count * 12);
 
     // Parents before children, so a bone's world transform is ready when its
     // children need it.
@@ -10144,55 +10158,98 @@ class RetargetPlan {
       visit(i);
     }
 
-    final scratch = Float32List(24);
+    final scratch = Float32List(12);
+    final left = Float32List(9);
+    final right = Float32List(9);
     for (var i = 0; i < count; i += 1) {
       parent[i] = bones[i].parent;
-      clipBone[i] = clip.indexOfBone(bones[i].name, path: bones[i].path);
 
-      // Both frames reduced to parent-relative, which is where a rotation
-      // means the same thing in either rig.
+      // The character's own local frame, kept whole for bones the clip does
+      // not drive and mined for the bone offset for the ones it does.
       _localOf(bind, i, parent[i], scratch, 0);
-      final k = clipBone[i];
-      if (k < 0) {
-        // Nothing drives this bone; leave it at its bind.
-        for (var j = 0; j < 12; j += 1) {
-          correction[i * 12 + j] = scratch[j];
-        }
-        continue;
+      for (var j = 0; j < 12; j += 1) {
+        bindLocal[i * 12 + j] = scratch[j];
       }
+      for (var j = 0; j < 3; j += 1) {
+        bindOffset[i * 3 + j] = scratch[9 + j];
+      }
+
+      final k = clip.indexOfBone(bones[i].name, path: bones[i].path);
       final r = identical(referenceRig, clip)
           ? k
           : referenceRig.indexOfBone(bones[i].name, path: bones[i].path);
-      if (r < 0) {
-        for (var j = 0; j < 12; j += 1) {
-          correction[i * 12 + j] = scratch[j];
-        }
-        continue;
-      }
-      _localOf(reference, r, referenceRig.bones[r].parent, scratch, 12);
+      // Both halves are needed: the clip says where the bone is now, the
+      // reference says where it started. Without either, the bone stays at
+      // its bind rather than being driven from a frame that means nothing.
+      clipBone[i] = k >= 0 && r >= 0 ? k : -1;
+      if (clipBone[i] < 0) continue;
 
-      final inverse = Float32List(12);
-      if (!invertMatrix(scratch, 12, inverse, 0)) {
-        for (var j = 0; j < 12; j += 1) {
-          correction[i * 12 + j] = scratch[j];
-        }
-        continue;
+      final referenceParent = referenceRig.bones[r].parent;
+      _localOf(reference, r, referenceParent, scratch, 0);
+      for (var j = 0; j < 3; j += 1) {
+        referenceOffset[i * 3 + j] = scratch[9 + j];
       }
-      multiplyMatrices(inverse, 0, scratch, 0, correction, i * 12);
+
+      // Undo the reference's world rotation and apply this rig's bind. What
+      // is left multiplies onto the clip's world rotation at playback, so a
+      // rig whose bones point along different axes -- Synty's character packs
+      // cycle x, y and z against the animation rig -- still turns correctly.
+      _transposeRotation(reference, r * 12, left, 0);
+      _multiplyRotations(left, 0, bind, i * 12, rotation, i * 9);
+
+      // A bone's slide is measured in the reference's parent frame. This
+      // rig's parent frame is turned differently, so the slide is carried
+      // across before it is added to a bind offset that lives here.
+      if (parent[i] >= 0) {
+        _transposeRotation(bind, parent[i] * 12, left, 0);
+      } else {
+        _identityRotation(left, 0);
+      }
+      if (referenceParent >= 0) {
+        for (var j = 0; j < 9; j += 1) {
+          right[j] = reference[referenceParent * 12 + j];
+        }
+      } else {
+        _identityRotation(right, 0);
+      }
+      _multiplyRotations(left, 0, right, 0, deltaToBind, i * 9);
     }
 
     final clipParents = Int32List(clip.bones.length);
     for (var i = 0; i < clip.bones.length; i += 1) {
       clipParents[i] = clip.bones[i].parent;
     }
-    return RetargetPlan._(correction, clipBone, clipParents, parent, order);
+
+    return RetargetPlan._(
+      rotation,
+      deltaToBind,
+      bindOffset,
+      referenceOffset,
+      bindLocal,
+      clipBone,
+      clipParents,
+      parent,
+      order,
+      _rigHeight(bind, count) / math.max(1e-6, _rigHeight(reference, referenceRig.bones.length)),
+    );
   }
 
-  final Float32List _correction;
+  final Float32List _rotation;
+  final Float32List _deltaToBind;
+  final Float32List _bindOffset;
+  final Float32List _referenceOffset;
+  final Float32List _bindLocal;
   final Int32List _clipBone;
   final Int32List _clipParents;
   final Int32List _parent;
   final Int32List _order;
+
+  /// How much taller this character is than the rig the clip was authored on.
+  ///
+  /// Only translation is scaled by it. A short character taking a stride
+  /// measured on a tall one should cover proportionally less ground, and its
+  /// hips should rise and fall proportionally less.
+  final double _motionScale;
 
   int get boneCount => _clipBone.length;
 
@@ -10209,25 +10266,123 @@ class RetargetPlan {
 
     for (final index in _order) {
       final k = _clipBone[index];
+      final up = _parent[index];
+
       if (k < 0) {
         for (var j = 0; j < 12; j += 1) {
-          local[j] = _correction[index * 12 + j];
+          local[j] = _bindLocal[index * 12 + j];
         }
-      } else {
-        _localOf(frameData, k, _clipParents[k], scratch, 0);
-        multiplyMatrices(scratch, 0, _correction, index * 12, local, 0);
+        if (up < 0 || up >= boneCount) {
+          for (var j = 0; j < 12; j += 1) {
+            out[index * 12 + j] = local[j];
+          }
+        } else {
+          multiplyMatrices(out, up * 12, local, 0, out, index * 12);
+        }
+        continue;
       }
 
-      final up = _parent[index];
+      // Orientation comes from the clip, in world space, which is the one
+      // frame both rigs agree on.
+      _multiplyRotations(frameData, k * 12, _rotation, index * 9, out, index * 12);
+
+      // Position is this rig's own bone offset, plus whatever the clip slid
+      // the bone by. For every bone but the hips that slide is zero, which is
+      // exactly why bone lengths survive.
+      _localOf(frameData, k, _clipParents[k], scratch, 0);
+      final sx = (scratch[9] - _referenceOffset[index * 3]) * _motionScale;
+      final sy = (scratch[10] - _referenceOffset[index * 3 + 1]) * _motionScale;
+      final sz = (scratch[11] - _referenceOffset[index * 3 + 2]) * _motionScale;
+      final d = index * 9;
+      final ox =
+          _bindOffset[index * 3] +
+          _deltaToBind[d] * sx +
+          _deltaToBind[d + 3] * sy +
+          _deltaToBind[d + 6] * sz;
+      final oy =
+          _bindOffset[index * 3 + 1] +
+          _deltaToBind[d + 1] * sx +
+          _deltaToBind[d + 4] * sy +
+          _deltaToBind[d + 7] * sz;
+      final oz =
+          _bindOffset[index * 3 + 2] +
+          _deltaToBind[d + 2] * sx +
+          _deltaToBind[d + 5] * sy +
+          _deltaToBind[d + 8] * sz;
+
       if (up < 0 || up >= boneCount) {
-        for (var j = 0; j < 12; j += 1) {
-          out[index * 12 + j] = local[j];
-        }
+        out[index * 12 + 9] = ox;
+        out[index * 12 + 10] = oy;
+        out[index * 12 + 11] = oz;
       } else {
-        multiplyMatrices(out, up * 12, local, 0, out, index * 12);
+        final p = up * 12;
+        out[index * 12 + 9] =
+            out[p] * ox + out[p + 3] * oy + out[p + 6] * oz + out[p + 9];
+        out[index * 12 + 10] =
+            out[p + 1] * ox + out[p + 4] * oy + out[p + 7] * oz + out[p + 10];
+        out[index * 12 + 11] =
+            out[p + 2] * ox + out[p + 5] * oy + out[p + 8] * oz + out[p + 11];
       }
     }
     return out;
+  }
+}
+
+/// The vertical span of a packed rig, used to scale one rig's motion onto
+/// another. Zero for a rig of one bone, which the caller guards against.
+double _rigHeight(Float32List world, int bones) {
+  if (bones <= 0) return 0;
+  var low = world[10];
+  var high = low;
+  for (var i = 1; i < bones; i += 1) {
+    final y = world[i * 12 + 10];
+    if (y < low) low = y;
+    if (y > high) high = y;
+  }
+  return high - low;
+}
+
+/// Writes the identity into a column-major 3x3 at `outOffset`.
+void _identityRotation(Float32List out, int outOffset) {
+  for (var j = 0; j < 9; j += 1) {
+    out[outOffset + j] = j % 4 == 0 ? 1 : 0;
+  }
+}
+
+/// Transposes the 3x3 rotation block of a matrix into `out`.
+///
+/// These blocks are orthonormal, so the transpose is the inverse and there is
+/// no determinant to check.
+void _transposeRotation(Float32List a, int aOffset, Float32List out, int outOffset) {
+  for (var column = 0; column < 3; column += 1) {
+    for (var row = 0; row < 3; row += 1) {
+      out[outOffset + column * 3 + row] = a[aOffset + row * 3 + column];
+    }
+  }
+}
+
+/// Multiplies the 3x3 rotation blocks of two matrices into `out`.
+///
+/// Offsets are free so this can read the rotation out of a 3x4 in place: a
+/// bone's frame data and a bone's world transform both begin with one.
+void _multiplyRotations(
+  Float32List a,
+  int aOffset,
+  Float32List b,
+  int bOffset,
+  Float32List out,
+  int outOffset,
+) {
+  for (var column = 0; column < 3; column += 1) {
+    final bx = b[bOffset + column * 3];
+    final by = b[bOffset + column * 3 + 1];
+    final bz = b[bOffset + column * 3 + 2];
+    for (var row = 0; row < 3; row += 1) {
+      out[outOffset + column * 3 + row] =
+          a[aOffset + row] * bx +
+          a[aOffset + 3 + row] * by +
+          a[aOffset + 6 + row] * bz;
+    }
   }
 }
 
@@ -11835,4 +11990,5 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 

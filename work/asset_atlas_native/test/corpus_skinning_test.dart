@@ -13,6 +13,8 @@
 // character must not change height.
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:asset_atlas_native/main.dart';
@@ -260,6 +262,47 @@ void main() {
         lessThan(bind.width * 0.6),
         reason: 'the mesh collapses inward: this is the bug being guarded',
       );
+    });
+
+    // Height alone does not catch a mangled retarget: the spine can stay the
+    // right length while the shoulders halve and the fingers stretch by half
+    // again. Every bone is measured instead.
+    test('retargeting leaves every bone its own length', () {
+      final rest = character.skeleton!;
+      final plan = RetargetPlan.build(
+        characterRest: rest,
+        clip: clip,
+        sourceReference: reference.skeleton,
+      )!;
+
+      double lengthOf(Float32List world, int bone, int parent) {
+        final dx = world[bone * 12 + 9] - world[parent * 12 + 9];
+        final dy = world[bone * 12 + 10] - world[parent * 12 + 10];
+        final dz = world[bone * 12 + 11] - world[parent * 12 + 11];
+        return math.sqrt(dx * dx + dy * dy + dz * dz);
+      }
+
+      final bind = rest.rest!;
+      for (final frame in [0, clip.frameCount ~/ 2]) {
+        final world = plan.worldForFrame(
+          clip,
+          frame,
+          Float32List(rest.bones.length * 12),
+        );
+        for (var i = 0; i < rest.bones.length; i += 1) {
+          final up = rest.bones[i].parent;
+          if (up < 0) continue;
+          final was = lengthOf(bind, i, up);
+          if (was < 1e-4) continue;
+          expect(
+            lengthOf(world, i, up),
+            closeTo(was, was * 0.02),
+            reason:
+                '${rest.bones[i].name} changed length on frame $frame, which '
+                'is what tore this character apart',
+          );
+        }
+      }
     });
 
     test('retargeting through the reference keeps it intact', () {
