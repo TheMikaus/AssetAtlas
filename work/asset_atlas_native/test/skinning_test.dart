@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:asset_atlas_native/main.dart';
@@ -534,6 +535,76 @@ void main() {
       plan!.worldForFrame(clip, 0, world);
       // Bone 1 must land back on its bind translation.
       expect(world[12 + 10], closeTo(2, 1e-5));
+    });
+
+    // A bone that turns in place does not move, and its children swing on
+    // the character's own bone lengths -- not the animator's. Composing the
+    // clip's local transforms instead imported the reference rig's offsets,
+    // which shortened this arm from 3 to 2.24 and, on a real character,
+    // shrank one shoulder to half its length while stretching the fingers.
+    test('a turning parent keeps the character its own proportions', () {
+      const turned = <double>[0, 1, 0, -1, 0, 0, 0, 0, 1];
+      List<double> arm(List<double> rotation, double lower) => [
+        ..._matrix(),
+        ..._matrix(ty: 4),
+        ...rotation,
+        0.0,
+        lower,
+        0.0,
+      ];
+      SkeletonAnimation rig(List<double> pose) => SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+          {'name': 'Upper', 'parent': 0, 'path': 'Root/Upper'},
+          {'name': 'Lower', 'parent': 1, 'path': 'Root/Upper/Lower'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': arm(const <double>[1, 0, 0, 0, 1, 0, 0, 0, 1], 5),
+        'frames': [pose],
+      })!;
+
+      // The character's forearm is 3 long; the rig the clip was made on has 1.
+      final character = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+          {'name': 'Upper', 'parent': 0, 'path': 'Root/Upper'},
+          {'name': 'Lower', 'parent': 1, 'path': 'Root/Upper/Lower'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': arm(const <double>[1, 0, 0, 0, 1, 0, 0, 0, 1], 7),
+        'frames': [arm(const <double>[1, 0, 0, 0, 1, 0, 0, 0, 1], 7)],
+      })!;
+      final reference = rig(arm(const <double>[1, 0, 0, 0, 1, 0, 0, 0, 1], 5));
+      final clip = rig(arm(turned, 5));
+
+      final plan = RetargetPlan.build(
+        characterRest: character,
+        clip: clip,
+        sourceReference: reference,
+      );
+      final world = plan!.worldForFrame(clip, 0, Float32List(3 * 12));
+
+      final upper = [world[21], world[22], world[23]];
+      final lower = [world[33], world[34], world[35]];
+      final length = math.sqrt(
+        math.pow(lower[0] - upper[0], 2) +
+            math.pow(lower[1] - upper[1], 2) +
+            math.pow(lower[2] - upper[2], 2),
+      );
+      expect(
+        length,
+        closeTo(3, 1e-5),
+        reason: 'the character keeps its own 3-long forearm, not the 1 the '
+            'clip was authored on',
+      );
+      // Turning a bone in place moves nothing but its children.
+      expect(lower[1], closeTo(7, 1e-5));
+      // And the bone really did turn: the clip's world rotation carried over.
+      for (var j = 0; j < 9; j += 1) {
+        expect(world[24 + j], closeTo(turned[j], 1e-5));
+      }
     });
 
     test('a rig with no rest pose cannot be planned against', () {
