@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.9';
+const appVersion = '1.10.18';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -174,6 +174,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
   bool loadingPersisted = true;
   String query = '';
   String typeFilter = 'all';
+
+  /// `all`, `compatible`, or a [RigFamily] name.
+  String rigFilter = 'all';
   String modelTextureFilter = 'all';
   bool hideIgnored = true;
   bool hideZipAssets = false;
@@ -359,11 +362,50 @@ class _CatalogScreenState extends State<CatalogScreen> {
     return _sortedCache!;
   }
 
-  List<AssetItem> get filteredAssets {
+  /// Everything the current filters allow, ignoring the search box.
+  ///
+  /// The denominator the count shows: "12 / 300" against the chosen type
+  /// answers a question you might have, while "12 / 26000" does not. Cached
+  /// separately from [filteredAssets] because both are wanted on every build,
+  /// and sharing one cache would miss on each in turn.
+  List<AssetItem> get filterableAssets => _assetsMatching(
+    query: '',
+    cache: _unqueriedCache,
+    cachedKey: _unqueriedCacheKey,
+    store: _storeUnqueried,
+  );
+
+  List<AssetItem> get filteredAssets => _assetsMatching(
+    query: query,
+    cache: _filteredCache,
+    cachedKey: _filteredCacheKey,
+    store: _storeFiltered,
+  );
+
+  List<AssetItem>? _unqueriedCache;
+  String? _unqueriedCacheKey;
+  void _storeUnqueried(List<AssetItem> value, String key) {
+    _unqueriedCache = value;
+    _unqueriedCacheKey = key;
+  }
+
+  void _storeFiltered(List<AssetItem> value, String key) {
+    _filteredCache = value;
+    _filteredCacheKey = key;
+  }
+
+  List<AssetItem> _assetsMatching({
+    required String query,
+    required List<AssetItem>? cache,
+    required String? cachedKey,
+    required void Function(List<AssetItem>, String) store,
+  }) {
     final lower = query.trim().toLowerCase();
     final cacheKey = [
       lower,
       typeFilter,
+      rigFilter,
+      AnimationCharacter.instance.rigFamily ?? '',
       modelTextureFilter,
       hideIgnored,
       hideZipAssets,
@@ -372,9 +414,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       catalogRevision,
       _listEpoch,
     ].join('|');
-    if (_filteredCache != null && _filteredCacheKey == cacheKey) {
-      return _filteredCache!;
-    }
+    if (cache != null && cachedKey == cacheKey) return cache;
 
     final matches = sortedAssets.where((asset) {
       if (hideIgnored && asset.ignored) return false;
@@ -383,7 +423,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
         return false;
       }
       if (hideZipAssets && isZipVirtualPath(asset.path)) return false;
-      if (typeFilter == 'animation') {
+      if (typeFilter == 'character') {
+        // Needs the same probe as the animation filter, for the same reason:
+        // only a parse can say whether a mesh has bones.
+        if (asset.type == 'model' && asset.ext == 'fbx') {
+          if (asset.rigFamily == null) {
+            _scheduleModelKindClassification([asset]);
+            return false;
+          }
+        }
+        if (!assetIsCharacterModel(asset)) return false;
+      } else if (typeFilter == 'animation') {
         // Only a parse can tell an animation clip from a mesh, so ask for one
         // and leave the asset out of the list until the answer arrives.
         if (asset.type == 'model' && asset.ext == 'fbx') {
@@ -398,6 +448,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
       } else if (typeFilter != 'all' && asset.effectiveType != typeFilter) {
         return false;
       }
+      if (!assetPassesRigFilter(
+        asset: asset,
+        rigFilter: rigFilter,
+        characterRig: AnimationCharacter.instance.rigFamily,
+      )) {
+        return false;
+      }
       if (asset.type == 'model' && modelTextureFilter != 'all') {
         final hasValid = modelHasValidTextures[asset.id];
         if (hasValid == null) {
@@ -410,11 +467,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
       }
       if (lower.isEmpty) return true;
-      return asset.searchText.contains(lower);
+      return assetMatchesSearch(asset.searchText, lower);
     }).toList();
 
-    _filteredCache = matches;
-    _filteredCacheKey = cacheKey;
+    store(matches, cacheKey);
     return matches;
   }
 
@@ -445,7 +501,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
   void _scheduleModelKindClassification(Iterable<AssetItem> subset) {
     final pending = <AssetItem>[];
     for (final asset in subset) {
-      if (asset.ext != 'fbx' || asset.modelKind != null) continue;
+      if (asset.ext != 'fbx') continue;
+      // Either fact missing is reason enough to probe. A catalog written
+      // before the rig column existed holds a kind and no rig, and skipping on
+      // kind alone left those files permanently unclassified.
+      if (asset.modelKind != null && asset.rigFamily != null) continue;
       if (!_modelKindInFlight.add(asset.id)) continue;
       pending.add(asset);
     }
@@ -544,7 +604,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     if (kinds.isEmpty) return;
     final byId = {for (final asset in assets) asset.id: asset};
     for (final entry in kinds.entries) {
-      byId[entry.key]?.modelKind = entry.value;
+      final decoded = FbxClassification.decode(entry.value);
+      final asset = byId[entry.key];
+      if (asset != null) {
+        asset.modelKind = decoded.kind;
+        asset.rigFamily = decoded.rig;
+      }
       _modelKindInFlight.remove(entry.key);
     }
     _modelKindClassified += kinds.length;
@@ -1249,7 +1314,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
     final visible = filteredAssets;
     // FBX files nothing has read yet, so the animation count is a lower bound.
     final unclassifiedFbxCount = assets
-        .where((asset) => asset.ext == 'fbx' && asset.modelKind == null)
+        .where(
+          (asset) =>
+              asset.ext == 'fbx' &&
+              (asset.modelKind == null || asset.rigFamily == null),
+        )
         .length;
     final counts = {
       'all': assets.length,
@@ -1258,6 +1327,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
           .where((asset) => asset.effectiveType == 'texture')
           .length,
       'model': assets.where((asset) => asset.effectiveType == 'model').length,
+      'character': assets.where(assetIsCharacterModel).length,
       'animation': assets
           .where((asset) => asset.effectiveType == 'animation')
           .length,
@@ -1298,6 +1368,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       counts: counts,
                       unclassifiedFbxCount: unclassifiedFbxCount,
                       typeFilter: typeFilter,
+                      rigFilter: rigFilter,
+                      characterRig: AnimationCharacter.instance.rigFamily,
+                      onRigFilterChanged: (value) =>
+                          setState(() => rigFilter = value),
                       modelTextureFilter: modelTextureFilter,
                       hideIgnored: hideIgnored,
                       hideZipAssets: hideZipAssets,
@@ -1374,7 +1448,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           SearchAndSummary(
                             controller: searchController,
                             visibleCount: visible.length,
-                            totalCount: assets.length,
+                            totalCount: filterableAssets.length,
                             selectedCount: selectedIds.length,
                             sortMode: sortMode,
                             gridMode: gridMode,
@@ -1410,7 +1484,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
                     VerticalResizeHandle(
                       onDrag: (delta) {
                         setState(() {
-                          assetListWidth = (assetListWidth - delta)
+                          // The list is to the left of the handle, so dragging
+                          // right widens it. Subtracting sent it the other way.
+                          assetListWidth = (assetListWidth + delta)
                               .clamp(280.0, 900.0)
                               .toDouble();
                         });
@@ -1904,6 +1980,8 @@ class FilterPanel extends StatelessWidget {
     required this.counts,
     required this.unclassifiedFbxCount,
     required this.typeFilter,
+    required this.rigFilter,
+    required this.characterRig,
     required this.modelTextureFilter,
     required this.hideIgnored,
     required this.hideZipAssets,
@@ -1914,6 +1992,7 @@ class FilterPanel extends StatelessWidget {
     required this.onFolderSelected,
     required this.onFolderExpandToggled,
     required this.onTypeChanged,
+    required this.onRigFilterChanged,
     required this.onModelTextureFilterChanged,
     required this.onHideIgnoredChanged,
     required this.onHideZipAssetsChanged,
@@ -1925,6 +2004,11 @@ class FilterPanel extends StatelessWidget {
   final Map<String, int> counts;
   final int unclassifiedFbxCount;
   final String typeFilter;
+  final String rigFilter;
+
+  /// The chosen animation character's rig, so the compatible option can name
+  /// it rather than being an unexplained toggle.
+  final String? characterRig;
   final String modelTextureFilter;
   final bool hideIgnored;
   final bool hideZipAssets;
@@ -1935,6 +2019,7 @@ class FilterPanel extends StatelessWidget {
   final ValueChanged<String?> onFolderSelected;
   final ValueChanged<String> onFolderExpandToggled;
   final ValueChanged<String> onTypeChanged;
+  final ValueChanged<String> onRigFilterChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
   final ValueChanged<bool> onHideIgnoredChanged;
   final ValueChanged<bool> onHideZipAssetsChanged;
@@ -1956,27 +2041,77 @@ class FilterPanel extends StatelessWidget {
               'image',
               'texture',
               'model',
+              'character',
               'animation',
               'audio',
             ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
                 child: Tooltip(
-                  message: type == 'animation' && unclassifiedFbxCount > 0
+                  message:
+                      (type == 'animation' || type == 'character') &&
+                          unclassifiedFbxCount > 0
                       ? '$unclassifiedFbxCount FBX files have not been read '
                             'yet. Pick this filter to classify them.'
+                      : type == 'character'
+                      ? 'Models with a skeleton, read from the bones rather '
+                            'than the file name.'
                       : '',
                   child: ChoiceChip(
                     selected: typeFilter == type,
                     // "(0)" would claim there are no animation clips when in
                     // fact nothing has looked yet.
                     label: Text(
-                      type == 'animation' && unclassifiedFbxCount > 0
-                          ? 'ANIMATION (${counts[type] ?? 0}+)'
+                      (type == 'animation' || type == 'character') &&
+                              unclassifiedFbxCount > 0
+                          ? '${type.toUpperCase()} (${counts[type] ?? 0}+)'
                           : '${type.toUpperCase()} (${counts[type] ?? 0})',
                     ),
                     onSelected: (_) => onTypeChanged(type),
                   ),
+                ),
+              ),
+            const SizedBox(height: 10),
+            const Text(
+              'Skeleton',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Read from the bones, not the file name.',
+              style: TextStyle(fontSize: 11, color: Colors.black54),
+            ),
+            const SizedBox(height: 8),
+            for (final option in [
+              'all',
+              if (characterRig != null) 'compatible',
+              ...RigFamily.values.map((family) => family.name),
+            ])
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: ChoiceChip(
+                  selected: rigFilter == option,
+                  label: Text(switch (option) {
+                    'all' => 'Any skeleton',
+                    'compatible' =>
+                      'Works with my character '
+                          '(${rigFamilyByName(characterRig).label})',
+                    _ => rigFamilyByName(option).label,
+                  }),
+                  onSelected: (_) => onRigFilterChanged(option),
+                ),
+              ),
+            if (characterRig != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2, bottom: 6),
+                child: ChoiceChip(
+                  selected:
+                      typeFilter == 'animation' && rigFilter == 'compatible',
+                  label: const Text('Only animations for my character'),
+                  onSelected: (_) {
+                    onTypeChanged('animation');
+                    onRigFilterChanged('compatible');
+                  },
                 ),
               ),
             const SizedBox(height: 10),
@@ -2366,6 +2501,16 @@ class AssetList extends StatelessWidget {
                       color: asset.ignored ? Colors.black87 : Colors.black26,
                     ),
                     onPressed: () => onIgnoredChanged(asset, !asset.ignored),
+                  ),
+                  IconButton(
+                    tooltip: 'Show in Explorer',
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
+                    ),
+                    icon: const Icon(Icons.folder_open_outlined, size: 15),
+                    onPressed: () => revealAssetInExplorer(asset),
                   ),
                   IconButton(
                     tooltip: 'Copy asset path',
@@ -3224,6 +3369,7 @@ class _ModelPreviewState extends State<ModelPreview> {
 
   /// A texture the user picked by hand, overriding whatever resolved.
   String? chosenTexturePath;
+  bool showVariantGrid = false;
   bool useBaseTexture = true;
   bool useNormalMaps = true;
   bool useEmissiveMaps = true;
@@ -3310,6 +3456,7 @@ class _ModelPreviewState extends State<ModelPreview> {
               return AnimationClipPreview(
                 mesh: mesh,
                 allAssets: widget.allAssets,
+                clipPath: widget.asset.path,
               );
             }
             return Column(
@@ -3320,6 +3467,14 @@ class _ModelPreviewState extends State<ModelPreview> {
                 // the viewport costs a little height and covers nothing.
                 ModelToolbarBar(
                   children: [
+                    if (mesh.materials.length > 1)
+                      FilterChip(
+                        avatar: const Icon(Icons.grid_view, size: 16),
+                        label: Text('Variants (${mesh.materials.length})'),
+                        selected: showVariantGrid,
+                        onSelected: (next) =>
+                            setState(() => showVariantGrid = next),
+                      ),
                     if (mesh.skin != null)
                       ValueListenableBuilder<String?>(
                         valueListenable: AnimationCharacter.instance.path,
@@ -3330,6 +3485,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                 chosen == widget.asset.path
                                     ? null
                                     : widget.asset.path,
+                                rig: widget.asset.rigFamily,
                               ),
                             ),
                       ),
@@ -3593,7 +3749,19 @@ class _ModelPreviewState extends State<ModelPreview> {
                             // buys nothing; everything filled goes through the
                             // rasteriser so interpenetrating and coplanar faces
                             // resolve correctly.
-                            child: renderMode == RenderMode.wireframe
+                            child: showVariantGrid
+                                ? MaterialVariantGrid(
+                                    mesh: mesh,
+                                    yaw: yaw,
+                                    pitch: pitch,
+                                    zoom: zoom,
+                                    renderMode: renderMode,
+                                    lightingMode: lightingMode,
+                                    cullBackFaces: cullBackFaces,
+                                    interacting: interacting,
+                                    uvSetOverride: uvSetOverride,
+                                  )
+                                : renderMode == RenderMode.wireframe
                                 ? CustomPaint(
                                     painter: MeshPainter(
                                       mesh: mesh,
@@ -3748,6 +3916,7 @@ class SkeletonPlayer extends StatefulWidget {
     required this.skeleton,
     this.characterPath,
     this.allAssets = const [],
+    this.clipPath = '',
     super.key,
   });
 
@@ -3756,6 +3925,7 @@ class SkeletonPlayer extends StatefulWidget {
   /// The model to play this clip on. Null falls back to the stick figure.
   final String? characterPath;
   final List<AssetItem> allAssets;
+  final String clipPath;
 
   @override
   State<SkeletonPlayer> createState() => _SkeletonPlayerState();
@@ -3771,6 +3941,9 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   String? _characterError;
   RasterScene? _restScene;
   Float32List? _posedPositions;
+  RetargetPlan? _plan;
+  Float32List? _boneWorld;
+  String? _retargetNote;
 
   /// The character's scene with this frame's positions written into it.
   ///
@@ -3791,6 +3964,8 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       clip: clip,
       frame: frame,
       out: buffer,
+      plan: _plan,
+      boneWorld: _boneWorld,
     );
     return scene.withPositions(buffer);
   }
@@ -3808,13 +3983,103 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   @override
   void didUpdateWidget(covariant SkeletonPlayer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.characterPath != widget.characterPath) {
+    if (oldWidget.characterPath != widget.characterPath ||
+        !identical(oldWidget.skeleton, widget.skeleton)) {
       _character = null;
       _characterError = null;
       _restScene = null;
       _posedPositions = null;
+      _plan = null;
+      _boneWorld = null;
+      _retargetNote = null;
       _loadCharacter();
     }
+  }
+
+  /// Works out how to drive this character with this clip.
+  ///
+  /// Rigs that agree are posed by the clip directly. Rigs that do not are
+  /// retargeted through a reference character shipped beside the clip; without
+  /// one there is nothing to correct against, so the character stays in its
+  /// bind pose rather than being torn apart.
+  Future<void> _buildPlan(MeshModel character) async {
+    final rest = character.skeleton;
+    if (rest == null) return;
+    // A character with no bones in common with the clip cannot be driven by it
+    // at all; say so rather than showing a bind pose with no explanation.
+    if (rigBoneOverlap(rest, widget.skeleton) < minimumRigOverlap) {
+      _plan = null;
+      _boneWorld = null;
+      _retargetNote =
+          'This clip is for a different skeleton, so it cannot move this '
+          'character. Look for clips beside it built for the same rig.';
+      return;
+    }
+
+    final difference = rigAxisDifference(rest, widget.skeleton);
+    if (difference <= maxDirectPoseAngle) {
+      _plan = null;
+      _boneWorld = null;
+      _retargetNote = null;
+      return;
+    }
+
+    // Measure every candidate against the clip and take the closest. This
+    // pack ships a Polygon and a Sidekick character side by side, and the
+    // clip was authored against exactly one of them; choosing by name picked
+    // whichever sorted first, which corrected half the clips against a rig
+    // they were never made for.
+    // The reference is the clip's own rig in a T-pose, so it is chosen by how
+    // many bones it shares with the clip -- not by how close its pose is. The
+    // pack ships a Polygon and a Sidekick character with no bones in common,
+    // and the clip belongs to exactly one of them.
+    SkeletonAnimation? reference;
+    AssetItem? referenceAsset;
+    var bestOverlap = 0;
+    for (final candidate in findClipReferenceCharacters(
+      widget.clipPath,
+      widget.allAssets,
+      clipRig: rigFamilyOfSkeleton(widget.skeleton),
+    )) {
+      try {
+        final candidateMesh = await MeshLoadCache.load(
+          candidate,
+          allAssets: widget.allAssets,
+        );
+        final candidateRig = candidateMesh.skeleton;
+        if (candidateRig == null) continue;
+        // The last word on what a file is belongs to the file. A clip has a
+        // skeleton and would score a perfect bone overlap, but its rest pose
+        // is wherever the animator left it, so correcting against one leaves
+        // the character standing in its bind. Only a bound character has skin.
+        if (candidateMesh.skin == null) continue;
+        final shared = rigBoneOverlap(candidateRig, widget.skeleton);
+        if (shared > bestOverlap) {
+          bestOverlap = shared;
+          reference = candidateRig;
+          referenceAsset = candidate;
+        }
+      } catch (error) {
+        fbxLog('Could not load the reference rig ${candidate.name}: $error');
+      }
+    }
+    if (bestOverlap < minimumRigOverlap) {
+      reference = null;
+      referenceAsset = null;
+    }
+
+    _plan = RetargetPlan.build(
+      characterRest: rest,
+      clip: widget.skeleton,
+      sourceReference: reference,
+    );
+    _boneWorld = Float32List(rest.bones.length * 12);
+    _retargetNote = reference == null
+        ? 'This rig sits ${difference.round()}° from the clip and no '
+              'matching reference character was found beside it, so only its '
+              'own bind pose can be shown.'
+        : 'Retargeted through ${referenceAsset!.name}: this rig sits '
+              '${difference.round()}° from the clip.';
   }
 
   Future<void> _loadCharacter() async {
@@ -3838,11 +4103,19 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     try {
       final mesh = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
       if (!mounted) return;
+      if (mesh.skin == null) {
+        setState(() {
+          _character = null;
+          _characterError =
+              '${asset!.name} has no skin weights, so a clip cannot move it.';
+        });
+        return;
+      }
+      await _buildPlan(mesh);
+      if (!mounted) return;
       setState(() {
-        _character = mesh.skin == null ? null : mesh;
-        _characterError = mesh.skin == null
-            ? '${asset!.name} has no skin weights, so a clip cannot move it.'
-            : null;
+        _character = mesh;
+        _characterError = null;
       });
     } catch (error) {
       if (!mounted) return;
@@ -3884,6 +4157,14 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     final character = _character;
     return Column(
       children: [
+        if (_retargetNote != null && _characterError == null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Text(
+              _retargetNote!,
+              style: const TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ),
         if (_characterError != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -3971,6 +4252,7 @@ class AnimationClipPreview extends StatelessWidget {
   const AnimationClipPreview({
     required this.mesh,
     this.allAssets = const [],
+    this.clipPath = '',
     super.key,
   });
 
@@ -3978,6 +4260,9 @@ class AnimationClipPreview extends StatelessWidget {
 
   /// Needed to find the chosen character, which lives elsewhere in the catalog.
   final List<AssetItem> allAssets;
+
+  /// Where this clip came from, so its reference rig can be found beside it.
+  final String clipPath;
 
   String get _duration {
     if (mesh.durationSeconds <= 0) return 'unknown';
@@ -3997,6 +4282,7 @@ class AnimationClipPreview extends StatelessWidget {
                 skeleton: skeleton,
                 characterPath: characterPath,
                 allAssets: allAssets,
+                clipPath: clipPath,
               ),
             ),
           ),
@@ -4108,6 +4394,7 @@ class RasterModelView extends StatefulWidget {
     required this.interacting,
     this.sceneOverride,
     this.sceneRevision,
+    this.visibleMaterial = -1,
     this.uvSetOverride,
     super.key,
   });
@@ -4138,6 +4425,9 @@ class RasterModelView extends StatefulWidget {
   /// Changes when [sceneOverride] holds different positions, so the frame
   /// cache can tell one pose from the next.
   final Object? sceneRevision;
+
+  /// Restrict drawing to one material; negative draws all of them.
+  final int visibleMaterial;
 
   @override
   State<RasterModelView> createState() => _RasterModelViewState();
@@ -4170,6 +4460,7 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.useEmissiveMaps,
     widget.useSpecular,
     widget.sceneRevision ?? '',
+    widget.visibleMaterial,
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -4215,6 +4506,7 @@ class _RasterModelViewState extends State<RasterModelView> {
         renderMode: widget.renderMode,
         lightingMode: widget.lightingMode,
         cullBackFaces: widget.cullBackFaces,
+        visibleMaterial: widget.visibleMaterial,
         useBaseTexture: widget.useBaseTexture,
         useNormalMaps: widget.useNormalMaps,
         useEmissiveMaps: widget.useEmissiveMaps,
@@ -4560,6 +4852,7 @@ RasterResult rasterizeMesh({
   String? uvSetOverride,
   int backgroundArgb = 0xffe9edf3,
   int maxFaces = maxRenderedFaces,
+  int visibleMaterial = -1,
 }) {
   return rasterizeScene(
     RasterRequest(
@@ -4578,6 +4871,7 @@ RasterResult rasterizeMesh({
       useSpecular: useSpecular,
       backgroundArgb: backgroundArgb,
       maxFaces: maxFaces,
+      visibleMaterial: visibleMaterial,
     ),
   );
 }
@@ -4600,6 +4894,7 @@ class RasterRequest {
     this.useSpecular = true,
     this.backgroundArgb = 0xffe9edf3,
     this.maxFaces = maxRenderedFaces,
+    this.visibleMaterial = -1,
   });
 
   final RasterScene scene;
@@ -4623,6 +4918,15 @@ class RasterRequest {
   final bool useSpecular;
   final int backgroundArgb;
   final int maxFaces;
+
+  /// Draw only the triangles using this material, or every one when negative.
+  ///
+  /// Some packs stack every variant of a character in one file, sharing the
+  /// geometry and differing only by material -- `SimplePeople3.fbx` has 12 of
+  /// them in the same place. Drawn together they fight for the same pixels at
+  /// exactly the same depth, which no depth buffer can settle. Drawn one at a
+  /// time they are twelve characters.
+  final int visibleMaterial;
 }
 
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
@@ -4715,9 +5019,14 @@ RasterResult rasterizeScene(RasterRequest request) {
     final area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
     if (area == 0) continue;
     if (request.cullBackFaces && area < 0) continue;
-    drawn += 1;
 
     final materialIndex = scene.triangleMaterial[triangleIndex];
+    if (request.visibleMaterial >= 0 &&
+        materialIndex != request.visibleMaterial) {
+      continue;
+    }
+    drawn += 1;
+
     final material =
         (materialIndex >= 0 && materialIndex < scene.materials.length)
         ? scene.materials[materialIndex]
@@ -6155,6 +6464,183 @@ class TextureDiscoveryEntry {
   final AssetItem? jumpAsset;
 }
 
+/// Shows an asset in Windows Explorer, selecting it where possible.
+///
+/// A zip entry has no folder of its own, so the archive is revealed instead --
+/// which is where you would go to extract it anyway.
+Future<void> revealAssetInExplorer(AssetItem asset) async {
+  final zip = parseZipVirtualPath(asset.path);
+  final target = zip?.zipPath ?? asset.path;
+  if (!File(target).existsSync()) {
+    // Fall back to the containing folder: a stale catalog row still tells you
+    // roughly where to look.
+    final folder = parentPath(target);
+    if (Directory(folder).existsSync()) {
+      await Process.run('explorer.exe', [folder]);
+    }
+    return;
+  }
+  // `/select,` needs the path as one argument and backslashes throughout.
+  await Process.run('explorer.exe', [
+    '/select,${target.replaceAll('/', chr92)}',
+  ]);
+}
+
+/// The path separator Explorer insists on, kept out of string literals so a
+/// patching script cannot mangle it.
+final chr92 = String.fromCharCode(92);
+
+/// Whether an asset is a model with a skeleton in it.
+///
+/// The useful sense of "character": a rigged mesh, as opposed to a prop, a
+/// building, or a clip with no geometry. Read from the bones, so a static mesh
+/// named `SK_Chr_Attach_Helmet_01` is correctly not one.
+bool assetIsCharacterModel(AssetItem asset) {
+  if (asset.effectiveType != 'model') return false;
+  final rig = asset.rigFamily;
+  return rig != null && rig != RigFamily.none.name;
+}
+
+/// Whether an asset passes the rig filter.
+///
+/// `all` passes everything. `compatible` keeps only files built on the same
+/// skeleton as the chosen animation character, which is the difference between
+/// "247 clips, most of which will not work" and a list you can trust. A file
+/// nothing has probed yet is kept, because hiding it would be a claim the
+/// catalog cannot make.
+bool assetPassesRigFilter({
+  required AssetItem asset,
+  required String rigFilter,
+  required String? characterRig,
+}) {
+  if (rigFilter == 'all') return true;
+  if (asset.rigFamily == null) return true;
+  if (rigFilter == 'compatible') {
+    if (characterRig == null) return true;
+    return rigFamiliesCompatible(
+      rigFamilyByName(asset.rigFamily),
+      rigFamilyByName(characterRig),
+    );
+  }
+  return asset.rigFamily == rigFilter;
+}
+
+/// Reads a [RigFamily] back from its stored name.
+RigFamily rigFamilyByName(String? name) {
+  for (final family in RigFamily.values) {
+    if (family.name == name) return family;
+  }
+  return RigFamily.none;
+}
+
+/// What one pass of the FBX probe learned about a file.
+///
+/// The classification pass crosses an isolate boundary and stores its answers
+/// in one map, so the two facts share a string rather than needing a second
+/// map threaded through every layer.
+class FbxClassification {
+  const FbxClassification({required this.kind, required this.rig});
+
+  /// Reads the encoded form. An older value with no rig reads as unknown,
+  /// which is what a catalog written before this existed will hold.
+  factory FbxClassification.decode(String value) {
+    final split = value.indexOf('#');
+    if (split < 0) return FbxClassification(kind: value, rig: null);
+    return FbxClassification(
+      kind: value.substring(0, split),
+      rig: value.substring(split + 1),
+    );
+  }
+
+  /// `mesh`, `animation`, or `unreadable`.
+  final String kind;
+
+  /// The [RigFamily] name, or null when the file was never probed for one.
+  final String? rig;
+
+  String encode() => rig == null ? kind : '$kind#$rig';
+}
+
+/// The skeleton a model or clip is built on.
+///
+/// Not derivable from the file name. `SK_` is Unreal's skeletal-mesh prefix
+/// and Synty puts it on Polygon-rigged characters, `SM_Chr_Captain_Male_01`
+/// turns out to be skinned, and the Sidekick rig is the Unreal mannequin with
+/// extra bones. The bones are unambiguous where every naming convention here
+/// is not.
+enum RigFamily {
+  /// Synty's own rig: `Root/Hips/Spine_01/UpperLeg_R`, around 50 bones.
+  polygon,
+
+  /// The Unreal mannequin plus Sidekick's attachment and IK bones.
+  sidekick,
+
+  /// The plain Unreal mannequin: `root/pelvis/spine_01/thigh_l`.
+  unreal,
+
+  /// A prop, or a mesh with no skeleton at all.
+  none,
+}
+
+extension RigFamilyLabel on RigFamily {
+  String get label => switch (this) {
+    RigFamily.polygon => 'Polygon',
+    RigFamily.sidekick => 'Sidekick',
+    RigFamily.unreal => 'Unreal',
+    RigFamily.none => 'No rig',
+  };
+}
+
+/// Classifies a rig from the marker bones the importer's probe reported.
+///
+/// Order matters: Sidekick carries every mannequin bone as well as its own, so
+/// it has to be checked first or it reads as plain Unreal.
+RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
+  final present = markers.toSet();
+  if (present.any(
+    (m) => m == 'hipAttachFront' || m == 'hipAttach_l' || m == 'hipAttach_r',
+  )) {
+    return RigFamily.sidekick;
+  }
+  if (present.contains('pelvis') || present.contains('thigh_l')) {
+    return RigFamily.unreal;
+  }
+  if (present.contains('Hips') || present.contains('UpperLeg_R')) {
+    return RigFamily.polygon;
+  }
+  return RigFamily.none;
+}
+
+/// The family a loaded skeleton belongs to, read from its own bone names.
+///
+/// The catalog's `rig_family` column comes from the importer's `--probe`, but a
+/// clip loaded for playback already carries its bones in memory, so its family
+/// can be named without going back to the file.
+RigFamily rigFamilyOfSkeleton(SkeletonAnimation skeleton) =>
+    rigFamilyFromMarkers(skeleton.bones.map((bone) => bone.name));
+
+/// Whether a clip can drive a model without retargeting between skeletons.
+///
+/// Two files of the same family share bone names, which is what posing needs.
+/// Across families they share none, so no amount of correction helps.
+bool rigFamiliesCompatible(RigFamily a, RigFamily b) {
+  if (a == RigFamily.none || b == RigFamily.none) return false;
+  return a == b;
+}
+
+/// Whether an asset matches a search box that treats spaces as "and".
+///
+/// "Jump Fem" finds `A_Jump_Running_Femn.fbx` without the words being adjacent
+/// or in that order, which matters when the thing you remember about a file is
+/// two pieces of its name rather than a substring of it.
+bool assetMatchesSearch(String searchText, String query) {
+  final terms = query.toLowerCase().split(' ').where((t) => t.isNotEmpty);
+  for (final term in terms) {
+    if (!searchText.contains(term)) return false;
+  }
+  return true;
+}
+
 /// Model formats the preview can import and therefore introspect.
 ///
 /// OBJ is here because the parser now keeps `vt` and `usemtl`; before that it
@@ -6291,6 +6777,105 @@ class AnimationCharacterButton extends StatelessWidget {
       onPressed: onPressed,
       icon: Icon(isChosen ? Icons.person : Icons.person_outline, size: 18),
       label: Text(isChosen ? 'Animation character' : 'Use for animations'),
+    );
+  }
+}
+
+/// Shows a model once per material, side by side.
+///
+/// Two quite different problems have the same answer. A pack may give one
+/// model several interchangeable looks, and you want to see them together
+/// rather than cycling. And some files stack every variant of a character on
+/// the same geometry -- `SimplePeople3.fbx` holds twelve, differing only by
+/// material -- which drawn together fight for identical pixels at identical
+/// depth and read as a mess of z-fighting. Drawn one per cell they are twelve
+/// characters.
+class MaterialVariantGrid extends StatelessWidget {
+  const MaterialVariantGrid({
+    required this.mesh,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    required this.interacting,
+    this.uvSetOverride,
+    super.key,
+  });
+
+  final MeshModel mesh;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool interacting;
+  final String? uvSetOverride;
+
+  @override
+  Widget build(BuildContext context) {
+    final count = mesh.materials.length;
+    if (count <= 1) {
+      return const Center(
+        child: Text(
+          'This model has one material, so there is nothing to compare.',
+          style: TextStyle(color: Colors.black54),
+        ),
+      );
+    }
+
+    // As square as the count allows, so cells stay large.
+    final columns = math.max(1, math.sqrt(count).ceil());
+    return GridView.builder(
+      padding: const EdgeInsets.all(8),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: columns,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+      ),
+      itemCount: count,
+      itemBuilder: (context, index) {
+        final material = mesh.materials[index];
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            border: Border.all(color: Colors.black12),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Column(
+            children: [
+              Expanded(
+                child: RasterModelView(
+                  mesh: mesh,
+                  yaw: yaw,
+                  pitch: pitch,
+                  zoom: zoom,
+                  renderMode: renderMode,
+                  lightingMode: lightingMode,
+                  cullBackFaces: cullBackFaces,
+                  useBaseTexture: true,
+                  useNormalMaps: true,
+                  useEmissiveMaps: true,
+                  useSpecular: true,
+                  interacting: interacting,
+                  uvSetOverride: uvSetOverride,
+                  visibleMaterial: index,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                child: Text(
+                  material.name.isEmpty ? 'Material $index' : material.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -6890,28 +7475,96 @@ bool canRelinkAcrossContainers({
   return hints.any((hint) => candidateLower.contains(hint));
 }
 
+/// The candidate textures for one model, split by container.
+///
+/// Partitioning the catalog is the expensive part of relinking: it walks every
+/// asset, parsing zip virtual paths as it goes. A model with twelve materials
+/// asks for thirty-odd textures and each one repeated the whole walk, which on
+/// a 26,000-asset catalog cost about a second of frozen UI per model. The
+/// split depends only on the model and the catalog, so it is done once.
+class _RelinkCandidates {
+  const _RelinkCandidates(
+    this.sameContainer,
+    this.otherContainers,
+    this.otherByBaseName,
+  );
+
+  final List<AssetItem> sameContainer;
+  final List<AssetItem> otherContainers;
+
+  /// Assets outside the model's container, keyed by file name without its
+  /// extension.
+  ///
+  /// Crossing containers demands an exact name match, so this turns a walk of
+  /// the whole catalog per reference into a lookup. With 26,000 assets and a
+  /// model asking for thirty textures, that walk was the load.
+  final Map<String, List<AssetItem>> otherByBaseName;
+}
+
+String? _relinkCacheModelPath;
+int? _relinkCacheAssets;
+_RelinkCandidates? _relinkCache;
+
+/// Partitions [allAssets] for [modelPath], reusing the last answer.
+///
+/// One entry is enough: every reference in a model is resolved back to back,
+/// so the cache is hot for exactly as long as it is useful.
+_RelinkCandidates _relinkCandidatesFor(
+  String modelPath,
+  List<AssetItem> allAssets,
+) {
+  final assetsIdentity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _relinkCache;
+  if (cached != null &&
+      _relinkCacheModelPath == modelPath &&
+      _relinkCacheAssets == assetsIdentity) {
+    return cached;
+  }
+
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
+  final same = <AssetItem>[];
+  final other = <AssetItem>[];
+  final otherByBaseName = <String, List<AssetItem>>{};
+  for (final asset in allAssets) {
+    if (!textureExts.contains(asset.ext)) continue;
+    bool isSame;
+    if (zipModel != null) {
+      final zipCandidate = parseZipVirtualPath(asset.path);
+      isSame =
+          zipCandidate != null &&
+          normalizePathKey(zipCandidate.zipPath) ==
+              normalizePathKey(zipModel.zipPath);
+    } else if (isZipVirtualPath(asset.path)) {
+      isSame = false;
+    } else {
+      final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
+      isSame = modelPathLower.startsWith(sourceLower);
+    }
+    if (isSame) {
+      same.add(asset);
+    } else {
+      other.add(asset);
+      final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
+      (otherByBaseName[base] ??= <AssetItem>[]).add(asset);
+    }
+  }
+
+  final result = _RelinkCandidates(same, other, otherByBaseName);
+  _relinkCacheModelPath = modelPath;
+  _relinkCacheAssets = assetsIdentity;
+  _relinkCache = result;
+  return result;
+}
+
 String? findDeterministicTextureRelink(
   String modelPath,
   String texturePath,
   List<AssetItem> allAssets,
 ) {
   if (allAssets.isEmpty) return null;
-  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
-  final zipModel = parseZipVirtualPath(modelPath);
-  bool sameContainer(AssetItem asset) {
-    if (!textureExts.contains(asset.ext)) return false;
-    if (zipModel != null) {
-      final zipCandidate = parseZipVirtualPath(asset.path);
-      return zipCandidate != null &&
-          normalizePathKey(zipCandidate.zipPath) ==
-              normalizePathKey(zipModel.zipPath);
-    }
-    if (isZipVirtualPath(asset.path)) return false;
-    final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
-    return modelPathLower.startsWith(sourceLower);
-  }
-
-  final sourceCandidates = allAssets.where(sameContainer).toList();
+  final candidates = _relinkCandidatesFor(modelPath, allAssets);
+  final sourceCandidates = candidates.sameContainer;
 
   final requestedBase = texturePath
       .split(_pathSeparatorPattern)
@@ -7012,18 +7665,20 @@ String? findDeterministicTextureRelink(
   // at another pack, so try that, on the stricter rules above.
   final crossContainer =
       [
-        for (final asset in allAssets)
-          if (textureExts.contains(asset.ext) && !sameContainer(asset))
-            if (canRelinkAcrossContainers(
-              texturePath: texturePath,
-              candidatePath: asset.path,
-              requestedBase: requestedBase,
-              candidateBase: asset.name.toLowerCase().replaceAll(
-                _extensionPattern,
-                '',
-              ),
-            ))
-              asset,
+        // Only a name that already matches can qualify, so the rest of the
+        // catalog is never visited.
+        for (final asset
+            in candidates.otherByBaseName[requestedBase] ?? const <AssetItem>[])
+          if (canRelinkAcrossContainers(
+            texturePath: texturePath,
+            candidatePath: asset.path,
+            requestedBase: requestedBase,
+            candidateBase: asset.name.toLowerCase().replaceAll(
+              _extensionPattern,
+              '',
+            ),
+          ))
+            asset,
       ]..sort(
         (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
       );
@@ -7031,14 +7686,33 @@ String? findDeterministicTextureRelink(
   return null;
 }
 
+int? _imageAssetsIdentity;
+List<AssetItem>? _imageAssetsCache;
+
+/// Every image in the catalog, remembered between calls.
+///
+/// The fallback lookup runs once per unresolved texture reference, and a model
+/// with a dozen unresolved materials asks thirty times. Filtering the whole
+/// catalog each time is most of what made such a model freeze the window.
+List<AssetItem> _imageAssetsOf(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _imageAssetsCache;
+  if (cached != null && _imageAssetsIdentity == identity) return cached;
+  final images = [
+    for (final asset in allAssets)
+      if (imageExts.contains(asset.ext)) asset,
+  ];
+  _imageAssetsIdentity = identity;
+  _imageAssetsCache = images;
+  return images;
+}
+
 String? findFallbackTexture(
   String modelPath,
   String texturePath,
   List<AssetItem> allAssets,
 ) {
-  final supported = allAssets
-      .where((asset) => imageExts.contains(asset.ext))
-      .toList();
+  final supported = _imageAssetsOf(allAssets);
   if (supported.isEmpty) return null;
   final modelDir = parentPath(modelPath).toLowerCase();
   final modelParent = parentPath(parentPath(modelPath)).toLowerCase();
@@ -8075,7 +8749,13 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
         continue;
       }
       final json = jsonDecode(result.stdout) as Map<String, dynamic>;
-      kinds[assetId] = json['kind'] == 'animation' ? 'animation' : 'mesh';
+      final markers = ((json['rigMarkers'] as List<dynamic>?) ?? const []).map(
+        (value) => value.toString(),
+      );
+      kinds[assetId] = FbxClassification(
+        kind: json['kind'] == 'animation' ? 'animation' : 'mesh',
+        rig: rigFamilyFromMarkers(markers).name,
+      ).encode();
     } catch (_) {
       kinds[assetId] = 'unreadable';
     }
@@ -9119,6 +9799,13 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
 /// Settings key for the model clips are played on.
 const animationCharacterKey = 'animation.character.path';
 
+/// Settings key for that character's rig family.
+///
+/// Stored rather than looked up, because the filter is wanted before the
+/// catalog has necessarily finished classifying, and re-deriving it would mean
+/// importing the character at startup.
+const animationCharacterRigKey = 'animation.character.rig';
+
 /// The model animation clips are played on, and the clip preview's fallback.
 ///
 /// Held here rather than threaded through the widget tree because a clip and
@@ -9132,10 +9819,17 @@ class AnimationCharacter {
   /// Notifies when the choice changes, so an open clip preview re-poses.
   final ValueNotifier<String?> path = ValueNotifier<String?>(null);
 
+  /// The chosen character's rig family, for the "works with this character"
+  /// filter. Null until a character with a known rig is chosen.
+  String? rigFamily;
+
   Future<void> load() async {
     try {
       path.value = await AssetAtlasDatabase.instance.readSetting(
         animationCharacterKey,
+      );
+      rigFamily = await AssetAtlasDatabase.instance.readSetting(
+        animationCharacterRigKey,
       );
     } catch (error) {
       // A missing settings row is not worth failing startup over.
@@ -9143,12 +9837,17 @@ class AnimationCharacter {
     }
   }
 
-  Future<void> set(String? assetPath) async {
+  Future<void> set(String? assetPath, {String? rig}) async {
+    rigFamily = assetPath == null ? null : rig;
     path.value = assetPath;
     try {
       await AssetAtlasDatabase.instance.writeSetting(
         animationCharacterKey,
         assetPath,
+      );
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterRigKey,
+        rigFamily,
       );
     } catch (error) {
       fbxLog('Could not save the animation character: $error');
@@ -9268,6 +9967,49 @@ Vec3 transformByMatrix(Float32List matrix, int offset, Vec3 point) {
   );
 }
 
+/// Inverts a column-major 3x4 affine matrix into `out` at `outOffset`.
+///
+/// Returns false and leaves `out` untouched when the matrix is singular,
+/// which a degenerate bone can be.
+bool invertMatrix(Float32List a, int aOffset, Float32List out, int outOffset) {
+  final m00 = a[aOffset], m01 = a[aOffset + 1], m02 = a[aOffset + 2];
+  final m10 = a[aOffset + 3], m11 = a[aOffset + 4], m12 = a[aOffset + 5];
+  final m20 = a[aOffset + 6], m21 = a[aOffset + 7], m22 = a[aOffset + 8];
+  final tx = a[aOffset + 9], ty = a[aOffset + 10], tz = a[aOffset + 11];
+
+  // Columns are the basis vectors, so the determinant is their triple product.
+  final det =
+      m00 * (m11 * m22 - m12 * m21) -
+      m10 * (m01 * m22 - m02 * m21) +
+      m20 * (m01 * m12 - m02 * m11);
+  if (det.abs() < 1e-12) return false;
+  final inv = 1.0 / det;
+
+  final i00 = (m11 * m22 - m12 * m21) * inv;
+  final i01 = (m02 * m21 - m01 * m22) * inv;
+  final i02 = (m01 * m12 - m02 * m11) * inv;
+  final i10 = (m12 * m20 - m10 * m22) * inv;
+  final i11 = (m00 * m22 - m02 * m20) * inv;
+  final i12 = (m02 * m10 - m00 * m12) * inv;
+  final i20 = (m10 * m21 - m11 * m20) * inv;
+  final i21 = (m01 * m20 - m00 * m21) * inv;
+  final i22 = (m00 * m11 - m01 * m10) * inv;
+
+  out[outOffset] = i00;
+  out[outOffset + 1] = i01;
+  out[outOffset + 2] = i02;
+  out[outOffset + 3] = i10;
+  out[outOffset + 4] = i11;
+  out[outOffset + 5] = i12;
+  out[outOffset + 6] = i20;
+  out[outOffset + 7] = i21;
+  out[outOffset + 8] = i22;
+  out[outOffset + 9] = -(i00 * tx + i10 * ty + i20 * tz);
+  out[outOffset + 10] = -(i01 * tx + i11 * ty + i21 * tz);
+  out[outOffset + 11] = -(i02 * tx + i12 * ty + i22 * tz);
+  return true;
+}
+
 /// Multiplies two column-major 3x4 matrices into `out` at `outOffset`.
 void multiplyMatrices(
   Float32List a,
@@ -9294,6 +10036,536 @@ void multiplyMatrices(
   }
 }
 
+/// Characters shipped alongside a clip, any of which may be its reference.
+///
+/// Retargeting needs to know what the clip's rig looks like in the same
+/// physical pose the character is bound in -- both T-posed, in practice. A
+/// clip file cannot supply that: its own rest pose is wherever the animator
+/// left the rig, which for a locomotion pack is a standing idle.
+///
+/// An animation pack ships a character on its own rig for exactly this reason,
+/// so references are looked for beside the clip, in the same archive. There
+/// can be more than one: the base locomotion pack ships clips for two rig
+/// families side by side with a character for each. Picking the wrong one
+/// corrects against a rig the clip was never authored for, which mangles the
+/// result as thoroughly as no correction at all -- so the caller measures each
+/// against the clip rather than guessing from the name.
+///
+/// Nothing here reads a folder name. This used to require `/character` in the
+/// path, which is a convention of two packs rather than a fact about files;
+/// what a file *is* comes from the importer instead. A clip cannot be its own
+/// reference (`modelKind`), and a rig of a different family cannot either
+/// (`rigFamily`, from the marker bones). Both are content, and both are
+/// permissive when unknown: a file the catalog has not probed yet is offered
+/// rather than hidden, because hiding it would assert something not known.
+List<AssetItem> findClipReferenceCharacters(
+  String clipPath,
+  List<AssetItem> allAssets, {
+  RigFamily? clipRig,
+}) {
+  AssetItem? clipAsset;
+  for (final asset in allAssets) {
+    if (normalizePathKey(asset.path) == normalizePathKey(clipPath)) {
+      clipAsset = asset;
+      break;
+    }
+  }
+  final clipContainer = clipAsset == null
+      ? assetContainerKeyOf(path: clipPath, sourceRoot: parentPath(clipPath))
+      : assetContainerKey(clipAsset);
+
+  final candidates = <AssetItem>[];
+  for (final asset in allAssets) {
+    if (asset.ext != 'fbx') continue;
+    if (normalizePathKey(asset.path) == normalizePathKey(clipPath)) continue;
+    if (assetContainerKey(asset) != clipContainer) continue;
+    // A clip has no mesh and no bind pose, so it cannot stand in for one.
+    if (asset.modelKind == 'animation') continue;
+    if (clipRig != null &&
+        clipRig != RigFamily.none &&
+        asset.rigFamily != null &&
+        rigFamilyByName(asset.rigFamily) != clipRig) {
+      continue;
+    }
+    candidates.add(asset);
+  }
+
+  // If the catalog knows of a rigged character here, those are the answer and
+  // the rest are noise. Falling back to unprobed files only when it does not
+  // matters on a cold catalog: an animation pack holds two characters and
+  // seven hundred clips, and until the clips are classified they are
+  // indistinguishable by anything but their contents. Ranked in, they would
+  // have filled the list before the alphabet reached the characters.
+  final known = candidates
+      .where((asset) => _referenceRank(asset) == 0)
+      .toList();
+  final chosen = known.isNotEmpty
+      ? known
+      : candidates.where((asset) => _referenceRank(asset) == 1).toList();
+
+  // By path, so ties do not depend on scan order.
+  chosen.sort(
+    (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+  );
+  return chosen.length > maxReferenceCandidates
+      ? chosen.sublist(0, maxReferenceCandidates)
+      : chosen;
+}
+
+/// The separator [normalizePathKey] leaves behind, whatever went in.
+const pathKeySeparator = '\\';
+
+/// The archive or pack folder a file belongs to.
+///
+/// Two files share a container when they came out of the same zip, or out of
+/// the same top-level folder under a scanned source root. That folder is what
+/// a downloaded pack unzips to, so it is the loose-file counterpart of an
+/// archive -- and the unit a clip's reference character has to be found in.
+/// Scoping loose files to the clip's own directory instead put a pack's
+/// animation folder and its character folder in different worlds, so a
+/// reference that was found inside a zip went missing once the same pack was
+/// unpacked on disk.
+String assetContainerKey(AssetItem asset) =>
+    assetContainerKeyOf(path: asset.path, sourceRoot: asset.sourceRoot);
+
+/// [assetContainerKey] for a path with no catalog entry to read a root from.
+String assetContainerKeyOf({required String path, required String sourceRoot}) {
+  final zip = parseZipVirtualPath(path);
+  if (zip != null) return normalizePathKey(zip.zipPath);
+
+  final root = normalizePathKey(sourceRoot);
+  final full = normalizePathKey(path);
+  if (root.isEmpty || !full.startsWith(root)) return full;
+
+  final rest = full
+      .substring(root.length)
+      .split(pathKeySeparator)
+      .where((segment) => segment.isNotEmpty);
+  // A file sitting directly in the source root has no pack folder of its own.
+  if (rest.length <= 1) return root;
+  return '$root$pathKeySeparator${rest.first}';
+}
+
+/// How many candidate references are worth importing to measure.
+///
+/// Each one is a full FBX import. An animation pack holds two characters and
+/// hundreds of clips, so the real list is short; the cap only bounds a pack
+/// laid out in some way not seen here.
+const maxReferenceCandidates = 12;
+
+/// Sorts a known character rig ahead of an unprobed file ahead of a prop.
+int _referenceRank(AssetItem asset) {
+  if (asset.rigFamily == null) return 1;
+  return rigFamilyByName(asset.rigFamily) == RigFamily.none ? 2 : 0;
+}
+
+/// Transfers a clip's pose onto a character whose rig holds its bones at
+/// different angles.
+///
+/// Two Synty rigs can share every bone name, every parent and the whole
+/// hierarchy and still be incompatible: the newer character packs re-oriented
+/// the joint axes, so `Hand_L` points 169 degrees away from where the older
+/// animation rig puts it. Applying a clip's bone transforms directly to such a
+/// character tears the mesh apart.
+///
+/// The fix is to work in each bone's *local* frame and go through a reference
+/// pose. For every bone, `correction` is the constant that takes the reference
+/// rig's local frame to the character's own bind:
+///
+///     correction = inverse(referenceLocal) * characterBindLocal
+///     characterLocal(t) = clipLocal(t) * correction
+///
+/// At the reference pose the correction cancels and the character stands in
+/// its bind, which is what makes this safe: a rig it cannot interpret comes
+/// out unposed rather than mangled.
+///
+/// [sourceReference] is the clip rig's own rest pose unless a better one is
+/// supplied. A reference in the same *physical* pose as the character's bind
+/// (both T-posed, say) makes the character adopt the clip's pose; the clip's
+/// own rest, which for a locomotion pack is a standing idle, makes it perform
+/// the clip's motion starting from its bind.
+class RetargetPlan {
+  RetargetPlan._(
+    this._rotation,
+    this._deltaToBind,
+    this._bindOffset,
+    this._referenceOffset,
+    this._bindLocal,
+    this._clipBone,
+    this._clipParents,
+    this._parent,
+    this._order,
+    this._motionScale,
+  );
+
+  /// Builds the plan once for a character and clip; it does not change frame
+  /// to frame, and computing it per frame would dominate playback.
+  ///
+  /// Two things are carried over from the clip and nothing else: how far each
+  /// bone has turned in the world since the reference's rest, and how far it
+  /// has slid from its reference offset. The character keeps its own bone
+  /// lengths, because they are its proportions, not the animator's.
+  ///
+  /// Returns null when the character carries no rest pose to correct against.
+  static RetargetPlan? build({
+    required SkeletonAnimation characterRest,
+    required SkeletonAnimation clip,
+    SkeletonAnimation? sourceReference,
+  }) {
+    final bind = characterRest.rest ?? characterRest.positions.firstOrNull;
+    if (bind == null) return null;
+    // The reference may be a different rig from the clip -- that is the point
+    // of supplying one -- so it carries its own bone list to look up in.
+    final referenceRig = sourceReference ?? clip;
+    final reference = referenceRig.rest;
+    if (reference == null) return null;
+
+    final bones = characterRest.bones;
+    final count = bones.length;
+    final parent = Int32List(count);
+    final clipBone = Int32List(count);
+    final rotation = Float32List(count * 9);
+    final deltaToBind = Float32List(count * 9);
+    final bindOffset = Float32List(count * 3);
+    final referenceOffset = Float32List(count * 3);
+    final bindLocal = Float32List(count * 12);
+
+    // Parents before children, so a bone's world transform is ready when its
+    // children need it.
+    final order = Int32List(count);
+    var filled = 0;
+    final placed = List<bool>.filled(count, false);
+    void visit(int index) {
+      if (placed[index]) return;
+      final up = bones[index].parent;
+      if (up >= 0 && up < count) visit(up);
+      placed[index] = true;
+      order[filled++] = index;
+    }
+
+    for (var i = 0; i < count; i += 1) {
+      visit(i);
+    }
+
+    final scratch = Float32List(12);
+    final left = Float32List(9);
+    final right = Float32List(9);
+    for (var i = 0; i < count; i += 1) {
+      parent[i] = bones[i].parent;
+
+      // The character's own local frame, kept whole for bones the clip does
+      // not drive and mined for the bone offset for the ones it does.
+      _localOf(bind, i, parent[i], scratch, 0);
+      for (var j = 0; j < 12; j += 1) {
+        bindLocal[i * 12 + j] = scratch[j];
+      }
+      for (var j = 0; j < 3; j += 1) {
+        bindOffset[i * 3 + j] = scratch[9 + j];
+      }
+
+      final k = clip.indexOfBone(bones[i].name, path: bones[i].path);
+      final r = identical(referenceRig, clip)
+          ? k
+          : referenceRig.indexOfBone(bones[i].name, path: bones[i].path);
+      // Both halves are needed: the clip says where the bone is now, the
+      // reference says where it started. Without either, the bone stays at
+      // its bind rather than being driven from a frame that means nothing.
+      clipBone[i] = k >= 0 && r >= 0 ? k : -1;
+      if (clipBone[i] < 0) continue;
+
+      final referenceParent = referenceRig.bones[r].parent;
+      _localOf(reference, r, referenceParent, scratch, 0);
+      for (var j = 0; j < 3; j += 1) {
+        referenceOffset[i * 3 + j] = scratch[9 + j];
+      }
+
+      // Undo the reference's world rotation and apply this rig's bind. What
+      // is left multiplies onto the clip's world rotation at playback, so a
+      // rig whose bones point along different axes -- Synty's character packs
+      // cycle x, y and z against the animation rig -- still turns correctly.
+      _transposeRotation(reference, r * 12, left, 0);
+      _multiplyRotations(left, 0, bind, i * 12, rotation, i * 9);
+
+      // A bone's slide is measured in the reference's parent frame. This
+      // rig's parent frame is turned differently, so the slide is carried
+      // across before it is added to a bind offset that lives here.
+      if (parent[i] >= 0) {
+        _transposeRotation(bind, parent[i] * 12, left, 0);
+      } else {
+        _identityRotation(left, 0);
+      }
+      if (referenceParent >= 0) {
+        for (var j = 0; j < 9; j += 1) {
+          right[j] = reference[referenceParent * 12 + j];
+        }
+      } else {
+        _identityRotation(right, 0);
+      }
+      _multiplyRotations(left, 0, right, 0, deltaToBind, i * 9);
+    }
+
+    final clipParents = Int32List(clip.bones.length);
+    for (var i = 0; i < clip.bones.length; i += 1) {
+      clipParents[i] = clip.bones[i].parent;
+    }
+
+    return RetargetPlan._(
+      rotation,
+      deltaToBind,
+      bindOffset,
+      referenceOffset,
+      bindLocal,
+      clipBone,
+      clipParents,
+      parent,
+      order,
+      _rigHeight(bind, count) / math.max(1e-6, _rigHeight(reference, referenceRig.bones.length)),
+    );
+  }
+
+  final Float32List _rotation;
+  final Float32List _deltaToBind;
+  final Float32List _bindOffset;
+  final Float32List _referenceOffset;
+  final Float32List _bindLocal;
+  final Int32List _clipBone;
+  final Int32List _clipParents;
+  final Int32List _parent;
+  final Int32List _order;
+
+  /// How much taller this character is than the rig the clip was authored on.
+  ///
+  /// Only translation is scaled by it. A short character taking a stride
+  /// measured on a tall one should cover proportionally less ground, and its
+  /// hips should rise and fall proportionally less.
+  final double _motionScale;
+
+  int get boneCount => _clipBone.length;
+
+  /// The character's bone world transforms for one frame of the clip.
+  Float32List worldForFrame(
+    SkeletonAnimation clip,
+    int frame,
+    Float32List out,
+  ) {
+    if (frame < 0 || frame >= clip.frameCount) return out;
+    final frameData = clip.positions[frame];
+    final local = Float32List(12);
+    final scratch = Float32List(12);
+
+    for (final index in _order) {
+      final k = _clipBone[index];
+      final up = _parent[index];
+
+      if (k < 0) {
+        for (var j = 0; j < 12; j += 1) {
+          local[j] = _bindLocal[index * 12 + j];
+        }
+        if (up < 0 || up >= boneCount) {
+          for (var j = 0; j < 12; j += 1) {
+            out[index * 12 + j] = local[j];
+          }
+        } else {
+          multiplyMatrices(out, up * 12, local, 0, out, index * 12);
+        }
+        continue;
+      }
+
+      // Orientation comes from the clip, in world space, which is the one
+      // frame both rigs agree on.
+      _multiplyRotations(frameData, k * 12, _rotation, index * 9, out, index * 12);
+
+      // Position is this rig's own bone offset, plus whatever the clip slid
+      // the bone by. For every bone but the hips that slide is zero, which is
+      // exactly why bone lengths survive.
+      _localOf(frameData, k, _clipParents[k], scratch, 0);
+      final sx = (scratch[9] - _referenceOffset[index * 3]) * _motionScale;
+      final sy = (scratch[10] - _referenceOffset[index * 3 + 1]) * _motionScale;
+      final sz = (scratch[11] - _referenceOffset[index * 3 + 2]) * _motionScale;
+      final d = index * 9;
+      final ox =
+          _bindOffset[index * 3] +
+          _deltaToBind[d] * sx +
+          _deltaToBind[d + 3] * sy +
+          _deltaToBind[d + 6] * sz;
+      final oy =
+          _bindOffset[index * 3 + 1] +
+          _deltaToBind[d + 1] * sx +
+          _deltaToBind[d + 4] * sy +
+          _deltaToBind[d + 7] * sz;
+      final oz =
+          _bindOffset[index * 3 + 2] +
+          _deltaToBind[d + 2] * sx +
+          _deltaToBind[d + 5] * sy +
+          _deltaToBind[d + 8] * sz;
+
+      if (up < 0 || up >= boneCount) {
+        out[index * 12 + 9] = ox;
+        out[index * 12 + 10] = oy;
+        out[index * 12 + 11] = oz;
+      } else {
+        final p = up * 12;
+        out[index * 12 + 9] =
+            out[p] * ox + out[p + 3] * oy + out[p + 6] * oz + out[p + 9];
+        out[index * 12 + 10] =
+            out[p + 1] * ox + out[p + 4] * oy + out[p + 7] * oz + out[p + 10];
+        out[index * 12 + 11] =
+            out[p + 2] * ox + out[p + 5] * oy + out[p + 8] * oz + out[p + 11];
+      }
+    }
+    return out;
+  }
+}
+
+/// The vertical span of a packed rig, used to scale one rig's motion onto
+/// another. Zero for a rig of one bone, which the caller guards against.
+double _rigHeight(Float32List world, int bones) {
+  if (bones <= 0) return 0;
+  var low = world[10];
+  var high = low;
+  for (var i = 1; i < bones; i += 1) {
+    final y = world[i * 12 + 10];
+    if (y < low) low = y;
+    if (y > high) high = y;
+  }
+  return high - low;
+}
+
+/// Writes the identity into a column-major 3x3 at `outOffset`.
+void _identityRotation(Float32List out, int outOffset) {
+  for (var j = 0; j < 9; j += 1) {
+    out[outOffset + j] = j % 4 == 0 ? 1 : 0;
+  }
+}
+
+/// Transposes the 3x3 rotation block of a matrix into `out`.
+///
+/// These blocks are orthonormal, so the transpose is the inverse and there is
+/// no determinant to check.
+void _transposeRotation(Float32List a, int aOffset, Float32List out, int outOffset) {
+  for (var column = 0; column < 3; column += 1) {
+    for (var row = 0; row < 3; row += 1) {
+      out[outOffset + column * 3 + row] = a[aOffset + row * 3 + column];
+    }
+  }
+}
+
+/// Multiplies the 3x3 rotation blocks of two matrices into `out`.
+///
+/// Offsets are free so this can read the rotation out of a 3x4 in place: a
+/// bone's frame data and a bone's world transform both begin with one.
+void _multiplyRotations(
+  Float32List a,
+  int aOffset,
+  Float32List b,
+  int bOffset,
+  Float32List out,
+  int outOffset,
+) {
+  for (var column = 0; column < 3; column += 1) {
+    final bx = b[bOffset + column * 3];
+    final by = b[bOffset + column * 3 + 1];
+    final bz = b[bOffset + column * 3 + 2];
+    for (var row = 0; row < 3; row += 1) {
+      out[outOffset + column * 3 + row] =
+          a[aOffset + row] * bx +
+          a[aOffset + 3 + row] * by +
+          a[aOffset + 6 + row] * bz;
+    }
+  }
+}
+
+/// Reduces a world transform to its parent-relative form.
+void _localOf(
+  Float32List world,
+  int bone,
+  int parent,
+  Float32List out,
+  int outOffset,
+) {
+  if (parent < 0) {
+    for (var j = 0; j < 12; j += 1) {
+      out[outOffset + j] = world[bone * 12 + j];
+    }
+    return;
+  }
+  final inverse = Float32List(12);
+  if (!invertMatrix(world, parent * 12, inverse, 0)) {
+    for (var j = 0; j < 12; j += 1) {
+      out[outOffset + j] = world[bone * 12 + j];
+    }
+    return;
+  }
+  multiplyMatrices(inverse, 0, world, bone * 12, out, outOffset);
+}
+
+/// Above this many degrees apart, a clip's bone transforms cannot be applied
+/// to a character directly.
+///
+/// The older Synty character rig sits about 19 degrees from the animation rig
+/// and poses correctly; the newer packs sit at 89 and tear apart. Forty is
+/// clear of both.
+const maxDirectPoseAngle = 40.0;
+
+/// How far apart two rigs hold the same bones, in degrees.
+///
+/// Near zero means the clip's transforms can be used directly. The older Synty
+/// character rig sits about 26 degrees from the animation rig; the newer packs
+/// sit at 89, which is what tore the mesh apart when posed directly.
+double rigAxisDifference(
+  SkeletonAnimation characterRest,
+  SkeletonAnimation clip,
+) {
+  final bind = characterRest.rest ?? characterRest.positions.firstOrNull;
+  final reference = clip.rest;
+  if (bind == null || reference == null) return 0;
+
+  final angles = <double>[];
+  for (var i = 0; i < characterRest.bones.length; i += 1) {
+    final bone = characterRest.bones[i];
+    final k = clip.indexOfBone(bone.name, path: bone.path);
+    if (k < 0) continue;
+    // The x column of each frame, compared as directions.
+    var ax = bind[i * 12], ay = bind[i * 12 + 1], az = bind[i * 12 + 2];
+    var bx = reference[k * 12], by = reference[k * 12 + 1];
+    var bz = reference[k * 12 + 2];
+    final la = math.sqrt(ax * ax + ay * ay + az * az);
+    final lb = math.sqrt(bx * bx + by * by + bz * bz);
+    if (la < 1e-9 || lb < 1e-9) continue;
+    ax /= la;
+    ay /= la;
+    az /= la;
+    bx /= lb;
+    by /= lb;
+    bz /= lb;
+    final dot = (ax * bx + ay * by + az * bz).clamp(-1.0, 1.0);
+    angles.add(math.acos(dot) * 180 / math.pi);
+  }
+  // No shared bones is not a perfect match, it is no comparison at all.
+  // Returning zero here made a rig with nothing in common look like the best
+  // possible reference, which is how a Sidekick character got chosen to
+  // correct a Polygon clip.
+  if (angles.length < minimumRigOverlap) return double.infinity;
+  angles.sort();
+  return angles[angles.length ~/ 2];
+}
+
+/// How many bones two rigs must share before they can be compared at all.
+const minimumRigOverlap = 4;
+
+/// How many bones a character's rig shares with a clip.
+///
+/// The Synty families do not overlap at all -- Polygon has 52 bones, Sidekick
+/// 121, and not one name in common -- so this separates "a different pose of
+/// the same rig" from "a different rig entirely".
+int rigBoneOverlap(SkeletonAnimation rig, SkeletonAnimation clip) {
+  var shared = 0;
+  for (final bone in rig.bones) {
+    if (clip.indexOfBone(bone.name, path: bone.path) >= 0) shared += 1;
+  }
+  return shared;
+}
+
 /// Poses a character's vertices into a packed buffer.
 ///
 /// The buffer form exists because animation calls this every frame: returning
@@ -9307,6 +10579,8 @@ Float32List poseSkinnedPositions({
   required SkeletonAnimation clip,
   required int frame,
   required Float32List out,
+  RetargetPlan? plan,
+  Float32List? boneWorld,
 }) {
   final vertices = character.vertices;
   final skin = character.skin;
@@ -9322,22 +10596,47 @@ Float32List poseSkinnedPositions({
   final boneCount = skin.boneNames.length;
   final skinMatrices = Float32List(boneCount * 12);
   final usable = List<bool>.filled(boneCount, false);
-  final clipFrame = clip.positions[frame];
-  for (var i = 0; i < boneCount; i += 1) {
-    final clipBone = clip.indexOfBone(
-      skin.boneNames[i],
-      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
-    );
-    if (clipBone < 0) continue;
-    multiplyMatrices(
-      clipFrame,
-      clipBone * 12,
-      skin.bindInverse,
-      i * 12,
-      skinMatrices,
-      i * 12,
-    );
-    usable[i] = true;
+
+  // Two ways to get a bone's animated transform. A retarget plan corrects for
+  // rigs that hold their bones at different angles; without one the clip's
+  // transforms are used directly, which is right only when both rigs agree.
+  final rest = character.skeleton;
+  if (plan != null && boneWorld != null && rest != null) {
+    plan.worldForFrame(clip, frame, boneWorld);
+    for (var i = 0; i < boneCount; i += 1) {
+      final bone = rest.indexOfBone(
+        skin.boneNames[i],
+        path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+      );
+      if (bone < 0) continue;
+      multiplyMatrices(
+        boneWorld,
+        bone * 12,
+        skin.bindInverse,
+        i * 12,
+        skinMatrices,
+        i * 12,
+      );
+      usable[i] = true;
+    }
+  } else {
+    final clipFrame = clip.positions[frame];
+    for (var i = 0; i < boneCount; i += 1) {
+      final clipBone = clip.indexOfBone(
+        skin.boneNames[i],
+        path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
+      );
+      if (clipBone < 0) continue;
+      multiplyMatrices(
+        clipFrame,
+        clipBone * 12,
+        skin.bindInverse,
+        i * 12,
+        skinMatrices,
+        i * 12,
+      );
+      usable[i] = true;
+    }
   }
 
   for (var v = 0; v < vertices.length; v += 1) {
@@ -9397,76 +10696,31 @@ Float32List poseSkinnedPositions({
 
 /// Poses a character's vertices with one frame of a clip.
 ///
-/// The join is by bone name, which is exact for Synty rigs. A bone the clip
-/// does not have contributes nothing, and a vertex left with no influence at
-/// all keeps its bind position rather than collapsing to the origin.
+/// Convenience wrapper over [poseSkinnedPositions] for callers that want a
+/// vertex list rather than a packed buffer; playback uses the buffer form.
 List<Vec3> poseSkinnedVertices({
   required MeshModel character,
   required SkeletonAnimation clip,
   required int frame,
+  RetargetPlan? plan,
 }) {
-  final skin = character.skin;
-  if (skin == null || frame < 0 || frame >= clip.frameCount) {
+  if (character.skin == null || frame < 0 || frame >= clip.frameCount) {
     return character.vertices;
   }
-
-  final boneCount = skin.boneNames.length;
-  final skinMatrices = Float32List(boneCount * 12);
-  final usable = List<bool>.filled(boneCount, false);
-  final clipFrame = clip.positions[frame];
-  for (var i = 0; i < boneCount; i += 1) {
-    final clipBone = clip.indexOfBone(
-      skin.boneNames[i],
-      path: i < skin.bonePaths.length ? skin.bonePaths[i] : null,
-    );
-    if (clipBone < 0) continue;
-    multiplyMatrices(
-      clipFrame,
-      clipBone * 12,
-      skin.bindInverse,
-      i * 12,
-      skinMatrices,
-      i * 12,
-    );
-    usable[i] = true;
-  }
-
-  final posed = <Vec3>[];
-  for (var v = 0; v < character.vertices.length; v += 1) {
-    final vertex = character.vertices[v];
-    final block = v < skin.vertexSkin.length ? skin.vertexSkin[v] : -1;
-    if (block < 0) {
-      posed.add(vertex);
-      continue;
-    }
-    var x = 0.0;
-    var y = 0.0;
-    var z = 0.0;
-    var total = 0.0;
-    for (var k = 0; k < 4; k += 1) {
-      final base = block * 8 + k * 2;
-      if (base + 1 >= skin.influences.length) break;
-      final weight = skin.influences[base + 1];
-      if (weight <= 0) continue;
-      final bone = skin.influences[base].toInt();
-      if (bone < 0 || bone >= boneCount || !usable[bone]) continue;
-      final moved = transformByMatrix(skinMatrices, bone * 12, vertex);
-      x += moved.x * weight;
-      y += moved.y * weight;
-      z += moved.z * weight;
-      total += weight;
-    }
-    posed.add(
-      total > 0
-          ? Vec3(
-              (x / total - skin.normalizeCenter.x) * skin.normalizeScale,
-              (y / total - skin.normalizeCenter.y) * skin.normalizeScale,
-              (z / total - skin.normalizeCenter.z) * skin.normalizeScale,
-            )
-          : vertex,
-    );
-  }
-  return posed;
+  final packed = poseSkinnedPositions(
+    character: character,
+    clip: clip,
+    frame: frame,
+    out: Float32List(character.vertices.length * 3),
+    plan: plan,
+    boneWorld: plan == null
+        ? null
+        : Float32List((character.skeleton?.bones.length ?? 0) * 12),
+  );
+  return [
+    for (var v = 0; v < character.vertices.length; v += 1)
+      Vec3(packed[v * 3], packed[v * 3 + 1], packed[v * 3 + 2]),
+  ];
 }
 
 /// One bone of a rig: a name, and where it hangs.
@@ -9522,6 +10776,7 @@ class SkeletonAnimation {
     required this.bones,
     required this.positions,
     required this.frameRate,
+    this.rest,
   });
 
   /// Reads the `skeleton` object the importer emits. Null when absent.
@@ -9554,10 +10809,20 @@ class SkeletonAnimation {
     }
     if (positions.isEmpty) return null;
 
+    final restValues = (json['rest'] as List<dynamic>?) ?? const [];
+    Float32List? rest;
+    if (restValues.length == stride) {
+      rest = Float32List(stride);
+      for (var i = 0; i < stride; i += 1) {
+        rest[i] = (restValues[i] as num).toDouble();
+      }
+    }
+
     return SkeletonAnimation(
       bones: bones,
       positions: positions,
       frameRate: (json['frameRate'] as num?)?.toDouble() ?? 30,
+      rest: rest,
     );
   }
 
@@ -9568,6 +10833,13 @@ class SkeletonAnimation {
   /// is all the stick-figure view reads.
   final List<Float32List> positions;
   final double frameRate;
+
+  /// The rig's own rest pose, unevaluated, as `bones.length * 12` floats.
+  ///
+  /// Two rigs can share every bone name and still hold those bones at
+  /// different angles. Transferring a pose between them needs each rig's own
+  /// rest as the reference, which is what this is.
+  final Float32List? rest;
 
   int get frameCount => positions.length;
 
@@ -10127,6 +11399,7 @@ class AssetItem {
     required this.tags,
     this.ignored = false,
     this.modelKind,
+    this.rigFamily,
     this.referencedByModel = false,
   });
 
@@ -10147,6 +11420,12 @@ class AssetItem {
   /// something has looked. Null means not classified yet -- classifying an FBX
   /// costs an importer run, so it happens lazily and is persisted.
   String? modelKind;
+
+  /// Which skeleton this file is built on, as a [RigFamily] name.
+  ///
+  /// Learned from the same probe that fills [modelKind] and persisted with it.
+  /// Null means not yet classified; `none` means classified and rigless.
+  String? rigFamily;
 
   /// Set once some model has been read and found to use this image. Persisted,
   /// because it is only learned by importing a model.
@@ -10210,7 +11489,7 @@ class AssetAtlasDatabase {
   ///        file no longer orphans it from projects and ignore flags
   ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
   ///   v5 - referenced_by_model, images a model was found to use
-  static const schemaVersion = 6;
+  static const schemaVersion = 7;
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -10262,6 +11541,11 @@ class AssetAtlasDatabase {
               'ADD COLUMN referenced_by_model INTEGER NOT NULL DEFAULT 0',
             );
           }
+          if (oldVersion < 7) {
+            await db.execute(
+              'ALTER TABLE catalog_assets ADD COLUMN rig_family TEXT',
+            );
+          }
           if (oldVersion < 6) {
             await db.execute('''
             CREATE TABLE settings (
@@ -10287,6 +11571,7 @@ class AssetAtlasDatabase {
               tags_json TEXT NOT NULL,
               ignored INTEGER NOT NULL DEFAULT 0,
               model_kind TEXT,
+              rig_family TEXT,
               referenced_by_model INTEGER NOT NULL DEFAULT 0
             )
           ''');
@@ -10373,6 +11658,7 @@ class AssetAtlasDatabase {
             .cast<String>()),
         ignored: (row['ignored'] as int) == 1,
         modelKind: row['model_kind'] as String?,
+        rigFamily: row['rig_family'] as String?,
         referencedByModel: (row['referenced_by_model'] as int? ?? 0) == 1,
       );
     }).toList();
@@ -10559,15 +11845,20 @@ class AssetAtlasDatabase {
 
   /// Writes a chunk of classifications in one transaction. Doing this per
   /// asset meant tens of thousands of separate writes.
+  /// Stores what the classification pass learned.
+  ///
+  /// Values are [FbxClassification.encode]d, carrying both the kind and the
+  /// rig family, which are written to their own columns here.
   Future<void> updateAssetModelKinds(Map<String, String> kindByAssetId) async {
     if (kindByAssetId.isEmpty) return;
     await initialize();
     await _db!.transaction((txn) async {
       final batch = txn.batch();
       for (final entry in kindByAssetId.entries) {
+        final decoded = FbxClassification.decode(entry.value);
         batch.update(
           'catalog_assets',
-          {'model_kind': entry.value},
+          {'model_kind': decoded.kind, 'rig_family': decoded.rig},
           where: 'id = ?',
           whereArgs: [entry.key],
         );
@@ -10788,4 +12079,6 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
+
 

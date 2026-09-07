@@ -108,6 +108,67 @@ Two checks that matter, in order:
 
 **Bone matching** is by path from the root, normalised through `normalizeBonePath`. These rigs give both hands the same bone names (`IndexFinger_01` under `Hand_L` and `Hand_R`) and ufbx renames whichever it meets second to `IndexFinger_01_1` — and node order differs between files, so one file's `Hand_R/IndexFinger_01_1` is another's `Hand_R/IndexFinger_01`. Only a single trailing digit is stripped, so Synty's own two-digit numbering (`Spine_01`) survives. Matching on the bare name silently binds a right hand to a left one, so it remains only as a last resort.
 
+**Retargeting.** Two Synty rigs can share every bone name, parent and path and still be incompatible: the newer character packs re-oriented the joint axes, so `Hand_L` points 169 degrees away from where the animation rig puts it. `rigAxisDifference` measures the median; the older character rig sits at ~19 degrees and poses directly, the newer at ~89 and tears apart. Above `maxDirectPoseAngle` (40) the clip's transforms are not applied directly — `RetargetPlan` takes two things from the clip and nothing else. **Orientation**, in world space: `characterWorldRotation(t) = clipWorldRotation(t) * transpose(referenceWorldRotation) * characterBindWorldRotation`. World space is the one frame two rigs with different joint axes agree on. **Displacement**, as a delta: `clipLocalTranslation(t) - referenceLocalTranslation`, carried into the character's parent frame and added to the character's own bind offset, scaled by the height ratio. For every bone but the hips that delta is zero, so the character keeps its own bone lengths exactly.
+
+**Never compose a clip's local transforms onto another rig.** The obvious formulation — `characterLocal(t) = clipLocal(t) * inverse(referenceLocal) * characterBindLocal` — looks right and is not: a bone's local translation then becomes `clipRotation * inverse(referenceRotation) * (bindOffset - referenceOffset) + clipOffset`, which is the character's bone length only when the clip is not rotating that bone. `SM_Chr_Captain_Male_01` came out with one shoulder at 0.53x its length and fingers at 1.48x, while its overall height stayed within 1% — which is why the height check missed it for so long. It was invisible in testing because the *reference* character poses perfectly under that formula: when character and reference are the same rig the correction collapses to the identity. Any other character is mangled. `test/skinning_test.dart` pins the synthetic case (a turning parent must not change a child's bone length) and `test/corpus_skinning_test.dart` measures every bone of a real character.
+
+The reference pose matters and is easy to get wrong. A clip's *own* rest is wherever the animator left the rig — for a locomotion pack, a standing idle — so using it makes the correction cancel and the character stays in its bind: safe, never mangled, but never posed either. What is needed is the clip rig in the same *physical* pose the character is bound in, i.e. both T-posed. Animation packs ship a character on their own rig for this, so `findClipReferenceCharacters` looks for one in the same container as the clip and the caller measures each against the clip by bone overlap. No reference found means the character shows its bind pose and the UI says so.
+
+### The skeletons
+
+Three rigs appear across this library, and they are told apart by their bones — never by a file name, a folder name, or a filename prefix.
+
+| Family | Root chain | Bones | Case | Marker bones | Where it shows up |
+| --- | --- | --- | --- | --- | --- |
+| `polygon` | `Root / Hips / Spine_01 / UpperLeg_R` | 50 on a character, 52 on a clip | Capitalised | `Hips`, `UpperLeg_R`, `Clavicle_L`, `Spine_01` | Synty's own rig. Most character packs, and the `Animations/Polygon` clips. |
+| `sidekick` | `root / pelvis / spine_01 / thigh_l`, plus attachment and IK bones | 88 on a character, 121 on a clip | lowercase | `hipAttachFront`, `hipAttach_l`, `ik_hand_gun`, `ik_hand_root` | Synty's Sidekick characters and the `Animations/Sidekick` clips. |
+| `unreal` | `root / pelvis / spine_01 / thigh_l` | mannequin | lowercase | `pelvis`, `thigh_l`, `clavicle_l`, `spine_01` | The plain Unreal mannequin. Supported, but see below. |
+| `none` | — | 0 | — | — | Props, collision hulls, anything with no skeleton. |
+
+**No file in this library actually classifies as `unreal`.** The Unreal builds of these packs ship `.uasset` and `.umap` only — zero FBX across every `*Unreal*.zip` checked — and the app indexes neither, so those archives contribute no models at all. The family exists so that a plain mannequin is not mistaken for Sidekick if one ever turns up; it is not exercised by anything here. (This is also why `Unreal_PolygonPirates` shows no assets: 636 `.uasset` and 2 `.umap`, all counted as `skippedUnsupported`.)
+
+Two things make this harder than it looks:
+
+- **Sidekick is a superset of Unreal.** It carries every mannequin bone plus attachment and IK bones, so testing for the mannequin first swallows it. `rigFamilyFromMarkers` checks Sidekick first, and the order is load-bearing.
+- **Polygon and Unreal differ only in case.** Both have a `spine_01`/`Spine_01`. The importer's marker comparison is exact and case-sensitive for exactly this reason.
+
+Polygon and Sidekick share **no bone names at all**, so a clip from one cannot drive a character from the other. `rigBoneOverlap` is what tells them apart, and `rigAxisDifference` returns `double.infinity` below `minimumRigOverlap` shared bones — returning 0 there made an unrelated rig look like a flawless reference and win the selection, which is why a reference is chosen by overlap rather than by angle.
+
+Same family does not mean same joint orientation. `SM_Chr_Captain_Male_01` and `PolygonSyntyCharacter` are both `polygon`, share all 50 bones and have identical bone lengths, and still sit 90 degrees apart: the Captain's bone axes are the reference's cycled x→y→z. Family decides *whether* a clip can drive a character; `rigAxisDifference` decides whether it needs retargeting to do it.
+
+### Nothing here reads a name
+
+Every rig question is answered from file contents. This is not fastidiousness — the naming conventions in this library actively lie:
+
+- `SK_` is Unreal's *skeletal mesh* prefix, and Synty puts it on Polygon-rigged characters. It does not mean Sidekick.
+- `SM_` is Unreal's *static mesh* prefix, and `SM_Chr_Captain_Male_01.fbx` is fully skinned.
+- Sidekick characters are also `SK_*`, so the prefix separates nothing.
+- A pack's `Characters/` folder holds attachments too, and its clips can sit under `Export/Polygon/` or `Animations/Polygon/` depending on the pack's vintage.
+
+So the inputs are:
+
+| Question | Answered by | From |
+| --- | --- | --- |
+| Does this file have geometry or is it a clip? | `modelKind` (`mesh` / `animation`) | importer `--probe` |
+| Which skeleton is it on? | `rigFamily` | marker bones, `--probe` |
+| Which skeleton is a *loaded* clip on? | `rigFamilyOfSkeleton` | the bone names already in memory |
+| Is it a character rather than a prop? | `assetIsCharacterModel` | `rigFamily != none` |
+| Can this clip drive this character? | `rigFamiliesCompatible`, `rigBoneOverlap` | bone names on both sides |
+| Does it need retargeting? | `rigAxisDifference` vs `maxDirectPoseAngle` | bind and rest matrices |
+| Which container is it in? | `assetContainerKey` | the zip path, or the pack folder under a source root |
+
+The one exception is `assetContainerKey`, which is *about* location by definition: two files are in the same container when they came from the same zip, or the same top-level folder under a scanned source root. That is a fact about where a file lives, not a claim about what it is.
+
+`findClipReferenceCharacters` used to require `/character` in the path, which is a habit of two packs rather than a fact about files. It now scopes by container and filters by `modelKind` and `rigFamily`, both permissive when unknown — a file nothing has probed is offered rather than hidden. On a cold catalog a known rigged character shuts out the unprobed files entirely; without that, an animation pack's seven hundred unclassified clips would fill the candidate list before the alphabet reached its two characters. The caller then rejects anything that imports without skin, because a clip would otherwise score a perfect bone overlap and win with a rest pose that is just an idle. `test/rig_reference_test.dart` pins all of it.
+
+**How classification runs.** `--probe` walks the FBX node graph and reports which of `kRigMarkerBones` (in `mesh_importer.cpp`) it saw; `rigFamilyFromMarkers` turns that list into a family. Adding a rig means adding its marker bones there and a case to that function — those two lists are the whole rule set. The answer rides home from the classification isolate encoded by `FbxClassification` (`kind#rig` in one string) and lands in the `rig_family` column.
+
+Classification is lazy and persisted, which has bitten once: the scheduler skipped any FBX that already had a `modelKind`, so files classified before the `rig_family` column existed kept a kind, never got a rig, and were invisible to the character filter forever. It now probes when *either* fact is missing.
+
+`assetPassesRigFilter` drives the sidebar's skeleton filter, including "works with my character", which keeps only files sharing the chosen animation character's family. A file nothing has probed yet is never hidden — that would assert something the catalog does not know.
+
+Each FBX also records its authoring path in `Original|FileName` (`U:\Synty\Animation\BaseLocomotion\...\Export\Polygon\...` for a clip, `E:\Individual_Characters\...` for a newer character). It is a useful forensic hint about which pipeline a file came from, but it is not used for matching — measuring the rigs is more reliable than parsing someone else's folder names.
+
 There is no standalone skeleton asset in these packs. Every `SK_Chr_*.fbx` (1,551 of them across the library) embeds its own copy of the rig and its own skin weights, so a character is matched to a clip directly with no shared avatar in between.
 
 Diagnostics: set `ASSET_ATLAS_DEBUG_SPACES=1` and the importer prints each mesh's raw extent and geometry-to-world on stderr. That is what finally showed the mesh standing at y 0..1.79 while the emitted vertices sat at ±0.88.
@@ -116,7 +177,7 @@ Diagnostics: set `ASSET_ATLAS_DEBUG_SPACES=1` and the importer prints each mesh'
 
 ### Catalog and persistence
 
-`AssetAtlasDatabase` is a singleton over `sqflite_common_ffi`, DB file in the app support dir (or `initialize(databasePath:)` in tests), schema `version: 5` with tables `catalog_assets`, `catalog_sources`, `projects`, `project_assets`. `onUpgrade` exists and is tested — add a migration step there and mirror any DDL in `onCreate`, since `test/database_test.dart` asserts the two paths converge. Asset ids come from `buildAssetId()` (source root + relative path, content-independent); never build one inline.
+`AssetAtlasDatabase` is a singleton over `sqflite_common_ffi`, DB file in the app support dir (or `initialize(databasePath:)` in tests), schema `version: 7` with tables `catalog_assets`, `catalog_sources`, `projects`, `project_assets`. `onUpgrade` exists and is tested — add a migration step there and mirror any DDL in `onCreate`, since `test/database_test.dart` asserts the two paths converge. Asset ids come from `buildAssetId()` (source root + relative path, content-independent); never build one inline.
 
 Assets inside `.zip` archives are indexed as virtual paths shaped `zip:<container>::<entry>`. Any code that touches a path must handle this: `isZipVirtualPath()` gates reads through `readZipVirtualAssetBytesByPath()` and an LRU-ish archive cache. ZIP entries are searchable, previewable (images, audio, OBJ and FBX), and copyable — the copy flow writes them out under their archive-relative path. Introspection is capped by `maxZipIntrospectionBytes` / `maxZipEntriesToInspect`.
 
