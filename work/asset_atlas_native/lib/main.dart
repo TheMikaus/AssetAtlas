@@ -55,7 +55,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.18';
+const appVersion = '1.10.19';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3370,6 +3370,25 @@ class _ModelPreviewState extends State<ModelPreview> {
   /// A texture the user picked by hand, overriding whatever resolved.
   String? chosenTexturePath;
   bool showVariantGrid = false;
+  VariantGridMode variantMode = VariantGridMode.texture;
+
+  /// Memoised, because finding variants walks the whole catalog and the answer
+  /// depends only on the loaded mesh.
+  MeshModel? _variantsFor;
+  List<AssetItem> _variants = const [];
+
+  List<AssetItem> textureVariantsOf(MeshModel mesh) {
+    if (!identical(_variantsFor, mesh)) {
+      _variantsFor = mesh;
+      _variants = findTextureVariants(
+        mesh: mesh,
+        model: widget.asset,
+        allAssets: widget.allAssets,
+      );
+    }
+    return _variants;
+  }
+
   bool useBaseTexture = true;
   bool useNormalMaps = true;
   bool useEmissiveMaps = true;
@@ -3459,6 +3478,22 @@ class _ModelPreviewState extends State<ModelPreview> {
                 clipPath: widget.asset.path,
               );
             }
+            final variants = textureVariantsOf(mesh);
+            final textureCells = variants.length;
+            final materialCells = mesh.materials.length;
+            // Textures are what "variants" means to almost every model here,
+            // so a model that has both starts there; a model that has only
+            // materials to show falls back to them whatever was last chosen.
+            final effectiveVariantMode =
+                variantMode == VariantGridMode.texture && textureCells > 1
+                ? VariantGridMode.texture
+                : materialCells > 1
+                ? VariantGridMode.material
+                : VariantGridMode.texture;
+            final variantCells = effectiveVariantMode == VariantGridMode.texture
+                ? textureCells
+                : materialCells;
+
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -3467,13 +3502,33 @@ class _ModelPreviewState extends State<ModelPreview> {
                 // the viewport costs a little height and covers nothing.
                 ModelToolbarBar(
                   children: [
-                    if (mesh.materials.length > 1)
+                    if (variantCells > 1)
                       FilterChip(
                         avatar: const Icon(Icons.grid_view, size: 16),
-                        label: Text('Variants (${mesh.materials.length})'),
+                        label: Text('Variants ($variantCells)'),
                         selected: showVariantGrid,
                         onSelected: (next) =>
                             setState(() => showVariantGrid = next),
+                      ),
+                    // Only worth asking when the answers differ. A character
+                    // has palettes and one material; a stacked file has a
+                    // dozen materials and one palette.
+                    if (showVariantGrid && textureCells > 1 && materialCells > 1)
+                      SegmentedButton<VariantGridMode>(
+                        segments: [
+                          ButtonSegment(
+                            value: VariantGridMode.texture,
+                            label: Text('By texture ($textureCells)'),
+                          ),
+                          ButtonSegment(
+                            value: VariantGridMode.material,
+                            label: Text('By material ($materialCells)'),
+                          ),
+                        ],
+                        selected: {effectiveVariantMode},
+                        showSelectedIcon: false,
+                        onSelectionChanged: (next) =>
+                            setState(() => variantMode = next.first),
                       ),
                     if (mesh.skin != null)
                       ValueListenableBuilder<String?>(
@@ -3749,18 +3804,32 @@ class _ModelPreviewState extends State<ModelPreview> {
                             // buys nothing; everything filled goes through the
                             // rasteriser so interpenetrating and coplanar faces
                             // resolve correctly.
-                            child: showVariantGrid
-                                ? MaterialVariantGrid(
-                                    mesh: mesh,
-                                    yaw: yaw,
-                                    pitch: pitch,
-                                    zoom: zoom,
-                                    renderMode: renderMode,
-                                    lightingMode: lightingMode,
-                                    cullBackFaces: cullBackFaces,
-                                    interacting: interacting,
-                                    uvSetOverride: uvSetOverride,
-                                  )
+                            child: showVariantGrid && variantCells > 1
+                                ? (effectiveVariantMode ==
+                                          VariantGridMode.texture
+                                      ? TextureVariantGrid(
+                                          mesh: mesh,
+                                          variants: variants,
+                                          yaw: yaw,
+                                          pitch: pitch,
+                                          zoom: zoom,
+                                          renderMode: renderMode,
+                                          lightingMode: lightingMode,
+                                          cullBackFaces: cullBackFaces,
+                                          interacting: interacting,
+                                          uvSetOverride: uvSetOverride,
+                                        )
+                                      : MaterialVariantGrid(
+                                          mesh: mesh,
+                                          yaw: yaw,
+                                          pitch: pitch,
+                                          zoom: zoom,
+                                          renderMode: renderMode,
+                                          lightingMode: lightingMode,
+                                          cullBackFaces: cullBackFaces,
+                                          interacting: interacting,
+                                          uvSetOverride: uvSetOverride,
+                                        ))
                                 : renderMode == RenderMode.wireframe
                                 ? CustomPaint(
                                     painter: MeshPainter(
@@ -6790,6 +6859,183 @@ class AnimationCharacterButton extends StatelessWidget {
 /// material -- which drawn together fight for identical pixels at identical
 /// depth and read as a mess of z-fighting. Drawn one per cell they are twelve
 /// characters.
+/// What a grid cell stands for.
+///
+/// Two different questions wear the same shape. "What does this model look
+/// like in each of its palettes" is about textures and is the common one;
+/// "what is actually stacked in this file" is about materials, and only
+/// matters for the files that hide a dozen characters in one mesh.
+enum VariantGridMode { texture, material }
+
+/// Shows a model once per texture, side by side.
+///
+/// The materials are left alone and each cell puts one atlas on all of them,
+/// exactly as picking that texture by hand would. For the models this is for
+/// -- a Synty character with one material and four palettes -- that is the
+/// whole story; for a multi-material model it flattens the materials
+/// together, which is a fair price for seeing the palettes at all.
+class TextureVariantGrid extends StatefulWidget {
+  const TextureVariantGrid({
+    required this.mesh,
+    required this.variants,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    required this.interacting,
+    this.uvSetOverride,
+    super.key,
+  });
+
+  final MeshModel mesh;
+  final List<AssetItem> variants;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool interacting;
+  final String? uvSetOverride;
+
+  @override
+  State<TextureVariantGrid> createState() => _TextureVariantGridState();
+}
+
+class _TextureVariantGridState extends State<TextureVariantGrid> {
+  late Future<List<MeshModel?>> _meshes;
+
+  @override
+  void initState() {
+    super.initState();
+    _meshes = _applyAll();
+  }
+
+  @override
+  void didUpdateWidget(covariant TextureVariantGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Only the mesh and the list matter. Rebuilding these on a camera drag
+    // would decode every image again, once per frame.
+    if (!identical(oldWidget.mesh, widget.mesh) ||
+        !_sameVariants(oldWidget.variants, widget.variants)) {
+      _meshes = _applyAll();
+    }
+  }
+
+  bool _sameVariants(List<AssetItem> a, List<AssetItem> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i += 1) {
+      if (a[i].path != b[i].path) return false;
+    }
+    return true;
+  }
+
+  Future<List<MeshModel?>> _applyAll() async {
+    final built = <MeshModel?>[];
+    for (final variant in widget.variants) {
+      try {
+        built.add(await applyChosenTexture(widget.mesh, variant.path));
+      } catch (error) {
+        // A format Flutter and the image package both refuse is a cell that
+        // says so, not a grid that fails.
+        fbxLog('Variant texture ${variant.name} could not be read: $error');
+        built.add(null);
+      }
+    }
+    return built;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<MeshModel?>>(
+      future: _meshes,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final meshes = snapshot.data!;
+        final columns = math.max(1, math.sqrt(meshes.length).ceil());
+        return GridView.builder(
+          padding: const EdgeInsets.all(8),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: columns,
+            mainAxisSpacing: 8,
+            crossAxisSpacing: 8,
+          ),
+          itemCount: meshes.length,
+          itemBuilder: (context, index) {
+            final variant = widget.variants[index];
+            final mesh = meshes[index];
+            return VariantGridCell(
+              label: variant.name,
+              child: mesh == null
+                  ? const Center(
+                      child: Text(
+                        'Could not read this image.',
+                        style: TextStyle(color: Colors.black54, fontSize: 11),
+                      ),
+                    )
+                  : RasterModelView(
+                      mesh: mesh,
+                      yaw: widget.yaw,
+                      pitch: widget.pitch,
+                      zoom: widget.zoom,
+                      renderMode: widget.renderMode,
+                      lightingMode: widget.lightingMode,
+                      cullBackFaces: widget.cullBackFaces,
+                      useBaseTexture: true,
+                      useNormalMaps: true,
+                      useEmissiveMaps: true,
+                      useSpecular: true,
+                      interacting: widget.interacting,
+                      uvSetOverride: widget.uvSetOverride,
+                    ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// One framed, captioned cell of either grid.
+class VariantGridCell extends StatelessWidget {
+  const VariantGridCell({
+    required this.label,
+    required this.child,
+    super.key,
+  });
+
+  final String label;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        children: [
+          Expanded(child: child),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class MaterialVariantGrid extends StatelessWidget {
   const MaterialVariantGrid({
     required this.mesh,
@@ -6838,41 +7084,23 @@ class MaterialVariantGrid extends StatelessWidget {
       itemCount: count,
       itemBuilder: (context, index) {
         final material = mesh.materials[index];
-        return DecoratedBox(
-          decoration: BoxDecoration(
-            border: Border.all(color: Colors.black12),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Column(
-            children: [
-              Expanded(
-                child: RasterModelView(
-                  mesh: mesh,
-                  yaw: yaw,
-                  pitch: pitch,
-                  zoom: zoom,
-                  renderMode: renderMode,
-                  lightingMode: lightingMode,
-                  cullBackFaces: cullBackFaces,
-                  useBaseTexture: true,
-                  useNormalMaps: true,
-                  useEmissiveMaps: true,
-                  useSpecular: true,
-                  interacting: interacting,
-                  uvSetOverride: uvSetOverride,
-                  visibleMaterial: index,
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                child: Text(
-                  material.name.isEmpty ? 'Material $index' : material.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 11),
-                ),
-              ),
-            ],
+        return VariantGridCell(
+          label: material.name.isEmpty ? 'Material $index' : material.name,
+          child: RasterModelView(
+            mesh: mesh,
+            yaw: yaw,
+            pitch: pitch,
+            zoom: zoom,
+            renderMode: renderMode,
+            lightingMode: lightingMode,
+            cullBackFaces: cullBackFaces,
+            useBaseTexture: true,
+            useNormalMaps: true,
+            useEmissiveMaps: true,
+            useSpecular: true,
+            interacting: interacting,
+            uvSetOverride: uvSetOverride,
+            visibleMaterial: index,
           ),
         );
       },
@@ -8622,6 +8850,91 @@ bool _shareARoot(AssetItem a, AssetItem b) {
     return normalizePathKey(zipA.zipPath) == normalizePathKey(zipB.zipPath);
   }
   return normalizePathKey(a.sourceRoot) == normalizePathKey(b.sourceRoot);
+}
+
+/// How many looks the grid will draw at once.
+///
+/// Each cell decodes its own image and rasterises its own copy of the model,
+/// so this is a real cost rather than a tidiness limit.
+const maxTextureVariants = 12;
+
+/// The interchangeable looks a model has, as texture assets.
+///
+/// A pack ships one atlas and several palette swaps of it, named by suffix: a
+/// material asking for `PolygonAncientWorlds_Texture_01` is served by
+/// `..._01_A`, `..._01_B` and `..._01_C`, each the same atlas in a different
+/// colourway and each fitting this model's UVs exactly. Which is why a Synty
+/// character can have one material and still have four looks -- the variants
+/// are not in the file, they are beside it.
+///
+/// Found by stem: a candidate counts when its name, with exporter noise
+/// stripped, is the requested name or extends it by a suffix. So `_01_A`
+/// counts and `_02_A` does not, which is the difference between the swaps of
+/// one atlas and every other atlas in the pack. The channel word has to agree
+/// as well, or the normal and metallic maps of the same atlas would be offered
+/// as colourways and render as noise.
+///
+/// Scoped to the model's own container, on the same reasoning as the relink:
+/// inside one pack the art is one set, across packs a shared name is a
+/// coincidence.
+List<AssetItem> findTextureVariants({
+  required MeshModel mesh,
+  required AssetItem model,
+  required List<AssetItem> allAssets,
+}) {
+  final stems = <String>{};
+  for (final material in mesh.materials) {
+    for (final reference in [
+      ...material.textures,
+      ...material.resolvedTextures,
+    ]) {
+      final stem = textureStemOf(reference);
+      if (stem.isNotEmpty) stems.add(stem);
+    }
+  }
+  if (stems.isEmpty) return const [];
+
+  final container = assetContainerKey(model);
+  final found = <String, AssetItem>{};
+  for (final asset in allAssets) {
+    if (!textureExts.contains(asset.ext)) continue;
+    if (assetContainerKey(asset) != container) continue;
+    final candidate = textureStemOf(asset.name);
+    if (candidate.isEmpty) continue;
+    for (final stem in stems) {
+      if (!_stemsShareARoot(stem, candidate)) continue;
+      if (!textureChannelsAgree(stem, candidate)) continue;
+      found[normalizePathKey(asset.path)] = asset;
+      break;
+    }
+  }
+
+  final variants =
+      found.values.toList()..sort(
+        (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+      );
+  return variants.length > maxTextureVariants
+      ? variants.sublist(0, maxTextureVariants)
+      : variants;
+}
+
+/// A texture reference reduced to a comparable name: no folder, no extension,
+/// no exporter prefix or duplicate-copy suffix.
+String textureStemOf(String reference) {
+  final base = reference.split(_pathSeparatorPattern).last;
+  return stripTextureNameNoise(base.replaceFirst(_extensionPattern, ''));
+}
+
+/// Whether one stem is the other, or the other plus a suffix.
+///
+/// Symmetric, because which of the two names is longer is not fixed: a
+/// material may reference the atlas the artist worked in (`..._01`) while the
+/// pack ships only its swaps (`..._01_A`), or reference a swap directly while
+/// the pack also ships the plain atlas. The separator is required, so `_01`
+/// does not swallow `_010`.
+bool _stemsShareARoot(String stem, String candidate) {
+  if (stem == candidate) return true;
+  return candidate.startsWith('${stem}_') || stem.startsWith('${candidate}_');
 }
 
 List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
@@ -12079,6 +12392,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
