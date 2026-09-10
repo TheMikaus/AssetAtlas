@@ -838,6 +838,15 @@ int main(int argc, char** argv) {
 
   printf("{\"kind\":\"mesh\",\"name\":");
   print_json_string(input_label.c_str());
+  // Where this mesh was before it was fitted into the viewer's unit box.
+  //
+  // Emitted for every mesh, not just skinned ones. An attachment -- a helmet,
+  // a beard -- is authored at the origin of the joint it belongs to, at the
+  // character's scale, and both facts are destroyed by the normalisation
+  // above. Undo it with these and the piece can be put back where the artist
+  // built it, which is the whole basis of placing one on a character.
+  printf(",\"framingCenter\":[%.9g,%.9g,%.9g],\"framingScale\":%.9g",
+    center.x, center.y, center.z, scale);
   printf(",\"vertices\":[");
   for (size_t i = 0; i < vertices.size(); ++i) {
     const Vec3& v = vertices[i];

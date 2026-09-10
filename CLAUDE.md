@@ -125,7 +125,7 @@ Three rigs appear across this library, and they are told apart by their bones �
 | `unreal` | `root / pelvis / spine_01 / thigh_l` | mannequin | lowercase | `pelvis`, `thigh_l`, `clavicle_l`, `spine_01` | The plain Unreal mannequin. Supported, but see below. |
 | `none` | — | 0 | — | — | Props, collision hulls, anything with no skeleton. |
 
-**No file in this library actually classifies as `unreal`.** The Unreal builds of these packs ship `.uasset` and `.umap` only — zero FBX across every `*Unreal*.zip` checked — and the app indexes neither, so those archives contribute no models at all. The family exists so that a plain mannequin is not mistaken for Sidekick if one ever turns up; it is not exercised by anything here. (This is also why `Unreal_PolygonPirates` shows no assets: 636 `.uasset` and 2 `.umap`, all counted as `skippedUnsupported`.)
+**No file in this library actually classifies as `unreal`.** The Unreal builds of these packs ship `.uasset` and `.umap` only — zero FBX across every `*Unreal*.zip` checked — and the app indexes neither, so those archives contribute no models at all. The family exists so that a plain mannequin is not mistaken for Sidekick if one ever turns up; it is not exercised by anything here. (`Unreal_PolygonPirates` is 636 `.uasset` and 2 `.umap`. Those now index as type `unreal` with their own sidebar filter and icon -- listed so a pack that ships nothing else is not mistaken for an empty folder -- but they carry no geometry anything here can read, so they are never previewed.)
 
 Two things make this harder than it looks:
 
@@ -136,9 +136,27 @@ Polygon and Sidekick share **no bone names at all**, so a clip from one cannot d
 
 Same family does not mean same joint orientation. `SM_Chr_Captain_Male_01` and `PolygonSyntyCharacter` are both `polygon`, share all 50 bones and have identical bone lengths, and still sit 90 degrees apart: the Captain's bone axes are the reference's cycled x→y→z. Family decides *whether* a clip can drive a character; `rigAxisDifference` decides whether it needs retargeting to do it.
 
+### Attachments
+
+Every character pack ships kit -- helmets, beards, hair, capes, pauldrons -- and the files say nothing about where any of it goes. An attachment FBX is a bare mesh with no skeleton, no socket and no metadata; `SM_Chr_Attach_Helmet_01.fbx` is 524 triangles sitting at the origin. So this is the one rig question that *is* answered by the name, and the guessing is gathered in a single table, `attachPoints`, rather than spread through the code pretending to be inference.
+
+Each entry maps a set of words to a bone per rig family. Sidekick names its own sockets and so answers outright -- `headAttach`, `faceAttach`, `backAttach`, `shoulderAttach_l/r`, `elbowAttach_l/r`, `kneeAttach_l/r`, `hipAttachFront/Back/_l/_r`, `prop_l/r`. Polygon has none of those, so the anatomical bone is used instead (`Head`, `Jaw`, `Spine_03`, `Hand_R`). The first bone in the list that the character actually has wins, and a rig with none of them wears nothing rather than wearing it in the wrong place.
+
+**Match whole words, never substrings.** `cape` contains `cap`, which sent every cloak in the library onto a head; `prop` is the name of a bone and also the name of half of every pack's scenery, so as a filename keyword it claimed every `SM_Prop_*` barrel and crate. Names here are underscore-separated, so splitting on punctuation recovers the words the artist wrote. A trailing number is stripped as well, so `Helmet01` still reads as a helmet. Both bugs were caught by the tests in `test/attachment_test.dart` rather than by reading the table, which is the argument for having the table.
+
+**Placement is not guesswork.** The artist builds a helmet at the head joint's origin at the character's own scale -- confirmed by `ASSET_ATLAS_DEBUG_SPACES=1`, which shows the helmet's raw mesh at y -0.063..0.268 rather than at head height. So three steps put it back: undo the attachment's framing to recover the coordinates it was authored in, carry those through the bone's rest transform, and apply the character's framing so it lands in the same box the character is drawn in. Nothing is scaled to fit. `attachToCharacter` returns null rather than placing a piece badly when a step is missing.
+
+That needed the importer to emit `framingCenter` / `framingScale` for **every** mesh, not just skinned ones. The values were already there for skinned meshes, carried on the `skin` object, because posing needs them; a helmet has no skin to carry them on, and without them its size and origin are gone for good. `framingOf` prefers the direct field so a character and its hat are read the same way.
+
+Attachments are found by `findAttachmentCandidates`: models in the character's own container, not already known to have a rig of their own (that is another character, not a hat), whose folder or name says `attach` or whose name contains a word from the table.
+
+**Stacked-variant files.** Some packs ship a character sheet rather than a character. `Characters.fbx` in Dungeon Realms holds eleven whole bodies standing in the same place, one material each; `SimplePeople3.fbx` does the same with twelve. Drawn together they interpenetrate and read as z-fighting. `materialsAreStackedVariants` detects it spatially rather than by name -- a material covering the model's full width *and* height is not a part of it, it is another copy of it, and three or more such materials is a stack -- and the variant grid opens in per-material mode for those files. Parts fail the test, so an ordinary multi-material model is left alone.
+
+**The variant grid has two modes** because there are two questions. By texture: one cell per palette swap of the atlas a material asks for, which is what a Synty character needs since it has one material and several colourways. By material: one cell per material, for the stacked files. A model with both gets a switch and starts on textures unless it is a stack.
+
 ### Nothing here reads a name
 
-Every rig question is answered from file contents. This is not fastidiousness — the naming conventions in this library actively lie:
+Every rig question is answered from file contents — with the single, declared exception of an attachment's attach point above, which no file records at all. This is not fastidiousness — the naming conventions in this library actively lie:
 
 - `SK_` is Unreal's *skeletal mesh* prefix, and Synty puts it on Polygon-rigged characters. It does not mean Sidekick.
 - `SM_` is Unreal's *static mesh* prefix, and `SM_Chr_Captain_Male_01.fbx` is fully skinned.
@@ -181,7 +199,7 @@ Diagnostics: set `ASSET_ATLAS_DEBUG_SPACES=1` and the importer prints each mesh'
 
 Assets inside `.zip` archives are indexed as virtual paths shaped `zip:<container>::<entry>`. Any code that touches a path must handle this: `isZipVirtualPath()` gates reads through `readZipVirtualAssetBytesByPath()` and an LRU-ish archive cache. ZIP entries are searchable, previewable (images, audio, OBJ and FBX), and copyable — the copy flow writes them out under their archive-relative path. Introspection is capped by `maxZipIntrospectionBytes` / `maxZipEntriesToInspect`.
 
-Type classification is driven by the top-level `const` sets in `lib/main.dart` (`imageExts`, `textureExts`, `audioExts`, `modelExts`, `archiveExts`) and `ignoredFolderNames` (`.git`, `.vs`, `Intermediate`, `Saved`, …). These are the authoritative rule set — changing them changes fixture test expectations in `test/fixtures/expected_results.json`.
+Type classification is driven by the top-level `const` sets in `lib/main.dart` (`imageExts`, `textureExts`, `audioExts`, `modelExts`, `archiveExts`, `unrealExts`) and `ignoredFolderNames` (`.git`, `.vs`, `Intermediate`, `Saved`, …). These are the authoritative rule set — changing them changes fixture test expectations in `test/fixtures/expected_results.json`.
 
 ### Known structural constraints
 
