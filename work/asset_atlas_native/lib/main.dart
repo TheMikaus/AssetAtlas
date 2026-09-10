@@ -51,11 +51,21 @@ const textureExts = {
 };
 const audioExts = {'wav', 'mp3', 'flac', 'ogg', 'midi', 'mid'};
 const modelExts = {'obj', 'fbx', 'gltf', 'glb', 'blend', 'dae', 'stl'};
+
+/// Unreal's own asset files: cooked or imported, and unreadable outside the
+/// engine.
+///
+/// Indexed but never previewed. The Unreal build of a Synty pack contains
+/// nothing else -- `Unreal_PolygonPirates` is 636 `.uasset` and 2 `.umap` with
+/// not one FBX among them -- so leaving them out made those archives look
+/// empty, which reads as a broken scanner rather than as the truth about what
+/// is in the file.
+const unrealExts = {'uasset', 'umap', 'uexp', 'ubulk'};
 const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.19';
+const appVersion = '1.10.20';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -1332,6 +1342,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
           .where((asset) => asset.effectiveType == 'animation')
           .length,
       'audio': assets.where((asset) => asset.effectiveType == 'audio').length,
+      'unreal': assets
+          .where((asset) => asset.effectiveType == 'unreal')
+          .length,
     };
 
     return Scaffold(
@@ -2044,6 +2057,7 @@ class FilterPanel extends StatelessWidget {
               'character',
               'animation',
               'audio',
+              'unreal',
             ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
@@ -2056,6 +2070,10 @@ class FilterPanel extends StatelessWidget {
                       : type == 'character'
                       ? 'Models with a skeleton, read from the bones rather '
                             'than the file name.'
+                      : type == 'unreal'
+                      ? 'Unreal asset files. Listed so a pack that ships '
+                            'nothing else is not mistaken for an empty '
+                            'folder; they cannot be previewed.'
                       : '',
                   child: ChoiceChip(
                     selected: typeFilter == type,
@@ -2374,6 +2392,7 @@ IconData iconForAssetType(String effectiveType) => switch (effectiveType) {
   'audio' => Icons.graphic_eq,
   'animation' => Icons.directions_run,
   'model' => Icons.view_in_ar_outlined,
+  'unreal' => Icons.videogame_asset_outlined,
   _ => Icons.insert_drive_file_outlined,
 };
 
@@ -3370,23 +3389,57 @@ class _ModelPreviewState extends State<ModelPreview> {
   /// A texture the user picked by hand, overriding whatever resolved.
   String? chosenTexturePath;
   bool showVariantGrid = false;
-  VariantGridMode variantMode = VariantGridMode.texture;
+  bool showAttachments = false;
 
-  /// Memoised, because finding variants walks the whole catalog and the answer
-  /// depends only on the loaded mesh.
+  /// Attachment asset paths currently worn, in the order they were put on.
+  final Set<String> wornPaths = <String>{};
+
+  /// Set when the grid mode is chosen by hand; null means read it off the
+  /// model, which is right far more often than not.
+  VariantGridMode? variantModeChoice;
+
+  /// Memoised, because finding variants walks the whole catalog and counting
+  /// coverage walks every face. Both depend only on the loaded mesh, and doing
+  /// either per frame while the camera drags would cost more than the feature
+  /// is worth.
   MeshModel? _variantsFor;
   List<AssetItem> _variants = const [];
+  bool _stacked = false;
+
+  /// Depends on the catalog rather than the mesh, but is measured with it so
+  /// the whole walk happens once per model rather than once per frame.
+  List<AssetItem> _attachments = const [];
+
+  void _measureVariants(MeshModel mesh) {
+    if (identical(_variantsFor, mesh)) return;
+    _variantsFor = mesh;
+    _variants = findTextureVariants(
+      mesh: mesh,
+      model: widget.asset,
+      allAssets: widget.allAssets,
+    );
+    _stacked = materialsAreStackedVariants(mesh);
+    _attachments = mesh.skeleton == null
+        ? const []
+        : findAttachmentCandidates(
+            character: widget.asset,
+            allAssets: widget.allAssets,
+          );
+  }
+
+  List<AssetItem> attachmentsFor(MeshModel mesh) {
+    _measureVariants(mesh);
+    return _attachments;
+  }
 
   List<AssetItem> textureVariantsOf(MeshModel mesh) {
-    if (!identical(_variantsFor, mesh)) {
-      _variantsFor = mesh;
-      _variants = findTextureVariants(
-        mesh: mesh,
-        model: widget.asset,
-        allAssets: widget.allAssets,
-      );
-    }
+    _measureVariants(mesh);
     return _variants;
+  }
+
+  bool isStackedVariants(MeshModel mesh) {
+    _measureVariants(mesh);
+    return _stacked;
   }
 
   bool useBaseTexture = true;
@@ -3413,10 +3466,57 @@ class _ModelPreviewState extends State<ModelPreview> {
       fallbackCheckerSquareSize: checkerSquareSize,
     );
     final chosen = chosenTexturePath;
-    if (chosen == null) return mesh;
     // Not cached: the cache is keyed on the file, and this is the user's
     // choice rather than anything the file said.
-    return applyChosenTexture(mesh, chosen);
+    final textured = chosen == null
+        ? mesh
+        : await applyChosenTexture(mesh, chosen);
+    return _dress(textured);
+  }
+
+  /// The character with everything the user has put on it.
+  ///
+  /// Each piece is merged in turn, so the result carries the character's
+  /// skeleton and framing throughout and the next piece is placed against the
+  /// same rig as the first. A piece that cannot be read, or that this rig has
+  /// no bone for, is skipped rather than allowed to fail the whole preview.
+  Future<MeshModel> _dress(MeshModel character) async {
+    if (wornPaths.isEmpty) return character;
+    final skeleton = character.skeleton;
+    if (skeleton == null) return character;
+
+    var dressed = character;
+    for (final path in wornPaths) {
+      AssetItem? asset;
+      for (final candidate in widget.allAssets) {
+        if (candidate.path == path) {
+          asset = candidate;
+          break;
+        }
+      }
+      if (asset == null) continue;
+      final bone = attachmentBoneFor(
+        attachmentName: asset.name,
+        skeleton: skeleton,
+      );
+      if (bone == null) continue;
+      try {
+        final piece = await MeshLoadCache.load(
+          asset,
+          allAssets: widget.allAssets,
+        );
+        dressed =
+            attachToCharacter(
+              character: dressed,
+              attachment: piece,
+              boneName: bone,
+            ) ??
+            dressed;
+      } catch (error) {
+        fbxLog('Could not put on ${asset.name}: $error');
+      }
+    }
+    return dressed;
   }
 
   @override
@@ -3436,6 +3536,10 @@ class _ModelPreviewState extends State<ModelPreview> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.asset.id != widget.asset.id ||
         oldWidget.catalogRevision != widget.catalogRevision) {
+      // A grid mode chosen for one model says nothing about the next, and
+      // neither does an outfit: the next character is a different rig.
+      variantModeChoice = null;
+      wornPaths.clear();
       meshFuture = _loadCurrentMesh();
       yaw = -0.6;
       pitch = 0.35;
@@ -3481,11 +3585,17 @@ class _ModelPreviewState extends State<ModelPreview> {
             final variants = textureVariantsOf(mesh);
             final textureCells = variants.length;
             final materialCells = mesh.materials.length;
-            // Textures are what "variants" means to almost every model here,
-            // so a model that has both starts there; a model that has only
-            // materials to show falls back to them whatever was last chosen.
+            // Textures are what "variants" means to almost every model
+            // here, so that is the default -- except for a file that turns out
+            // to be several whole models in one, where separating the
+            // materials is the entire point of opening the grid.
+            final wantedVariantMode =
+                variantModeChoice ??
+                (isStackedVariants(mesh)
+                    ? VariantGridMode.material
+                    : VariantGridMode.texture);
             final effectiveVariantMode =
-                variantMode == VariantGridMode.texture && textureCells > 1
+                wantedVariantMode == VariantGridMode.texture && textureCells > 1
                 ? VariantGridMode.texture
                 : materialCells > 1
                 ? VariantGridMode.material
@@ -3528,7 +3638,19 @@ class _ModelPreviewState extends State<ModelPreview> {
                         selected: {effectiveVariantMode},
                         showSelectedIcon: false,
                         onSelectionChanged: (next) =>
-                            setState(() => variantMode = next.first),
+                            setState(() => variantModeChoice = next.first),
+                      ),
+                    if (attachmentsFor(mesh).isNotEmpty)
+                      FilterChip(
+                        avatar: const Icon(Icons.checkroom, size: 16),
+                        label: Text(
+                          wornPaths.isEmpty
+                              ? 'Attachments (${attachmentsFor(mesh).length})'
+                              : 'Attachments (${wornPaths.length} on)',
+                        ),
+                        selected: showAttachments,
+                        onSelected: (next) =>
+                            setState(() => showAttachments = next),
                       ),
                     if (mesh.skin != null)
                       ValueListenableBuilder<String?>(
@@ -3774,6 +3896,22 @@ class _ModelPreviewState extends State<ModelPreview> {
                     ),
                   ],
                 ),
+                if (showAttachments && mesh.skeleton != null)
+                  AttachmentPanel(
+                    candidates: attachmentsFor(mesh),
+                    skeleton: mesh.skeleton!,
+                    worn: wornPaths,
+                    onToggle: (asset) => setState(() {
+                      if (!wornPaths.remove(asset.path)) {
+                        wornPaths.add(asset.path);
+                      }
+                      meshFuture = _loadCurrentMesh();
+                    }),
+                    onClear: () => setState(() {
+                      wornPaths.clear();
+                      meshFuture = _loadCurrentMesh();
+                    }),
+                  ),
                 Expanded(
                   child: Listener(
                     onPointerSignal: (event) {
@@ -7108,6 +7246,129 @@ class MaterialVariantGrid extends StatelessWidget {
   }
 }
 
+/// An attachment's file name with the boilerplate taken off.
+///
+/// `SM_Chr_Attach_Dwarf_Beard_04.fbx` becomes `Dwarf Beard 04`. Purely for the
+/// chip label: every pack prefixes the same four tokens, so leaving them on
+/// means every chip starts with the same eleven characters and the part that
+/// tells them apart is the part that gets ellipsised away.
+String attachmentDisplayName(String fileName) {
+  const boilerplate = {'sm', 'sk', 'chr', 'attach', 'fbx', 'obj'};
+  final words = fileName
+      .replaceFirst(RegExp(r'\.[^.]+$'), '')
+      .split(RegExp(r'[^A-Za-z0-9]+'))
+      .where((word) => word.isNotEmpty && !boilerplate.contains(word.toLowerCase()));
+  return words.isEmpty ? fileName : words.join(' ');
+}
+
+/// The kit a character can wear, grouped by where it goes.
+///
+/// Only pieces this rig can actually hold are listed. A Polygon character has
+/// no shoulder or knee joints to hang anything from, so offering its pack's
+/// pauldrons would be offering something that cannot be done.
+class AttachmentPanel extends StatelessWidget {
+  const AttachmentPanel({
+    required this.candidates,
+    required this.skeleton,
+    required this.worn,
+    required this.onToggle,
+    required this.onClear,
+    super.key,
+  });
+
+  final List<AssetItem> candidates;
+  final SkeletonAnimation skeleton;
+  final Set<String> worn;
+  final void Function(AssetItem asset) onToggle;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    // Grouped in the table's own order, so the head comes before the hands
+    // however the files happen to be named.
+    final grouped = <String, List<AssetItem>>{};
+    for (final point in attachPoints) {
+      for (final asset in candidates) {
+        if (attachPointFor(asset.name)?.name != point.name) continue;
+        if (attachmentBoneFor(
+              attachmentName: asset.name,
+              skeleton: skeleton,
+            ) ==
+            null) {
+          continue;
+        }
+        grouped.putIfAbsent(point.name, () => <AssetItem>[]).add(asset);
+      }
+    }
+
+    if (grouped.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Text(
+          'This pack has attachments, but none of them fit this rig.',
+          style: TextStyle(color: Colors.black54, fontSize: 12),
+        ),
+      );
+    }
+
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 200),
+      decoration: const BoxDecoration(
+        color: Color(0xfffafbfe),
+        border: Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Attachments are placed by name: the file says nothing '
+                    'about where it goes.',
+                    style: TextStyle(color: Colors.black54, fontSize: 11),
+                  ),
+                ),
+                if (worn.isNotEmpty)
+                  TextButton(onPressed: onClear, child: const Text('Take off all')),
+              ],
+            ),
+            for (final entry in grouped.entries) ...[
+              Padding(
+                padding: const EdgeInsets.only(top: 6, bottom: 4),
+                child: Text(
+                  entry.key,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final asset in entry.value)
+                    FilterChip(
+                      label: Text(
+                        attachmentDisplayName(asset.name),
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                      selected: worn.contains(asset.path),
+                      onSelected: (_) => onToggle(asset),
+                    ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// The strip of controls above the 3D viewport.
 ///
 /// These used to float over the model in the top-right corner, which is where
@@ -8551,6 +8812,7 @@ String typeForExt(String ext) {
   if (imageExts.contains(ext)) return 'image';
   if (audioExts.contains(ext)) return 'audio';
   if (modelExts.contains(ext)) return 'model';
+  if (unrealExts.contains(ext)) return 'unreal';
   return 'other';
 }
 
@@ -8850,6 +9112,427 @@ bool _shareARoot(AssetItem a, AssetItem b) {
     return normalizePathKey(zipA.zipPath) == normalizePathKey(zipB.zipPath);
   }
   return normalizePathKey(a.sourceRoot) == normalizePathKey(b.sourceRoot);
+}
+
+/// The framing a mesh was fitted with, from wherever it was recorded.
+///
+/// Skinned meshes have carried it on their skin since skinning was added;
+/// every mesh carries it directly now. Preferring the direct field means a
+/// character and its hat are read the same way.
+MeshFraming? framingOf(MeshModel mesh) {
+  final direct = mesh.framing;
+  if (direct != null) return direct;
+  final skin = mesh.skin;
+  if (skin == null || skin.normalizeScale <= 0) return null;
+  return MeshFraming(center: skin.normalizeCenter, scale: skin.normalizeScale);
+}
+
+/// A character wearing a piece of kit, as a single mesh.
+///
+/// The whole of the placement is three steps: undo the attachment's framing to
+/// get back the coordinates it was authored in, carry those through the bone's
+/// rest transform, and apply the character's framing so the result lands in
+/// the same box the character is drawn in. Nothing is scaled to fit and
+/// nothing is guessed -- the artist built the helmet at the head joint's
+/// origin at the character's own scale, and this is only putting it back.
+///
+/// Returns null when a step is missing rather than placing the piece badly: no
+/// skeleton, no rest pose, no bone by that name, or a mesh imported before the
+/// importer recorded its framing.
+MeshModel? attachToCharacter({
+  required MeshModel character,
+  required MeshModel attachment,
+  required String boneName,
+}) {
+  final skeleton = character.skeleton;
+  final rest = skeleton?.rest ?? skeleton?.positions.firstOrNull;
+  if (skeleton == null || rest == null) return null;
+  final bone = skeleton.indexOfBone(boneName);
+  if (bone < 0) return null;
+
+  final characterFraming = framingOf(character);
+  final attachmentFraming = framingOf(attachment);
+  if (characterFraming == null || attachmentFraming == null) return null;
+  if (attachment.vertices.isEmpty || attachment.faces.isEmpty) return null;
+
+  final placed = <Vec3>[
+    for (final vertex in attachment.vertices)
+      characterFraming.toEmitted(
+        transformByMatrix(
+          rest,
+          bone * 12,
+          attachmentFraming.toOriginal(vertex),
+        ),
+      ),
+  ];
+
+  final vertexOffset = character.vertices.length;
+  final materialOffset = character.materials.length;
+  return MeshModel(
+    name: character.name,
+    vertices: [...character.vertices, ...placed],
+    faces: [
+      ...character.faces,
+      for (final face in attachment.faces)
+        MeshFace(
+          [for (final index in face.indices) index + vertexOffset],
+          face.materialIndex + materialOffset,
+          face.uvs,
+          face.uvSets,
+        ),
+    ],
+    materials: [...character.materials, ...attachment.materials],
+    textureFiles: character.textureFiles,
+    // Colours multiply the surface, so a mesh that has none has to be padded
+    // with white rather than left short: a ragged list would tint the wrong
+    // vertices. If the character has none, neither does the result.
+    vertexColors: character.vertexColors.isEmpty
+        ? const []
+        : [
+            ...character.vertexColors,
+            for (var i = 0; i < placed.length; i += 1)
+              (i < attachment.vertexColors.length
+                  ? attachment.vertexColors[i]
+                  : const Color(0xffffffff)),
+          ],
+    kind: character.kind,
+    skeleton: skeleton,
+    skin: character.skin,
+    framing: character.framing,
+  );
+}
+
+/// Where on a body a piece of kit belongs, and which bone holds it there.
+///
+/// Unlike every other question this app asks about a rig, this one *is*
+/// answered by the name. An attachment FBX records no attach point: a helmet
+/// is a bare mesh sitting at the origin with no skeleton, no socket and no
+/// metadata saying what it goes on. The only thing that says "helmet" is the
+/// word "Helmet". So the guessing is gathered here, in one table, rather than
+/// spread through the code pretending to be inference.
+///
+/// The bone lists are in order of preference and the first one the character
+/// actually has wins. Sidekick rigs name their own sockets -- `headAttach`,
+/// `faceAttach`, `backAttach`, `shoulderAttach_l` -- which is Synty telling us
+/// the answer outright; Polygon has no sockets, so the anatomical bone is used
+/// instead.
+class AttachPoint {
+  const AttachPoint({
+    required this.name,
+    required this.keywords,
+    required this.polygon,
+    required this.sidekick,
+    required this.unreal,
+  });
+
+  /// What this point is called in the UI.
+  final String name;
+
+  /// Words in an attachment's file name that put it here.
+  final List<String> keywords;
+
+  final List<String> polygon;
+  final List<String> sidekick;
+  final List<String> unreal;
+
+  List<String> bonesFor(RigFamily family) => switch (family) {
+    RigFamily.polygon => polygon,
+    RigFamily.sidekick => sidekick,
+    RigFamily.unreal => unreal,
+    RigFamily.none => const [],
+  };
+}
+
+/// Ordered: the first point whose keyword appears wins, so narrower words come
+/// first. `Dwarf_Beard_Attach_01` has to reach the face and not the head, and
+/// `Hair_Beard_01` names both.
+const attachPoints = <AttachPoint>[
+  AttachPoint(
+    name: 'Face',
+    keywords: [
+      'beard',
+      'moustache',
+      'mustache',
+      'goatee',
+      'sideburn',
+      'faceplate',
+      'gasmask',
+      'facemask',
+      'glasses',
+      'eyepatch',
+      'monocle',
+      'mask',
+      'jaw',
+      'teeth',
+      'tusk',
+    ],
+    polygon: ['Jaw', 'Head'],
+    sidekick: ['faceAttach', 'jaw', 'head'],
+    unreal: ['jaw', 'head'],
+  ),
+  AttachPoint(
+    name: 'Head',
+    keywords: [
+      'helmet',
+      'helm',
+      'hat',
+      'hood',
+      'crown',
+      'tiara',
+      'circlet',
+      'headband',
+      'bandana',
+      'hair',
+      'wig',
+      'horn',
+      'antler',
+      'ear',
+      'head',
+    ],
+    polygon: ['Head', 'Neck'],
+    sidekick: ['headAttach', 'head'],
+    unreal: ['head'],
+  ),
+  AttachPoint(
+    name: 'Back',
+    keywords: [
+      'cape',
+      'cloak',
+      'backpack',
+      'rucksack',
+      'quiver',
+      'scabbard',
+      'sheath',
+      'banner',
+      'wing',
+      'jetpack',
+      'gasbag',
+      'back',
+    ],
+    polygon: ['Spine_03', 'Spine_02'],
+    sidekick: ['backAttach', 'spine_03'],
+    unreal: ['spine_03'],
+  ),
+  AttachPoint(
+    name: 'Shoulder',
+    keywords: ['shoulder', 'pauldron', 'epaulette', 'epaulet', 'spaulder'],
+    polygon: ['Shoulder_R', 'Shoulder_L', 'Clavicle_R'],
+    sidekick: ['shoulderAttach_r', 'shoulderAttach_l'],
+    unreal: ['upperarm_r', 'upperarm_l'],
+  ),
+  AttachPoint(
+    name: 'Elbow',
+    keywords: ['elbow', 'bracer', 'vambrace'],
+    polygon: ['Elbow_R', 'Elbow_L'],
+    sidekick: ['elbowAttach_r', 'elbowAttach_l'],
+    unreal: ['lowerarm_r', 'lowerarm_l'],
+  ),
+  AttachPoint(
+    name: 'Knee',
+    keywords: ['knee', 'greave', 'kneepad'],
+    polygon: ['LowerLeg_R', 'LowerLeg_L'],
+    sidekick: ['kneeAttach_r', 'kneeAttach_l'],
+    unreal: ['calf_r', 'calf_l'],
+  ),
+  AttachPoint(
+    name: 'Hip',
+    keywords: ['belt', 'holster', 'pouch', 'skirt', 'tail', 'hip', 'waist'],
+    polygon: ['Hips', 'Spine_01'],
+    sidekick: ['hipAttachFront', 'hipAttachBack', 'pelvis'],
+    unreal: ['pelvis'],
+  ),
+  AttachPoint(
+    name: 'Hand',
+    keywords: [
+      'sword',
+      'axe',
+      'shield',
+      'staff',
+      'wand',
+      'bow',
+      'gun',
+      'rifle',
+      'pistol',
+      'torch',
+      'lantern',
+      'hammer',
+      'spear',
+      'weapon',
+    ],
+    polygon: ['Hand_R', 'Hand_L'],
+    sidekick: ['prop_r', 'hand_r'],
+    unreal: ['hand_r'],
+  ),
+];
+
+/// The attach point an attachment's name puts it at, or null.
+///
+/// Whole words only. Matching substrings looked equivalent and was not: `cape`
+/// contains `cap`, so every cloak in the library went on a head, and `prop`
+/// is inside nothing but is itself the name of half a pack's scenery. Names
+/// here are underscore-separated, so splitting on punctuation recovers the
+/// words the artist actually wrote.
+AttachPoint? attachPointFor(String attachmentName) {
+  final tokens = <String>{};
+  for (final raw in attachmentName.toLowerCase().split(RegExp(r'[^a-z0-9]+'))) {
+    if (raw.isEmpty) continue;
+    tokens.add(raw);
+    // `Helmet01` is one word to a splitter and two to a person.
+    final unnumbered = raw.replaceFirst(RegExp(r'[0-9]+$'), '');
+    if (unnumbered.isNotEmpty) tokens.add(unnumbered);
+  }
+  for (final point in attachPoints) {
+    for (final keyword in point.keywords) {
+      if (tokens.contains(keyword)) return point;
+    }
+  }
+  return null;
+}
+
+/// The bone of [skeleton] an attachment named [attachmentName] belongs on.
+///
+/// Returns null when nothing in the name places it, or when the rig has none
+/// of the bones that point uses -- both of which are honest answers, and both
+/// of which leave the piece unattached rather than stuck somewhere wrong.
+String? attachmentBoneFor({
+  required String attachmentName,
+  required SkeletonAnimation skeleton,
+}) {
+  final point = attachPointFor(attachmentName);
+  if (point == null) return null;
+
+  final family = rigFamilyOfSkeleton(skeleton);
+  final wanted = point.bonesFor(family);
+  if (wanted.isEmpty) return null;
+
+  // A name that picks a side gets that side, whichever way the table is
+  // ordered: `Shoulder_L` must not land on the right shoulder just because
+  // the right is listed first.
+  final side = _sideOf(attachmentName);
+  if (side != null) {
+    for (final bone in wanted) {
+      if (_sideOf(bone) != side) continue;
+      final index = skeleton.indexOfBone(bone);
+      if (index >= 0) return skeleton.bones[index].name;
+    }
+  }
+  for (final bone in wanted) {
+    final index = skeleton.indexOfBone(bone);
+    if (index >= 0) return skeleton.bones[index].name;
+  }
+  return null;
+}
+
+/// 'l' or 'r' when a name commits to a side, else null.
+String? _sideOf(String name) {
+  final lower = name.toLowerCase();
+  if (RegExp(r'(^|[_\- ])(l|left)([_\- .]|$)').hasMatch(lower)) return 'l';
+  if (RegExp(r'(^|[_\- ])(r|right)([_\- .]|$)').hasMatch(lower)) return 'r';
+  return null;
+}
+
+/// Models in a character's own pack that look like kit rather than characters.
+///
+/// Two signals, both from the file's name or its folder, because there is
+/// nothing else: the pack puts them under an `Attachments` folder or says
+/// `Attach` in the name, or the name contains a word from [attachPoints].
+/// Anything already known to have a rig of its own is excluded -- that is a
+/// character, not a hat -- and so is the character being dressed.
+List<AssetItem> findAttachmentCandidates({
+  required AssetItem character,
+  required List<AssetItem> allAssets,
+}) {
+  final container = assetContainerKey(character);
+  final found = <AssetItem>[];
+  for (final asset in allAssets) {
+    if (asset.effectiveType != 'model') continue;
+    if (normalizePathKey(asset.path) == normalizePathKey(character.path)) {
+      continue;
+    }
+    if (assetContainerKey(asset) != container) continue;
+    // A rigged model is another character. An unprobed one is still a
+    // candidate: its name has to carry the day either way.
+    final rig = asset.rigFamily;
+    if (rig != null && rig != RigFamily.none.name) continue;
+
+    final lower = asset.path.toLowerCase().replaceAll(pathKeySeparator, '/');
+    final looksLikeKit =
+        lower.contains('attach') || attachPointFor(asset.name) != null;
+    if (!looksLikeKit) continue;
+    found.add(asset);
+  }
+  found.sort(
+    (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+  );
+  return found;
+}
+
+/// How much of the model a material must cover to count as a whole body.
+const stackedVariantCoverage = 0.7;
+
+/// How many whole-body materials make a file a stack rather than a model.
+///
+/// Two could be a model and its separately-materialled interior. Three is a
+/// pattern.
+const stackedVariantMinimum = 3;
+
+/// Whether this file is several complete models sharing one origin.
+///
+/// Some packs ship a character sheet rather than a character:
+/// `Characters.fbx` in Dungeon Realms holds eleven whole bodies standing in
+/// the same place, one material each, and `SimplePeople3.fbx` does the same
+/// with twelve. Drawn together they interpenetrate and read as a mess of
+/// z-fighting, which is what "renders weird" means for these files.
+///
+/// The test is spatial, not nominal: a material that covers the model's full
+/// width and height is not a part of it, it is another copy of it. Parts fail
+/// this -- a roof, a hat, a pair of eyes each occupy their own corner -- so a
+/// normal multi-material model is left alone.
+bool materialsAreStackedVariants(MeshModel mesh) {
+  if (mesh.materials.length < stackedVariantMinimum) return false;
+  if (mesh.vertices.isEmpty || mesh.faces.isEmpty) return false;
+
+  var modelMinX = double.infinity, modelMaxX = double.negativeInfinity;
+  var modelMinY = double.infinity, modelMaxY = double.negativeInfinity;
+  for (final vertex in mesh.vertices) {
+    if (vertex.x < modelMinX) modelMinX = vertex.x;
+    if (vertex.x > modelMaxX) modelMaxX = vertex.x;
+    if (vertex.y < modelMinY) modelMinY = vertex.y;
+    if (vertex.y > modelMaxY) modelMaxY = vertex.y;
+  }
+  final modelWidth = modelMaxX - modelMinX;
+  final modelHeight = modelMaxY - modelMinY;
+  if (modelWidth <= 1e-6 || modelHeight <= 1e-6) return false;
+
+  final count = mesh.materials.length;
+  final minX = List<double>.filled(count, double.infinity);
+  final maxX = List<double>.filled(count, double.negativeInfinity);
+  final minY = List<double>.filled(count, double.infinity);
+  final maxY = List<double>.filled(count, double.negativeInfinity);
+  for (final face in mesh.faces) {
+    final m = face.materialIndex;
+    if (m < 0 || m >= count) continue;
+    for (final index in face.indices) {
+      if (index < 0 || index >= mesh.vertices.length) continue;
+      final vertex = mesh.vertices[index];
+      if (vertex.x < minX[m]) minX[m] = vertex.x;
+      if (vertex.x > maxX[m]) maxX[m] = vertex.x;
+      if (vertex.y < minY[m]) minY[m] = vertex.y;
+      if (vertex.y > maxY[m]) maxY[m] = vertex.y;
+    }
+  }
+
+  var wholeBodies = 0;
+  for (var m = 0; m < count; m += 1) {
+    if (minX[m] > maxX[m]) continue;
+    final coversWidth = (maxX[m] - minX[m]) / modelWidth;
+    final coversHeight = (maxY[m] - minY[m]) / modelHeight;
+    if (coversWidth >= stackedVariantCoverage &&
+        coversHeight >= stackedVariantCoverage) {
+      wholeBodies += 1;
+    }
+  }
+  return wholeBodies >= stackedVariantMinimum;
 }
 
 /// How many looks the grid will draw at once.
@@ -9784,6 +10467,7 @@ Future<MeshModel> meshModelFromImporterJson(
     vertexColors: vertexColors,
     skin: skin,
     skeleton: restSkeleton,
+    framing: MeshFraming.fromJson(json),
   );
 }
 
@@ -11219,6 +11903,56 @@ class SkeletonAnimation {
 /// geometry is a legitimate asset, not an import failure.
 enum FbxContentKind { mesh, animation }
 
+/// Where a mesh was before the importer fitted it into the viewer's box.
+///
+/// The importer recentres and rescales every mesh so it can be framed, which
+/// throws away both its position and its size. For a lone model that is
+/// harmless. For a piece meant to sit on another model it is everything: a
+/// helmet is authored at the origin of the joint it belongs to, at the
+/// character's own scale, and neither fact survives the fit.
+class MeshFraming {
+  const MeshFraming({required this.center, required this.scale});
+
+  final Vec3 center;
+  final double scale;
+
+  /// Reads the fields the importer emits, or null when they are absent.
+  ///
+  /// Absent means a file imported before the importer emitted them, so the
+  /// caller has to cope rather than assume an identity: pretending the scale
+  /// was 1 would put an attachment in the wrong place at the wrong size, which
+  /// is worse than declining to place it.
+  static MeshFraming? fromJson(Map<String, dynamic> json) {
+    final center = json['framingCenter'] as List<dynamic>?;
+    final scale = (json['framingScale'] as num?)?.toDouble();
+    if (center == null || center.length < 3 || scale == null || scale <= 0) {
+      return null;
+    }
+    return MeshFraming(
+      center: Vec3(
+        (center[0] as num).toDouble(),
+        (center[1] as num).toDouble(),
+        (center[2] as num).toDouble(),
+      ),
+      scale: scale,
+    );
+  }
+
+  /// An emitted vertex put back where the artist built it.
+  Vec3 toOriginal(Vec3 emitted) => Vec3(
+    emitted.x / scale + center.x,
+    emitted.y / scale + center.y,
+    emitted.z / scale + center.z,
+  );
+
+  /// A point in the file's own coordinates, fitted into the viewer's box.
+  Vec3 toEmitted(Vec3 original) => Vec3(
+    (original.x - center.x) * scale,
+    (original.y - center.y) * scale,
+    (original.z - center.z) * scale,
+  );
+}
+
 class MeshModel {
   MeshModel({
     required this.name,
@@ -11231,6 +11965,7 @@ class MeshModel {
     this.animationStacks = 0,
     this.skeleton,
     this.skin,
+    this.framing,
     this.boneCount = 0,
     this.durationSeconds = 0,
     this.animationNames = const [],
@@ -11296,6 +12031,10 @@ class MeshModel {
   /// How this mesh's vertices follow that rig, when it is skinned.
   final SkinBinding? skin;
 
+  /// Where this mesh sat before it was fitted into the viewer's box.
+  /// Null for a model imported before the importer emitted it.
+  final MeshFraming? framing;
+
   /// This mesh with different vertex positions. Everything else is shared,
   /// so posing a character per frame does not rebuild its materials.
   MeshModel withVertices(List<Vec3> replacements) => MeshModel(
@@ -11309,6 +12048,7 @@ class MeshModel {
     animationStacks: animationStacks,
     skeleton: skeleton,
     skin: skin,
+    framing: framing,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -11326,6 +12066,7 @@ class MeshModel {
     animationStacks: animationStacks,
     skeleton: skeleton,
     skin: skin,
+    framing: framing,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -12392,6 +13133,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
