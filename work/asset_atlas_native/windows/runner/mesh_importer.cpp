@@ -30,6 +30,11 @@ struct Face {
   int b;
   int c;
   int material;
+  // Which node in the file this face came from. A character sheet is a dozen
+  // characters as a dozen nodes, and the material split does not follow the
+  // node split -- one pack puts all of them in a single material -- so this is
+  // the only way to take such a file apart again.
+  int object;
   double u1;
   double v1;
   double u2;
@@ -625,8 +630,11 @@ int main(int argc, char** argv) {
     return (int)skin_bone_names.size() - 1;
   };
 
-  auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world) {
+  std::vector<std::string> object_names;
+  auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world, const char* object_name) {
     if (!mesh || mesh->num_faces == 0) return;
+    const int object_index = static_cast<int>(object_names.size());
+    object_names.push_back(object_name ? object_name : "");
     if (debug_spaces_enabled()) {
       if (geometry_to_world) {
         const ufbx_matrix& g = *geometry_to_world;
@@ -732,6 +740,7 @@ int main(int argc, char** argv) {
           base + 1,
           base + 2,
           material_index,
+          object_index,
           tri_uvs[0],
           tri_uvs[1],
           tri_uvs[2],
@@ -750,14 +759,14 @@ int main(int argc, char** argv) {
   for (size_t node_index = 0; node_index < scene->nodes.count; ++node_index) {
     ufbx_node* node = scene->nodes.data[node_index];
     if (!node || !node->mesh) continue;
-    append_mesh(node->mesh, &node->geometry_to_world);
+    append_mesh(node->mesh, &node->geometry_to_world, string_from_ufbx(node->name).c_str());
   }
 
   // Defensive fallback for unusual scenes that contain an unattached mesh.
   for (size_t mesh_index = 0; mesh_index < scene->meshes.count; ++mesh_index) {
     ufbx_mesh* mesh = scene->meshes.data[mesh_index];
     if (!mesh || mesh->instances.count != 0) continue;
-    append_mesh(mesh, nullptr);
+    append_mesh(mesh, nullptr, string_from_ufbx(mesh->name).c_str());
   }
 
   if (vertices.empty() || faces.empty()) {
@@ -858,6 +867,16 @@ int main(int argc, char** argv) {
     const Vec4& c = vertex_colors[i];
     if (i) putchar(',');
     printf("[%.9g,%.9g,%.9g,%.9g]", c.x, c.y, c.z, c.w);
+  }
+  printf("],\"objects\":[");
+  for (size_t i = 0; i < object_names.size(); ++i) {
+    if (i) putchar(',');
+    print_json_string(object_names[i].c_str());
+  }
+  printf("],\"faceObjects\":[");
+  for (size_t i = 0; i < faces.size(); ++i) {
+    if (i) putchar(',');
+    printf("%d", faces[i].object);
   }
   printf("],\"faces\":[");
   for (size_t i = 0; i < faces.size(); ++i) {

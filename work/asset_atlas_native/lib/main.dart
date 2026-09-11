@@ -65,7 +65,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.20';
+const appVersion = '1.10.21';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3391,6 +3391,9 @@ class _ModelPreviewState extends State<ModelPreview> {
   bool showVariantGrid = false;
   bool showAttachments = false;
 
+  /// The mesh most recently drawn, kept so a re-dress does not blank the view.
+  MeshModel? _shownMesh;
+
   /// Attachment asset paths currently worn, in the order they were put on.
   final Set<String> wornPaths = <String>{};
 
@@ -3404,7 +3407,8 @@ class _ModelPreviewState extends State<ModelPreview> {
   /// is worth.
   MeshModel? _variantsFor;
   List<AssetItem> _variants = const [];
-  bool _stacked = false;
+  bool _stackedByMaterial = false;
+  bool _stackedByObject = false;
 
   /// Depends on the catalog rather than the mesh, but is measured with it so
   /// the whole walk happens once per model rather than once per frame.
@@ -3418,7 +3422,8 @@ class _ModelPreviewState extends State<ModelPreview> {
       model: widget.asset,
       allAssets: widget.allAssets,
     );
-    _stacked = materialsAreStackedVariants(mesh);
+    _stackedByMaterial = materialsAreStackedVariants(mesh);
+    _stackedByObject = objectsAreStackedVariants(mesh);
     _attachments = mesh.skeleton == null
         ? const []
         : findAttachmentCandidates(
@@ -3437,9 +3442,12 @@ class _ModelPreviewState extends State<ModelPreview> {
     return _variants;
   }
 
-  bool isStackedVariants(MeshModel mesh) {
+  /// The grid mode a file asks for by its shape, before the user says.
+  VariantGridMode naturalVariantMode(MeshModel mesh) {
     _measureVariants(mesh);
-    return _stacked;
+    if (_stackedByObject) return VariantGridMode.object;
+    if (_stackedByMaterial) return VariantGridMode.material;
+    return VariantGridMode.texture;
   }
 
   bool useBaseTexture = true;
@@ -3474,54 +3482,57 @@ class _ModelPreviewState extends State<ModelPreview> {
     return _dress(textured);
   }
 
-  /// The character with everything the user has put on it.
-  ///
-  /// Each piece is merged in turn, so the result carries the character's
-  /// skeleton and framing throughout and the next piece is placed against the
-  /// same rig as the first. A piece that cannot be read, or that this rig has
-  /// no bone for, is skipped rather than allowed to fail the whole preview.
-  Future<MeshModel> _dress(MeshModel character) async {
-    if (wornPaths.isEmpty) return character;
-    final skeleton = character.skeleton;
-    if (skeleton == null) return character;
-
-    var dressed = character;
-    for (final path in wornPaths) {
-      AssetItem? asset;
-      for (final candidate in widget.allAssets) {
-        if (candidate.path == path) {
-          asset = candidate;
-          break;
-        }
-      }
-      if (asset == null) continue;
-      final bone = attachmentBoneFor(
-        attachmentName: asset.name,
-        skeleton: skeleton,
-      );
-      if (bone == null) continue;
-      try {
-        final piece = await MeshLoadCache.load(
-          asset,
+  Future<MeshModel> _dress(MeshModel character) => wornPaths.isEmpty
+      ? Future.value(character)
+      : dressCharacter(
+          character,
+          wornPaths: wornPaths,
           allAssets: widget.allAssets,
         );
-        dressed =
-            attachToCharacter(
-              character: dressed,
-              attachment: piece,
-              boneName: bone,
-            ) ??
-            dressed;
-      } catch (error) {
-        fbxLog('Could not put on ${asset.name}: $error');
+
+  /// Whether this model is the one clips are played on.
+  bool get _isAnimationCharacter =>
+      AnimationCharacter.instance.path.value == widget.asset.path;
+
+  /// Puts a piece on or takes it off.
+  ///
+  /// One piece per body part is the rule, because that is what a body has
+  /// room for: choosing a second helmet replaces the first. Shift held keeps
+  /// the first as well, for the cases where two pieces genuinely share a
+  /// socket -- a beard under a mask.
+  void _toggleAttachment(AssetItem asset) {
+    final shift = HardwareKeyboard.instance.isShiftPressed;
+    setState(() {
+      if (wornPaths.remove(asset.path)) {
+        // Taken off.
+      } else {
+        if (!shift) {
+          final point = attachPointFor(asset.name)?.name;
+          wornPaths.removeWhere((path) {
+            final name = path.split(RegExp(r'[/\\]')).last;
+            return attachPointFor(name)?.name == point;
+          });
+        }
+        wornPaths.add(asset.path);
       }
+      _outfitChanged();
+    });
+  }
+
+  void _outfitChanged() {
+    meshFuture = _loadCurrentMesh();
+    // The character clips play on wears what it was dressed in here.
+    if (_isAnimationCharacter) {
+      AnimationCharacter.instance.setWorn(wornPaths);
     }
-    return dressed;
   }
 
   @override
   void initState() {
     super.initState();
+    if (_isAnimationCharacter) {
+      wornPaths.addAll(AnimationCharacter.instance.worn);
+    }
     meshFuture = _loadCurrentMesh();
   }
 
@@ -3537,9 +3548,14 @@ class _ModelPreviewState extends State<ModelPreview> {
     if (oldWidget.asset.id != widget.asset.id ||
         oldWidget.catalogRevision != widget.catalogRevision) {
       // A grid mode chosen for one model says nothing about the next, and
-      // neither does an outfit: the next character is a different rig.
+      // neither does an outfit: the next character is a different rig --
+      // unless it is the animation character, which keeps what it wears.
       variantModeChoice = null;
+      _shownMesh = null;
       wornPaths.clear();
+      if (_isAnimationCharacter) {
+        wornPaths.addAll(AnimationCharacter.instance.worn);
+      }
       meshFuture = _loadCurrentMesh();
       yaw = -0.6;
       pitch = 0.35;
@@ -3559,7 +3575,15 @@ class _ModelPreviewState extends State<ModelPreview> {
         child: FutureBuilder<MeshModel>(
           future: meshFuture,
           builder: (context, snapshot) {
-            if (snapshot.connectionState != ConnectionState.done) {
+            // Dressing or re-texturing a model replaces the future, and the
+            // spinner that used to fill that gap threw away the whole view --
+            // the camera held, but the grid, the panel and its scroll position
+            // all came back from scratch. The last mesh stands in until the
+            // next is ready. A different model starts from nothing, since
+            // showing the previous one would be showing the wrong thing.
+            final mesh = snapshot.data ?? (snapshot.hasError ? null : _shownMesh);
+            if (mesh == null &&
+                snapshot.connectionState != ConnectionState.done) {
               return const Center(child: CircularProgressIndicator());
             }
             if (snapshot.hasError) {
@@ -3574,7 +3598,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                 ),
               );
             }
-            final mesh = snapshot.data!;
+            _shownMesh = mesh!;
             if (mesh.isAnimationOnly) {
               return AnimationClipPreview(
                 mesh: mesh,
@@ -3583,26 +3607,25 @@ class _ModelPreviewState extends State<ModelPreview> {
               );
             }
             final variants = textureVariantsOf(mesh);
-            final textureCells = variants.length;
-            final materialCells = mesh.materials.length;
+            final cellCounts = {
+              VariantGridMode.texture: variants.length,
+              VariantGridMode.material: mesh.materials.length,
+              VariantGridMode.object: mesh.objectNames.length,
+            };
+            final availableModes = [
+              for (final mode in VariantGridMode.values)
+                if (cellCounts[mode]! > 1) mode,
+            ];
             // Textures are what "variants" means to almost every model
             // here, so that is the default -- except for a file that turns out
-            // to be several whole models in one, where separating the
-            // materials is the entire point of opening the grid.
+            // to be several whole models in one, where taking it apart along
+            // whichever seam actually separates them is the entire point.
             final wantedVariantMode =
-                variantModeChoice ??
-                (isStackedVariants(mesh)
-                    ? VariantGridMode.material
-                    : VariantGridMode.texture);
-            final effectiveVariantMode =
-                wantedVariantMode == VariantGridMode.texture && textureCells > 1
-                ? VariantGridMode.texture
-                : materialCells > 1
-                ? VariantGridMode.material
-                : VariantGridMode.texture;
-            final variantCells = effectiveVariantMode == VariantGridMode.texture
-                ? textureCells
-                : materialCells;
+                variantModeChoice ?? naturalVariantMode(mesh);
+            final effectiveVariantMode = availableModes.contains(wantedVariantMode)
+                ? wantedVariantMode
+                : availableModes.firstOrNull ?? VariantGridMode.texture;
+            final variantCells = cellCounts[effectiveVariantMode]!;
 
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3622,18 +3645,24 @@ class _ModelPreviewState extends State<ModelPreview> {
                       ),
                     // Only worth asking when the answers differ. A character
                     // has palettes and one material; a stacked file has a
-                    // dozen materials and one palette.
-                    if (showVariantGrid && textureCells > 1 && materialCells > 1)
+                    // dozen bodies and one palette.
+                    if (showVariantGrid && availableModes.length > 1)
                       SegmentedButton<VariantGridMode>(
                         segments: [
-                          ButtonSegment(
-                            value: VariantGridMode.texture,
-                            label: Text('By texture ($textureCells)'),
-                          ),
-                          ButtonSegment(
-                            value: VariantGridMode.material,
-                            label: Text('By material ($materialCells)'),
-                          ),
+                          for (final mode in availableModes)
+                            ButtonSegment(
+                              value: mode,
+                              label: Text(
+                                switch (mode) {
+                                  VariantGridMode.texture =>
+                                    'By texture (${cellCounts[mode]})',
+                                  VariantGridMode.material =>
+                                    'By material (${cellCounts[mode]})',
+                                  VariantGridMode.object =>
+                                    'By object (${cellCounts[mode]})',
+                                },
+                              ),
+                            ),
                         ],
                         selected: {effectiveVariantMode},
                         showSelectedIcon: false,
@@ -3663,6 +3692,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     ? null
                                     : widget.asset.path,
                                 rig: widget.asset.rigFamily,
+                                wearing: wornPaths,
                               ),
                             ),
                       ),
@@ -3901,15 +3931,10 @@ class _ModelPreviewState extends State<ModelPreview> {
                     candidates: attachmentsFor(mesh),
                     skeleton: mesh.skeleton!,
                     worn: wornPaths,
-                    onToggle: (asset) => setState(() {
-                      if (!wornPaths.remove(asset.path)) {
-                        wornPaths.add(asset.path);
-                      }
-                      meshFuture = _loadCurrentMesh();
-                    }),
+                    onToggle: _toggleAttachment,
                     onClear: () => setState(() {
                       wornPaths.clear();
-                      meshFuture = _loadCurrentMesh();
+                      _outfitChanged();
                     }),
                   ),
                 Expanded(
@@ -3957,8 +3982,15 @@ class _ModelPreviewState extends State<ModelPreview> {
                                           interacting: interacting,
                                           uvSetOverride: uvSetOverride,
                                         )
-                                      : MaterialVariantGrid(
+                                      : CellVariantGrid(
                                           mesh: mesh,
+                                          cells:
+                                              effectiveVariantMode ==
+                                                  VariantGridMode.object
+                                              ? CellVariantGrid.byObject(mesh)
+                                              : CellVariantGrid.byMaterial(
+                                                  mesh,
+                                                ),
                                           yaw: yaw,
                                           pitch: pitch,
                                           zoom: zoom,
@@ -4184,6 +4216,23 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       if (!_playing) return;
       setState(() => _elapsed = elapsed);
     })..start();
+    // The outfit can change while a clip is open -- a helmet put on in the
+    // model preview -- and the character here has to be re-dressed to match.
+    AnimationCharacter.instance.outfitRevision.addListener(_onOutfitChanged);
+    _loadCharacter();
+  }
+
+  void _onOutfitChanged() {
+    if (!mounted) return;
+    // Everything derived from the old mesh: a dressed character has more
+    // vertices, so a cached scene or position buffer would be the wrong size.
+    _character = null;
+    _characterError = null;
+    _restScene = null;
+    _posedPositions = null;
+    _plan = null;
+    _boneWorld = null;
+    _retargetNote = null;
     _loadCharacter();
   }
 
@@ -4308,9 +4357,9 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       return;
     }
     try {
-      final mesh = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
+      final bare = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
       if (!mounted) return;
-      if (mesh.skin == null) {
+      if (bare.skin == null) {
         setState(() {
           _character = null;
           _characterError =
@@ -4318,6 +4367,14 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
         });
         return;
       }
+      // Wearing what it was dressed in. The pieces are skinned to their
+      // sockets, so from here on the clip moves them like any other part.
+      final mesh = await dressCharacter(
+        bare,
+        wornPaths: AnimationCharacter.instance.worn,
+        allAssets: widget.allAssets,
+      );
+      if (!mounted) return;
       await _buildPlan(mesh);
       if (!mounted) return;
       setState(() {
@@ -4332,6 +4389,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
 
   @override
   void dispose() {
+    AnimationCharacter.instance.outfitRevision.removeListener(_onOutfitChanged);
     _ticker.dispose();
     super.dispose();
   }
@@ -4602,6 +4660,7 @@ class RasterModelView extends StatefulWidget {
     this.sceneOverride,
     this.sceneRevision,
     this.visibleMaterial = -1,
+    this.visibleObject = -1,
     this.uvSetOverride,
     super.key,
   });
@@ -4636,6 +4695,9 @@ class RasterModelView extends StatefulWidget {
   /// Restrict drawing to one material; negative draws all of them.
   final int visibleMaterial;
 
+  /// Restrict drawing to one of the file's nodes; negative draws all of them.
+  final int visibleObject;
+
   @override
   State<RasterModelView> createState() => _RasterModelViewState();
 }
@@ -4668,6 +4730,7 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.useSpecular,
     widget.sceneRevision ?? '',
     widget.visibleMaterial,
+    widget.visibleObject,
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -4714,6 +4777,7 @@ class _RasterModelViewState extends State<RasterModelView> {
         lightingMode: widget.lightingMode,
         cullBackFaces: widget.cullBackFaces,
         visibleMaterial: widget.visibleMaterial,
+        visibleObject: widget.visibleObject,
         useBaseTexture: widget.useBaseTexture,
         useNormalMaps: widget.useNormalMaps,
         useEmissiveMaps: widget.useEmissiveMaps,
@@ -4817,6 +4881,7 @@ class RasterScene {
     required this.positions,
     required this.triangleIndices,
     required this.triangleMaterial,
+    required this.triangleObject,
     required this.triangleUvs,
     required this.triangleHasUv,
     required this.triangleTint,
@@ -4837,6 +4902,7 @@ class RasterScene {
     positions: replacement,
     triangleIndices: triangleIndices,
     triangleMaterial: triangleMaterial,
+    triangleObject: triangleObject,
     triangleTint: triangleTint,
     triangleUvs: triangleUvs,
     triangleHasUv: triangleHasUv,
@@ -4847,6 +4913,7 @@ class RasterScene {
   /// Three vertex indices per triangle.
   final Int32List triangleIndices;
   final Int32List triangleMaterial;
+  final Int32List triangleObject;
 
   /// Six values per triangle: u, v for each corner.
   final Float32List triangleUvs;
@@ -4861,6 +4928,7 @@ class RasterScene {
   static RasterScene fromMesh(MeshModel mesh, {String? uvSetOverride}) {
     final triangles = <int>[];
     final triMaterial = <int>[];
+    final triObject = <int>[];
     final triUvs = <double>[];
     final triHasUv = <int>[];
     final triTint = <int>[];
@@ -4895,6 +4963,7 @@ class RasterScene {
       for (var i = 1; i + 1 < indices.length; i += 1) {
         triangles.addAll([indices[0], indices[i], indices[i + 1]]);
         triMaterial.add(face.materialIndex);
+        triObject.add(face.objectIndex);
         triTint.add(packedTint);
         if (hasUv && i == 1) {
           triUvs.addAll([
@@ -4926,6 +4995,7 @@ class RasterScene {
       positions: positions,
       triangleIndices: Int32List.fromList(triangles),
       triangleMaterial: Int32List.fromList(triMaterial),
+      triangleObject: Int32List.fromList(triObject),
       triangleUvs: Float32List.fromList(triUvs),
       triangleHasUv: Uint8List.fromList(triHasUv),
       triangleTint: Int32List.fromList(triTint),
@@ -5060,6 +5130,7 @@ RasterResult rasterizeMesh({
   int backgroundArgb = 0xffe9edf3,
   int maxFaces = maxRenderedFaces,
   int visibleMaterial = -1,
+  int visibleObject = -1,
 }) {
   return rasterizeScene(
     RasterRequest(
@@ -5079,6 +5150,7 @@ RasterResult rasterizeMesh({
       backgroundArgb: backgroundArgb,
       maxFaces: maxFaces,
       visibleMaterial: visibleMaterial,
+      visibleObject: visibleObject,
     ),
   );
 }
@@ -5102,6 +5174,7 @@ class RasterRequest {
     this.backgroundArgb = 0xffe9edf3,
     this.maxFaces = maxRenderedFaces,
     this.visibleMaterial = -1,
+    this.visibleObject = -1,
   });
 
   final RasterScene scene;
@@ -5134,6 +5207,14 @@ class RasterRequest {
   /// exactly the same depth, which no depth buffer can settle. Drawn one at a
   /// time they are twelve characters.
   final int visibleMaterial;
+
+  /// Restrict drawing to one node of the file; negative draws all of them.
+  ///
+  /// The other way to take a character sheet apart, and the one that works
+  /// when the material split does not follow the characters: Ancient Empire's
+  /// sheet puts all eleven bodies in one material, and the nodes are the only
+  /// seam left.
+  final int visibleObject;
 }
 
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
@@ -5230,6 +5311,10 @@ RasterResult rasterizeScene(RasterRequest request) {
     final materialIndex = scene.triangleMaterial[triangleIndex];
     if (request.visibleMaterial >= 0 &&
         materialIndex != request.visibleMaterial) {
+      continue;
+    }
+    if (request.visibleObject >= 0 &&
+        scene.triangleObject[triangleIndex] != request.visibleObject) {
       continue;
     }
     drawn += 1;
@@ -7003,7 +7088,7 @@ class AnimationCharacterButton extends StatelessWidget {
 /// like in each of its palettes" is about textures and is the common one;
 /// "what is actually stacked in this file" is about materials, and only
 /// matters for the files that hide a dozen characters in one mesh.
-enum VariantGridMode { texture, material }
+enum VariantGridMode { texture, material, object }
 
 /// Shows a model once per texture, side by side.
 ///
@@ -7094,14 +7179,7 @@ class _TextureVariantGridState extends State<TextureVariantGrid> {
           return const Center(child: CircularProgressIndicator());
         }
         final meshes = snapshot.data!;
-        final columns = math.max(1, math.sqrt(meshes.length).ceil());
-        return GridView.builder(
-          padding: const EdgeInsets.all(8),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: columns,
-            mainAxisSpacing: 8,
-            crossAxisSpacing: 8,
-          ),
+        return PagedGrid(
           itemCount: meshes.length,
           itemBuilder: (context, index) {
             final variant = widget.variants[index];
@@ -7174,9 +7252,127 @@ class VariantGridCell extends StatelessWidget {
   }
 }
 
-class MaterialVariantGrid extends StatelessWidget {
-  const MaterialVariantGrid({
+/// One cell of a [CellVariantGrid]: a label and which slice of the mesh to
+/// draw.
+class VariantCell {
+  const VariantCell({
+    required this.label,
+    this.material = -1,
+    this.object = -1,
+  });
+
+  final String label;
+  final int material;
+  final int object;
+}
+
+/// How many cells a page holds. Three by three keeps each cell large enough
+/// to read a face on.
+const variantCellsPerPage = 9;
+
+/// A grid that turns pages instead of scrolling.
+///
+/// The viewport's wheel is the zoom, and a scrolling grid took the same
+/// wheel: one notch both zoomed every cell and slid the grid, which is the
+/// worst of both. Pages leave the wheel to the camera, and a page is built
+/// from rows of expanded cells rather than a scroll view so there is nothing
+/// for the wheel to move.
+class PagedGrid extends StatefulWidget {
+  const PagedGrid({
+    required this.itemCount,
+    required this.itemBuilder,
+    super.key,
+  });
+
+  final int itemCount;
+  final Widget Function(BuildContext context, int index) itemBuilder;
+
+  @override
+  State<PagedGrid> createState() => _PagedGridState();
+}
+
+class _PagedGridState extends State<PagedGrid> {
+  int page = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = math.max(1, (widget.itemCount / variantCellsPerPage).ceil());
+    if (page >= pages) page = pages - 1;
+    final start = page * variantCellsPerPage;
+    final end = math.min(widget.itemCount, start + variantCellsPerPage);
+    final onPage = end - start;
+    final columns = math.max(1, math.sqrt(onPage).ceil());
+    final rows = math.max(1, (onPage / columns).ceil());
+
+    return Column(
+      children: [
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Column(
+              children: [
+                for (var row = 0; row < rows; row += 1)
+                  Expanded(
+                    child: Row(
+                      children: [
+                        for (var column = 0; column < columns; column += 1)
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.all(4),
+                              child: start + row * columns + column < end
+                                  ? widget.itemBuilder(
+                                      context,
+                                      start + row * columns + column,
+                                    )
+                                  : const SizedBox.shrink(),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        if (pages > 1)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                IconButton(
+                  tooltip: 'Previous page',
+                  icon: const Icon(Icons.chevron_left),
+                  onPressed: page > 0 ? () => setState(() => page -= 1) : null,
+                ),
+                Text('Page ${page + 1} of $pages'),
+                IconButton(
+                  tooltip: 'Next page',
+                  icon: const Icon(Icons.chevron_right),
+                  onPressed: page + 1 < pages
+                      ? () => setState(() => page += 1)
+                      : null,
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// Shows a model once per slice, side by side.
+///
+/// A slice is a material or a node of the file. Both exist for the same
+/// reason: some files are several complete models standing in one place --
+/// `SimplePeople3.fbx` holds twelve, one per material; `Characters.fbx` in
+/// Dungeon Realms holds eleven, one per node -- which drawn together fight
+/// for identical pixels at identical depth and read as a mess of z-fighting.
+/// Drawn one per cell they are twelve characters.
+class CellVariantGrid extends StatelessWidget {
+  const CellVariantGrid({
     required this.mesh,
+    required this.cells,
     required this.yaw,
     required this.pitch,
     required this.zoom,
@@ -7189,6 +7385,7 @@ class MaterialVariantGrid extends StatelessWidget {
   });
 
   final MeshModel mesh;
+  final List<VariantCell> cells;
   final double yaw;
   final double pitch;
   final double zoom;
@@ -7198,32 +7395,42 @@ class MaterialVariantGrid extends StatelessWidget {
   final bool interacting;
   final String? uvSetOverride;
 
+  /// One cell per material.
+  static List<VariantCell> byMaterial(MeshModel mesh) => [
+    for (var i = 0; i < mesh.materials.length; i += 1)
+      VariantCell(
+        label: mesh.materials[i].name.isEmpty
+            ? 'Material $i'
+            : mesh.materials[i].name,
+        material: i,
+      ),
+  ];
+
+  /// One cell per node of the file.
+  static List<VariantCell> byObject(MeshModel mesh) => [
+    for (var i = 0; i < mesh.objectNames.length; i += 1)
+      VariantCell(
+        label: mesh.objectNames[i].isEmpty ? 'Object $i' : mesh.objectNames[i],
+        object: i,
+      ),
+  ];
+
   @override
   Widget build(BuildContext context) {
-    final count = mesh.materials.length;
-    if (count <= 1) {
+    if (cells.length <= 1) {
       return const Center(
         child: Text(
-          'This model has one material, so there is nothing to compare.',
+          'There is only one of these, so there is nothing to compare.',
           style: TextStyle(color: Colors.black54),
         ),
       );
     }
-
-    // As square as the count allows, so cells stay large.
-    final columns = math.max(1, math.sqrt(count).ceil());
-    return GridView.builder(
-      padding: const EdgeInsets.all(8),
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: columns,
-        mainAxisSpacing: 8,
-        crossAxisSpacing: 8,
-      ),
-      itemCount: count,
+    return PagedGrid(
+      itemCount: cells.length,
       itemBuilder: (context, index) {
-        final material = mesh.materials[index];
+        final cell = cells[index];
         return VariantGridCell(
-          label: material.name.isEmpty ? 'Material $index' : material.name,
+          label: cell.label,
           child: RasterModelView(
             mesh: mesh,
             yaw: yaw,
@@ -7238,7 +7445,8 @@ class MaterialVariantGrid extends StatelessWidget {
             useSpecular: true,
             interacting: interacting,
             uvSetOverride: uvSetOverride,
-            visibleMaterial: index,
+            visibleMaterial: cell.material,
+            visibleObject: cell.object,
           ),
         );
       },
@@ -7255,7 +7463,7 @@ class MaterialVariantGrid extends StatelessWidget {
 String attachmentDisplayName(String fileName) {
   const boilerplate = {'sm', 'sk', 'chr', 'attach', 'fbx', 'obj'};
   final words = fileName
-      .replaceFirst(RegExp(r'\.[^.]+$'), '')
+      .replaceFirst(RegExp(r'\\.[^.]+$'), '')
       .split(RegExp(r'[^A-Za-z0-9]+'))
       .where((word) => word.isNotEmpty && !boilerplate.contains(word.toLowerCase()));
   return words.isEmpty ? fileName : words.join(' ');
@@ -7318,6 +7526,7 @@ class AttachmentPanel extends StatelessWidget {
         border: Border(bottom: BorderSide(color: Colors.black12)),
       ),
       child: SingleChildScrollView(
+        key: const PageStorageKey('attachment-panel'),
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -7326,8 +7535,8 @@ class AttachmentPanel extends StatelessWidget {
               children: [
                 const Expanded(
                   child: Text(
-                    'Attachments are placed by name: the file says nothing '
-                    'about where it goes.',
+                    'One piece per body part; hold Shift to add a second. '
+                    'Placed by name: the file says nothing about where it goes.',
                     style: TextStyle(color: Colors.black54, fontSize: 11),
                   ),
                 ),
@@ -9155,19 +9364,31 @@ MeshModel? attachToCharacter({
   if (characterFraming == null || attachmentFraming == null) return null;
   if (attachment.vertices.isEmpty || attachment.faces.isEmpty) return null;
 
-  final placed = <Vec3>[
-    for (final vertex in attachment.vertices)
+  // Only the bone's *position* is used. Synty authors a piece hanging the
+  // way it hangs on the character -- a cape points down in its own file --
+  // and expects to be dropped at the socket with its orientation kept. The
+  // rig's bone axes are no help here: Head happens to be the identity on
+  // these characters, so a helmet came out right by luck, while Spine_03 is
+  // cycled x->y->z and swung the cape out sideways. In bind pose the socket
+  // is a place, not a direction.
+  final socket = Vec3(rest[bone * 12 + 9], rest[bone * 12 + 10], rest[bone * 12 + 11]);
+  final placed = <Vec3>[];
+  for (final vertex in attachment.vertices) {
+    final original = attachmentFraming.toOriginal(vertex);
+    placed.add(
       characterFraming.toEmitted(
-        transformByMatrix(
-          rest,
-          bone * 12,
-          attachmentFraming.toOriginal(vertex),
+        Vec3(
+          original.x + socket.x,
+          original.y + socket.y,
+          original.z + socket.z,
         ),
       ),
-  ];
+    );
+  }
 
   final vertexOffset = character.vertices.length;
   final materialOffset = character.materials.length;
+  final objectOffset = character.objectNames.length;
   return MeshModel(
     name: character.name,
     vertices: [...character.vertices, ...placed],
@@ -9179,9 +9400,11 @@ MeshModel? attachToCharacter({
           face.materialIndex + materialOffset,
           face.uvs,
           face.uvSets,
+          face.objectIndex + objectOffset,
         ),
     ],
     materials: [...character.materials, ...attachment.materials],
+    objectNames: [...character.objectNames, ...attachment.objectNames],
     textureFiles: character.textureFiles,
     // Colours multiply the surface, so a mesh that has none has to be padded
     // with white rather than left short: a ragged list would tint the wrong
@@ -9197,9 +9420,151 @@ MeshModel? attachToCharacter({
           ],
     kind: character.kind,
     skeleton: skeleton,
-    skin: character.skin,
+    skin: _skinWithAttachment(
+      character.skin,
+      skeleton: skeleton,
+      rest: rest,
+      bone: bone,
+      framing: characterFraming,
+      vertexCount: placed.length,
+    ),
     framing: character.framing,
   );
+}
+
+/// The character's skin with every new vertex weighted wholly to one bone.
+///
+/// This is what makes a worn piece move with the animation: the skinning
+/// loop treats it like any other part of the body, and because posing is
+/// relative to the bone's rest transform, however the piece was placed at
+/// rest is where it stays until the bone turns. A bone nothing on the body
+/// was weighted to -- the jaw, often -- is added with a bind matrix built
+/// from its rest pose, which is what the importer would have written for it.
+SkinBinding? _skinWithAttachment(
+  SkinBinding? skin, {
+  required SkeletonAnimation skeleton,
+  required Float32List rest,
+  required int bone,
+  required MeshFraming framing,
+  required int vertexCount,
+}) {
+  if (skin == null) return null;
+  final boneName = skeleton.bones[bone].name;
+  final bonePath = skeleton.bones[bone].path;
+
+  var skinBone = -1;
+  for (var i = 0; i < skin.boneNames.length; i += 1) {
+    final path = i < skin.bonePaths.length ? skin.bonePaths[i] : '';
+    if (path.isNotEmpty && normalizeBonePath(path) == normalizeBonePath(bonePath)) {
+      skinBone = i;
+      break;
+    }
+  }
+  if (skinBone < 0) {
+    for (var i = 0; i < skin.boneNames.length; i += 1) {
+      if (skin.boneNames[i] == boneName) {
+        skinBone = i;
+        break;
+      }
+    }
+  }
+
+  var names = skin.boneNames;
+  var paths = skin.bonePaths;
+  var bindInverse = skin.bindInverse;
+  if (skinBone < 0) {
+    // bindInverse takes an emitted vertex into bone space at the bind pose:
+    // undo the framing, then undo the bone's rest world transform.
+    final restInverse = Float32List(12);
+    if (!invertMatrix(rest, bone * 12, restInverse, 0)) return skin;
+    final denormalize = Float32List.fromList([
+      1 / framing.scale, 0, 0,
+      0, 1 / framing.scale, 0,
+      0, 0, 1 / framing.scale,
+      framing.center.x, framing.center.y, framing.center.z,
+    ]);
+    final combined = Float32List(12);
+    multiplyMatrices(restInverse, 0, denormalize, 0, combined, 0);
+
+    skinBone = skin.boneNames.length;
+    names = [...skin.boneNames, boneName];
+    paths = [
+      ...skin.bonePaths,
+      for (var i = skin.bonePaths.length; i < skin.boneNames.length; i += 1) '',
+      bonePath,
+    ];
+    bindInverse = Float32List(skin.bindInverse.length + 12)
+      ..setAll(0, skin.bindInverse)
+      ..setAll(skin.bindInverse.length, combined);
+  }
+
+  // One influence block per new vertex, wholly on the socket bone.
+  final blocks = skin.influences.length ~/ 8;
+  final influences = Float32List(skin.influences.length + vertexCount * 8)
+    ..setAll(0, skin.influences);
+  final vertexSkin = Int32List(skin.vertexSkin.length + vertexCount)
+    ..setAll(0, skin.vertexSkin);
+  for (var i = 0; i < vertexCount; i += 1) {
+    final base = (blocks + i) * 8;
+    influences[base] = skinBone.toDouble();
+    influences[base + 1] = 1;
+    vertexSkin[skin.vertexSkin.length + i] = blocks + i;
+  }
+
+  return SkinBinding(
+    boneNames: names,
+    bonePaths: paths,
+    bindInverse: bindInverse,
+    influences: influences,
+    vertexSkin: vertexSkin,
+    normalizeCenter: skin.normalizeCenter,
+    normalizeScale: skin.normalizeScale,
+  );
+}
+
+/// A character with everything in [wornPaths] put on it, in that order.
+///
+/// Shared by the model preview and the animation preview so the character
+/// animates wearing exactly what it was dressed in. A piece that cannot be
+/// read, or that this rig has no bone for, is skipped rather than allowed to
+/// fail the whole character.
+Future<MeshModel> dressCharacter(
+  MeshModel character, {
+  required Iterable<String> wornPaths,
+  required List<AssetItem> allAssets,
+}) async {
+  final skeleton = character.skeleton;
+  if (skeleton == null) return character;
+
+  var dressed = character;
+  for (final path in wornPaths) {
+    AssetItem? asset;
+    for (final candidate in allAssets) {
+      if (candidate.path == path) {
+        asset = candidate;
+        break;
+      }
+    }
+    if (asset == null) continue;
+    final bone = attachmentBoneFor(
+      attachmentName: asset.name,
+      skeleton: skeleton,
+    );
+    if (bone == null) continue;
+    try {
+      final piece = await MeshLoadCache.load(asset, allAssets: allAssets);
+      dressed =
+          attachToCharacter(
+            character: dressed,
+            attachment: piece,
+            boneName: bone,
+          ) ??
+          dressed;
+    } catch (error) {
+      fbxLog('Could not put on ${asset.name}: $error');
+    }
+  }
+  return dressed;
 }
 
 /// Where on a body a piece of kit belongs, and which bone holds it there.
@@ -9446,6 +9811,12 @@ List<AssetItem> findAttachmentCandidates({
   final found = <AssetItem>[];
   for (final asset in allAssets) {
     if (asset.effectiveType != 'model') continue;
+    // FBX only. These packs ship an OBJ twin of every piece, and it is a
+    // trap: the OBJ is in centimetres with nothing in the file to say so,
+    // where the FBX carries its units, so the same helmet would come out a
+    // hundred times too big. Listing both also put two identical chips in
+    // the panel, one of which silently did nothing.
+    if (asset.ext != 'fbx') continue;
     if (normalizePathKey(asset.path) == normalizePathKey(character.path)) {
       continue;
     }
@@ -9488,9 +9859,30 @@ const stackedVariantMinimum = 3;
 /// width and height is not a part of it, it is another copy of it. Parts fail
 /// this -- a roof, a hat, a pair of eyes each occupy their own corner -- so a
 /// normal multi-material model is left alone.
-bool materialsAreStackedVariants(MeshModel mesh) {
-  if (mesh.materials.length < stackedVariantMinimum) return false;
-  if (mesh.vertices.isEmpty || mesh.faces.isEmpty) return false;
+bool materialsAreStackedVariants(MeshModel mesh) => _wholeBodyGroups(
+      mesh,
+      mesh.materials.length,
+      (face) => face.materialIndex,
+    ) >=
+    stackedVariantMinimum;
+
+/// Whether this file's nodes are several complete models sharing one origin.
+///
+/// The same test as [materialsAreStackedVariants] along the other seam. It is
+/// the one that holds up: Ancient Empire's `characters.fbx` has eleven bodies
+/// and *one* material, and Battle Royale's has twenty-one bodies in five, so
+/// by material neither comes apart at all. By node, every sheet does.
+bool objectsAreStackedVariants(MeshModel mesh) => _wholeBodyGroups(
+      mesh,
+      mesh.objectNames.length,
+      (face) => face.objectIndex,
+    ) >=
+    stackedVariantMinimum;
+
+/// How many of [count] groups each cover most of the model's width and height.
+int _wholeBodyGroups(MeshModel mesh, int count, int Function(MeshFace) groupOf) {
+  if (count < stackedVariantMinimum) return 0;
+  if (mesh.vertices.isEmpty || mesh.faces.isEmpty) return 0;
 
   var modelMinX = double.infinity, modelMaxX = double.negativeInfinity;
   var modelMinY = double.infinity, modelMaxY = double.negativeInfinity;
@@ -9502,15 +9894,14 @@ bool materialsAreStackedVariants(MeshModel mesh) {
   }
   final modelWidth = modelMaxX - modelMinX;
   final modelHeight = modelMaxY - modelMinY;
-  if (modelWidth <= 1e-6 || modelHeight <= 1e-6) return false;
+  if (modelWidth <= 1e-6 || modelHeight <= 1e-6) return 0;
 
-  final count = mesh.materials.length;
   final minX = List<double>.filled(count, double.infinity);
   final maxX = List<double>.filled(count, double.negativeInfinity);
   final minY = List<double>.filled(count, double.infinity);
   final maxY = List<double>.filled(count, double.negativeInfinity);
   for (final face in mesh.faces) {
-    final m = face.materialIndex;
+    final m = groupOf(face);
     if (m < 0 || m >= count) continue;
     for (final index in face.indices) {
       if (index < 0 || index >= mesh.vertices.length) continue;
@@ -9532,7 +9923,7 @@ bool materialsAreStackedVariants(MeshModel mesh) {
       wholeBodies += 1;
     }
   }
-  return wholeBodies >= stackedVariantMinimum;
+  return wholeBodies;
 }
 
 /// How many looks the grid will draw at once.
@@ -10096,6 +10487,10 @@ Future<MeshModel> meshModelFromImporterJson(
       ];
     }
   }
+  final objectNames = ((json['objects'] as List<dynamic>?) ?? const [])
+      .map((value) => value.toString())
+      .toList();
+  final faceObjects = (json['faceObjects'] as List<dynamic>?) ?? const [];
   final faces = importedFaces.indexed.map((entry) {
     final faceIndex = entry.$1;
     final item = entry.$2;
@@ -10124,6 +10519,9 @@ Future<MeshModel> meshModelFromImporterJson(
             ]
           : const [],
       namedUvsByFace[faceIndex],
+      faceIndex < faceObjects.length
+          ? (faceObjects[faceIndex] as num).toInt()
+          : 0,
     );
   }).toList();
   final skin = SkinBinding.fromJson(json['skin'] as Map<String, dynamic>?);
@@ -10468,6 +10866,7 @@ Future<MeshModel> meshModelFromImporterJson(
     skin: skin,
     skeleton: restSkeleton,
     framing: MeshFraming.fromJson(json),
+    objectNames: objectNames,
   );
 }
 
@@ -10796,6 +11195,10 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
 /// Settings key for the model clips are played on.
 const animationCharacterKey = 'animation.character.path';
 
+/// Settings key for what that character is wearing: attachment paths, one
+/// per line.
+const animationCharacterWornKey = 'animation.character.worn';
+
 /// Settings key for that character's rig family.
 ///
 /// Stored rather than looked up, because the filter is wanted before the
@@ -10820,6 +11223,16 @@ class AnimationCharacter {
   /// filter. Null until a character with a known rig is chosen.
   String? rigFamily;
 
+  /// What the chosen character is wearing, as attachment asset paths.
+  ///
+  /// Kept with the character rather than with the preview so the clip
+  /// preview can dress it the same way: a character chosen while wearing a
+  /// helmet animates wearing the helmet.
+  List<String> worn = const [];
+
+  /// Bumps whenever [worn] changes, so an open clip preview re-dresses.
+  final ValueNotifier<int> outfitRevision = ValueNotifier<int>(0);
+
   Future<void> load() async {
     try {
       path.value = await AssetAtlasDatabase.instance.readSetting(
@@ -10828,15 +11241,27 @@ class AnimationCharacter {
       rigFamily = await AssetAtlasDatabase.instance.readSetting(
         animationCharacterRigKey,
       );
+      final wornSetting = await AssetAtlasDatabase.instance.readSetting(
+        animationCharacterWornKey,
+      );
+      worn = wornSetting == null || wornSetting.isEmpty
+          ? const []
+          : wornSetting.split('\n').where((p) => p.isNotEmpty).toList();
     } catch (error) {
       // A missing settings row is not worth failing startup over.
       fbxLog('Could not read the animation character: $error');
     }
   }
 
-  Future<void> set(String? assetPath, {String? rig}) async {
+  Future<void> set(
+    String? assetPath, {
+    String? rig,
+    Iterable<String> wearing = const [],
+  }) async {
     rigFamily = assetPath == null ? null : rig;
+    worn = assetPath == null ? const [] : List.unmodifiable(wearing);
     path.value = assetPath;
+    outfitRevision.value += 1;
     try {
       await AssetAtlasDatabase.instance.writeSetting(
         animationCharacterKey,
@@ -10846,8 +11271,26 @@ class AnimationCharacter {
         animationCharacterRigKey,
         rigFamily,
       );
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterWornKey,
+        worn.join('\n'),
+      );
     } catch (error) {
       fbxLog('Could not save the animation character: $error');
+    }
+  }
+
+  /// Changes what the chosen character wears without changing the character.
+  Future<void> setWorn(Iterable<String> wearing) async {
+    worn = List.unmodifiable(wearing);
+    outfitRevision.value += 1;
+    try {
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterWornKey,
+        worn.join('\n'),
+      );
+    } catch (error) {
+      fbxLog('Could not save the outfit: $error');
     }
   }
 }
@@ -11966,10 +12409,20 @@ class MeshModel {
     this.skeleton,
     this.skin,
     this.framing,
+    this.objectNames = const [],
     this.boneCount = 0,
     this.durationSeconds = 0,
     this.animationNames = const [],
   });
+
+  /// The nodes the importer flattened into this mesh, by name.
+  ///
+  /// Usually one. A character sheet is a dozen: `Characters.fbx` in Dungeon
+  /// Realms is `Chr_Hero_Female_01` through `Chr_Undead_Knight_01`, eleven
+  /// bodies standing in one place, and the material split does not follow
+  /// the node split -- Ancient Empire's sheet puts all eleven in a single
+  /// material -- so the nodes are the only way to take such a file apart.
+  final List<String> objectNames;
 
   /// True when the file carries animation or skeleton data and nothing to draw.
   bool get isAnimationOnly => kind == FbxContentKind.animation;
@@ -12049,6 +12502,7 @@ class MeshModel {
     skeleton: skeleton,
     skin: skin,
     framing: framing,
+    objectNames: objectNames,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -12067,6 +12521,7 @@ class MeshModel {
     skeleton: skeleton,
     skin: skin,
     framing: framing,
+    objectNames: objectNames,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -12171,6 +12626,13 @@ class MeshModel {
     for (final index in face.indices) {
       if (index < 0 || index >= vertexColors.length) continue;
       final color = vertexColors[index];
+      // Alpha zero is what an exporter writes for a vertex nobody painted,
+      // and it comes out as (0,0,0,0): black, if taken as a colour. The
+      // character sheets carry it on a quarter of their vertices, which
+      // turned whole bodies black while the rest of the set was fine -- so
+      // the all-or-nothing rule on the set could not catch it. Unpainted
+      // means untinted.
+      if (color.a <= 0) continue;
       red += (color.r * 255).round().clamp(0, 255);
       green += (color.g * 255).round().clamp(0, 255);
       blue += (color.b * 255).round().clamp(0, 255);
@@ -12405,9 +12867,13 @@ class MeshFace {
     this.materialIndex = 0,
     this.uvs = const [],
     this.uvSets = const {},
+    this.objectIndex = 0,
   ]);
   final List<int> indices;
   final int materialIndex;
+
+  /// Which node of the file this face came from; see [MeshModel.objectNames].
+  final int objectIndex;
   final List<Vec2> uvs;
   final Map<String, List<Vec2>> uvSets;
 
@@ -13133,6 +13599,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
