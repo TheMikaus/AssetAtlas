@@ -12,6 +12,7 @@
 // framing simply puts it back.
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:asset_atlas_native/main.dart';
@@ -223,6 +224,24 @@ void main() {
       ]);
     });
 
+    test('the OBJ twin of a piece is left out', () {
+      // Every piece ships as FBX and OBJ. The OBJ is in centimetres with
+      // nothing in the file to say so, so it cannot be placed -- and listing
+      // it put two identical chips in the panel, one of which did nothing.
+      final found = findAttachmentCandidates(
+        character: _asset(character, rigFamily: 'polygon'),
+        allAssets: [
+          _asset(character, rigFamily: 'polygon'),
+          _asset(r'C:\Packs\Empire\FBX\Attachments\SM_Chr_Attach_Helmet_01.fbx'),
+          _asset(
+            r'C:\Packs\Empire\OBJ\SM_Chr_Attach_Helmet_01.obj',
+            ext: 'obj',
+          ),
+        ],
+      );
+      expect(found.map((a) => a.name), ['SM_Chr_Attach_Helmet_01.fbx']);
+    });
+
     test('another rigged character is not a hat', () {
       final found = findAttachmentCandidates(
         character: _asset(character, rigFamily: 'polygon'),
@@ -283,6 +302,100 @@ void main() {
       final tip = worn.vertices[5];
       expect(tip.x, closeTo(0, 1e-6));
       expect(tip.y, closeTo(1.175, 1e-6));
+    });
+
+    test('the bone position places it; the bone orientation does not', () {
+      // Spine_03 on these rigs is cycled x->y->z, which swung a cape out
+      // sideways when the whole bone transform was applied. A piece hangs the
+      // way it hangs in its own file; the socket is a place, not a direction.
+      final turned = <double>[];
+      for (var i = 0; i < 2; i += 1) {
+        turned.addAll([0, 1, 0, -1, 0, 0, 0, 0, 1, 0, i * 3.0, 0]);
+      }
+      final rig = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+          {'name': 'Spine_03', 'parent': 0, 'path': 'Root/Spine_03'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': turned,
+        'frames': [turned],
+      })!;
+      final character = _box(
+        name: 'character',
+        skeleton: rig,
+        framing: const MeshFraming(center: Vec3(0, 0, 0), scale: 1),
+      );
+      final cape = _box(
+        name: 'cape',
+        framing: const MeshFraming(center: Vec3(0, 0, 0), scale: 1),
+      );
+      final worn = attachToCharacter(
+        character: character,
+        attachment: cape,
+        boneName: 'Spine_03',
+      )!;
+      // The cape's tip (0,1,0) lands straight above the socket at (0,3,0):
+      // (0,4,0), not turned onto the x axis.
+      final tip = worn.vertices[5];
+      expect(tip.x, closeTo(0, 1e-6));
+      expect(tip.y, closeTo(4, 1e-6));
+    });
+
+    test('the piece is skinned to its socket, so it follows the clip', () {
+      final character = _box(
+        name: 'character',
+        skeleton: _rig(_polygonRig),
+        framing: const MeshFraming(center: Vec3(0, 0, 0), scale: 1),
+      );
+      // A skin with one bone the body uses, and no Head: the head has to be
+      // added with a bind matrix of its own.
+      final skinned = MeshModel(
+        name: character.name,
+        vertices: character.vertices,
+        faces: character.faces,
+        materials: character.materials,
+        skeleton: character.skeleton,
+        framing: character.framing,
+        skin: SkinBinding(
+          boneNames: const ['Hips'],
+          bonePaths: const ['Hips'],
+          bindInverse: Float32List.fromList([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1, 0]),
+          influences: Float32List.fromList([0, 1, 0, 0, 0, 0, 0, 0]),
+          vertexSkin: Int32List.fromList([0, 0, 0]),
+        ),
+      );
+      final helmet = _box(
+        name: 'helmet',
+        framing: const MeshFraming(center: Vec3(0, 0, 0), scale: 1),
+      );
+      final worn = attachToCharacter(
+        character: skinned,
+        attachment: helmet,
+        boneName: 'Head',
+      )!;
+      final skin = worn.skin!;
+      expect(skin.boneNames.last, 'Head');
+      expect(skin.vertexSkin, hasLength(6));
+      // Each helmet vertex has one influence, weight 1, on the Head bone.
+      final block = skin.vertexSkin[5];
+      expect(skin.influences[block * 8], skin.boneNames.length - 1);
+      expect(skin.influences[block * 8 + 1], 1);
+
+      // Posed against its own rest, the character -- helmet included -- must
+      // come back where it was. That is the identity test, and it is what
+      // proves the added bind matrix is right.
+      final posed = poseSkinnedVertices(
+        character: worn,
+        clip: character.skeleton!,
+        frame: 0,
+      );
+      for (var i = 0; i < worn.vertices.length; i += 1) {
+        expect(posed[i].x, closeTo(worn.vertices[i].x, 1e-4), reason: 'v$i');
+        expect(posed[i].y, closeTo(worn.vertices[i].y, 1e-4), reason: 'v$i');
+        expect(posed[i].z, closeTo(worn.vertices[i].z, 1e-4), reason: 'v$i');
+      }
     });
 
     test('a character with no rest pose wears nothing', () {
