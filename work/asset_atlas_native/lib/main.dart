@@ -65,7 +65,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.22';
+const appVersion = '1.10.23';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -1142,8 +1142,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
     setState(() {
       _activeScan = null;
       sourceRoots.add(rootPath);
+      // What a file *is* does not change because the folder was walked
+      // again. Classification is an importer run per FBX -- 27,000 of them
+      // in this library -- and the first rescan after it landed threw every
+      // one away, which emptied the Character and Animation filters until
+      // the whole lot had been probed a second time. Ids are content
+      // independent, so the answers carry across by id.
+      final remembered = <String, AssetItem>{
+        for (final asset in assets)
+          if (asset.sourceRoot == rootPath) asset.id: asset,
+      };
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
-      assets.addAll(result.assets);
+      assets.addAll(carryClassification(result.assets, remembered));
       MeshLoadCache.clear();
       ModelThumbnailCache.clear();
       catalogRevision += 1;
@@ -6949,6 +6959,26 @@ bool assetIsCharacterModel(AssetItem asset) {
   if (asset.effectiveType != 'model') return false;
   final rig = asset.rigFamily;
   return rig != null && rig != RigFamily.none.name;
+}
+
+/// The fresh scan results with what an earlier catalog already knew about the
+/// same files copied across: the kind and rig a probe found, and whether the
+/// user had ignored the file. Matched by id, which is built from the source
+/// root and relative path and so survives a rescan. A file that has grown or
+/// changed is not distinguished here; a probe result is cheap to be wrong
+/// about compared with the cost of redoing all of them.
+List<AssetItem> carryClassification(
+  List<AssetItem> fresh,
+  Map<String, AssetItem> remembered,
+) {
+  for (final asset in fresh) {
+    final known = remembered[asset.id];
+    if (known == null) continue;
+    asset.modelKind ??= known.modelKind;
+    asset.rigFamily ??= known.rigFamily;
+    if (known.ignored) asset.ignored = true;
+  }
+  return fresh;
 }
 
 /// Whether an asset passes the rig filter.
@@ -14027,6 +14057,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
