@@ -127,6 +127,8 @@ Three rigs appear across this library, and they are told apart by their bones �
 
 **The Unreal *builds* of packs contribute no models.** They ship `.uasset` and `.umap` only — zero FBX across every `*Unreal*.zip` checked. Those files index as type `unreal` with their own sidebar filter and icon, listed so a pack that ships nothing else is not mistaken for an empty folder, but they are Unreal's serialised object format and carry no geometry anything outside the engine can read, so they are never previewed. (An earlier version of this file said nothing classified as `unreal`; that was wrong — the Mini Fantasy *source* pack is on the mannequin rig, and it was the attachments work that surfaced it.)
 
+**A rescan carries classification across.** `scanFolder` replaces a root's rows with fresh ones, and the first rescan after the Unreal rules landed threw away 27,511 probe results with them -- the Character and Animation filters read `0` until every FBX had been probed again. `carryClassification` copies `modelKind`, `rigFamily` and `ignored` from the old rows by id, which is built from the source root and relative path and so survives. (The one-off recovery was `--probe` over every FBX from Python, 12 workers, 53 seconds; the app's own lazy path would have taken an evening.)
+
 **The catalog records the rules it was scanned under** (`catalog.rules`, compared with `scanRulesVersion`). A catalog saved before a rule change is missing whatever the change added and would otherwise report `0` as if that were the truth about the library; the sidebar says so and offers a rescan. Bump `scanRulesVersion` whenever the extension sets change.
 
 Two things make this harder than it looks:
