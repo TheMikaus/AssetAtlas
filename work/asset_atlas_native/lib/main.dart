@@ -65,7 +65,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.21';
+const appVersion = '1.10.22';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -176,6 +176,23 @@ class _CatalogScreenState extends State<CatalogScreen> {
   final assets = <AssetItem>[];
   final selectedIds = <String>{};
   final sourceRoots = <String>{};
+
+  /// True when the persisted catalog was scanned under older rules than the
+  /// scanner now applies, so the counts understate what the folders hold.
+  bool catalogRulesStale = false;
+
+  /// Narrows the folder tree to names containing this. Distinct from
+  /// [folderFilter], which is the folder the asset list is narrowed to.
+  String folderTreeFilter = '';
+  final TextEditingController folderFilterController = TextEditingController();
+
+  /// Scans every source again, in order. What a catalog saved under older
+  /// rules needs, and otherwise a long way round to the Scan button.
+  Future<void> _rescanAllSources() async {
+    for (final root in sourceRoots.toList()) {
+      await scanFolder(root);
+    }
+  }
   final searchController = TextEditingController();
 
   AssetItem? active;
@@ -684,6 +701,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     _activeScan?.cancel();
     _searchDebounce?.cancel();
     searchController.dispose();
+    folderFilterController.dispose();
     super.dispose();
   }
 
@@ -691,7 +709,17 @@ class _CatalogScreenState extends State<CatalogScreen> {
     try {
       final snapshot = await db.loadCatalog();
       if (!mounted) return;
+      // A catalog saved before a rule change is missing whatever the change
+      // added -- Unreal files, most recently -- and would otherwise report
+      // "0" as if that were the truth about the library. Saying so is the
+      // least the app can do; the rescan is the user's to start.
+      final rules = int.tryParse(await db.readSetting(catalogRulesKey) ?? '');
+      final stale =
+          snapshot.assets.isNotEmpty &&
+          (rules == null || rules < scanRulesVersion);
+      if (!mounted) return;
       setState(() {
+        catalogRulesStale = stale;
         sourceRoots
           ..clear()
           ..addAll(snapshot.sourceRoots);
@@ -726,6 +754,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
   Future<void> _persistCatalog() async {
     if (!widget.enablePersistence) return;
     await db.saveCatalog(assets: assets, sourceRoots: sourceRoots.toList());
+    // A catalog written now was scanned under the current rules; a stale
+    // banner, if one was up, comes down with the next restore.
+    await db.writeSetting(catalogRulesKey, '$scanRulesVersion');
+    if (mounted) setState(() => catalogRulesStale = false);
   }
 
   /// Runs a persistence call without blocking the caller, but surfaces a
@@ -1442,6 +1474,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         });
                       },
                       onRemoveSource: removeSource,
+                      folderFilter: folderTreeFilter,
+                      folderFilterController: folderFilterController,
+                      onFolderFilterChanged: (value) =>
+                          setState(() => folderTreeFilter = value),
+                      catalogRulesStale: catalogRulesStale,
+                      onRescanAll: _rescanAllSources,
                     ),
                     VerticalResizeHandle(
                       onDrag: (delta) {
@@ -1841,6 +1879,16 @@ bool isUnderFolder(String relativePath, String folderPath) {
   return normalized == folderPath || normalized.startsWith('$folderPath/');
 }
 
+/// Whether [node] or anything under it has [needle] in its name.
+bool folderTreeMatches(FolderNode node, String needle) {
+  if (needle.isEmpty) return true;
+  if (node.name.toLowerCase().contains(needle)) return true;
+  for (final child in node.childrenByName.values) {
+    if (folderTreeMatches(child, needle)) return true;
+  }
+  return false;
+}
+
 class FolderTreeView extends StatelessWidget {
   const FolderTreeView({
     required this.roots,
@@ -1848,6 +1896,7 @@ class FolderTreeView extends StatelessWidget {
     required this.expandedFolders,
     required this.onSelect,
     required this.onToggleExpanded,
+    this.filter = '',
     super.key,
   });
 
@@ -1856,6 +1905,11 @@ class FolderTreeView extends StatelessWidget {
   final Set<String> expandedFolders;
   final ValueChanged<String?> onSelect;
   final ValueChanged<String> onToggleExpanded;
+
+  /// Only folders whose name -- or a descendant's -- contains this are shown,
+  /// and the path down to each match is held open. Three hundred packs under
+  /// one root is a long list to scroll for the one you want.
+  final String filter;
 
   @override
   Widget build(BuildContext context) {
@@ -1866,26 +1920,43 @@ class FolderTreeView extends StatelessWidget {
       );
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _FolderRow(
-          label: 'All folders',
-          count: null,
-          depth: 0,
-          selected: selectedFolder == null,
-          expandable: false,
-          expanded: false,
-          onTap: () => onSelect(null),
-          onToggleExpanded: () {},
+    final needle = filter.trim().toLowerCase();
+    final rows = <Widget>[
+      _FolderRow(
+        label: 'All folders',
+        count: null,
+        depth: 0,
+        selected: selectedFolder == null,
+        expandable: false,
+        expanded: false,
+        onTap: () => onSelect(null),
+        onToggleExpanded: () {},
+      ),
+      for (final root in roots) ..._buildNode(root, 0, needle),
+    ];
+    if (needle.isNotEmpty && rows.length == 1) {
+      rows.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 6),
+          child: Text(
+            'No folder has that in its name.',
+            style: TextStyle(color: Colors.black54, fontSize: 12),
+          ),
         ),
-        for (final root in roots) ..._buildNode(root, 0),
-      ],
-    );
+      );
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows);
   }
 
-  List<Widget> _buildNode(FolderNode node, int depth) {
-    final expanded = expandedFolders.contains(node.path);
+  List<Widget> _buildNode(FolderNode node, int depth, String needle) {
+    if (!folderTreeMatches(node, needle)) return const [];
+    // While filtering, a node is open whenever something under it matches:
+    // the point of the filter is to reach the match, not to find it closed.
+    final selfMatches =
+        needle.isNotEmpty && node.name.toLowerCase().contains(needle);
+    final expanded = needle.isEmpty
+        ? expandedFolders.contains(node.path)
+        : !selfMatches || expandedFolders.contains(node.path);
     return [
       _FolderRow(
         label: node.name,
@@ -1899,7 +1970,7 @@ class FolderTreeView extends StatelessWidget {
       ),
       if (expanded)
         for (final child in node.sortedChildren)
-          ..._buildNode(child, depth + 1),
+          ..._buildNode(child, depth + 1, needle),
     ];
   }
 }
@@ -2010,6 +2081,11 @@ class FilterPanel extends StatelessWidget {
     required this.onHideIgnoredChanged,
     required this.onHideZipAssetsChanged,
     required this.onRemoveSource,
+    required this.folderFilter,
+    required this.folderFilterController,
+    required this.onFolderFilterChanged,
+    required this.catalogRulesStale,
+    required this.onRescanAll,
     super.key,
   });
 
@@ -2034,6 +2110,11 @@ class FilterPanel extends StatelessWidget {
   final ValueChanged<String> onTypeChanged;
   final ValueChanged<String> onRigFilterChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
+  final String folderFilter;
+  final TextEditingController folderFilterController;
+  final ValueChanged<String> onFolderFilterChanged;
+  final bool catalogRulesStale;
+  final VoidCallback onRescanAll;
   final ValueChanged<bool> onHideIgnoredChanged;
   final ValueChanged<bool> onHideZipAssetsChanged;
   final ValueChanged<String> onRemoveSource;
@@ -2047,6 +2128,35 @@ class FilterPanel extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(14),
           children: [
+            if (catalogRulesStale)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xfffff4e0),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xffe0c080)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'This catalog was scanned under older rules, so it '
+                        'is missing file types added since -- Unreal assets, '
+                        'most recently. The counts below understate what the '
+                        'folders hold until they are rescanned.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                      const SizedBox(height: 6),
+                      FilledButton.tonal(
+                        onPressed: onRescanAll,
+                        child: const Text('Rescan all folders'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             const Text('Types', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             for (final type in [
@@ -2175,12 +2285,37 @@ class FilterPanel extends StatelessWidget {
               style: TextStyle(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 4),
+            TextField(
+              controller: folderFilterController,
+              onChanged: onFolderFilterChanged,
+              decoration: InputDecoration(
+                isDense: true,
+                prefixIcon: const Icon(Icons.filter_alt_outlined, size: 18),
+                hintText: 'Filter folders',
+                suffixIcon: folderFilter.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close, size: 16),
+                        onPressed: () {
+                          folderFilterController.clear();
+                          onFolderFilterChanged('');
+                        },
+                      ),
+                border: const OutlineInputBorder(),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 8,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
             FolderTreeView(
               roots: folderRoots,
               selectedFolder: selectedFolder,
               expandedFolders: expandedFolders,
               onSelect: onFolderSelected,
               onToggleExpanded: onFolderExpandToggled,
+              filter: folderFilter,
             ),
             const Divider(height: 28),
             const Text(
@@ -3377,9 +3512,12 @@ class ModelPreview extends StatefulWidget {
 
 class _ModelPreviewState extends State<ModelPreview> {
   late Future<MeshModel> meshFuture;
-  double yaw = -0.6;
-  double pitch = 0.35;
-  double zoom = 1;
+  final ViewportCamera camera = ViewportCamera();
+  double get yaw => camera.yaw;
+  double get pitch => camera.pitch;
+  double get zoom => camera.zoom;
+  double get panX => camera.panX;
+  double get panY => camera.panY;
   RenderMode renderMode = RenderMode.textured;
   int checkerSquareSize = 16;
   String? uvSetOverride;
@@ -3501,12 +3639,13 @@ class _ModelPreviewState extends State<ModelPreview> {
   /// the first as well, for the cases where two pieces genuinely share a
   /// socket -- a beard under a mask.
   void _toggleAttachment(AssetItem asset) {
-    final shift = HardwareKeyboard.instance.isShiftPressed;
+    final keyboard = HardwareKeyboard.instance;
+    final keepOthers = keyboard.isShiftPressed || keyboard.isControlPressed;
     setState(() {
       if (wornPaths.remove(asset.path)) {
         // Taken off.
       } else {
-        if (!shift) {
+        if (!keepOthers) {
           final point = attachPointFor(asset.name)?.name;
           wornPaths.removeWhere((path) {
             final name = path.split(RegExp(r'[/\\]')).last;
@@ -3557,9 +3696,7 @@ class _ModelPreviewState extends State<ModelPreview> {
         wornPaths.addAll(AnimationCharacter.instance.worn);
       }
       meshFuture = _loadCurrentMesh();
-      yaw = -0.6;
-      pitch = 0.35;
-      zoom = 1;
+      camera.reset();
       uvSetOverride = null;
       // A texture chosen for one model means nothing for the next.
       chosenTexturePath = null;
@@ -3938,29 +4075,13 @@ class _ModelPreviewState extends State<ModelPreview> {
                     }),
                   ),
                 Expanded(
-                  child: Listener(
-                    onPointerSignal: (event) {
-                      if (event is PointerScrollEvent) {
-                        _touchInteraction();
-                        setState(() {
-                          zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
-                              .clamp(.35, 4)
-                              .toDouble();
-                        });
-                      }
+                  child: ViewportController(
+                    camera: camera,
+                    onChanged: () {
+                      _touchInteraction();
+                      setState(() {});
                     },
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onPanUpdate: (details) {
-                        _touchInteraction();
-                        setState(() {
-                          yaw += details.delta.dx * .01;
-                          pitch = (pitch + details.delta.dy * .01)
-                              .clamp(-1.45, 1.45)
-                              .toDouble();
-                        });
-                      },
-                      child: Stack(
+                    child: Stack(
                         children: [
                           Positioned.fill(
                             // Wireframe is lines only, where per-pixel depth
@@ -4007,6 +4128,8 @@ class _ModelPreviewState extends State<ModelPreview> {
                                       yaw: yaw,
                                       pitch: pitch,
                                       zoom: zoom,
+                                      panX: panX,
+                                      panY: panY,
                                       renderMode: renderMode,
                                       uvSetOverride: uvSetOverride,
                                       lightingMode: lightingMode,
@@ -4021,6 +4144,8 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     yaw: yaw,
                                     pitch: pitch,
                                     zoom: zoom,
+                                    panX: panX,
+                                    panY: panY,
                                     renderMode: renderMode,
                                     lightingMode: lightingMode,
                                     cullBackFaces: cullBackFaces,
@@ -4065,7 +4190,6 @@ class _ModelPreviewState extends State<ModelPreview> {
                           ),
                         ],
                       ),
-                    ),
                   ),
                 ),
               ],
@@ -4175,7 +4299,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   late final Ticker _ticker;
   Duration _elapsed = Duration.zero;
   bool _playing = true;
-  double _yaw = 0.4;
+  final ViewportCamera _camera = ViewportCamera(yaw: 0.4, pitch: 0);
   MeshModel? _character;
   String? _characterError;
   RasterScene? _restScene;
@@ -4439,15 +4563,15 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
             ),
           ),
         Expanded(
-          child: GestureDetector(
-            onHorizontalDragUpdate: (details) =>
-                setState(() => _yaw += details.delta.dx * 0.01),
+          child: ViewportController(
+            camera: _camera,
+            onChanged: () => setState(() {}),
             child: character == null
                 ? CustomPaint(
                     painter: SkeletonPainter(
                       skeleton: skeleton,
                       frame: frame,
-                      yaw: _yaw,
+                      yaw: _camera.yaw,
                     ),
                     child: const SizedBox.expand(),
                   )
@@ -4455,9 +4579,11 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
                     mesh: character,
                     sceneOverride: _poseScene(character, skeleton, frame),
                     sceneRevision: frame,
-                    yaw: _yaw,
-                    pitch: 0,
-                    zoom: 1,
+                    yaw: _camera.yaw,
+                    pitch: _camera.pitch,
+                    zoom: _camera.zoom,
+                    panX: _camera.panX,
+                    panY: _camera.panY,
                     renderMode: RenderMode.textured,
                     lightingMode: LightingMode.corner,
                     cullBackFaces: false,
@@ -4662,6 +4788,8 @@ class RasterModelView extends StatefulWidget {
     this.visibleMaterial = -1,
     this.visibleObject = -1,
     this.uvSetOverride,
+    this.panX = 0,
+    this.panY = 0,
     super.key,
   });
 
@@ -4698,6 +4826,10 @@ class RasterModelView extends StatefulWidget {
   /// Restrict drawing to one of the file's nodes; negative draws all of them.
   final int visibleObject;
 
+  /// See [RasterRequest.panX].
+  final double panX;
+  final double panY;
+
   @override
   State<RasterModelView> createState() => _RasterModelViewState();
 }
@@ -4731,6 +4863,8 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.sceneRevision ?? '',
     widget.visibleMaterial,
     widget.visibleObject,
+    widget.panX,
+    widget.panY,
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -4778,6 +4912,8 @@ class _RasterModelViewState extends State<RasterModelView> {
         cullBackFaces: widget.cullBackFaces,
         visibleMaterial: widget.visibleMaterial,
         visibleObject: widget.visibleObject,
+        panX: widget.panX,
+        panY: widget.panY,
         useBaseTexture: widget.useBaseTexture,
         useNormalMaps: widget.useNormalMaps,
         useEmissiveMaps: widget.useEmissiveMaps,
@@ -5131,6 +5267,8 @@ RasterResult rasterizeMesh({
   int maxFaces = maxRenderedFaces,
   int visibleMaterial = -1,
   int visibleObject = -1,
+  double panX = 0,
+  double panY = 0,
 }) {
   return rasterizeScene(
     RasterRequest(
@@ -5151,6 +5289,8 @@ RasterResult rasterizeMesh({
       maxFaces: maxFaces,
       visibleMaterial: visibleMaterial,
       visibleObject: visibleObject,
+      panX: panX,
+      panY: panY,
     ),
   );
 }
@@ -5175,6 +5315,8 @@ class RasterRequest {
     this.maxFaces = maxRenderedFaces,
     this.visibleMaterial = -1,
     this.visibleObject = -1,
+    this.panX = 0,
+    this.panY = 0,
   });
 
   final RasterScene scene;
@@ -5215,6 +5357,13 @@ class RasterRequest {
   /// sheet puts all eleven bodies in one material, and the nodes are the only
   /// seam left.
   final int visibleObject;
+
+  /// Where the model's origin sits on screen, as a fraction of the shorter
+  /// side from the centre. Zero is centred; positive x is right, positive y
+  /// is up. A fraction rather than pixels so the same camera frames the same
+  /// view at any size.
+  final double panX;
+  final double panY;
 }
 
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
@@ -5247,9 +5396,10 @@ RasterResult rasterizeScene(RasterRequest request) {
   final viewY = Float32List(vertexCount);
   final viewZ = Float32List(vertexCount);
 
-  final centerX = width / 2;
-  final centerY = height / 2;
-  final scale = math.min(width, height) * .38 * request.zoom;
+  final shorter = math.min(width, height);
+  final centerX = width / 2 + request.panX * shorter;
+  final centerY = height / 2 - request.panY * shorter;
+  final scale = shorter * .38 * request.zoom;
   final sy = math.sin(request.yaw);
   final cy = math.cos(request.yaw);
   final sx = math.sin(request.pitch);
@@ -5633,6 +5783,8 @@ class MeshPainter extends CustomPainter {
     required this.renderMode,
     required this.lightingMode,
     required this.cullBackFaces,
+    this.panX = 0,
+    this.panY = 0,
     this.useNormalMaps = true,
     this.uvSetOverride,
   });
@@ -5646,11 +5798,17 @@ class MeshPainter extends CustomPainter {
   final String? uvSetOverride;
   final bool cullBackFaces;
   final bool useNormalMaps;
+  final double panX;
+  final double panY;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final scale = math.min(size.width, size.height) * .38 * zoom;
+    final shorter = math.min(size.width, size.height);
+    final center = Offset(
+      size.width / 2 + panX * shorter,
+      size.height / 2 - panY * shorter,
+    );
+    final scale = shorter * .38 * zoom;
     final sy = math.sin(yaw);
     final cy = math.cos(yaw);
     final sx = math.sin(pitch);
@@ -7535,7 +7693,7 @@ class AttachmentPanel extends StatelessWidget {
               children: [
                 const Expanded(
                   child: Text(
-                    'One piece per body part; hold Shift to add a second. '
+                    'One piece per body part; hold Shift or Ctrl to add another. '
                     'Placed by name: the file says nothing about where it goes.',
                     style: TextStyle(color: Colors.black54, fontSize: 11),
                   ),
@@ -7572,6 +7730,194 @@ class AttachmentPanel extends StatelessWidget {
               ),
             ],
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The camera of a 3D viewport: where it looks from and where the model sits.
+class ViewportCamera {
+  ViewportCamera({
+    this.yaw = -0.6,
+    this.pitch = 0.35,
+    this.zoom = 1,
+    this.panX = 0,
+    this.panY = 0,
+  });
+
+  double yaw;
+  double pitch;
+  double zoom;
+  double panX;
+  double panY;
+
+  /// Back to the framing a model opens with.
+  void reset() {
+    yaw = -0.6;
+    pitch = 0.35;
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+  }
+}
+
+/// How fast the wheel zooms: one notch is this many times closer or further.
+const viewportZoomStep = 1.1;
+const viewportZoomMin = 0.2;
+const viewportZoomMax = 6.0;
+
+/// How far a key held for one second flies, as a fraction of the view.
+const viewportFlySpeed = 0.9;
+
+/// Mouse and keyboard for a 3D viewport, the way an engine viewport works.
+///
+/// Hold the left button and move to look around; the cursor disappears while
+/// held and comes back when released, so the drag can go as far as it likes.
+/// Hold the right or middle button to pan. The wheel zooms. While any button
+/// is held, W/S move the model closer and further, A/D and Q/E slide it, so
+/// a long drag is not the only way to get somewhere. Dragging up tilts the
+/// view so the model turns *towards* you, which is what a hand on a globe
+/// does; the earlier version had it backwards.
+///
+/// One controller serves the model preview and the animation preview, which
+/// used to have two different sets of controls -- the animation one could not
+/// zoom or tilt at all, which is most of why it felt wrong.
+class ViewportController extends StatefulWidget {
+  const ViewportController({
+    required this.camera,
+    required this.onChanged,
+    required this.child,
+    super.key,
+  });
+
+  final ViewportCamera camera;
+
+  /// Called whenever the camera moves. The caller redraws.
+  final VoidCallback onChanged;
+  final Widget child;
+
+  @override
+  State<ViewportController> createState() => _ViewportControllerState();
+}
+
+class _ViewportControllerState extends State<ViewportController>
+    with SingleTickerProviderStateMixin {
+  int _buttonsDown = 0;
+  Ticker? _flyTicker;
+  Duration _lastTick = Duration.zero;
+  final FocusNode _focus = FocusNode(debugLabel: 'viewport');
+
+  @override
+  void dispose() {
+    _flyTicker?.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _startFlying() {
+    _lastTick = Duration.zero;
+    _flyTicker ??= createTicker(_fly);
+    if (!_flyTicker!.isActive) _flyTicker!.start();
+  }
+
+  void _stopFlying() {
+    _flyTicker?.stop();
+  }
+
+  /// Applies whatever keys are held, once per frame while a button is down.
+  void _fly(Duration elapsed) {
+    final dt = _lastTick == Duration.zero
+        ? 0.0
+        : (elapsed - _lastTick).inMicroseconds / 1e6;
+    _lastTick = elapsed;
+    if (dt <= 0) return;
+    final keys = HardwareKeyboard.instance.logicalKeysPressed;
+    var moved = false;
+    final camera = widget.camera;
+    final step = viewportFlySpeed * dt;
+    if (keys.contains(LogicalKeyboardKey.keyW)) {
+      camera.zoom = (camera.zoom * (1 + step)).clamp(viewportZoomMin, viewportZoomMax);
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyS)) {
+      camera.zoom = (camera.zoom / (1 + step)).clamp(viewportZoomMin, viewportZoomMax);
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyA)) {
+      camera.panX += step;
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyD)) {
+      camera.panX -= step;
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyE)) {
+      camera.panY -= step;
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyQ)) {
+      camera.panY += step;
+      moved = true;
+    }
+    if (moved) widget.onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final camera = widget.camera;
+    return Focus(
+      focusNode: _focus,
+      child: MouseRegion(
+        // The cursor goes away while a button is held so the drag reads as
+        // grabbing the view rather than sliding a pointer across it.
+        cursor: _buttonsDown != 0
+            ? SystemMouseCursors.none
+            : SystemMouseCursors.basic,
+        child: Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: (event) {
+            _focus.requestFocus();
+            setState(() => _buttonsDown = event.buttons);
+            _startFlying();
+          },
+          onPointerUp: (event) {
+            setState(() => _buttonsDown = event.buttons);
+            if (event.buttons == 0) _stopFlying();
+          },
+          onPointerCancel: (event) {
+            setState(() => _buttonsDown = 0);
+            _stopFlying();
+          },
+          onPointerMove: (event) {
+            if (event.buttons == 0) return;
+            final size = context.size;
+            final shorter = size == null
+                ? 400.0
+                : math.max(1.0, math.min(size.width, size.height));
+            if (event.buttons & kPrimaryMouseButton != 0) {
+              camera.yaw += event.delta.dx * .01;
+              camera.pitch = (camera.pitch - event.delta.dy * .01)
+                  .clamp(-1.45, 1.45)
+                  .toDouble();
+            } else {
+              camera.panX += event.delta.dx / shorter;
+              camera.panY -= event.delta.dy / shorter;
+            }
+            widget.onChanged();
+          },
+          onPointerSignal: (event) {
+            if (event is! PointerScrollEvent) return;
+            camera.zoom =
+                (camera.zoom *
+                        (event.scrollDelta.dy > 0
+                            ? 1 / viewportZoomStep
+                            : viewportZoomStep))
+                    .clamp(viewportZoomMin, viewportZoomMax)
+                    .toDouble();
+            widget.onChanged();
+          },
+          child: widget.child,
         ),
       ),
     );
@@ -9352,6 +9698,7 @@ MeshModel? attachToCharacter({
   required MeshModel character,
   required MeshModel attachment,
   required String boneName,
+  bool alongBone = false,
 }) {
   final skeleton = character.skeleton;
   final rest = skeleton?.rest ?? skeleton?.positions.firstOrNull;
@@ -9372,9 +9719,26 @@ MeshModel? attachToCharacter({
   // cycled x->y->z and swung the cape out sideways. In bind pose the socket
   // is a place, not a direction.
   final socket = Vec3(rest[bone * 12 + 9], rest[bone * 12 + 10], rest[bone * 12 + 11]);
+
+  // A held piece is turned so its +Y runs from the bone's parent out through
+  // the bone -- along the forearm for a hand. The one exception to "position
+  // only", and it still uses only positions; see [AttachPoint.held].
+  Float32List? turn;
+  final parent = skeleton.bones[bone].parent;
+  if (alongBone && parent >= 0 && parent < skeleton.bones.length) {
+    turn = _rotationTakingYTo(
+      Vec3(
+        socket.x - rest[parent * 12 + 9],
+        socket.y - rest[parent * 12 + 10],
+        socket.z - rest[parent * 12 + 11],
+      ),
+    );
+  }
+
   final placed = <Vec3>[];
   for (final vertex in attachment.vertices) {
-    final original = attachmentFraming.toOriginal(vertex);
+    var original = attachmentFraming.toOriginal(vertex);
+    if (turn != null) original = _rotate(turn, original);
     placed.add(
       characterFraming.toEmitted(
         Vec3(
@@ -9431,6 +9795,46 @@ MeshModel? attachToCharacter({
     framing: character.framing,
   );
 }
+
+/// A column-major 3x3 turning the +Y axis onto [direction], or null when the
+/// direction is too short to have one.
+///
+/// Rodrigues' formula about the axis Y x d. When d is already +Y there is
+/// nothing to do; when it is -Y any half turn will do and the one about X is
+/// taken.
+Float32List? _rotationTakingYTo(Vec3 direction) {
+  final length = math.sqrt(
+    direction.x * direction.x +
+        direction.y * direction.y +
+        direction.z * direction.z,
+  );
+  if (length < 1e-9) return null;
+  final dx = direction.x / length;
+  final dy = direction.y / length;
+  final dz = direction.z / length;
+  // axis = Y x d = (dz, 0, -dx); cos = dy.
+  final ax = dz, az = -dx;
+  final sinAngle = math.sqrt(ax * ax + az * az);
+  final cosAngle = dy;
+  if (sinAngle < 1e-9) {
+    if (cosAngle > 0) return null;
+    return Float32List.fromList([1, 0, 0, 0, -1, 0, 0, 0, -1]);
+  }
+  final kx = ax / sinAngle, kz = az / sinAngle;
+  final t = 1 - cosAngle;
+  // R = I + sin K + (1 - cos) K^2 with K the cross-product matrix of (kx,0,kz).
+  return Float32List.fromList([
+    1 + t * (kx * kx - 1), sinAngle * kz, t * kx * kz,
+    -sinAngle * kz, 1 - t, sinAngle * kx,
+    t * kx * kz, -sinAngle * kx, 1 + t * (kz * kz - 1),
+  ]);
+}
+
+Vec3 _rotate(Float32List m, Vec3 v) => Vec3(
+  m[0] * v.x + m[3] * v.y + m[6] * v.z,
+  m[1] * v.x + m[4] * v.y + m[7] * v.z,
+  m[2] * v.x + m[5] * v.y + m[8] * v.z,
+);
 
 /// The character's skin with every new vertex weighted wholly to one bone.
 ///
@@ -9558,6 +9962,7 @@ Future<MeshModel> dressCharacter(
             character: dressed,
             attachment: piece,
             boneName: bone,
+            alongBone: attachPointFor(asset.name)?.held ?? false,
           ) ??
           dressed;
     } catch (error) {
@@ -9588,6 +9993,7 @@ class AttachPoint {
     required this.polygon,
     required this.sidekick,
     required this.unreal,
+    this.held = false,
   });
 
   /// What this point is called in the UI.
@@ -9595,6 +10001,18 @@ class AttachPoint {
 
   /// Words in an attachment's file name that put it here.
   final List<String> keywords;
+
+  /// Whether a piece here is held rather than worn.
+  ///
+  /// Worn pieces keep the orientation they were authored in: a cape hangs
+  /// down in its file and hangs down on the body. Held pieces do not -- every
+  /// weapon and tool in these packs stands on its grip with the business end
+  /// along +Y, so dropped at the hand unturned a sword stands straight up out
+  /// of the fist and, in a T-pose, pokes past the head. A held piece is turned
+  /// so its +Y runs along the arm, from the elbow out through the hand, which
+  /// is where a straight wrist points it. Positions only, so it is the same
+  /// answer on every rig.
+  final bool held;
 
   final List<String> polygon;
   final List<String> sidekick;
@@ -9727,6 +10145,7 @@ const attachPoints = <AttachPoint>[
     polygon: ['Hand_R', 'Hand_L'],
     sidekick: ['prop_r', 'hand_r'],
     unreal: ['hand_r'],
+    held: true,
   ),
 ];
 
@@ -11191,6 +11610,15 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
   }
   return black >= colors.length * unusableVertexColorFraction;
 }
+
+/// Bumped whenever the scanner's rules change what gets indexed, so a catalog
+/// saved under older rules can say so instead of silently lacking things.
+///
+/// 1: the original rule set. 2: Unreal asset files are indexed.
+const scanRulesVersion = 2;
+
+/// Settings key for the rules a persisted catalog was scanned under.
+const catalogRulesKey = 'catalog.rules';
 
 /// Settings key for the model clips are played on.
 const animationCharacterKey = 'animation.character.path';
@@ -13599,6 +14027,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
