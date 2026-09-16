@@ -343,6 +343,62 @@ void main() {
       expect(tip.y, closeTo(4, 1e-6));
     });
 
+    test('a held piece points along the arm, a worn one keeps its way up', () {
+      // Elbow at (0,1,0), hand at (1,1,0): the forearm runs along +x. A sword
+      // is authored standing on its grip with the blade along +y.
+      final rest = <double>[
+        1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, // Root
+        1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, // Elbow_R
+        1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, // Hand_R
+      ];
+      final rig = SkeletonAnimation.fromJson({
+        'bones': [
+          {'name': 'Root', 'parent': -1, 'path': 'Root'},
+          {'name': 'Elbow_R', 'parent': 0, 'path': 'Root/Elbow_R'},
+          {'name': 'Hand_R', 'parent': 1, 'path': 'Root/Elbow_R/Hand_R'},
+        ],
+        'stride': 12,
+        'frameRate': 30.0,
+        'rest': rest,
+        'frames': [rest],
+      })!;
+      final character = _box(
+        name: 'character',
+        skeleton: rig,
+        framing: const MeshFraming(center: Vec3(0, 0, 0), scale: 1),
+      );
+      final sword = _box(
+        name: 'sword',
+        framing: const MeshFraming(center: Vec3(0, 0, 0), scale: 1),
+      );
+
+      final held = attachToCharacter(
+        character: character,
+        attachment: sword,
+        boneName: 'Hand_R',
+        alongBone: true,
+      )!;
+      // The blade tip (0,1,0) now lies along +x from the hand: (2,1,0).
+      final tip = held.vertices[5];
+      expect(tip.x, closeTo(2, 1e-5));
+      expect(tip.y, closeTo(1, 1e-5));
+
+      final worn = attachToCharacter(
+        character: character,
+        attachment: sword,
+        boneName: 'Hand_R',
+      )!;
+      // Not held: it stands straight up out of the hand, which is the bug
+      // that made every mini-fantasy weapon poke past the head.
+      expect(worn.vertices[5].x, closeTo(1, 1e-5));
+      expect(worn.vertices[5].y, closeTo(2, 1e-5));
+    });
+
+    test('the hand point is held and the head point is worn', () {
+      expect(attachPointFor('Prop_Sword_Broken_01.fbx')?.held, isTrue);
+      expect(attachPointFor('SM_Chr_Attach_Helmet_01.fbx')?.held, isFalse);
+    });
+
     test('the piece is skinned to its socket, so it follows the clip', () {
       final character = _box(
         name: 'character',
