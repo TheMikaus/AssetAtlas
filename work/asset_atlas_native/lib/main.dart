@@ -65,7 +65,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.23';
+const appVersion = '1.10.24';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -5305,6 +5305,76 @@ RasterResult rasterizeMesh({
   );
 }
 
+/// The [budget] triangles nearest the camera, without sorting the rest.
+///
+/// A histogram over the perspective divide, which is monotonic in depth: count
+/// how many triangles fall in each of [_depthBuckets] bands, walk the bands
+/// from nearest until the budget is used up, and take everything above that
+/// band. Three linear passes instead of an n-log-n sort, and it never
+/// allocates a boxed list.
+///
+/// The cut is approximate at the boundary band -- triangles there are taken in
+/// index order rather than by exact depth -- which does not matter: this only
+/// runs when a model is too big to draw honestly anyway, and the overlay says
+/// so.
+Int32List _nearestTriangles(
+  RasterScene scene,
+  Float32List invW,
+  int triangleCount,
+  int budget,
+) {
+  final nearest = Float32List(triangleCount);
+  var low = double.infinity;
+  var high = double.negativeInfinity;
+  for (var i = 0; i < triangleCount; i += 1) {
+    final a = scene.triangleIndices[i * 3];
+    final b = scene.triangleIndices[i * 3 + 1];
+    final c = scene.triangleIndices[i * 3 + 2];
+    final value = math.max(invW[a], math.max(invW[b], invW[c]));
+    nearest[i] = value;
+    if (value < low) low = value;
+    if (value > high) high = value;
+  }
+
+  final span = high - low;
+  if (!(span > 0)) {
+    // Every triangle at one depth: nothing to choose between, take the first.
+    final flat = Int32List(budget);
+    for (var i = 0; i < budget; i += 1) {
+      flat[i] = i;
+    }
+    return flat;
+  }
+
+  final counts = Int32List(_depthBuckets);
+  final bucketOf = Int32List(triangleCount);
+  for (var i = 0; i < triangleCount; i += 1) {
+    // Bucket 0 is the nearest, so the scan below walks forward.
+    var bucket = (((high - nearest[i]) / span) * (_depthBuckets - 1)).floor();
+    if (bucket < 0) bucket = 0;
+    if (bucket >= _depthBuckets) bucket = _depthBuckets - 1;
+    bucketOf[i] = bucket;
+    counts[bucket] += 1;
+  }
+
+  var cutoff = _depthBuckets - 1;
+  var running = 0;
+  for (var bucket = 0; bucket < _depthBuckets; bucket += 1) {
+    running += counts[bucket];
+    if (running >= budget) {
+      cutoff = bucket;
+      break;
+    }
+  }
+
+  final picked = Int32List(budget);
+  var written = 0;
+  for (var i = 0; i < triangleCount && written < budget; i += 1) {
+    if (bucketOf[i] <= cutoff) picked[written++] = i;
+  }
+  return written == budget ? picked : Int32List.sublistView(picked, 0, written);
+}
+
 /// Everything one frame needs, in a single sendable object.
 class RasterRequest {
   const RasterRequest({
@@ -5433,19 +5503,14 @@ RasterResult rasterizeScene(RasterRequest request) {
   }
 
   final triangleCount = scene.totalTriangles;
-  var order = List<int>.generate(triangleCount, (i) => i);
-  if (request.maxFaces >= 0 && order.length > request.maxFaces) {
-    // Order no longer matters for correctness, but a budget still does: keep
-    // the nearest triangles when a mesh is enormous.
-    final nearest = Float32List(triangleCount);
-    for (var i = 0; i < triangleCount; i += 1) {
-      final a = scene.triangleIndices[i * 3];
-      final b = scene.triangleIndices[i * 3 + 1];
-      final c = scene.triangleIndices[i * 3 + 2];
-      nearest[i] = math.max(invW[a], math.max(invW[b], invW[c]));
-    }
-    order.sort((a, b) => nearest[b].compareTo(nearest[a]));
-    order = order.sublist(0, request.maxFaces);
+  // Null means "every triangle, in order", which is the overwhelmingly common
+  // case. Building a List<int> of every index cost more than the drawing did
+  // on a large model: 261,410 boxed integers allocated per frame, and then a
+  // comparison sort over them that made the *capped* render slower than the
+  // uncapped one -- 576ms against 233ms.
+  Int32List? order;
+  if (request.maxFaces >= 0 && triangleCount > request.maxFaces) {
+    order = _nearestTriangles(scene, invW, triangleCount, request.maxFaces);
   }
 
   final (lx, ly, lz) = request.lightingMode == LightingMode.top
@@ -5455,7 +5520,9 @@ RasterResult rasterizeScene(RasterRequest request) {
   final textured = request.renderMode == RenderMode.textured;
 
   var drawn = 0;
-  for (final triangleIndex in order) {
+  final drawCount = order?.length ?? triangleCount;
+  for (var orderIndex = 0; orderIndex < drawCount; orderIndex += 1) {
+    final triangleIndex = order == null ? orderIndex : order[orderIndex];
     final i0 = scene.triangleIndices[triangleIndex * 3];
     final i1 = scene.triangleIndices[triangleIndex * 3 + 1];
     final i2 = scene.triangleIndices[triangleIndex * 3 + 2];
@@ -6254,7 +6321,17 @@ class MeshPainter extends CustomPainter {
 /// Upper bound on triangles drawn per frame. When a mesh exceeds it the
 /// viewer draws the nearest [maxRenderedFaces] and says so in the overlay --
 /// it must never quietly drop geometry in an inspection tool.
-const maxRenderedFaces = 14000;
+///
+/// This was 14,000, which is a 2015 number. A 261,410-face mech rasterises
+/// in 233ms at 640x640 -- fine for the settled frame, which runs on a worker
+/// isolate -- while the cap drew 8,349 of its faces and showed a handful of
+/// disconnected fragments floating in space. The cap is a safety valve for
+/// something pathological, not a quality setting, so it sits well above any
+/// real model.
+const maxRenderedFaces = 400000;
+
+/// Buckets used to pick the nearest faces without sorting them all.
+const _depthBuckets = 1024;
 
 /// Diffuse term for a face, optionally perturbed by a normal map.
 ///
@@ -14057,6 +14134,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
