@@ -65,7 +65,7 @@ const archiveExts = {'zip'};
 const maxZipIntrospectionBytes = 128 * 1024 * 1024;
 const maxZipEntriesToInspect = 25000;
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.24';
+const appVersion = '1.10.25';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3538,6 +3538,18 @@ class _ModelPreviewState extends State<ModelPreview> {
   String? chosenTexturePath;
   bool showVariantGrid = false;
   bool showAttachments = false;
+  bool showSlots = false;
+
+  /// Whether a modular kit is drawn one variant per slot, or whole.
+  ///
+  /// True by default, because a kit drawn whole is eight heads in the same
+  /// place. Turning it off is how you see what the file actually holds.
+  bool slotsApplied = true;
+
+  /// Which variant each slot is showing, by [ObjectSlot.key] so the choice
+  /// survives a reload -- picking a different texture rebuilds the mesh, and
+  /// losing the assembly to that would be its own bug.
+  final Map<String, int> slotChoice = <String, int>{};
 
   /// The mesh most recently drawn, kept so a re-dress does not blank the view.
   MeshModel? _shownMesh;
@@ -3557,6 +3569,8 @@ class _ModelPreviewState extends State<ModelPreview> {
   List<AssetItem> _variants = const [];
   bool _stackedByMaterial = false;
   bool _stackedByObject = false;
+  List<ObjectSlot> _slots = const [];
+  Int32List _objectFaceCounts = Int32List(0);
 
   /// Depends on the catalog rather than the mesh, but is measured with it so
   /// the whole walk happens once per model rather than once per frame.
@@ -3572,6 +3586,10 @@ class _ModelPreviewState extends State<ModelPreview> {
     );
     _stackedByMaterial = materialsAreStackedVariants(mesh);
     _stackedByObject = objectsAreStackedVariants(mesh);
+    // A character sheet is taken apart by [visibleObject] instead; see
+    // [modelIsModularKit].
+    _slots = _stackedByObject ? const [] : objectSlotsOf(mesh);
+    _objectFaceCounts = objectFaceCounts(mesh);
     _attachments = mesh.skeleton == null
         ? const []
         : findAttachmentCandidates(
@@ -3588,6 +3606,34 @@ class _ModelPreviewState extends State<ModelPreview> {
   List<AssetItem> textureVariantsOf(MeshModel mesh) {
     _measureVariants(mesh);
     return _variants;
+  }
+
+  /// The kit's interchangeable slots, or nothing when this is not a kit.
+  List<ObjectSlot> slotsOf(MeshModel mesh) {
+    _measureVariants(mesh);
+    return _slots.length >= modularKitMinimumSlots ? _slots : const [];
+  }
+
+  /// The nodes the current slot choice leaves out, or null for the whole file.
+  Uint8List? hiddenObjectsOf(MeshModel mesh) {
+    final slots = slotsOf(mesh);
+    if (!slotsApplied || slots.isEmpty) return null;
+    return hiddenObjectsFor(
+      objectCount: mesh.objectNames.length,
+      slots: slots,
+      choice: [for (final slot in slots) slotChoice[slot.key] ?? 0],
+    );
+  }
+
+  /// How many of the file's faces [hidden] leaves on screen.
+  int shownFaceCount(MeshModel mesh, Uint8List? hidden) {
+    if (hidden == null) return mesh.faces.length;
+    var shown = mesh.faces.length;
+    final limit = math.min(hidden.length, _objectFaceCounts.length);
+    for (var i = 0; i < limit; i += 1) {
+      if (hidden[i] != 0) shown -= _objectFaceCounts[i];
+    }
+    return shown;
   }
 
   /// The grid mode a file asks for by its shape, before the user says.
@@ -3701,6 +3747,8 @@ class _ModelPreviewState extends State<ModelPreview> {
       // unless it is the animation character, which keeps what it wears.
       variantModeChoice = null;
       _shownMesh = null;
+      slotChoice.clear();
+      slotsApplied = true;
       wornPaths.clear();
       if (_isAnimationCharacter) {
         wornPaths.addAll(AnimationCharacter.instance.worn);
@@ -3815,6 +3863,13 @@ class _ModelPreviewState extends State<ModelPreview> {
                         showSelectedIcon: false,
                         onSelectionChanged: (next) =>
                             setState(() => variantModeChoice = next.first),
+                      ),
+                    if (slotsOf(mesh).isNotEmpty)
+                      FilterChip(
+                        avatar: const Icon(Icons.tune, size: 16),
+                        label: Text('Slots (${slotsOf(mesh).length})'),
+                        selected: showSlots,
+                        onSelected: (next) => setState(() => showSlots = next),
                       ),
                     if (attachmentsFor(mesh).isNotEmpty)
                       FilterChip(
@@ -4073,6 +4128,17 @@ class _ModelPreviewState extends State<ModelPreview> {
                     ),
                   ],
                 ),
+                if (showSlots && slotsOf(mesh).isNotEmpty)
+                  SlotPickerPanel(
+                    slots: slotsOf(mesh),
+                    objectNames: mesh.objectNames,
+                    choice: slotChoice,
+                    applied: slotsApplied,
+                    onChoose: (key, index) =>
+                        setState(() => slotChoice[key] = index),
+                    onApplied: (next) => setState(() => slotsApplied = next),
+                    onReset: () => setState(() => slotChoice.clear()),
+                  ),
                 if (showAttachments && mesh.skeleton != null)
                   AttachmentPanel(
                     candidates: attachmentsFor(mesh),
@@ -4144,6 +4210,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                       uvSetOverride: uvSetOverride,
                                       lightingMode: lightingMode,
                                       cullBackFaces: cullBackFaces,
+                                      hiddenObjects: hiddenObjectsOf(mesh),
                                       // Wireframe draws no surface, so the
                                       // shading channels do not apply to it.
                                       useNormalMaps: useNormalMaps,
@@ -4164,6 +4231,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     useEmissiveMaps: useEmissiveMaps,
                                     useSpecular: useSpecular,
                                     uvSetOverride: uvSetOverride,
+                                    hiddenObjects: hiddenObjectsOf(mesh),
                                     interacting: interacting,
                                   ),
                           ),
@@ -4182,12 +4250,21 @@ class _ModelPreviewState extends State<ModelPreview> {
                               child: Builder(
                                 builder: (context) {
                                   final total = mesh.faces.length;
-                                  final capped = total > maxRenderedFaces;
+                                  final shown = shownFaceCount(
+                                    mesh,
+                                    hiddenObjectsOf(mesh),
+                                  );
+                                  final capped = shown > maxRenderedFaces;
                                   final summary =
                                       '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
-                                  if (!capped) return Text(summary);
+                                  // Hiding geometry is never silent, slots
+                                  // included: say how much is on screen.
+                                  final assembled = shown == total
+                                      ? ''
+                                      : ' · assembled: $shown faces';
+                                  if (!capped) return Text('$summary$assembled');
                                   return Text(
-                                    '$summary · face cap: showing '
+                                    '$summary$assembled · face cap: showing '
                                     '$maxRenderedFaces nearest',
                                     style: const TextStyle(
                                       color: Color(0xffb3540a),
@@ -4797,6 +4874,7 @@ class RasterModelView extends StatefulWidget {
     this.sceneRevision,
     this.visibleMaterial = -1,
     this.visibleObject = -1,
+    this.hiddenObjects,
     this.uvSetOverride,
     this.panX = 0,
     this.panY = 0,
@@ -4836,6 +4914,9 @@ class RasterModelView extends StatefulWidget {
   /// Restrict drawing to one of the file's nodes; negative draws all of them.
   final int visibleObject;
 
+  /// See [RasterRequest.hiddenObjects].
+  final Uint8List? hiddenObjects;
+
   /// See [RasterRequest.panX].
   final double panX;
   final double panY;
@@ -4873,6 +4954,7 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.sceneRevision ?? '',
     widget.visibleMaterial,
     widget.visibleObject,
+    hiddenObjectsDigest(widget.hiddenObjects),
     widget.panX,
     widget.panY,
     widget.uvSetOverride ?? '',
@@ -4922,6 +5004,7 @@ class _RasterModelViewState extends State<RasterModelView> {
         cullBackFaces: widget.cullBackFaces,
         visibleMaterial: widget.visibleMaterial,
         visibleObject: widget.visibleObject,
+        hiddenObjects: widget.hiddenObjects,
         panX: widget.panX,
         panY: widget.panY,
         useBaseTexture: widget.useBaseTexture,
@@ -5277,6 +5360,7 @@ RasterResult rasterizeMesh({
   int maxFaces = maxRenderedFaces,
   int visibleMaterial = -1,
   int visibleObject = -1,
+  Uint8List? hiddenObjects,
   double panX = 0,
   double panY = 0,
 }) {
@@ -5299,6 +5383,7 @@ RasterResult rasterizeMesh({
       maxFaces: maxFaces,
       visibleMaterial: visibleMaterial,
       visibleObject: visibleObject,
+      hiddenObjects: hiddenObjects,
       panX: panX,
       panY: panY,
     ),
@@ -5395,6 +5480,7 @@ class RasterRequest {
     this.maxFaces = maxRenderedFaces,
     this.visibleMaterial = -1,
     this.visibleObject = -1,
+    this.hiddenObjects,
     this.panX = 0,
     this.panY = 0,
   });
@@ -5437,6 +5523,16 @@ class RasterRequest {
   /// sheet puts all eleven bodies in one material, and the nodes are the only
   /// seam left.
   final int visibleObject;
+
+  /// Nodes not to draw, one byte per node, non-zero meaning hidden.
+  ///
+  /// How a modular kit is drawn as one model: a mech ships eight heads and ten
+  /// shoulder plates in the same file, all at the same joints, and this is the
+  /// mask that leaves one of each. Null draws everything.
+  ///
+  /// A mask rather than a set because the frame goes to a worker isolate, and
+  /// typed bytes cross that boundary without being rebuilt.
+  final Uint8List? hiddenObjects;
 
   /// Where the model's origin sits on screen, as a fraction of the shorter
   /// side from the centre. Zero is centred; positive x is right, positive y
@@ -5520,6 +5616,7 @@ RasterResult rasterizeScene(RasterRequest request) {
   final textured = request.renderMode == RenderMode.textured;
 
   var drawn = 0;
+  final hiddenObjects = request.hiddenObjects;
   final drawCount = order?.length ?? triangleCount;
   for (var orderIndex = 0; orderIndex < drawCount; orderIndex += 1) {
     final triangleIndex = order == null ? orderIndex : order[orderIndex];
@@ -5543,6 +5640,14 @@ RasterResult rasterizeScene(RasterRequest request) {
     if (request.visibleObject >= 0 &&
         scene.triangleObject[triangleIndex] != request.visibleObject) {
       continue;
+    }
+    if (hiddenObjects != null) {
+      final object = scene.triangleObject[triangleIndex];
+      if (object >= 0 &&
+          object < hiddenObjects.length &&
+          hiddenObjects[object] != 0) {
+        continue;
+      }
     }
     drawn += 1;
 
@@ -5864,6 +5969,7 @@ class MeshPainter extends CustomPainter {
     this.panY = 0,
     this.useNormalMaps = true,
     this.uvSetOverride,
+    this.hiddenObjects,
   });
 
   final MeshModel mesh;
@@ -5877,6 +5983,10 @@ class MeshPainter extends CustomPainter {
   final bool useNormalMaps;
   final double panX;
   final double panY;
+
+  /// See [RasterRequest.hiddenObjects]. Wireframe honours a kit's slots too:
+  /// the point of looking at a wireframe is to see the shape you picked.
+  final Uint8List? hiddenObjects;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -5951,6 +6061,11 @@ class MeshPainter extends CustomPainter {
     for (var index = 0; index < faces.length; index += 1) {
       final face = faces[index];
       if (face.indices.any((i) => i < 0 || i >= projected.length)) continue;
+      final mask = hiddenObjects;
+      if (mask != null) {
+        final object = face.objectIndex;
+        if (object >= 0 && object < mask.length && mask[object] != 0) continue;
+      }
       depths[index] = _faceDepth(projected, face);
       if (cullBackFaces && face.indices.length >= 3) {
         final p0 = projected[face.indices[0]];
@@ -6314,7 +6429,9 @@ class MeshPainter extends CustomPainter {
         oldDelegate.lightingMode != lightingMode ||
         oldDelegate.cullBackFaces != cullBackFaces ||
         oldDelegate.useNormalMaps != useNormalMaps ||
-        oldDelegate.uvSetOverride != uvSetOverride;
+        oldDelegate.uvSetOverride != uvSetOverride ||
+        hiddenObjectsDigest(oldDelegate.hiddenObjects) !=
+            hiddenObjectsDigest(hiddenObjects);
   }
 }
 
@@ -7732,6 +7849,142 @@ String attachmentDisplayName(String fileName) {
       .split(RegExp(r'[^A-Za-z0-9]+'))
       .where((word) => word.isNotEmpty && !boilerplate.contains(word.toLowerCase()));
   return words.isEmpty ? fileName : words.join(' ');
+}
+
+/// Which variant of each interchangeable part a modular kit is wearing.
+///
+/// A kit ships every option in the one file, each at the joint it hangs from:
+/// the Polygon mech has eight heads, ten shoulder plates and twelve chest
+/// weapons per side, 215 nodes in all. Drawn together they interpenetrate,
+/// which is the difference between looking at a mech and looking at every
+/// mech at once. One variant per slot is the default; the rest are a click.
+class SlotPickerPanel extends StatelessWidget {
+  const SlotPickerPanel({
+    required this.slots,
+    required this.objectNames,
+    required this.choice,
+    required this.applied,
+    required this.onChoose,
+    required this.onApplied,
+    required this.onReset,
+    super.key,
+  });
+
+  final List<ObjectSlot> slots;
+  final List<String> objectNames;
+
+  /// Which variant each slot shows, by [ObjectSlot.key]; absent means the
+  /// first, and [slotChoiceNone] means the slot is empty.
+  final Map<String, int> choice;
+
+  /// False while the whole file is drawn at once, which disables the picks.
+  final bool applied;
+  final void Function(String key, int index) onChoose;
+  final ValueChanged<bool> onApplied;
+  final VoidCallback onReset;
+
+  String _nameOf(int object) =>
+      object >= 0 && object < objectNames.length ? objectNames[object] : '';
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 260),
+      decoration: const BoxDecoration(
+        color: Color(0xfffafbfe),
+        border: Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: SingleChildScrollView(
+        key: const PageStorageKey('slot-picker-panel'),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'A modular kit: every option ships in the one file, at the '
+                    'joint it hangs from. One of each is drawn -- pick another, '
+                    'or leave a slot empty.',
+                    style: TextStyle(color: Colors.black54, fontSize: 11),
+                  ),
+                ),
+                TextButton(onPressed: onReset, child: const Text('Reset')),
+                const Text(
+                  'Draw every variant',
+                  style: TextStyle(fontSize: 11),
+                ),
+                Switch(
+                  value: !applied,
+                  onChanged: (next) => onApplied(!next),
+                ),
+              ],
+            ),
+            for (final slot in slots)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 1),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 150,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          slotDisplayName(slot.key),
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 11,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Wrap(
+                        spacing: 4,
+                        runSpacing: 4,
+                        children: [
+                          for (var i = 0; i < slot.objects.length; i += 1)
+                            ChoiceChip(
+                              visualDensity: VisualDensity.compact,
+                              label: Text(
+                                slotVariantLabel(
+                                  key: slot.key,
+                                  objectName: _nameOf(slot.objects[i]),
+                                ),
+                                style: const TextStyle(fontSize: 10),
+                              ),
+                              selected:
+                                  applied && (choice[slot.key] ?? 0) == i,
+                              onSelected: applied
+                                  ? (_) => onChoose(slot.key, i)
+                                  : null,
+                            ),
+                          ChoiceChip(
+                            visualDensity: VisualDensity.compact,
+                            label: const Text(
+                              'none',
+                              style: TextStyle(fontSize: 10),
+                            ),
+                            selected: applied &&
+                                (choice[slot.key] ?? 0) == slotChoiceNone,
+                            onSelected: applied
+                                ? (_) => onChoose(slot.key, slotChoiceNone)
+                                : null,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 /// The kit a character can wear, grouped by where it goes.
@@ -10450,6 +10703,250 @@ int _wholeBodyGroups(MeshModel mesh, int count, int Function(MeshFace) groupOf) 
     }
   }
   return wholeBodies;
+}
+
+/// How much of the smaller part must lie inside the larger, measured on the
+/// tightest of the three axes, for two parts to count as occupying one place.
+const slotVariantOverlap = 0.5;
+
+/// How many of a name family's pairs must occupy one place before the family
+/// is a slot rather than a row of separate parts.
+const slotVariantAgreement = 0.5;
+
+/// How many slots make a file a kit rather than a model that repeats a part.
+const modularKitMinimumSlots = 3;
+
+/// One interchangeable position on a modular model, and everything that fits.
+///
+/// `geo_c_head_01` through `_08` are eight heads for one neck; drawn together
+/// they interpenetrate. The slot holds all eight and the viewer draws one.
+class ObjectSlot {
+  const ObjectSlot({required this.key, required this.objects});
+
+  /// The shared part of the members' names, lowercased.
+  final String key;
+
+  /// Indices into [MeshModel.objectNames], in the order the file lists them.
+  final List<int> objects;
+}
+
+/// The part of [name] that its numbered variants share.
+///
+/// Everything up to the last all-digit token: `geo_l_shoulder_armor_07` and
+/// `geo_l_shoulder_armor_07_energyShields` both reduce to
+/// `geo_l_shoulder_armor`, and `SM_Mech_Cockpit_01_Monitor_04` keeps the `01`
+/// that belongs to the cockpit rather than the monitor.
+String objectSlotFamily(String name) {
+  final lower = name.toLowerCase();
+  final tokens = lower.split('_');
+  var last = -1;
+  for (var i = 0; i < tokens.length; i += 1) {
+    final token = tokens[i];
+    if (token.isEmpty) continue;
+    var digits = true;
+    for (final unit in token.codeUnits) {
+      if (unit < 0x30 || unit > 0x39) {
+        digits = false;
+        break;
+      }
+    }
+    if (digits) last = i;
+  }
+  // A name that is nothing but a number, or whose only number leads it, has
+  // no family to belong to.
+  if (last <= 0) return lower;
+  return tokens.sublist(0, last).join('_');
+}
+
+/// A label for a slot, with the modelling prefixes and the side letter spelled
+/// out. Same spirit as [attachmentDisplayName]: drop what every name carries.
+String slotDisplayName(String key) {
+  const boilerplate = {'geo', 'sm', 'sk', 'mesh'};
+  final words = <String>[];
+  for (final token in key.split('_')) {
+    if (token.isEmpty) continue;
+    if (boilerplate.contains(token)) continue;
+    // The l/r/c convention these rigs use for sides, as read by [_sideOf].
+    if (token == 'l') {
+      words.add('left');
+    } else if (token == 'r') {
+      words.add('right');
+    } else if (token == 'c') {
+      // Centre, which needs no saying.
+      continue;
+    } else {
+      words.add(token);
+    }
+  }
+  return words.isEmpty ? key : words.join(' ');
+}
+
+/// What distinguishes one variant of a slot from the others.
+///
+/// The tail of the object's name past the part its siblings share, so a slot
+/// reads `01 02 03 ... 07 energyShields 08 heavy` rather than eight numbers
+/// with the interesting ones indistinguishable.
+String slotVariantLabel({required String key, required String objectName}) {
+  var rest = objectName;
+  if (objectName.toLowerCase().startsWith(key)) {
+    rest = objectName.substring(key.length);
+  }
+  final words = rest
+      .split(RegExp(r'[^A-Za-z0-9]+'))
+      .where((word) => word.isNotEmpty);
+  return words.isEmpty ? objectName : words.join(' ');
+}
+
+/// The interchangeable slots of [mesh], in the order the file lists them.
+///
+/// Name families alone will not do this: `geo_l_index_01..03` are the three
+/// segments of a finger and `geo_c_head_01..08` are eight whole heads, and
+/// nothing in the names tells them apart. So the test is spatial, the same
+/// way [objectsAreStackedVariants] is: variants of one slot all contain the
+/// joint they hang from, so their boxes overlap each other, while a row of
+/// separate parts is laid out end to end and barely touches.
+///
+/// Measured over pairs rather than against the family's full extent, because
+/// variants differ wildly in size -- a stub cannon and a long one share a
+/// socket, and neither fills the box the pair of them spans.
+List<ObjectSlot> objectSlotsOf(MeshModel mesh) {
+  final count = mesh.objectNames.length;
+  if (count < 2 || mesh.faces.isEmpty || mesh.vertices.isEmpty) {
+    return const [];
+  }
+
+  final minX = List<double>.filled(count, double.infinity);
+  final maxX = List<double>.filled(count, double.negativeInfinity);
+  final minY = List<double>.filled(count, double.infinity);
+  final maxY = List<double>.filled(count, double.negativeInfinity);
+  final minZ = List<double>.filled(count, double.infinity);
+  final maxZ = List<double>.filled(count, double.negativeInfinity);
+  for (final face in mesh.faces) {
+    final object = face.objectIndex;
+    if (object < 0 || object >= count) continue;
+    for (final index in face.indices) {
+      if (index < 0 || index >= mesh.vertices.length) continue;
+      final vertex = mesh.vertices[index];
+      if (vertex.x < minX[object]) minX[object] = vertex.x;
+      if (vertex.x > maxX[object]) maxX[object] = vertex.x;
+      if (vertex.y < minY[object]) minY[object] = vertex.y;
+      if (vertex.y > maxY[object]) maxY[object] = vertex.y;
+      if (vertex.z < minZ[object]) minZ[object] = vertex.z;
+      if (vertex.z > maxZ[object]) maxZ[object] = vertex.z;
+    }
+  }
+
+  /// How much of the smaller box lies inside the larger, on its worst axis.
+  double sharedPlace(int a, int b) {
+    var worst = 1.0;
+    for (var axis = 0; axis < 3; axis += 1) {
+      final lowA = switch (axis) { 0 => minX[a], 1 => minY[a], _ => minZ[a] };
+      final highA = switch (axis) { 0 => maxX[a], 1 => maxY[a], _ => maxZ[a] };
+      final lowB = switch (axis) { 0 => minX[b], 1 => minY[b], _ => minZ[b] };
+      final highB = switch (axis) { 0 => maxX[b], 1 => maxY[b], _ => maxZ[b] };
+      final smaller = math.min(highA - lowA, highB - lowB);
+      // A part flat on this axis says nothing about it either way.
+      if (smaller <= 1e-6) continue;
+      final shared = math.min(highA, highB) - math.max(lowA, lowB);
+      final fraction = shared <= 0 ? 0.0 : shared / smaller;
+      if (fraction < worst) worst = fraction;
+    }
+    return worst;
+  }
+
+  final families = <String, List<int>>{};
+  final order = <String>[];
+  for (var i = 0; i < count; i += 1) {
+    // An object no face refers to has no box and nothing to compare.
+    if (minX[i] > maxX[i]) continue;
+    final key = objectSlotFamily(mesh.objectNames[i]);
+    final members = families.putIfAbsent(key, () {
+      order.add(key);
+      return <int>[];
+    });
+    members.add(i);
+  }
+
+  final slots = <ObjectSlot>[];
+  for (final key in order) {
+    final members = families[key]!;
+    if (members.length < 2) continue;
+    var together = 0;
+    var pairs = 0;
+    for (var i = 0; i < members.length; i += 1) {
+      for (var j = i + 1; j < members.length; j += 1) {
+        pairs += 1;
+        if (sharedPlace(members[i], members[j]) >= slotVariantOverlap) {
+          together += 1;
+        }
+      }
+    }
+    if (together > pairs * slotVariantAgreement) {
+      slots.add(ObjectSlot(key: key, objects: members));
+    }
+  }
+  return slots;
+}
+
+/// Whether [mesh] is a modular kit: one model with interchangeable parts.
+///
+/// A character sheet passes the slot test too -- eleven bodies in one file are
+/// eleven variants of one slot -- but it is not a kit, and the viewer already
+/// takes it apart one body at a time. What makes a kit is slots in different
+/// places that assemble into a single model, so a file whose nodes are whole
+/// bodies is excluded before anything else is asked.
+bool modelIsModularKit(MeshModel mesh) =>
+    !objectsAreStackedVariants(mesh) &&
+    objectSlotsOf(mesh).length >= modularKitMinimumSlots;
+
+/// Hiding every member of every slot but the chosen one.
+///
+/// [choice] runs parallel to [slots]: an index into that slot's objects, or
+/// [slotChoiceNone] to leave the slot empty. Objects in no slot are the
+/// chassis and are never hidden.
+Uint8List hiddenObjectsFor({
+  required int objectCount,
+  required List<ObjectSlot> slots,
+  required List<int> choice,
+}) {
+  final hidden = Uint8List(objectCount);
+  for (var slot = 0; slot < slots.length; slot += 1) {
+    final members = slots[slot].objects;
+    final chosen = slot < choice.length ? choice[slot] : 0;
+    for (var i = 0; i < members.length; i += 1) {
+      if (i == chosen) continue;
+      final object = members[i];
+      if (object >= 0 && object < objectCount) hidden[object] = 1;
+    }
+  }
+  return hidden;
+}
+
+/// An empty slot: no variant of it is drawn.
+const slotChoiceNone = -1;
+
+/// How many faces each node of the file contributes, so the overlay can say
+/// how much of the model a slot choice is showing without walking the faces
+/// again on every frame.
+Int32List objectFaceCounts(MeshModel mesh) {
+  final counts = Int32List(mesh.objectNames.length);
+  for (final face in mesh.faces) {
+    final object = face.objectIndex;
+    if (object >= 0 && object < counts.length) counts[object] += 1;
+  }
+  return counts;
+}
+
+/// Distinguishes one visibility mask from another for the frame cache,
+/// without turning 215 bytes into a string on every build.
+int hiddenObjectsDigest(Uint8List? hidden) {
+  if (hidden == null) return 0;
+  var digest = 0x811c9dc5;
+  for (var i = 0; i < hidden.length; i += 1) {
+    if (hidden[i] == 0) continue;
+    digest = ((digest ^ (i + 1)) * 0x01000193) & 0x3fffffff;
+  }
+  return digest;
 }
 
 /// How many looks the grid will draw at once.
@@ -14134,6 +14631,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 
