@@ -680,6 +680,23 @@ int main(int argc, char** argv) {
       }
     }
 
+    // A node scaled negatively on an odd number of axes is a mirror, and a
+    // mirror reverses which way a triangle faces. ufbx transforms the points
+    // and leaves the winding alone, so the two mirrored parts of the Polygon
+    // mech came out inside out: culled away when backface culling was on, lit
+    // from within when it was off. Emitting the corners in reverse order puts
+    // the normal back outside -- reversing the whole corner rather than just
+    // the indices, so UVs, colours and skin weights stay with their vertex.
+    bool mirrored = false;
+    if (geometry_to_world) {
+      const ufbx_matrix& g = *geometry_to_world;
+      const double determinant =
+        g.cols[0].x * (g.cols[1].y * g.cols[2].z - g.cols[1].z * g.cols[2].y) -
+        g.cols[1].x * (g.cols[0].y * g.cols[2].z - g.cols[0].z * g.cols[2].y) +
+        g.cols[2].x * (g.cols[0].y * g.cols[1].z - g.cols[0].z * g.cols[1].y);
+      mirrored = determinant < 0.0;
+    }
+
     std::vector<unsigned int> tri_indices(mesh->max_face_triangles * 3);
     for (size_t face_index = 0; face_index < mesh->num_faces; ++face_index) {
       ufbx_face face = mesh->faces.data[face_index];
@@ -699,7 +716,9 @@ int main(int argc, char** argv) {
         double tri_uvs[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         std::vector<std::array<double, 6>> tri_uv_sets(uv_set_names.size());
         for (size_t corner = 0; corner < 3; ++corner) {
-          unsigned int vertex_index = tri_indices[tri * 3 + corner];
+          // 0,1,2 normally; 0,2,1 when mirrored.
+          const size_t source = (mirrored && corner != 0) ? 3 - corner : corner;
+          unsigned int vertex_index = tri_indices[tri * 3 + source];
           ufbx_vec3 p = ufbx_get_vertex_vec3(&mesh->vertex_position, vertex_index);
           if (geometry_to_world) {
             p = ufbx_transform_position(geometry_to_world, p);
