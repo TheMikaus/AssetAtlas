@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "atlas": {
+      "command": "python",
+      "args": [
+        "-I",
+        "work/atlas_mcp/atlas_mcp.py"
+      ]
+    }
+  }
+}

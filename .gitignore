@@ -5,3 +5,7 @@
 **/.dart_tool/
 **/.pub-cache/
 **/.pub/
+
+# Python bytecode from the MCP server and its tests.
+__pycache__/
+*.pyc
