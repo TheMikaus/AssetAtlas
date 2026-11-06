@@ -62,10 +62,34 @@ const modelExts = {'obj', 'fbx', 'gltf', 'glb', 'blend', 'dae', 'stl'};
 /// is in the file.
 const unrealExts = {'uasset', 'umap', 'uexp', 'ubulk'};
 const archiveExts = {'zip'};
-const maxZipIntrospectionBytes = 128 * 1024 * 1024;
-const maxZipEntriesToInspect = 25000;
+
+/// A ceiling on entries read out of one archive's directory.
+///
+/// A safety valve against something pathological, not a quality setting: the
+/// largest archive in this library holds a few thousand entries, and reading
+/// the directory costs no more than that whatever the archive weighs.
+///
+/// There used to be a companion byte cap as well, and it was quietly the
+/// biggest hole in the catalog. Archives were read by slurping the whole file
+/// into memory, so anything over 128MB had to be skipped -- which silently
+/// dropped 49 Synty archives holding 66,441 indexable entries, 3,284 of them
+/// FBX, against the 73,865 the catalog did have. Reads come off the central
+/// directory now (`InputFileStream`), so a 2GB archive opens as cheaply as a
+/// 2MB one and there is nothing left for a byte cap to protect.
+const maxZipEntriesToInspect = 200000;
+
+/// How many archives keep an open file handle for reading entries.
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.26';
+
+/// How long an archive stays open after the last entry read.
+///
+/// An open handle is what makes browsing cheap -- reopening costs 20-40ms of
+/// directory parsing, and scrolling a grid reads hundreds of entries -- but on
+/// Windows it also blocks renaming or deleting that archive. Nobody expects a
+/// browser to lock the file they are trying to reorganise, so the handles are
+/// dropped shortly after the reading stops.
+const zipArchiveIdleTimeout = Duration(seconds: 5);
+const appVersion = '1.10.27';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -9342,6 +9366,10 @@ Future<ScanHandle> startFolderScan(
   String rootPath, {
   required void Function(ScanStatus status) onStatus,
 }) async {
+  // A scan walks the same archives the preview cache may be holding open, and
+  // an open handle stops Windows replacing the file underneath it. Let go
+  // before the walk rather than racing it.
+  closeCachedArchives();
   final port = ReceivePort();
   final completer = Completer<ScanResult>();
 
@@ -9486,22 +9514,16 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
     );
   }
 
-  final zipSize = await zipFile.length();
-  if (zipSize > maxZipIntrospectionBytes) {
-    fbxLog(
-      'Skipping ZIP introspection for large archive: $zipPath ($zipSize bytes)',
-    );
-    return const ZipAssetScanResult(
-      assets: [],
-      skippedUnsupported: 0,
-      skippedBinaryObj: 0,
-      entriesInspected: 0,
-    );
-  }
-
+  // Read through the archive's own directory rather than loading the file.
+  // Every entry below needs only its name, its size and -- for an OBJ -- its
+  // first few bytes, all of which the directory and an on-demand inflate
+  // provide. Slurping instead is what forced the byte cap this scan used to
+  // give up at, and a scan is the one place giving up is invisible: the
+  // archive simply contributed no rows.
+  InputFileStream? stream;
   try {
-    final bytes = await zipFile.readAsBytes();
-    final archive = ZipDecoder().decodeBytes(bytes, verify: false);
+    stream = InputFileStream(zipPath);
+    final archive = ZipDecoder().decodeStream(stream, verify: false);
     final zipRelative = relativeTo(zipPath, rootPath).replaceAll('\\', '/');
     final assets = <AssetItem>[];
     var skippedUnsupported = 0;
@@ -9525,8 +9547,10 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       }
 
       if (ext == 'obj') {
-        final content = entry.content;
-        if (isLikelyBinaryObjBytes(content)) {
+        // Read without letting the entry keep its decompressed bytes: a pack
+        // ships hundreds of OBJs and `entry.content` caches every one of them
+        // on the archive for as long as the scan holds it.
+        if (isLikelyBinaryObjBytes(archiveEntryBytes(entry))) {
           skippedBinaryObj += 1;
           continue;
         }
@@ -9572,6 +9596,12 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       skippedBinaryObj: 0,
       entriesInspected: 0,
     );
+  } finally {
+    // The scan is done with this archive; nothing should still hold the file
+    // open once its rows exist.
+    try {
+      stream?.closeSync();
+    } catch (_) {}
   }
 }
 
@@ -9637,7 +9667,72 @@ class ZipVirtualPath {
   final String entryPath;
 }
 
-final _zipArchiveCache = <String, Archive>{};
+/// An archive held open so its entries can be read one at a time.
+///
+/// The stream is the point: entries inflate straight out of the file, so the
+/// cost of having an archive open is its directory rather than its size, and a
+/// 2GB archive is as cheap to browse as a small one.
+class _OpenArchive {
+  _OpenArchive({required this.stream, required this.archive, required this.key});
+
+  final InputFileStream stream;
+  final Archive archive;
+
+  /// Size and modification time when it was opened, so a rebuilt archive is
+  /// noticed rather than served stale out of the cache.
+  final String key;
+
+  void close() {
+    try {
+      stream.closeSync();
+    } catch (_) {}
+  }
+}
+
+final _zipArchiveCache = <String, _OpenArchive>{};
+Timer? _zipArchiveIdleTimer;
+
+/// Closes every open archive handle.
+///
+/// Called when reading goes quiet, and directly before a scan: a scan walks
+/// the same archives, and on Windows a handle this cache is holding would stop
+/// the user moving or replacing the file underneath it.
+void closeCachedArchives() {
+  _zipArchiveIdleTimer?.cancel();
+  _zipArchiveIdleTimer = null;
+  for (final open in _zipArchiveCache.values) {
+    open.close();
+  }
+  _zipArchiveCache.clear();
+}
+
+void _touchZipArchiveIdleTimer() {
+  _zipArchiveIdleTimer?.cancel();
+  _zipArchiveIdleTimer = Timer(zipArchiveIdleTimeout, closeCachedArchives);
+}
+
+/// Identifies the bytes an open archive was read from.
+String? _archiveStateKey(String zipPath) {
+  try {
+    final stat = File(zipPath).statSync();
+    if (stat.type == FileSystemEntityType.notFound) return null;
+    return '${stat.size}:${stat.modified.millisecondsSinceEpoch}';
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Reads one entry without the archive keeping its decompressed bytes.
+///
+/// `ArchiveFile.content` caches what it inflates on the entry, which for a
+/// long-lived archive means the memory the streaming read just saved comes
+/// back as soon as anything browses it. Decompressing into an output stream
+/// hands back the same bytes and keeps nothing.
+Uint8List archiveEntryBytes(ArchiveFile entry) {
+  final out = OutputMemoryStream();
+  entry.decompress(out);
+  return out.getBytes();
+}
 
 ZipVirtualPath? parseZipVirtualPath(String value) {
   if (!isZipVirtualPath(value)) return null;
@@ -9649,46 +9744,65 @@ ZipVirtualPath? parseZipVirtualPath(String value) {
   return ZipVirtualPath(zipPath: zipPath, entryPath: entryPath);
 }
 
-Future<Archive?> _readArchiveFromDisk(String zipPath) async {
-  final file = File(zipPath);
-  if (!file.existsSync()) return null;
-  final length = await file.length();
-  if (length > maxZipIntrospectionBytes) return null;
-  final bytes = await file.readAsBytes();
-  return ZipDecoder().decodeBytes(bytes, verify: false);
+_OpenArchive? _openArchive(String zipPath) {
+  final stateKey = _archiveStateKey(zipPath);
+  if (stateKey == null) return null;
+  InputFileStream? stream;
+  try {
+    stream = InputFileStream(zipPath);
+    return _OpenArchive(
+      stream: stream,
+      archive: ZipDecoder().decodeStream(stream, verify: false),
+      key: stateKey,
+    );
+  } catch (error) {
+    fbxLog('Opening archive failed for $zipPath: $error');
+    try {
+      stream?.closeSync();
+    } catch (_) {}
+    return null;
+  }
 }
 
-Future<Archive?> _loadCachedArchive(String zipPath) async {
+Archive? _loadCachedArchive(String zipPath) {
   final cacheKey = normalizePathKey(zipPath);
   final cached = _zipArchiveCache[cacheKey];
   if (cached != null) {
-    // Promote recently-used entries to the end for LRU eviction.
-    _zipArchiveCache.remove(cacheKey);
-    _zipArchiveCache[cacheKey] = cached;
-    return cached;
-  }
-  final archive = await _readArchiveFromDisk(zipPath);
-  if (archive != null) {
-    _zipArchiveCache[cacheKey] = archive;
-    while (_zipArchiveCache.length > maxZipArchiveCacheEntries) {
-      _zipArchiveCache.remove(_zipArchiveCache.keys.first);
+    if (cached.key == _archiveStateKey(zipPath)) {
+      // Promote recently-used entries to the end for LRU eviction.
+      _zipArchiveCache.remove(cacheKey);
+      _zipArchiveCache[cacheKey] = cached;
+      _touchZipArchiveIdleTimer();
+      return cached.archive;
     }
+    // Replaced on disk since it was opened.
+    _zipArchiveCache.remove(cacheKey);
+    cached.close();
   }
-  return archive;
-}
-
-Uint8List? _archiveEntryToBytes(ArchiveFile entry) {
-  return entry.content;
+  final open = _openArchive(zipPath);
+  if (open == null) return null;
+  _zipArchiveCache[cacheKey] = open;
+  while (_zipArchiveCache.length > maxZipArchiveCacheEntries) {
+    final oldest = _zipArchiveCache.keys.first;
+    _zipArchiveCache.remove(oldest)?.close();
+  }
+  _touchZipArchiveIdleTimer();
+  return open.archive;
 }
 
 Future<Uint8List?> readZipVirtualAssetBytesByPath(String virtualPath) async {
   final parsed = parseZipVirtualPath(virtualPath);
   if (parsed == null) return null;
-  final archive = await _loadCachedArchive(parsed.zipPath);
+  final archive = _loadCachedArchive(parsed.zipPath);
   if (archive == null) return null;
   final entry = archive.findFile(parsed.entryPath);
   if (entry == null || !entry.isFile) return null;
-  return _archiveEntryToBytes(entry);
+  try {
+    return archiveEntryBytes(entry);
+  } catch (error) {
+    fbxLog('Reading ${parsed.entryPath} from ${parsed.zipPath} failed: $error');
+    return null;
+  }
 }
 
 Future<Uint8List?> readAssetBytes(String path) async {
@@ -11115,18 +11229,24 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
   final kinds = <String, String>{};
 
   Archive? archive;
+  InputFileStream? stream;
   if (chunk.containerPath != null) {
     try {
       final file = File(chunk.containerPath!);
-      if (file.existsSync() &&
-          await file.length() <= maxZipIntrospectionBytes) {
-        // Opened once for the whole chunk; entries inflate individually.
-        archive = ZipDecoder().decodeBytes(
-          await file.readAsBytes(),
-          verify: false,
-        );
+      if (file.existsSync()) {
+        // Opened once for the whole chunk; entries inflate individually off
+        // the stream, so the worker's memory is one entry rather than one
+        // archive. This used to skip any container over 128MB, which left
+        // every FBX in it unclassified -- invisible to the character and
+        // animation filters for as long as the catalog lived.
+        stream = InputFileStream(chunk.containerPath!);
+        archive = ZipDecoder().decodeStream(stream, verify: false);
       }
     } catch (_) {
+      try {
+        stream?.closeSync();
+      } catch (_) {}
+      stream = null;
       archive = null;
     }
   }
@@ -11145,7 +11265,7 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
           kinds[assetId] = 'unreadable';
           continue;
         }
-        bytes = entry.content;
+        bytes = archiveEntryBytes(entry);
       }
 
       final result = await runMeshImporter(
@@ -11170,6 +11290,9 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
       kinds[assetId] = 'unreadable';
     }
   }
+  try {
+    stream?.closeSync();
+  } catch (_) {}
   return kinds;
 }
 
@@ -12218,8 +12341,11 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
 /// Bumped whenever the scanner's rules change what gets indexed, so a catalog
 /// saved under older rules can say so instead of silently lacking things.
 ///
-/// 1: the original rule set. 2: Unreal asset files are indexed.
-const scanRulesVersion = 2;
+/// 1: the original rule set. 2: Unreal asset files are indexed. 3: archives
+/// are read through their directory rather than loaded whole, so the ones over
+/// the old 128MB byte cap are indexed instead of skipped -- 49 of them here,
+/// holding 66,441 entries.
+const scanRulesVersion = 3;
 
 /// Settings key for the rules a persisted catalog was scanned under.
 const catalogRulesKey = 'catalog.rules';
@@ -14631,6 +14757,7 @@ class PersistedProject {
   final String? rootPath;
   final int createdMs;
 }
+
 
 
 

@@ -7,6 +7,9 @@ import 'package:flutter_test/flutter_test.dart';
 Future<Directory> _tempDir(String prefix) async {
   final dir = await Directory.systemTemp.createTemp(prefix);
   addTearDown(() async {
+    // Reading an entry keeps its archive open, and on Windows that blocks
+    // deleting the fixture underneath it.
+    closeCachedArchives();
     if (dir.existsSync()) {
       await dir.delete(recursive: true);
     }

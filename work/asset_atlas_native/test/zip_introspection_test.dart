@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:archive/archive.dart';
+import 'dart:typed_data';
+
+import 'package:archive/archive_io.dart';
 import 'package:asset_atlas_native/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -11,6 +13,7 @@ void main() {
       'asset_atlas_zip_scan_',
     );
     addTearDown(() async {
+      closeCachedArchives();
       if (tempRoot.existsSync()) {
         await tempRoot.delete(recursive: true);
       }
@@ -50,6 +53,7 @@ void main() {
       'asset_atlas_zip_copy_',
     );
     addTearDown(() async {
+      closeCachedArchives();
       if (tempRoot.existsSync()) {
         await tempRoot.delete(recursive: true);
       }
@@ -111,6 +115,7 @@ void main() {
         'asset_atlas_zip_fbx_preview_',
       );
       addTearDown(() async {
+        closeCachedArchives();
         if (tempRoot.existsSync()) {
           await tempRoot.delete(recursive: true);
         }
@@ -143,6 +148,7 @@ void main() {
       'asset_atlas_zip_fbx_external_texture_',
     );
     addTearDown(() async {
+      closeCachedArchives();
       if (tempRoot.existsSync()) {
         await tempRoot.delete(recursive: true);
       }
@@ -205,5 +211,159 @@ void main() {
       ),
       renamedPackTexture.path,
     );
+  });
+
+  test('an archive past the old 128MB byte cap is indexed', () async {
+    // Archives used to be read by loading the whole file, so anything over
+    // 128MB was skipped and contributed no rows at all -- silently, which is
+    // how 49 archives and 66,441 entries went missing from the real catalog.
+    final tempRoot = await Directory.systemTemp.createTemp(
+      'asset_atlas_zip_big_',
+    );
+    final fillerDir = await Directory.systemTemp.createTemp(
+      'asset_atlas_zip_filler_',
+    );
+    addTearDown(() async {
+      closeCachedArchives();
+      for (final dir in [tempRoot, fillerDir]) {
+        if (dir.existsSync()) await dir.delete(recursive: true);
+      }
+    });
+
+    // Stored, not deflated, so the archive on disk really is over the cap.
+    final fillerPath =
+        '${fillerDir.path}${Platform.pathSeparator}filler.bin';
+    final filler = File(fillerPath).openSync(mode: FileMode.write);
+    final megabyte = Uint8List(1024 * 1024);
+    for (var written = 0; written < 129; written += 1) {
+      filler.writeFromSync(megabyte);
+    }
+    await filler.close();
+
+    final smallPath = '${fillerDir.path}${Platform.pathSeparator}albedo.png';
+    await File(smallPath).writeAsBytes(const [1, 2, 3], flush: true);
+
+    final zipPath = '${tempRoot.path}${Platform.pathSeparator}huge.zip';
+    final encoder = ZipFileEncoder();
+    encoder.create(zipPath, level: ZipFileEncoder.store);
+    await encoder.addFile(File(fillerPath), 'raw/filler.bin', 0);
+    await encoder.addFile(File(smallPath), 'textures/albedo.png', 0);
+    encoder.closeSync();
+
+    expect(
+      File(zipPath).lengthSync(),
+      greaterThan(128 * 1024 * 1024),
+      reason: 'the fixture has to cross the cap it is testing',
+    );
+
+    final scan = await scanAssetFolder(tempRoot.path, onStatus: (_) {});
+    final zipAssets = scan.assets
+        .where((asset) => asset.path.startsWith('zip:'))
+        .toList();
+
+    expect(zipAssets.length, 1);
+    expect(zipAssets.single.name, 'albedo.png');
+
+    // And the entry is readable, not merely listed.
+    final bytes = await readZipVirtualAssetBytesByPath(
+      buildZipVirtualPath(zipPath, 'textures/albedo.png'),
+    );
+    expect(bytes, const [1, 2, 3]);
+    closeCachedArchives();
+  });
+
+  test('one open archive serves repeated entry reads', () async {
+    final tempRoot = await Directory.systemTemp.createTemp(
+      'asset_atlas_zip_reread_',
+    );
+    addTearDown(() async {
+      closeCachedArchives();
+      if (tempRoot.existsSync()) await tempRoot.delete(recursive: true);
+    });
+
+    final zipPath = '${tempRoot.path}${Platform.pathSeparator}pack.zip';
+    final archive = Archive()
+      ..addFile(ArchiveFile('textures/albedo.png', 3, [1, 2, 3]))
+      ..addFile(ArchiveFile('textures/normal.png', 4, [4, 5, 6, 7]));
+    await File(zipPath).writeAsBytes(ZipEncoder().encode(archive), flush: true);
+
+    final first = await readZipVirtualAssetBytesByPath(
+      buildZipVirtualPath(zipPath, 'textures/albedo.png'),
+    );
+    final second = await readZipVirtualAssetBytesByPath(
+      buildZipVirtualPath(zipPath, 'textures/normal.png'),
+    );
+    // Reading the same entry twice has to work as well: the bytes are not
+    // retained on the entry, so the second read inflates again off the stream.
+    final again = await readZipVirtualAssetBytesByPath(
+      buildZipVirtualPath(zipPath, 'textures/albedo.png'),
+    );
+
+    expect(first, const [1, 2, 3]);
+    expect(second, const [4, 5, 6, 7]);
+    expect(again, const [1, 2, 3]);
+  });
+
+  test('closeCachedArchives lets go of the file', () async {
+    // Browsing keeps archives open because reopening one costs 20-40ms of
+    // directory parsing. On Windows that also locks the file, so a browser
+    // that never let go would stop the user reorganising their own library.
+    final tempRoot = await Directory.systemTemp.createTemp(
+      'asset_atlas_zip_handle_',
+    );
+    addTearDown(() async {
+      closeCachedArchives();
+      if (tempRoot.existsSync()) await tempRoot.delete(recursive: true);
+    });
+
+    final zipPath = '${tempRoot.path}${Platform.pathSeparator}pack.zip';
+    final movedPath = '${tempRoot.path}${Platform.pathSeparator}moved.zip';
+    final archive = Archive()
+      ..addFile(ArchiveFile('textures/albedo.png', 3, [1, 2, 3]));
+    await File(zipPath).writeAsBytes(ZipEncoder().encode(archive), flush: true);
+
+    await readZipVirtualAssetBytesByPath(
+      buildZipVirtualPath(zipPath, 'textures/albedo.png'),
+    );
+
+    if (Platform.isWindows) {
+      expect(
+        () => File(zipPath).renameSync(movedPath),
+        throwsA(isA<FileSystemException>()),
+        reason: 'the read should still be holding the archive open',
+      );
+    }
+
+    closeCachedArchives();
+    File(zipPath).renameSync(movedPath);
+    expect(File(movedPath).existsSync(), isTrue);
+  });
+
+  test('an archive rebuilt on disk is re-read, not served stale', () async {
+    final tempRoot = await Directory.systemTemp.createTemp(
+      'asset_atlas_zip_stale_',
+    );
+    addTearDown(() async {
+      closeCachedArchives();
+      if (tempRoot.existsSync()) await tempRoot.delete(recursive: true);
+    });
+
+    final zipPath = '${tempRoot.path}${Platform.pathSeparator}pack.zip';
+    final entryPath = buildZipVirtualPath(zipPath, 'textures/albedo.png');
+
+    final before = Archive()
+      ..addFile(ArchiveFile('textures/albedo.png', 3, [1, 2, 3]));
+    await File(zipPath).writeAsBytes(ZipEncoder().encode(before), flush: true);
+    expect(await readZipVirtualAssetBytesByPath(entryPath), const [1, 2, 3]);
+
+    // Re-downloaded or re-exported in place. A cache keyed only on the path
+    // would keep answering with the old contents, and keep a handle on bytes
+    // that no longer exist.
+    closeCachedArchives();
+    final after = Archive()
+      ..addFile(ArchiveFile('textures/albedo.png', 5, [9, 9, 9, 9, 9]));
+    await File(zipPath).writeAsBytes(ZipEncoder().encode(after), flush: true);
+
+    expect(await readZipVirtualAssetBytesByPath(entryPath), const [9, 9, 9, 9, 9]);
   });
 }
