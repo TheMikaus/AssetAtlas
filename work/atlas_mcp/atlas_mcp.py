@@ -145,6 +145,126 @@ def container_of(row):
     return row["source_name"] or ""
 
 
+# ------------------------------------------------------- packs and builds
+
+# Synty ships one pack several times over: the source files, and a built
+# project per engine version. The archive name is the only place that is
+# recorded, so this is a deliberate exception to "nothing here reads a name" --
+# the engine a build targets is not inside the files, and an AI assembling an
+# Unreal project needs it before anything else.
+_ARCHIVE_COPY = re.compile(r"\s*\(\d+\)$")
+_ENGINE_VERSIONED = re.compile(
+    r"[_ -](unreal|unity)[_ -]*(?:project[_ -]*)?(\d+)[._](\d+)", re.I)
+_ENGINE_BARE = re.compile(r"[_ -](unreal|unity)(?=[_ -]|$)", re.I)
+# A bare `4_22` with no engine word: every archive shaped like this in the
+# reference library is an Unreal project export.
+_BARE_ENGINE_VERSION = re.compile(r"[_ -](\d+)[._](\d+)(?=[_ -]|$)")
+_SOURCE_BUILD = re.compile(r"[_ -]source[_ -]*(?:files?|sprites?)?", re.I)
+_PACK_VERSION = re.compile(r"[_ -]v(\d+(?:[_.]\d+)*)\s*$", re.I)
+# Synty's product lines. Stripped from the pack name so POLYGON_Town and
+# PolygonTown are one pack.
+PACK_FAMILIES = ("polygon", "interface", "animation", "simple", "sidekick")
+_WORDS = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+BUILD_KINDS = ("source", "unreal", "unity", "other")
+
+
+def _split_words(text_value):
+    """Words out of a name, splitting runCamelCase as well as separators."""
+    words = []
+    for chunk in re.split(r"[^A-Za-z0-9]+", text_value):
+        if chunk:
+            words.extend(_WORDS.findall(chunk) or [chunk])
+    return words
+
+
+def _singular(word):
+    # Dungeon_Realms and Dungeons_Realms are the same pack; so are Dog and
+    # Dogs. Only on words long enough that the trailing s is a plural.
+    return word[:-1] if len(word) > 3 and word.lower().endswith("s") else word
+
+
+def parse_archive_name(name):
+    """Pack, product line, build kind and engine version out of an archive name.
+
+    POLYGON_Shops_Unreal_5_4_v1_9_0.zip
+        -> family polygon, pack "Shops", build unreal, engine 5.4, version 1_9_0
+
+    `pack_key` is the grouping key: lowercased, camel-split and singularised,
+    so POLYGON_Office_SourceFiles_v2 and PolygonOffice_SourceFiles land
+    together. Near-miss names are left apart rather than fuzzily merged --
+    "Explorer" and "Explorer Kit" stay two packs instead of a guess.
+    """
+    stem = name[:-4] if name.lower().endswith(".zip") else name
+    stem = _ARCHIVE_COPY.sub("", stem)
+
+    build, engine, cut = "other", None, len(stem)
+    match = _ENGINE_VERSIONED.search(stem)
+    if match:
+        build, engine, cut = match.group(1).lower(), "%s.%s" % (
+            match.group(2), match.group(3)), match.start()
+    else:
+        match = _SOURCE_BUILD.search(stem)
+        if match:
+            build, cut = "source", match.start()
+        else:
+            match = _ENGINE_BARE.search(stem)
+            if match:
+                build, cut = match.group(1).lower(), match.start()
+            else:
+                match = _BARE_ENGINE_VERSION.search(stem)
+                if match:
+                    build, engine, cut = "unreal", "%s.%s" % (
+                        match.group(1), match.group(2)), match.start()
+
+    version_match = _PACK_VERSION.search(stem)
+    version = version_match.group(1) if version_match else None
+
+    words = _split_words(stem[:cut])
+    family = ""
+    if words and words[0].lower() in PACK_FAMILIES:
+        family = words[0].lower()
+        words = words[1:]
+    pack = " ".join(words)
+    pack_key = " ".join(_singular(word) for word in words).lower()
+    return {
+        "family": family,
+        "pack": pack,
+        "pack_key": pack_key,
+        "build": build,
+        "engine": engine,
+        "version": version,
+        "archive": name,
+    }
+
+
+def archive_of(row):
+    """The archive a row came out of, or '' for a loose file."""
+    path = row["path"] or ""
+    if path.startswith("zip:") and "::" in path:
+        return os.path.basename(path[4:].split("::", 1)[0])
+    return ""
+
+
+def build_of(row):
+    """parse_archive_name for the row's archive; None for a loose file."""
+    archive = archive_of(row)
+    return parse_archive_name(archive) if archive else None
+
+
+def describe_build(info):
+    """'unreal 5.4 (v1_9_0)' -- how one build of a pack reads in a listing."""
+    if info is None:
+        return "loose files"
+    bits = [info["build"]]
+    if info["engine"]:
+        bits.append(info["engine"])
+    label = " ".join(bits)
+    if info["version"]:
+        label += " (v%s)" % info["version"]
+    return label
+
+
 # The search text Atlas builds per asset: name, path and tags, lowercased,
 # with separators so a term cannot straddle two fields.
 _SEARCH_SQL = (
@@ -195,6 +315,115 @@ def build_query(arguments):
         params.append(ext)
 
     return " AND ".join(clauses), params, kind
+
+
+MAX_EXPORT_FILES = 5000
+DEFAULT_EXPORT_FILES = 500
+# A pack's built Content folder is a few hundred megabytes; this is the point
+# at which an export is more likely a mistake than a request.
+MAX_EXPORT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def catalog_archives(connection):
+    """Every archive the catalog holds, as {full container path: parsed name}."""
+    rows = connection.execute(
+        "SELECT DISTINCT substr(path, 5, instr(path, '::') - 5) AS container "
+        "FROM catalog_assets WHERE path LIKE 'zip:%' AND instr(path, '::') > 0"
+    ).fetchall()
+    found = {}
+    for row in rows:
+        container = row["container"]
+        if container:
+            found[container] = parse_archive_name(os.path.basename(container))
+    return found
+
+
+def archive_clause(connection, arguments):
+    """A WHERE fragment restricting to archives whose build matches.
+
+    The engine version lives in the archive name and nowhere else, so this
+    resolves the filter to the archives it means and matches on those -- a LIKE
+    over the path would have to guess at Unreal_5_4 against Unreal_Project_4_22
+    against a bare 4_22, and would quietly miss builds.
+    """
+    engine = (arguments.get("engine") or "").strip().lower()
+    build = (arguments.get("build") or "").strip().lower()
+    if not engine and not build:
+        return None, []
+    if build and build not in BUILD_KINDS:
+        raise AtlasError(
+            "Unknown build %r. Use one of: %s." % (build, ", ".join(BUILD_KINDS)))
+
+    wanted = []
+    for container, info in catalog_archives(connection).items():
+        if build and info["build"] != build:
+            continue
+        if engine and (info["engine"] or "") != engine:
+            continue
+        wanted.append(container)
+    if not wanted:
+        known = sorted({
+            info["engine"] for info in catalog_archives(connection).values()
+            if info["engine"]})
+        raise AtlasError(
+            "No archive in the catalog is a %s build%s. Engine versions "
+            "present: %s." % (build or "matching", " for engine " + engine
+                              if engine else "", ", ".join(known) or "none"))
+    clause = "(%s)" % " OR ".join(["path LIKE ?"] * len(wanted))
+    return clause, ["zip:" + container + "::%" for container in wanted]
+
+
+def grouped_rows_for(connection, arguments, limit, offset):
+    """Search results with identical copies collapsed to one row.
+
+    Half this library is the same file several times over: packs are
+    re-released and re-exported per engine version, so 13,719 of 27,652 FBX
+    rows share a name and a byte size with another row. Left alone, a search
+    for a door returns the same door six times and a limit of 40 is really a
+    limit of 20. Grouping is on name and size -- two files that agree on both
+    are the same file in practice -- and the surviving row says how many
+    copies there are and where the others live.
+    """
+    where, params, kind = build_query(arguments)
+    extra, extra_params = archive_clause(connection, arguments)
+    if extra:
+        where += " AND " + extra
+        params = params + extra_params
+
+    fetch = limit if kind != "texture" else max(limit * 4, 200)
+    groups = connection.execute(
+        "SELECT min(path) AS rep, count(*) AS copies FROM catalog_assets "
+        "WHERE %s GROUP BY lower(name), size ORDER BY min(name) LIMIT ? OFFSET ?"
+        % where, params + [fetch, offset]).fetchall()
+    total = connection.execute(
+        "SELECT count(*) FROM (SELECT 1 FROM catalog_assets WHERE %s "
+        "GROUP BY lower(name), size)" % where, params).fetchone()[0]
+
+    copies = {row["rep"]: row["copies"] for row in groups}
+    if not copies:
+        return [], total, kind, {}
+    placeholders = ", ".join(["?"] * len(copies))
+    rows = connection.execute(
+        "SELECT * FROM catalog_assets WHERE path IN (%s)" % placeholders,
+        list(copies)).fetchall()
+    if kind == "texture":
+        rows = [row for row in rows if effective_type(row) == "texture"]
+    rows = sorted(rows, key=lambda row: (row["name"] or "").lower())[:limit]
+
+    # Where the other copies live, for the rows actually being shown.
+    elsewhere = {}
+    duplicated = [row for row in rows if copies.get(row["path"], 1) > 1]
+    if duplicated:
+        pairs = " OR ".join(["(lower(name) = ? AND size = ?)"] * len(duplicated))
+        args = []
+        for row in duplicated:
+            args.extend([(row["name"] or "").lower(), row["size"]])
+        for other in connection.execute(
+                "SELECT name, size, path, relative_path, source_name "
+                "FROM catalog_assets WHERE %s" % pairs, args).fetchall():
+            key = ((other["name"] or "").lower(), other["size"])
+            elsewhere.setdefault(key, set()).add(container_of(other))
+    return rows, total, kind, {"copies": copies, "elsewhere": elsewhere}
 
 
 def rows_for(connection, arguments, limit, offset):
@@ -424,8 +653,29 @@ def text(body):
 def tool_search_assets(arguments):
     limit = min(int(arguments.get("limit") or DEFAULT_LIMIT), MAX_LIMIT)
     offset = max(int(arguments.get("offset") or 0), 0)
+    distinct = arguments.get("distinct")
+    distinct = True if distinct is None else bool(distinct)
+
     with open_catalog() as connection:
-        rows, total, kind = rows_for(connection, arguments, limit, offset)
+        if distinct:
+            rows, total, kind, dupes = grouped_rows_for(
+                connection, arguments, limit, offset)
+        else:
+            where, params, kind = build_query(arguments)
+            extra, extra_params = archive_clause(connection, arguments)
+            if extra:
+                where += " AND " + extra
+                params = params + extra_params
+            rows = connection.execute(
+                "SELECT * FROM catalog_assets WHERE %s ORDER BY name "
+                "LIMIT ? OFFSET ?" % where,
+                params + [limit, offset]).fetchall()
+            if kind == "texture":
+                rows = [r for r in rows if effective_type(r) == "texture"]
+            total = connection.execute(
+                "SELECT count(*) FROM catalog_assets WHERE %s" % where,
+                params).fetchone()[0]
+            dupes = {}
 
     if not rows:
         hint = ""
@@ -437,13 +687,33 @@ def tool_search_assets(arguments):
                     "for type=mesh and inspect candidates individually.")
         return text("No assets matched.%s" % hint)
 
-    shown = "\n".join(
-        describe_row(row, offset + i + 1) for i, row in enumerate(rows))
+    copies = dupes.get("copies") or {}
+    elsewhere = dupes.get("elsewhere") or {}
+    blocks = []
+    for index, row in enumerate(rows):
+        block = describe_row(row, offset + index + 1)
+        count = copies.get(row["path"], 1)
+        if count > 1:
+            block = block.replace("\n", "   x%d copies\n" % count, 1)
+            others = sorted(
+                elsewhere.get(((row["name"] or "").lower(), row["size"]), set())
+                - {container_of(row)})
+            if others:
+                shown_others = ", ".join(others[:4])
+                if len(others) > 4:
+                    shown_others += ", +%d more" % (len(others) - 4)
+                block += "\n     also in: " + shown_others
+        blocks.append(block)
+
+    header = "%d matches." % total
+    if distinct:
+        header = ("%d distinct files (identical copies collapsed; pass "
+                  "distinct=false for every row)." % total)
     more = ""
     if total > offset + len(rows):
         more = ("\n\n%d of %d shown. Ask again with offset=%d for more."
                 % (offset + len(rows), total, offset + len(rows)))
-    return text("%d matches.\n\n%s%s" % (total, shown, more))
+    return text("%s\n\n%s%s" % (header, "\n".join(blocks), more))
 
 
 def _find_row(connection, needle):
@@ -787,6 +1057,237 @@ def tool_get_texture(arguments):
     ]}
 
 
+def tool_find_packs(arguments):
+    """Packs rather than archives, with the builds each one ships."""
+    query = (arguments.get("query") or "").strip().lower()
+    engine = (arguments.get("engine") or "").strip().lower()
+    build = (arguments.get("build") or "").strip().lower()
+    if build and build not in BUILD_KINDS:
+        raise AtlasError(
+            "Unknown build %r. Use one of: %s." % (build, ", ".join(BUILD_KINDS)))
+
+    with open_catalog() as connection:
+        rows = connection.execute(
+            "SELECT path, relative_path, source_name, type, model_kind, size, "
+            "referenced_by_model FROM catalog_assets WHERE ignored = 0").fetchall()
+
+    packs = {}
+    for row in rows:
+        info = build_of(row)
+        key = info["pack_key"] if info else (row["source_name"] or "loose")
+        label = info["pack"] if info else (row["source_name"] or "loose files")
+        bucket = packs.setdefault(key, {
+            "label": label, "family": info["family"] if info else "",
+            "files": 0, "mesh": 0, "animation": 0, "texture": 0, "unreal": 0,
+            "bytes": 0, "builds": {}})
+        if info:
+            bucket["builds"].setdefault(describe_build(info), 0)
+            bucket["builds"][describe_build(info)] += 1
+        bucket["files"] += 1
+        bucket["bytes"] += row["size"] or 0
+        if row["model_kind"] == "mesh":
+            bucket["mesh"] += 1
+        elif row["model_kind"] == "animation":
+            bucket["animation"] += 1
+        if row["type"] == "unreal":
+            bucket["unreal"] += 1
+        if effective_type(row) == "texture":
+            bucket["texture"] += 1
+
+    def keeps(key, bucket):
+        if query and query not in key and query not in bucket["label"].lower():
+            return False
+        if not engine and not build:
+            return True
+        for label in bucket["builds"]:
+            words = label.split()
+            if build and words[0] != build:
+                continue
+            if engine and engine not in words:
+                continue
+            return True
+        return False
+
+    chosen = [(k, v) for k, v in packs.items() if keeps(k, v)]
+    if not chosen:
+        return text(
+            "No packs matched. Ask with no filters to see everything, or "
+            "catalog_stats for which engine versions exist.")
+
+    chosen.sort(key=lambda item: -item[1]["files"])
+    lines = ["%d packs.  files / meshes / clips / textures / unreal" % len(chosen), ""]
+    for key, bucket in chosen:
+        lines.append("%-26s %6d %6d %6d %6d %7d   %s"
+                     % (bucket["label"][:26], bucket["files"], bucket["mesh"],
+                        bucket["animation"], bucket["texture"], bucket["unreal"],
+                        ", ".join(sorted(bucket["builds"]))))
+    lines.append("")
+    lines.append("A source build ships FBX and OBJ. An unreal build ships .uasset "
+                 "and .umap only -- no geometry readable outside the engine, but "
+                 "it is what drops into a project. export_assets writes either "
+                 "out of its archive.")
+    return text("\n".join(lines))
+
+
+def tool_find_duplicates(arguments):
+    """Files the catalog holds more than one copy of."""
+    limit = min(int(arguments.get("limit") or 30), MAX_LIMIT)
+    ext = (arguments.get("ext") or "").strip().lower().lstrip(".")
+    clauses = ["ignored = 0"]
+    params = []
+    if ext:
+        clauses.append("ext = ?")
+        params.append(ext)
+    where = " AND ".join(clauses)
+
+    with open_catalog() as connection:
+        groups = connection.execute(
+            "SELECT name, size, count(*) AS copies FROM catalog_assets "
+            "WHERE %s GROUP BY lower(name), size HAVING copies > 1 "
+            "ORDER BY (copies - 1) * size DESC LIMIT ?" % where,
+            params + [limit]).fetchall()
+        totals = connection.execute(
+            "SELECT count(*) AS rows_total, "
+            "count(DISTINCT lower(name) || ':' || size) AS distinct_total, "
+            "sum(size) AS bytes_total FROM catalog_assets WHERE %s" % where,
+            params).fetchone()
+        wasted = connection.execute(
+            "SELECT sum(extra) FROM (SELECT (count(*) - 1) * size AS extra "
+            "FROM catalog_assets WHERE %s GROUP BY lower(name), size)" % where,
+            params).fetchone()[0] or 0
+
+    if not groups:
+        return text("No duplicates.")
+    redundant = totals["rows_total"] - totals["distinct_total"]
+    lines = [
+        "%d of %d %srows are redundant copies (%d distinct files), %s of disk."
+        % (redundant, totals["rows_total"], (ext + " ") if ext else "",
+           totals["distinct_total"], format_bytes(wasted)),
+        "",
+        "Copies come from packs re-released per engine version and per pack "
+        "revision, so the copies are usually interchangeable -- but an unreal "
+        "build's copy is only useful to that engine version. search_assets "
+        "collapses them by default.",
+        "",
+    ]
+    for row in groups:
+        lines.append("%-52s %2d copies  %s each  %s wasted"
+                     % (row["name"][:52], row["copies"],
+                        format_bytes(row["size"]),
+                        format_bytes((row["copies"] - 1) * row["size"])))
+    return text("\n".join(lines))
+
+
+def _safe_relative(entry_path):
+    """Where an archive entry may be written, or None if it may not be.
+
+    An archive is untrusted input: an entry named ../../x or C:/x would have an
+    export write outside the folder it was given.
+    """
+    cleaned = (entry_path or "").replace("\\", "/")
+    if not cleaned or cleaned.startswith("/") or ":" in cleaned.split("/")[0]:
+        return None
+    parts = []
+    for part in cleaned.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            return None
+        parts.append(part)
+    return os.path.join(*parts) if parts else None
+
+
+def tool_export_assets(arguments):
+    """Write assets out of their archives into a folder."""
+    dest = (arguments.get("dest") or "").strip()
+    if not dest:
+        raise AtlasError("Give dest: the folder to write into.")
+    dest = os.path.abspath(dest)
+    paths = arguments.get("paths") or []
+    if isinstance(paths, str):
+        paths = [paths]
+    overwrite = bool(arguments.get("overwrite"))
+    limit = min(int(arguments.get("limit") or DEFAULT_EXPORT_FILES),
+                MAX_EXPORT_FILES)
+
+    with open_catalog() as connection:
+        if paths:
+            rows = []
+            for path in paths:
+                rows.append(_find_row(connection, path))
+        else:
+            if not any(arguments.get(key) for key in
+                       ("query", "pack", "folder", "ext", "engine", "build")):
+                raise AtlasError(
+                    "Give paths, or a selection (query / pack / folder / ext / "
+                    "engine / build). Exporting the whole catalog is never "
+                    "what anyone means.")
+            where, params, kind = build_query(arguments)
+            extra, extra_params = archive_clause(connection, arguments)
+            if extra:
+                where += " AND " + extra
+                params = params + extra_params
+            rows = connection.execute(
+                "SELECT * FROM catalog_assets WHERE %s ORDER BY relative_path "
+                "LIMIT ?" % where, params + [limit + 1]).fetchall()
+            if kind == "texture":
+                rows = [row for row in rows if effective_type(row) == "texture"]
+
+    if not rows:
+        return text("Nothing matched, so nothing was written.")
+    truncated = len(rows) > limit
+    rows = rows[:limit]
+    planned = sum(row["size"] or 0 for row in rows)
+    if planned > MAX_EXPORT_BYTES:
+        raise AtlasError(
+            "That selection is %s across %d files, past the %s export ceiling. "
+            "Narrow it, or raise it deliberately."
+            % (format_bytes(planned), len(rows), format_bytes(MAX_EXPORT_BYTES)))
+
+    written, skipped, failed, written_bytes = [], [], [], 0
+    for row in rows:
+        parsed = parse_zip_path(row["path"])
+        relative = _safe_relative(parsed[1] if parsed else row["name"])
+        if relative is None:
+            failed.append("%s (unsafe entry name)" % row["path"])
+            continue
+        target = os.path.join(dest, relative)
+        if os.path.exists(target) and not overwrite:
+            skipped.append(relative)
+            continue
+        try:
+            data = read_asset_bytes(row["path"])
+            folder = os.path.dirname(target)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(data)
+        except (AtlasError, OSError) as error:
+            failed.append("%s (%s)" % (relative, error))
+            continue
+        written.append(relative)
+        written_bytes += len(data)
+
+    lines = ["Wrote %d files (%s) into %s."
+             % (len(written), format_bytes(written_bytes), dest)]
+    if skipped:
+        lines.append("Left %d already-present files alone; pass overwrite=true "
+                     "to replace them." % len(skipped))
+    if failed:
+        lines.append("%d failed:" % len(failed))
+        lines.extend("  " + item for item in failed[:10])
+    if truncated:
+        lines.append("Stopped at the limit of %d files -- there were more. "
+                     "Raise limit or narrow the selection." % limit)
+    if written:
+        lines.append("")
+        lines.append("A few of them:")
+        lines.extend("  " + item for item in written[:12])
+        if len(written) > 12:
+            lines.append("  ... and %d more" % (len(written) - 12))
+    return text("\n".join(lines))
+
+
 TOOLS = [
     {
         "name": "search_assets",
@@ -811,6 +1312,19 @@ TOOLS = [
                 "folder": {"type": "string",
                            "description": "Restrict to paths containing this folder."},
                 "ext": {"type": "string", "description": "File extension, e.g. fbx."},
+                "build": {"type": "string", "enum": list(BUILD_KINDS),
+                          "description":
+                              "Only assets from this kind of build: 'source' "
+                              "(FBX/OBJ) or 'unreal'/'unity' (engine assets)."},
+                "engine": {"type": "string",
+                           "description":
+                               "Only assets from a build for this engine "
+                               "version, e.g. '5.4'. See find_packs."},
+                "distinct": {"type": "boolean",
+                             "description":
+                                 "Collapse identical copies (same name and "
+                                 "size). Default true; half this library is "
+                                 "duplicates."},
                 "limit": {"type": "integer", "description": "Default 40, max 200."},
                 "offset": {"type": "integer"},
             },
@@ -927,6 +1441,78 @@ TOOLS = [
         },
         "handler": tool_get_texture,
     },
+    {
+        "name": "find_packs",
+        "description":
+            "The asset packs in the library, one row per pack rather than per "
+            "archive, with the builds each one ships -- source files, and an "
+            "Unreal or Unity build per engine version. Start here when the "
+            "question is 'what do I have for X' or 'is there a 5.4 build'.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": "Filter pack names, e.g. 'dungeon'."},
+                "build": {"type": "string", "enum": list(BUILD_KINDS),
+                          "description": "Only packs that ship this build kind."},
+                "engine": {"type": "string",
+                           "description":
+                               "Only packs with a build for this engine "
+                               "version, e.g. '5.4' or '4.25'."},
+            },
+        },
+        "handler": tool_find_packs,
+    },
+    {
+        "name": "find_duplicates",
+        "description":
+            "Files the library holds more than one copy of, biggest waste "
+            "first. Copies come from pack re-releases and per-engine builds.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ext": {"type": "string",
+                        "description": "Restrict to one extension, e.g. fbx."},
+                "limit": {"type": "integer", "description": "Default 30."},
+            },
+        },
+        "handler": tool_find_duplicates,
+    },
+    {
+        "name": "export_assets",
+        "description":
+            "Write assets out of their archives into a folder -- the step that "
+            "turns a search into files on disk. Entries keep their "
+            "archive-relative path, so exporting an Unreal build's Content "
+            "folder lands it ready to drop into a project. Existing files are "
+            "left alone unless overwrite is set; nothing is ever deleted.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dest": {"type": "string",
+                         "description": "Folder to write into. Created if needed."},
+                "paths": {"type": "array", "items": {"type": "string"},
+                          "description":
+                              "Exact asset paths to write. Otherwise give a "
+                              "selection below."},
+                "query": {"type": "string", "description": "Search terms."},
+                "pack": {"type": "string", "description": "Restrict to a pack."},
+                "folder": {"type": "string",
+                           "description": "Restrict to paths containing this folder."},
+                "ext": {"type": "string", "description": "File extension."},
+                "type": {"type": "string", "enum": sorted(TYPE_FILTERS)},
+                "build": {"type": "string", "enum": list(BUILD_KINDS)},
+                "engine": {"type": "string",
+                           "description": "Engine version, e.g. '5.4'."},
+                "overwrite": {"type": "boolean",
+                              "description": "Replace files already there. Default false."},
+                "limit": {"type": "integer",
+                          "description": "Max files to write. Default 500, max 5000."},
+            },
+            "required": ["dest"],
+        },
+        "handler": tool_export_assets,
+    },
 ]
 
 HANDLERS = {tool["name"]: tool["handler"] for tool in TOOLS}
@@ -946,7 +1532,25 @@ names, bounds and which textures it asks for. Paths look like
 Names in this library are not reliable -- 'SK_' is Unreal's skeletal-mesh
 prefix that the packs put on differently-rigged characters, and 'SM_' sits on
 fully skinned ones -- so prefer what get_asset reads out of the file over what
-a file name suggests."""
+a file name suggests.
+
+Building in Unreal: a pack ships several times over, as source files and as a
+built project per engine version, so ask find_packs first -- it lists packs
+with the builds each one has, and takes engine='5.4'. A source build holds FBX
+and OBJ, which is what you want for inspecting geometry or importing yourself.
+An unreal build holds .uasset and .umap only: no geometry anything outside the
+engine can read, and tied to its engine version, but it is what drops straight
+into a project. export_assets writes either one out of its archive, keeping
+archive-relative paths.
+
+Half the library is duplicate files -- packs re-released and re-exported -- so
+search_assets collapses identical copies by default and says how many there
+were. Copies of a source asset are interchangeable; a copy from an unreal
+build is only useful to that engine version.
+
+rig_family drives type='character' and find_animations' rig matching, and the
+catalog fills it in lazily, so it may be nearly empty; catalog_stats says how
+many files have it."""
 
 
 # ------------------------------------------------------------------ server

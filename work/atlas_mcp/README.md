@@ -59,7 +59,7 @@ twelve seconds — so every read is cached by the file's size and timestamp.
 
 | Tool | Answers |
 | --- | --- |
-| `search_assets` | "what have I got called X?" Terms are ANDed across name, path and tags, so `jump femn` finds `A_Jump_Running_Femn.fbx`. Filter by `type`, `pack`, `folder`, `ext`. |
+| `search_assets` | "what have I got called X?" Terms are ANDed across name, path and tags, so `jump femn` finds `A_Jump_Running_Femn.fbx`. Filter by `type`, `pack`, `folder`, `ext`, and by `build` / `engine` for a particular engine build. Identical copies collapse by default. |
 | `get_asset` | Everything about one file: catalog entry, then the file itself — geometry counts, bounds, units, rig family, bone count, materials, the textures it asks for, and the images sitting beside it. `inspect: "full"` also lists every node and bone. |
 | `list_packs` | One row per pack, with files / meshes / clips / textures / Unreal assets. |
 | `browse` | The folder tree, one level per call, like the Atlas folder pane. |
@@ -67,9 +67,34 @@ twelve seconds — so every read is cached by the file's size and timestamp.
 | `find_animations` | Clips, optionally only those on a given rig. Pass a character's path and the rig is read off that character. Matching means reading each clip, so it is slower than a search. |
 | `find_attachments` | Kit in a character's own pack that could be worn on it, grouped by body part. |
 | `get_texture` | Hands back an image so it can be looked at rather than described. |
+| `find_packs` | One row per **pack** rather than per archive, with the builds it ships -- source files, and Unreal or Unity per engine version. Takes `engine="5.4"`. Start here. |
+| `find_duplicates` | What the library holds more than one copy of, biggest waste first. |
+| `export_assets` | Writes assets out of their archives into a folder, keeping archive-relative paths. The step that turns a search into files. |
 
 Paths look like `zip:<archive>::<entry>` for files inside an archive. Pass them
 back verbatim; the server reads the entry out of the zip in place.
+
+## Building in Unreal
+
+A pack arrives several times over, and only the archive name says which engine
+a build targets -- an `.uasset` does not. So ask `find_packs` first:
+
+```
+find_packs(query="dungeon")        -> which packs exist, and their builds
+find_packs(engine="5.4")           -> packs with a 5.4 build
+search_assets(query="crate", engine="5.4")
+export_assets(dest="D:/MyGame/Content", pack="CityZombies", engine="5.4")
+```
+
+A **source** build holds FBX and OBJ: that is what `get_asset` can read
+geometry, rigs and bounds out of, and what you import yourself. An **unreal**
+build holds `.uasset` and `.umap` only -- no geometry readable outside the
+engine, and tied to its engine version -- but it is what drops straight into a
+project, materials and blueprints included.
+
+`export_assets` requires a destination and a selection, keeps files already
+there unless `overwrite=true`, never deletes anything, and refuses archive
+entries whose names would write outside the destination.
 
 ## The rig_family gap
 
@@ -94,7 +119,7 @@ It fixes the rig filter inside Atlas too, for the same reason.
 cd work/atlas_mcp && python -I -m unittest
 ```
 
-39 of them, over a catalog the tests build themselves — the protocol handshake,
+73 of them, over catalogs the tests build themselves — the protocol handshake,
 the search semantics, the folder walk, and a mirror test that reads the
 `attachPoints` table out of `lib/main.dart` and fails if the copy here has
 drifted from it. That table is restated in a second language, which is the kind

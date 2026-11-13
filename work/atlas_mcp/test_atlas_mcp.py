@@ -15,6 +15,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 
 import atlas_mcp
 
@@ -380,6 +381,394 @@ class FormattingTest(unittest.TestCase):
             atlas_mcp.parse_zip_path("zip:K:/a.zip::b/c.fbx"),
             ("K:/a.zip", "b/c.fbx"))
         self.assertIsNone(atlas_mcp.parse_zip_path("K:/a/b.fbx"))
+
+
+# A second catalog, richer than FIXTURE: the same pack several times over, the
+# way Synty actually ships -- source files, two engine builds, and a pack
+# re-release -- because that is what the duplicate and build tools are about.
+BUILDS_ROOT = r"K:\Assets\Synty"
+
+
+def _build_asset(archive, entry, name, size, **overrides):
+    ext = name.rsplit(".", 1)[-1].lower()
+    row = {
+        "id": "asset:v2:" + (archive + "/" + entry).lower(),
+        "name": name,
+        "path": "zip:%s\\%s::%s" % (BUILDS_ROOT, archive, entry),
+        "relative_path": "Synty/%s!/%s" % (archive, entry),
+        "source_root": BUILDS_ROOT,
+        "source_name": "Synty",
+        "ext": ext,
+        "type": {"fbx": "model", "png": "image",
+                 "uasset": "unreal", "umap": "unreal"}.get(ext, "other"),
+        "size": size,
+        "modified_ms": 0,
+        "tags_json": json.dumps(name.lower().replace(".", "_").split("_")),
+        "ignored": 0,
+        "model_kind": "mesh" if ext == "fbx" else None,
+        "rig_family": None,
+        "referenced_by_model": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+# SM_Bld_Door_01.fbx is byte-identical in three archives; the Wall is unique.
+BUILD_FIXTURE = [
+    _build_asset("POLYGON_Town_SourceFiles.zip", "SourceFiles/FBX/SM_Bld_Door_01.fbx",
+                 "SM_Bld_Door_01.fbx", 2048),
+    _build_asset("POLYGON_Town_SourceFiles_v3.zip", "SourceFiles/FBX/SM_Bld_Door_01.fbx",
+                 "SM_Bld_Door_01.fbx", 2048),
+    _build_asset("PolygonTown_Source_Files.zip", "SourceFiles/FBX/SM_Bld_Door_01.fbx",
+                 "SM_Bld_Door_01.fbx", 2048),
+    _build_asset("POLYGON_Town_SourceFiles.zip", "SourceFiles/FBX/SM_Bld_Wall_01.fbx",
+                 "SM_Bld_Wall_01.fbx", 3072),
+    _build_asset("POLYGON_Town_Unreal_5_4_v1_2_0.zip",
+                 "PolygonTown/Content/SM_Bld_Door_01.uasset",
+                 "SM_Bld_Door_01.uasset", 9000),
+    _build_asset("POLYGON_Town_Unreal_4_25_v1_1_0.zip",
+                 "PolygonTown/Content/SM_Bld_Door_01.uasset",
+                 "SM_Bld_Door_01.uasset", 8000),
+    _build_asset("POLYGON_Dungeon_Realms_Unreal_5_4_v1_5_0.zip",
+                 "PolygonDungeon/Content/SM_Bld_Crypt_01.uasset",
+                 "SM_Bld_Crypt_01.uasset", 7000),
+    _build_asset("POLYGON_Dungeons_Realms_SourceFiles_v4.zip",
+                 "SourceFiles/FBX/SM_Bld_Crypt_01.fbx",
+                 "SM_Bld_Crypt_01.fbx", 4096),
+]
+
+
+def build_builds_catalog(path):
+    connection = sqlite3.connect(path)
+    connection.executescript(SCHEMA)
+    columns = list(BUILD_FIXTURE[0])
+    connection.executemany(
+        "INSERT INTO catalog_assets (%s) VALUES (%s)"
+        % (",".join(columns), ",".join("?" * len(columns))),
+        [[row[c] for c in columns] for row in BUILD_FIXTURE])
+    connection.execute("INSERT INTO catalog_sources VALUES (?)", (BUILDS_ROOT,))
+    connection.commit()
+    connection.close()
+
+
+class ArchiveNameTest(unittest.TestCase):
+    """The one place a name is read on purpose: which engine a build targets.
+
+    That fact is not inside the files -- an Unreal build is .uasset, which
+    says nothing about its engine version -- and it is the first thing anyone
+    assembling a project needs.
+    """
+
+    def test_a_built_archive_yields_its_engine_and_pack_version(self):
+        info = atlas_mcp.parse_archive_name("POLYGON_Shops_Unreal_5_4_v1_9_0.zip")
+        self.assertEqual(info["family"], "polygon")
+        self.assertEqual(info["pack_key"], "shop")
+        self.assertEqual(info["build"], "unreal")
+        self.assertEqual(info["engine"], "5.4")
+        self.assertEqual(info["version"], "1_9_0")
+
+    def test_source_builds_carry_no_engine(self):
+        info = atlas_mcp.parse_archive_name("POLYGON_Town_SourceFiles_v4.zip")
+        self.assertEqual(info["build"], "source")
+        self.assertIsNone(info["engine"])
+        self.assertEqual(info["version"], "4")
+
+    def test_unity_is_told_apart_from_unreal(self):
+        info = atlas_mcp.parse_archive_name("POLYGON_City_Characters_Unity_5_6.zip")
+        self.assertEqual(info["build"], "unity")
+        self.assertEqual(info["engine"], "5.6")
+
+    def test_a_camel_joined_prefix_groups_with_the_underscored_one(self):
+        # PolygonOffice_SourceFiles and POLYGON_Office_SourceFiles_v2 are one
+        # pack. Stripping the family before splitting runCamelCase missed
+        # this and split Office, Town and Shops into two packs each.
+        self.assertEqual(
+            atlas_mcp.parse_archive_name("PolygonOffice_SourceFiles.zip")["pack_key"],
+            atlas_mcp.parse_archive_name(
+                "POLYGON_Office_SourceFiles_v2.zip")["pack_key"])
+
+    def test_a_stray_plural_groups_too(self):
+        # Synty ships "Dungeon_Realms" and "Dungeons_Realms".
+        self.assertEqual(
+            atlas_mcp.parse_archive_name(
+                "POLYGON_Dungeon_Realms_Unreal_5_1_v1_5_0.zip")["pack_key"],
+            atlas_mcp.parse_archive_name(
+                "POLYGON_Dungeons_Realms_SourceFiles_v4.zip")["pack_key"])
+
+    def test_a_bare_version_with_no_engine_word_is_an_unreal_project(self):
+        # PolygonDungeonRealms_4_22_Sub_02.zip: every archive shaped like this
+        # in the library is an Unreal export.
+        info = atlas_mcp.parse_archive_name("PolygonDungeonRealms_4_22_Sub_02.zip")
+        self.assertEqual(info["build"], "unreal")
+        self.assertEqual(info["engine"], "4.22")
+        self.assertEqual(info["pack_key"], "dungeon realm")
+
+    def test_a_browser_copy_marker_is_not_part_of_the_name(self):
+        info = atlas_mcp.parse_archive_name(
+            "POLYGON_BattleRoyale_Unreal_5_3_v1_8_0 (1).zip")
+        self.assertEqual(info["pack_key"], "battle royale")
+        self.assertEqual(info["engine"], "5.3")
+
+    def test_near_miss_names_are_left_apart_rather_than_guessed(self):
+        # "Explorer" and "Explorer Kit" may well be the same product, but
+        # fuzzy-merging pack names would also merge things that are not.
+        self.assertNotEqual(
+            atlas_mcp.parse_archive_name("POLYGON_Explorer_Unreal_4_25_v1_4.zip")["pack_key"],
+            atlas_mcp.parse_archive_name("POLYGON_ExplorerKit_SourceFiles.zip")["pack_key"])
+
+    def test_a_build_reads_as_one_phrase(self):
+        self.assertEqual(
+            atlas_mcp.describe_build(atlas_mcp.parse_archive_name(
+                "POLYGON_Town_Unreal_5_4_v1_2_0.zip")),
+            "unreal 5.4 (v1_2_0)")
+        self.assertEqual(atlas_mcp.describe_build(None), "loose files")
+
+
+class BuildsCatalogTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.mkdtemp(prefix="atlas-mcp-builds-")
+        cls.db = os.path.join(cls.directory, "builds.db")
+        build_builds_catalog(cls.db)
+        cls.previous = atlas_mcp.DB_PATH
+        atlas_mcp.DB_PATH = cls.db
+
+    @classmethod
+    def tearDownClass(cls):
+        atlas_mcp.DB_PATH = cls.previous
+
+    def call(self, name, **arguments):
+        result = atlas_mcp.handle_tools_call({"name": name, "arguments": arguments})
+        self.assertFalse(result.get("isError"), result["content"][0].get("text"))
+        return result["content"][0]["text"]
+
+    def call_raw(self, name, **arguments):
+        return atlas_mcp.handle_tools_call({"name": name, "arguments": arguments})
+
+    def rows_in(self, body):
+        """The numbered result lines, so a count is of rows not substrings.
+
+        Every row prints the file name twice -- once in the summary line and
+        again inside its path -- so counting the name counts double.
+        """
+        return [line for line in body.splitlines()
+                if re.match(r"\s*\d+\. ", line)]
+
+class DedupSearchTest(BuildsCatalogTest):
+    def test_identical_copies_collapse_to_one_row(self):
+        body = self.call("search_assets", query="door", ext="fbx")
+        rows = self.rows_in(body)
+        self.assertEqual(len(rows), 1, body)
+        self.assertIn("SM_Bld_Door_01.fbx", rows[0])
+        self.assertIn("x3 copies", rows[0])
+
+    def test_the_row_says_where_the_other_copies_live(self):
+        body = self.call("search_assets", query="door", ext="fbx")
+        self.assertIn("also in:", body)
+        self.assertIn("POLYGON_Town_SourceFiles_v3.zip", body)
+        self.assertIn("PolygonTown_Source_Files.zip", body)
+
+    def test_a_unique_file_is_not_labelled_as_duplicated(self):
+        body = self.call("search_assets", query="wall", ext="fbx")
+        rows = self.rows_in(body)
+        self.assertEqual(len(rows), 1, body)
+        self.assertIn("SM_Bld_Wall_01.fbx", rows[0])
+        self.assertNotIn("copies", rows[0])
+        self.assertNotIn("also in:", body)
+
+    def test_distinct_false_returns_every_row(self):
+        body = self.call("search_assets", query="door", ext="fbx", distinct=False)
+        self.assertEqual(len(self.rows_in(body)), 3, body)
+
+    def test_the_count_is_of_distinct_files_not_rows(self):
+        grouped = self.call("search_assets", query="door", ext="fbx")
+        self.assertIn("1 distinct files", grouped)
+        every = self.call("search_assets", query="door", ext="fbx", distinct=False)
+        self.assertIn("3 matches", every)
+
+    def test_files_that_differ_in_size_are_not_merged(self):
+        # The same name in two engine builds, different bytes: two files.
+        body = self.call("search_assets", query="door", ext="uasset")
+        self.assertIn("2 distinct files", body)
+
+
+class EngineFilterTest(BuildsCatalogTest):
+    def test_an_engine_version_restricts_to_that_build(self):
+        body = self.call("search_assets", query="door", engine="5.4")
+        self.assertIn("POLYGON_Town_Unreal_5_4_v1_2_0.zip", body)
+        self.assertNotIn("4_25", body)
+
+    def test_a_build_kind_restricts_to_source_or_engine_assets(self):
+        body = self.call("search_assets", query="door", build="source")
+        self.assertIn("SM_Bld_Door_01.fbx", body)
+        self.assertNotIn(".uasset", body)
+
+    def test_an_engine_nobody_has_is_an_error_that_lists_what_there_is(self):
+        result = self.call_raw("search_assets", query="door", engine="9.9")
+        self.assertTrue(result.get("isError"))
+        body = result["content"][0]["text"]
+        self.assertIn("5.4", body)
+        self.assertIn("4.25", body)
+
+    def test_an_unknown_build_kind_is_a_tool_error(self):
+        result = self.call_raw("search_assets", build="godot")
+        self.assertTrue(result.get("isError"))
+        self.assertIn("source", result["content"][0]["text"])
+
+
+class FindPacksTest(BuildsCatalogTest):
+    def test_archives_of_one_pack_are_one_row_with_its_builds(self):
+        body = self.call("find_packs", query="town")
+        self.assertIn("1 packs", body)
+        self.assertIn("source", body)
+        self.assertIn("unreal 5.4", body)
+        self.assertIn("unreal 4.25", body)
+
+    def test_the_engine_filter_keeps_only_packs_built_for_it(self):
+        body = self.call("find_packs", engine="4.25")
+        self.assertIn("Town", body)
+        self.assertNotIn("Dungeon", body)
+
+    def test_a_pack_with_no_match_says_so_rather_than_erroring(self):
+        body = self.call("find_packs", query="spaceship")
+        self.assertIn("No packs matched", body)
+
+    def test_the_plural_and_singular_spellings_are_one_pack(self):
+        body = self.call("find_packs", query="dungeon")
+        self.assertIn("1 packs", body)
+        self.assertIn("unreal 5.4", body)
+        self.assertIn("source", body)
+
+
+class FindDuplicatesTest(BuildsCatalogTest):
+    def test_the_waste_is_counted_in_bytes_not_just_files(self):
+        body = self.call("find_duplicates")
+        self.assertIn("SM_Bld_Door_01.fbx", body)
+        self.assertIn("3 copies", body)
+        # Two redundant copies of a 2048-byte file.
+        self.assertIn("4.0 KB", body)
+
+    def test_unique_files_are_not_listed(self):
+        body = self.call("find_duplicates")
+        self.assertNotIn("SM_Bld_Wall_01.fbx", body)
+
+    def test_an_extension_narrows_it(self):
+        body = self.call("find_duplicates", ext="uasset")
+        self.assertIn("No duplicates", body)
+
+
+class ExportTest(unittest.TestCase):
+    """Writing assets out of their archives, which is a real side effect."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.mkdtemp(prefix="atlas-mcp-export-")
+        cls.archive = os.path.join(cls.directory, "POLYGON_Town_Unreal_5_4_v1_2_0.zip")
+        with zipfile.ZipFile(cls.archive, "w") as zf:
+            zf.writestr("PolygonTown/Content/SM_Bld_Door_01.uasset", b"door-bytes")
+            zf.writestr("PolygonTown/Content/SM_Bld_Wall_01.uasset", b"wall-bytes")
+
+        cls.db = os.path.join(cls.directory, "export.db")
+        connection = sqlite3.connect(cls.db)
+        connection.executescript(SCHEMA)
+        rows = []
+        for entry, name, size in (
+                ("PolygonTown/Content/SM_Bld_Door_01.uasset",
+                 "SM_Bld_Door_01.uasset", 10),
+                ("PolygonTown/Content/SM_Bld_Wall_01.uasset",
+                 "SM_Bld_Wall_01.uasset", 10)):
+            rows.append({
+                "id": "asset:v2:" + entry.lower(),
+                "name": name,
+                "path": "zip:%s::%s" % (cls.archive, entry),
+                "relative_path": "Town/POLYGON_Town_Unreal_5_4_v1_2_0.zip!/" + entry,
+                "source_root": cls.directory,
+                "source_name": "Town",
+                "ext": "uasset",
+                "type": "unreal",
+                "size": size,
+                "modified_ms": 0,
+                "tags_json": "[]",
+                "ignored": 0,
+                "model_kind": None,
+                "rig_family": None,
+                "referenced_by_model": 0,
+            })
+        columns = list(rows[0])
+        connection.executemany(
+            "INSERT INTO catalog_assets (%s) VALUES (%s)"
+            % (",".join(columns), ",".join("?" * len(columns))),
+            [[row[c] for c in columns] for row in rows])
+        connection.execute("INSERT INTO catalog_sources VALUES (?)", (cls.directory,))
+        connection.commit()
+        connection.close()
+
+        cls.previous = atlas_mcp.DB_PATH
+        atlas_mcp.DB_PATH = cls.db
+
+    @classmethod
+    def tearDownClass(cls):
+        atlas_mcp.DB_PATH = cls.previous
+
+    def export(self, **arguments):
+        result = atlas_mcp.handle_tools_call(
+            {"name": "export_assets", "arguments": arguments})
+        return result
+
+    def test_entries_keep_their_archive_relative_path(self):
+        dest = tempfile.mkdtemp(prefix="atlas-export-dest-")
+        body = self.export(dest=dest, ext="uasset")["content"][0]["text"]
+        self.assertIn("Wrote 2 files", body)
+        landed = os.path.join(dest, "PolygonTown", "Content", "SM_Bld_Door_01.uasset")
+        self.assertTrue(os.path.exists(landed))
+        with open(landed, "rb") as handle:
+            self.assertEqual(handle.read(), b"door-bytes")
+
+    def test_existing_files_are_left_alone_unless_asked(self):
+        dest = tempfile.mkdtemp(prefix="atlas-export-dest-")
+        self.export(dest=dest, ext="uasset")
+        again = self.export(dest=dest, ext="uasset")["content"][0]["text"]
+        self.assertIn("Wrote 0 files", again)
+        self.assertIn("already-present", again)
+        forced = self.export(dest=dest, ext="uasset",
+                             overwrite=True)["content"][0]["text"]
+        self.assertIn("Wrote 2 files", forced)
+
+    def test_a_selection_is_required(self):
+        dest = tempfile.mkdtemp(prefix="atlas-export-dest-")
+        result = self.export(dest=dest)
+        self.assertTrue(result.get("isError"))
+        self.assertIn("whole catalog", result["content"][0]["text"])
+
+    def test_a_destination_is_required(self):
+        result = self.export(ext="uasset")
+        self.assertTrue(result.get("isError"))
+
+    def test_one_asset_can_be_named_outright(self):
+        dest = tempfile.mkdtemp(prefix="atlas-export-dest-")
+        body = self.export(
+            dest=dest, paths=["SM_Bld_Wall_01.uasset"])["content"][0]["text"]
+        self.assertIn("Wrote 1 files", body)
+        self.assertTrue(os.path.exists(os.path.join(
+            dest, "PolygonTown", "Content", "SM_Bld_Wall_01.uasset")))
+
+
+class SafePathTest(unittest.TestCase):
+    """An archive is untrusted input, and an export writes to disk."""
+
+    def test_an_entry_cannot_climb_out_of_the_destination(self):
+        for entry in ("../../evil.txt", "a/../../b", "/etc/passwd",
+                      "C:/evil.txt", "..", ""):
+            self.assertIsNone(atlas_mcp._safe_relative(entry), entry)
+
+    def test_an_ordinary_entry_survives(self):
+        self.assertEqual(
+            atlas_mcp._safe_relative("PolygonTown/Content/A.uasset"),
+            os.path.join("PolygonTown", "Content", "A.uasset"))
+
+    def test_a_leading_dot_is_dropped_rather_than_refused(self):
+        self.assertEqual(atlas_mcp._safe_relative("./x/y.png"),
+                         os.path.join("x", "y.png"))
 
 
 if __name__ == "__main__":
