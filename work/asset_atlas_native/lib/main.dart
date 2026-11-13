@@ -89,7 +89,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.27';
+const appVersion = '1.10.28';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -283,6 +283,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
         'Restoring catalog in the background...',
       );
       _restorePersistedCatalog();
+      // The MCP's model tools ask the running app rather than restating its
+      // texture and rig logic, so the bridge is up for as long as the window
+      // is. Not in tests: binding a port is not a widget test's business.
+      AtlasBridge.instance.bindCatalog(() => assets);
+      unawaited(AtlasBridge.instance.start());
     } else {
       loadingPersisted = false;
     }
@@ -726,6 +731,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
     _searchDebounce?.cancel();
     searchController.dispose();
     folderFilterController.dispose();
+    unawaited(AtlasBridge.instance.stop());
     super.dispose();
   }
 
@@ -14768,4 +14774,592 @@ class PersistedProject {
 
 
 
+
+
+// ---------------------------------------------------------------------------
+// The MCP bridge
+// ---------------------------------------------------------------------------
+
+/// A loopback HTTP server that answers questions only the running app can.
+///
+/// The MCP server reads the catalog directly and answers most questions from
+/// it, but three of them are not in the database: whether a model's textures
+/// actually resolve, whether a file is one model or a sheet of twelve, and
+/// whether a clip will drive a given character. Atlas computes all of that,
+/// here, in this file -- the texture scoring, [objectSlotsOf], the rig
+/// comparison -- and restating any of it in Python would be two copies of
+/// load-bearing logic drifting apart, which is what the `attachPoints` guard
+/// test in `test_atlas_mcp.py` exists to catch.
+///
+/// So the MCP asks the app instead. The cost is that those tools need Atlas
+/// open; the catalog tools go on working without it.
+///
+/// Loopback only, and a token the caller has to echo back: any process on this
+/// machine can reach a listening socket, and this one loads and rasterises
+/// files on request.
+class AtlasBridge {
+  AtlasBridge._();
+
+  static final instance = AtlasBridge._();
+
+  HttpServer? _server;
+  String _token = '';
+  File? _descriptor;
+  List<AssetItem> Function()? _catalog;
+
+  bool get running => _server != null;
+  int? get port => _server?.port;
+
+  /// Where the app's live asset list comes from.
+  ///
+  /// A supplier rather than a copy: the list changes as scans finish, and a
+  /// stale snapshot would answer texture and attachment questions against a
+  /// library that no longer matches the one on screen.
+  void bindCatalog(List<AssetItem> Function() supplier) {
+    _catalog = supplier;
+  }
+
+  List<AssetItem> get _assets => _catalog?.call() ?? const [];
+
+  Future<void> start({Directory? descriptorDirectory}) async {
+    if (_server != null) return;
+    final random = math.Random.secure();
+    _token = List<int>.generate(24, (_) => random.nextInt(256))
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _server = server;
+
+    final directory =
+        descriptorDirectory ?? await getApplicationSupportDirectory();
+    _descriptor = File(
+      '${directory.path}${Platform.pathSeparator}$atlasBridgeFileName',
+    );
+    try {
+      _descriptor!.writeAsStringSync(
+        jsonEncode({
+          'port': server.port,
+          'token': _token,
+          'version': appVersion,
+          'pid': pid,
+          'started': DateTime.now().toIso8601String(),
+        }),
+      );
+    } catch (error) {
+      // A bridge nobody can find is no reason to fail startup: the app's own
+      // job is unaffected.
+      fbxLog('Bridge descriptor could not be written: $error');
+    }
+
+    server.listen(
+      _handle,
+      onError: (Object error) => fbxLog('Bridge listen error: $error'),
+      cancelOnError: false,
+    );
+    fbxLog('MCP bridge listening on 127.0.0.1:${server.port}');
+  }
+
+  Future<void> stop() async {
+    final server = _server;
+    _server = null;
+    final descriptor = _descriptor;
+    _descriptor = null;
+    if (descriptor != null) {
+      try {
+        if (descriptor.existsSync()) descriptor.deleteSync();
+      } catch (_) {
+        // Leaving a stale descriptor behind is survivable: the port will
+        // refuse the connection and the client says Atlas is not running.
+      }
+    }
+    await server?.close(force: true);
+  }
+
+  Future<void> _handle(HttpRequest request) async {
+    final response = request.response;
+    response.headers.contentType = ContentType.json;
+    try {
+      if (request.headers.value(atlasBridgeTokenHeader) != _token) {
+        response.statusCode = HttpStatus.forbidden;
+        response.write(jsonEncode({'error': 'Bad or missing bridge token.'}));
+        return;
+      }
+
+      final route = request.uri.path;
+      if (route == '/health') {
+        response.write(
+          jsonEncode({
+            'version': appVersion,
+            'assets': _assets.length,
+            'pid': pid,
+          }),
+        );
+        return;
+      }
+
+      final body = await utf8.decoder.bind(request).join();
+      final payload = body.trim().isEmpty
+          ? const <String, Object?>{}
+          : (jsonDecode(body) as Map<String, Object?>);
+
+      final Map<String, Object?> answer;
+      switch (route) {
+        case '/inspect':
+          answer = await bridgeInspect(payload, _assets);
+        case '/rig_compat':
+          answer = await bridgeRigCompat(payload, _assets);
+        case '/render':
+          answer = await bridgeRender(payload, _assets);
+        default:
+          response.statusCode = HttpStatus.notFound;
+          response.write(jsonEncode({'error': 'No route $route.'}));
+          return;
+      }
+      response.write(jsonEncode(answer));
+    } on BridgeRequestException catch (error) {
+      response.statusCode = HttpStatus.badRequest;
+      response.write(jsonEncode({'error': error.message}));
+    } catch (error) {
+      response.statusCode = HttpStatus.internalServerError;
+      response.write(jsonEncode({'error': '$error'}));
+    } finally {
+      try {
+        await response.close();
+      } catch (_) {
+        // The client hung up; nothing left to say.
+      }
+    }
+  }
+}
+
+/// The file Atlas drops its port and token into, beside the catalog database.
+const atlasBridgeFileName = 'atlas_bridge.json';
+
+/// The header the caller echoes its token back in.
+const atlasBridgeTokenHeader = 'X-Atlas-Token';
+
+/// Something the caller asked for that cannot be answered, as opposed to a
+/// fault in answering it. Becomes a 400 and a sentence, not a stack trace.
+class BridgeRequestException implements Exception {
+  const BridgeRequestException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// JSON cannot carry an infinity or a NaN, and two of these measurements are
+/// legitimately both: [rigAxisDifference] returns infinity for "no comparison
+/// possible", and an empty mesh has no bounds. Null says that honestly.
+Object? _jsonNumber(double value) => value.isFinite ? value : null;
+
+/// Finds the one asset a request means.
+///
+/// Exact path first, then a path ending, then a unique name. A name that
+/// matches several files is an error rather than a guess -- picking the first
+/// of eleven `SM_Door_01.fbx` would answer confidently about the wrong file.
+AssetItem bridgeFindAsset(String? needle, List<AssetItem> assets) {
+  final wanted = (needle ?? '').trim();
+  if (wanted.isEmpty) {
+    throw const BridgeRequestException('No path given.');
+  }
+  if (assets.isEmpty) {
+    throw const BridgeRequestException(
+      'Atlas has no catalog loaded yet. Wait for it to finish opening.',
+    );
+  }
+
+  final key = normalizePathKey(wanted);
+  for (final asset in assets) {
+    if (normalizePathKey(asset.path) == key) return asset;
+    if (asset.id == wanted) return asset;
+  }
+
+  final suffixed = <AssetItem>[];
+  final named = <AssetItem>[];
+  final lowerName = wanted.toLowerCase();
+  for (final asset in assets) {
+    if (normalizePathKey(asset.path).endsWith(key)) suffixed.add(asset);
+    if (asset.name.toLowerCase() == lowerName) named.add(asset);
+  }
+  for (final candidates in [suffixed, named]) {
+    if (candidates.length == 1) return candidates.first;
+    if (candidates.length > 1) {
+      final sample = candidates
+          .take(4)
+          .map((a) => a.path)
+          .join('\n  ');
+      throw BridgeRequestException(
+        '$wanted matches ${candidates.length} assets. Give a full path. '
+        'For example:\n  $sample',
+      );
+    }
+  }
+  throw BridgeRequestException('Nothing in the catalog matches $wanted.');
+}
+
+/// What a material asks for and what it got.
+Map<String, Object?> _materialReport(MeshMaterial material) {
+  final textured = material.textureWidth > 0 && material.textureHeight > 0;
+  final resolved = material.resolvedTextures
+      .where((reference) => reference.trim().isNotEmpty)
+      .toList();
+  final missing = material.texturesMissing
+      ? material.textures.where((t) => t.trim().isNotEmpty).toList()
+      : const <String>[];
+  return {
+    'name': material.name,
+    'summary': textured
+        ? materialSummaryLine(
+            material,
+            width: material.textureWidth,
+            height: material.textureHeight,
+          )
+        : materialSummaryLine(material),
+    'textured': textured,
+    'asks': material.textures,
+    'resolved': resolved,
+    'missing': missing,
+    'normalMap': material.hasNormalMap,
+    'emissiveMap': material.hasEmissiveMap,
+    'uvSet': material.uvSet,
+  };
+}
+
+/// The archive a zipped asset lives in, by name. Null for a loose file.
+///
+/// Not [assetContainerKey], which is normalised for comparison -- lowercased,
+/// separators folded -- and so is the wrong thing to show anyone. This is the
+/// name as it reads on disk, and for these packs the archive *is* the pack.
+String? bridgeArchiveName(AssetItem asset) {
+  final zip = parseZipVirtualPath(asset.path);
+  if (zip == null) return null;
+  return zip.zipPath.split(_pathSeparatorPattern).last;
+}
+
+/// Whether this file is one model, a sheet of several, or a kit of parts.
+///
+/// The three cases need different handling downstream and nothing in the file
+/// name distinguishes them, which is why a model asking "can I use this" has
+/// to be told which it is. See [materialsAreStackedVariants] and
+/// [modelIsModularKit] for how each is decided.
+String bridgeModelShape(MeshModel mesh) {
+  if (mesh.isAnimationOnly) return 'animation';
+  if (objectsAreStackedVariants(mesh) || materialsAreStackedVariants(mesh)) {
+    return 'sheet';
+  }
+  if (modelIsModularKit(mesh)) return 'kit';
+  return 'model';
+}
+
+/// Everything the app knows about one model, as JSON.
+Future<Map<String, Object?>> bridgeInspect(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final asset = bridgeFindAsset(payload['path'] as String?, assets);
+  if (asset.effectiveType != 'model' && asset.effectiveType != 'animation') {
+    throw BridgeRequestException(
+      '${asset.name} is a ${asset.effectiveType}, not a model. '
+      'inspect_model reads geometry.',
+    );
+  }
+
+  final mesh = await loadMesh(asset, allAssets: assets);
+  final shape = bridgeModelShape(mesh);
+  final framing = framingOf(mesh);
+
+  var minX = double.infinity, minY = double.infinity, minZ = double.infinity;
+  var maxX = -double.infinity, maxY = -double.infinity, maxZ = -double.infinity;
+  for (final vertex in mesh.vertices) {
+    minX = math.min(minX, vertex.x);
+    minY = math.min(minY, vertex.y);
+    minZ = math.min(minZ, vertex.z);
+    maxX = math.max(maxX, vertex.x);
+    maxY = math.max(maxY, vertex.y);
+    maxZ = math.max(maxZ, vertex.z);
+  }
+
+  // The viewer fits every model into the same box, so the drawn size says
+  // nothing about how big the thing is. The framing scale undoes that, and is
+  // the only way to answer "what units is this in" -- which decides whether a
+  // prop arrives in an Unreal level a hundred times too big.
+  final authoredSize = framing == null || framing.scale <= 0
+      ? null
+      : [
+          (maxX - minX) / framing.scale,
+          (maxY - minY) / framing.scale,
+          (maxZ - minZ) / framing.scale,
+        ];
+
+  final slots = objectSlotsOf(mesh);
+  final warnings = <String>[];
+  var missingTextures = 0;
+  var resolvedTextures = 0;
+  for (final material in mesh.materials) {
+    if (material.texturesMissing) {
+      missingTextures += 1;
+    } else if (material.textureWidth > 0) {
+      resolvedTextures += 1;
+    }
+  }
+  if (missingTextures > 0) {
+    warnings.add(
+      '$missingTextures of ${mesh.materials.length} materials ask for a '
+      'texture that is not in the library. They draw flat.',
+    );
+  }
+  if (shape == 'sheet') {
+    warnings.add(
+      'This file is several whole models standing in the same place, not one '
+      'model. Imported whole they interpenetrate. Take it apart by object.',
+    );
+  }
+  if (shape == 'kit') {
+    warnings.add(
+      'This file is a kit: ${slots.length} slots of interchangeable parts, '
+      'all stacked at their joints. Draw one variant per slot, not all.',
+    );
+  }
+  if (authoredSize == null && asset.ext == 'obj') {
+    warnings.add(
+      'OBJ carries no units. These packs ship OBJ in centimetres beside an '
+      'FBX in metres, so prefer the FBX twin if there is one.',
+    );
+  }
+
+  final skeleton = mesh.skeleton;
+  final rigFamily = skeleton == null
+      ? rigFamilyByName(asset.rigFamily)
+      : rigFamilyOfSkeleton(skeleton);
+
+  return {
+    'name': asset.name,
+    'path': asset.path,
+    'container': assetContainerKey(asset),
+    'archive': bridgeArchiveName(asset),
+    'pack': asset.sourceName,
+    'ext': asset.ext,
+    'size': asset.size,
+    'shape': shape,
+    'kind': mesh.isAnimationOnly ? 'animation' : 'mesh',
+    'vertices': mesh.vertices.length,
+    'faces': mesh.faces.length,
+    'objects': mesh.objectNames.length,
+    'objectNames': mesh.objectNames.take(40).toList(),
+    'bounds': mesh.vertices.isEmpty
+        ? null
+        : {
+            'min': [
+              _jsonNumber(minX),
+              _jsonNumber(minY),
+              _jsonNumber(minZ),
+            ],
+            'max': [
+              _jsonNumber(maxX),
+              _jsonNumber(maxY),
+              _jsonNumber(maxZ),
+            ],
+          },
+    'authoredSize': authoredSize?.map(_jsonNumber).toList(),
+    'framingScale': framing == null ? null : _jsonNumber(framing.scale),
+    'materials': [for (final m in mesh.materials) _materialReport(m)],
+    'texturesResolved': resolvedTextures,
+    'texturesMissing': missingTextures,
+    'rig': {
+      'family': rigFamily.name,
+      'label': rigFamily.label,
+      'bones': skeleton?.bones.length ?? mesh.boneCount,
+      'skinned': mesh.skin != null,
+      'frames': skeleton?.frameCount ?? 0,
+      'durationSeconds': _jsonNumber(mesh.durationSeconds),
+      'clips': mesh.animationNames,
+    },
+    'slots': [
+      for (final slot in slots)
+        {
+          'key': slot.key,
+          'label': slotDisplayName(slot.key),
+          'variants': slot.objects.length,
+        },
+    ],
+    'attachments': [
+      for (final candidate in findAttachmentCandidates(
+        character: asset,
+        allAssets: assets,
+      ).take(60))
+        {
+          'name': candidate.name,
+          'path': candidate.path,
+          'point': attachPointFor(candidate.name)?.name,
+        },
+    ],
+    'textureVariants': [
+      for (final variant in findTextureVariants(
+        mesh: mesh,
+        model: asset,
+        allAssets: assets,
+      ))
+        {'name': variant.name, 'path': variant.path},
+    ],
+    'warnings': warnings,
+  };
+}
+
+/// Whether a clip will drive a character, and how well.
+Future<Map<String, Object?>> bridgeRigCompat(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final character = bridgeFindAsset(payload['character'] as String?, assets);
+  final clip = bridgeFindAsset(payload['clip'] as String?, assets);
+
+  final characterMesh = await loadMesh(character, allAssets: assets);
+  final clipMesh = await loadMesh(clip, allAssets: assets);
+
+  final characterRig = characterMesh.skeleton;
+  final clipRig = clipMesh.skeleton;
+  if (characterRig == null) {
+    throw BridgeRequestException(
+      '${character.name} has no skeleton, so nothing can animate it.',
+    );
+  }
+  if (clipRig == null) {
+    throw BridgeRequestException(
+      '${clip.name} carries no skeleton or motion, so it is not a clip.',
+    );
+  }
+
+  final characterFamily = rigFamilyOfSkeleton(characterRig);
+  final clipFamily = rigFamilyOfSkeleton(clipRig);
+  final shared = rigBoneOverlap(characterRig, clipRig);
+  final compatible = rigFamiliesCompatible(characterFamily, clipFamily);
+  final difference = rigAxisDifference(characterRig, clipRig);
+
+  final String verdict;
+  if (!compatible) {
+    verdict =
+        'No. ${characterFamily.label} and ${clipFamily.label} are different '
+        'rigs; they share $shared bones.';
+  } else if (shared < minimumRigOverlap) {
+    verdict =
+        'No. Only $shared bones in common, below the $minimumRigOverlap '
+        'needed to compare them at all.';
+  } else if (!difference.isFinite) {
+    verdict = 'Probably not: the rigs cannot be compared in their rest poses.';
+  } else if (difference < 5) {
+    verdict =
+        'Yes. $shared shared bones and rest poses agree to '
+        '${difference.toStringAsFixed(1)} degrees.';
+  } else {
+    verdict =
+        'Playable, but the rest poses differ by '
+        '${difference.toStringAsFixed(1)} degrees over $shared shared bones, '
+        'so expect the limbs to sit wrong unless Atlas retargets it.';
+  }
+
+  return {
+    'character': {
+      'name': character.name,
+      'path': character.path,
+      'family': characterFamily.name,
+      'label': characterFamily.label,
+      'bones': characterRig.bones.length,
+    },
+    'clip': {
+      'name': clip.name,
+      'path': clip.path,
+      'family': clipFamily.name,
+      'label': clipFamily.label,
+      'bones': clipRig.bones.length,
+      'frames': clipRig.frameCount,
+      'durationSeconds': _jsonNumber(clipMesh.durationSeconds),
+    },
+    'sharedBones': shared,
+    'familiesCompatible': compatible,
+    'restPoseDifferenceDegrees': _jsonNumber(difference),
+    'willPlay': compatible && shared >= minimumRigOverlap,
+    'verdict': verdict,
+  };
+}
+
+/// Draws a model and hands back a PNG.
+///
+/// The rasteriser is the viewer's own ([rasterizeMesh], pure and synchronous),
+/// so the picture a model is shown is the picture a person would see. A kit is
+/// drawn one variant per slot rather than every part at once, for the same
+/// reason the viewer does it: all of them together is an unreadable pile.
+Future<Map<String, Object?>> bridgeRender(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final asset = bridgeFindAsset(payload['path'] as String?, assets);
+  final size = (payload['size'] as num?)?.toInt() ?? 512;
+  if (size < 64 || size > 2048) {
+    throw const BridgeRequestException('size must be between 64 and 2048.');
+  }
+
+  final mesh = await loadMesh(asset, allAssets: assets);
+  if (mesh.faces.isEmpty) {
+    throw BridgeRequestException(
+      '${asset.name} has no geometry to draw'
+      '${mesh.isAnimationOnly ? ": it is an animation." : "."}',
+    );
+  }
+
+  final slots = objectSlotsOf(mesh);
+  final hidden = modelIsModularKit(mesh)
+      ? hiddenObjectsFor(
+          objectCount: mesh.objectNames.length,
+          slots: slots,
+          choice: List<int>.filled(slots.length, 0),
+        )
+      : null;
+
+  // On a worker isolate even for a small model. [rasterizeMesh] is
+  // synchronous, and the bridge runs on the isolate that draws the window: a
+  // mech rasterised in place freezes Atlas for as long as it takes, in front
+  // of a user who did not ask for a picture and cannot see why it stopped.
+  final raster = await rasterizeSceneInIsolate(
+    RasterRequest(
+      scene: RasterScene.fromMesh(mesh),
+      yaw: (payload['yaw'] as num?)?.toDouble() ?? 0.6,
+      pitch: (payload['pitch'] as num?)?.toDouble() ?? 0.35,
+      zoom: (payload['zoom'] as num?)?.toDouble() ?? 1.0,
+      width: size,
+      height: size,
+      renderMode: RenderMode.textured,
+      lightingMode: LightingMode.corner,
+      cullBackFaces: true,
+      hiddenObjects: hidden,
+    ),
+  );
+
+  final image = img.Image.fromBytes(
+    width: raster.width,
+    height: raster.height,
+    bytes: raster.pixels.buffer,
+    numChannels: 4,
+  );
+  final png = img.encodePng(image);
+
+  return {
+    'name': asset.name,
+    'path': asset.path,
+    'width': raster.width,
+    'height': raster.height,
+    'drawnFaces': raster.drawnFaces,
+    'totalFaces': raster.totalFaces,
+    // Not RasterResult.capped, which is true whenever any face went undrawn
+    // -- including the back half of every closed model, culled on purpose.
+    // Reported as "capped" that reads as a truncated mesh, which would have
+    // the caller distrust a picture of the whole thing.
+    'capped': raster.totalFaces > maxRenderedFaces,
+    'faceLimit': maxRenderedFaces,
+    'shape': bridgeModelShape(mesh),
+    'png': base64Encode(png),
+  };
+}
 

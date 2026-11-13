@@ -70,6 +70,9 @@ twelve seconds — so every read is cached by the file's size and timestamp.
 | `find_packs` | One row per **pack** rather than per archive, with the builds it ships -- source files, and Unreal or Unity per engine version. Takes `engine="5.4"`. Start here. |
 | `find_duplicates` | What the library holds more than one copy of, biggest waste first. |
 | `export_assets` | Writes assets out of their archives into a folder, keeping archive-relative paths. The step that turns a search into files. |
+| `inspect_model` | Whether a model is actually usable: which textures resolve, whether it is one model or a sheet or a kit, its real authored size, its rig, the kit pieces that fit it. **Needs Atlas running.** |
+| `rig_compatibility` | Whether a clip will drive a character, and how far apart their rest poses sit. **Needs Atlas running.** |
+| `render_asset` | Draws a model with Atlas's own renderer and hands back the picture. **Needs Atlas running.** |
 
 Paths look like `zip:<archive>::<entry>` for files inside an archive. Pass them
 back verbatim; the server reads the entry out of the zip in place.
@@ -96,6 +99,35 @@ project, materials and blueprints included.
 there unless `overwrite=true`, never deletes anything, and refuses archive
 entries whose names would write outside the destination.
 
+## The three tools that need Atlas open
+
+Most of this server reads the catalog and the FBX reader directly and works
+whether or not the app is running. Three tools do not, because what they
+answer is not in the database: does this model's textures resolve, is this
+file one model or a sheet of twelve, will this clip drive that character.
+Atlas computes all of it already, and restating any of it here would be a
+second copy of load-bearing logic drifting out of step with the one the app
+uses.
+
+So those three ask the app. Atlas opens a loopback HTTP server when its window
+opens and writes the port and a token to `atlas_bridge.json` beside the
+catalog; this server reads that file. Nothing is exposed off the machine, and
+a request without the token is refused.
+
+```
+inspect_model(path="...SK_Dungeon_GoblinChief_01.fbx")
+rig_compatibility(character="...GoblinChief_01.fbx", clip="...A_Idle.fbx")
+render_asset(path="...SM_Prop_RubbishBin_02.fbx", size=512)
+```
+
+With Atlas closed they say so and name the alternative; everything else keeps
+working. `catalog_stats` reports whether the app is up.
+
+`inspect_model` is the tool to run before importing anything: a name and a
+file size do not say whether a model will arrive whole. It reports the real
+authored size too, which is the number that decides whether a prop lands in a
+level a hundred times too big.
+
 ## The rig_family gap
 
 Atlas fills `rig_family` in lazily — it reads a file when a filter needs the
@@ -119,7 +151,7 @@ It fixes the rig filter inside Atlas too, for the same reason.
 cd work/atlas_mcp && python -I -m unittest
 ```
 
-73 of them, over catalogs the tests build themselves — the protocol handshake,
+109 of them, over catalogs the tests build themselves — the protocol handshake,
 the search semantics, the folder walk, and a mirror test that reads the
 `attachPoints` table out of `lib/main.dart` and fails if the copy here has
 drifted from it. That table is restated in a second language, which is the kind

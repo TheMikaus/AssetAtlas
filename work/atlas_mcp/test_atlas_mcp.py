@@ -8,12 +8,16 @@ actually uses -- the hazard of restating a table in a second language.
 Run: python -m unittest discover -s work/atlas_mcp
 """
 
+import base64
+import http.server
 import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
+import threading
 import unittest
 import zipfile
 
@@ -769,6 +773,361 @@ class SafePathTest(unittest.TestCase):
     def test_a_leading_dot_is_dropped_rather_than_refused(self):
         self.assertEqual(atlas_mcp._safe_relative("./x/y.png"),
                          os.path.join("x", "y.png"))
+
+
+# A stub standing in for the running app. Atlas's own side of this contract is
+# tested in Dart (test/bridge_test.dart); what is tested here is the client:
+# that it finds the endpoint, carries the token, and turns the app's JSON into
+# something worth reading.
+BRIDGE_ROUTES = {}
+BRIDGE_SEEN = []
+BRIDGE_TOKEN = "token-for-tests"
+
+
+class _StubAtlas(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, *args):
+        """Quiet: the test runner's output is not a web server log."""
+
+    def _reply(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._serve(None)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        self._serve(json.loads(raw.decode("utf-8")) if raw else {})
+
+    def _serve(self, payload):
+        token = self.headers.get("X-Atlas-Token")
+        BRIDGE_SEEN.append({"path": self.path, "payload": payload,
+                            "token": token})
+        if token != BRIDGE_TOKEN:
+            self._reply(403, {"error": "Bad or missing bridge token."})
+            return
+        if self.path not in BRIDGE_ROUTES:
+            self._reply(404, {"error": "No route %s." % self.path})
+            return
+        status, body = BRIDGE_ROUTES[self.path]
+        self._reply(status, body)
+
+
+INSPECT_REPORT = {
+    "name": "SK_PolygonMech_Main_Full.fbx",
+    "archive": "POLYGON_Mech_SourceFiles_v2.zip",
+    "path": r"zip:Z:\Polygon-Mech.zip::Mech/SK_PolygonMech_Main_Full.fbx",
+    "pack": "Polygon-Mech",
+    "shape": "kit",
+    "faces": 261410,
+    "vertices": 148302,
+    "objects": 215,
+    "authoredSize": [180.0, 420.5, 160.25],
+    "materials": [
+        {"name": "Mech_Body", "summary": "textured 2048x2048, normal map"},
+        {"name": "Mech_Glass", "summary": "missing: asks for 1 texture, none found"},
+    ],
+    "texturesResolved": 1,
+    "texturesMissing": 1,
+    "rig": {"family": "polygon", "label": "Polygon", "bones": 52,
+            "skinned": True, "frames": 0, "durationSeconds": 0, "clips": []},
+    "slots": [{"key": "geo_head", "label": "Head", "variants": 8},
+              {"key": "geo_l_shoulder", "label": "Shoulder L", "variants": 10}],
+    "attachments": [{"name": "SM_Wep_Rifle_01.fbx", "path": "x", "point": "Right hand"}],
+    "textureVariants": [{"name": "T_Mech_Red.png", "path": "y"}],
+    "warnings": ["This file is a kit: 2 slots of interchangeable parts."],
+}
+
+RIG_REPORT = {
+    "character": {"name": "Chr_Hero.fbx", "path": "a", "family": "polygon",
+                  "label": "Polygon", "bones": 52},
+    "clip": {"name": "A_Jump.fbx", "path": "b", "family": "sidekick",
+             "label": "Sidekick", "bones": 121, "frames": 40,
+             "durationSeconds": 1.33},
+    "sharedBones": 0,
+    "familiesCompatible": False,
+    "restPoseDifferenceDegrees": None,
+    "willPlay": False,
+    "verdict": "No. Polygon and Sidekick are different rigs; they share 0 bones.",
+}
+
+
+class BridgeTest(unittest.TestCase):
+
+    def setUp(self):
+        BRIDGE_ROUTES.clear()
+        del BRIDGE_SEEN[:]
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), _StubAtlas)
+        # serve_forever polls at half a second by default, and shutdown waits
+        # for the next tick, which put eight seconds of nothing into the run.
+        self.thread = threading.Thread(
+            target=lambda: self.server.serve_forever(poll_interval=0.01),
+            daemon=True)
+        self.thread.start()
+        self.temp = tempfile.mkdtemp(prefix="atlas-bridge-client")
+        self.descriptor = os.path.join(self.temp, "atlas_bridge.json")
+        self.write_descriptor(port=self.server.server_address[1],
+                              token=BRIDGE_TOKEN)
+        self.saved_path = atlas_mcp.BRIDGE_PATH
+        atlas_mcp.BRIDGE_PATH = self.descriptor
+
+    def tearDown(self):
+        atlas_mcp.BRIDGE_PATH = self.saved_path
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def write_descriptor(self, **fields):
+        with io.open(self.descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(fields))
+
+    def route(self, path, body, status=200):
+        BRIDGE_ROUTES[path] = (status, body)
+
+    def body_of(self, result):
+        return result["content"][0]["text"]
+
+
+class BridgeClientTest(BridgeTest):
+
+    def test_it_finds_the_running_app_through_the_descriptor(self):
+        self.route("/health", {"version": "1.10.28", "assets": 73865})
+        self.assertEqual(atlas_mcp.bridge_version(), "1.10.28")
+
+    def test_it_carries_the_token_the_app_wrote(self):
+        self.route("/health", {"version": "1.10.28"})
+        atlas_mcp.bridge_version()
+        self.assertEqual(BRIDGE_SEEN[-1]["token"], BRIDGE_TOKEN)
+
+    def test_no_descriptor_means_atlas_is_not_running(self):
+        os.remove(self.descriptor)
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.bridge_call("/inspect", {"path": "x"})
+        self.assertIn("not running", str(caught.exception))
+        self.assertIn("Open Atlas", str(caught.exception))
+
+    def test_an_unreadable_descriptor_is_not_a_crash(self):
+        with io.open(self.descriptor, "w", encoding="utf-8") as handle:
+            handle.write("{half a json")
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.bridge_call("/inspect", {"path": "x"})
+        self.assertIn("not running", str(caught.exception))
+
+    def test_a_descriptor_without_a_port_is_not_a_crash(self):
+        self.write_descriptor(token=BRIDGE_TOKEN)
+        with self.assertRaises(atlas_mcp.AtlasError):
+            atlas_mcp.bridge_call("/inspect", {"path": "x"})
+
+    def test_a_descriptor_left_behind_by_a_crash_says_so(self):
+        # Atlas killed rather than closed leaves the file pointing at a port
+        # that now refuses. That has to read as "not running", not as a
+        # network error the caller cannot act on.
+        self.server.shutdown()
+        self.server.server_close()
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.bridge_call("/inspect", {"path": "x"})
+        self.assertIn("not running", str(caught.exception))
+
+    def test_the_apps_own_sentence_reaches_the_caller(self):
+        self.route("/inspect", {"error": "SM_Door_01.fbx matches 2 assets."},
+                   status=400)
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.bridge_call("/inspect", {"path": "SM_Door_01.fbx"})
+        self.assertEqual(str(caught.exception),
+                         "SM_Door_01.fbx matches 2 assets.")
+
+    def test_the_payload_arrives_as_the_app_expects_it(self):
+        self.route("/inspect", INSPECT_REPORT)
+        atlas_mcp.tool_inspect_model({"path": "SK_PolygonMech_Main_Full.fbx"})
+        self.assertEqual(BRIDGE_SEEN[-1]["payload"],
+                         {"path": "SK_PolygonMech_Main_Full.fbx"})
+
+    def test_version_is_none_rather_than_an_error_when_atlas_is_closed(self):
+        # catalog_stats calls this on every run and must not fail because
+        # the app happens to be shut.
+        os.remove(self.descriptor)
+        self.assertIsNone(atlas_mcp.bridge_version())
+
+
+class InspectFormattingTest(BridgeTest):
+
+    def report(self, **overrides):
+        body = dict(INSPECT_REPORT)
+        body.update(overrides)
+        self.route("/inspect", body)
+        return self.body_of(atlas_mcp.tool_inspect_model({"path": "x"}))
+
+    def test_it_says_which_of_the_three_shapes_the_file_is(self):
+        self.assertIn("kit of interchangeable parts", self.report())
+        self.assertIn("sheet of several whole models",
+                      self.report(shape="sheet"))
+        self.assertIn("one model", self.report(shape="model"))
+
+    def test_it_counts_the_geometry_readably(self):
+        self.assertIn("261,410 faces", self.report())
+
+    def test_it_gives_the_authored_size_not_the_drawn_one(self):
+        # The viewer fits everything into the same box, so the drawn size is
+        # the same for a rivet and a cathedral. This is the number that says
+        # whether a prop will arrive in a level a hundred times too big.
+        self.assertIn("as the artist built it", self.report())
+        self.assertIn("420", self.report())
+
+    def test_it_names_the_material_that_did_not_resolve(self):
+        body = self.report()
+        self.assertIn("1 of 2 materials textured", body)
+        self.assertIn("Mech_Glass", body)
+        self.assertIn("none found", body)
+
+    def test_it_reports_the_rig_and_that_it_is_skinned(self):
+        self.assertIn("Polygon, 52 bones, skinned", self.report())
+
+    def test_it_lists_the_slots_with_their_variant_counts(self):
+        self.assertIn("Head x8", self.report())
+
+    def test_it_names_the_archive_rather_than_the_scanned_root(self):
+        # "pack" is the scanned root's name, which is the same unhelpful word
+        # on 50,000 files here. The archive is what someone can act on.
+        body = self.report()
+        self.assertIn("POLYGON_Mech_SourceFiles_v2.zip", body)
+        self.assertNotIn("Polygon-Mech", body.splitlines()[0])
+
+    def test_a_loose_file_falls_back_to_its_source_name(self):
+        body = self.report(archive=None)
+        self.assertIn("Polygon-Mech", body.splitlines()[0])
+
+    def test_one_recolour_is_not_described_in_the_plural(self):
+        self.assertIn("1 other texture in this archive fits it", self.report())
+
+    def test_an_attachment_with_no_known_point_is_listed_without_an_arrow(self):
+        body = self.report(attachments=[{"name": "SM_Mech_Ankle_01.fbx",
+                                         "path": "x", "point": None}])
+        self.assertIn("SM_Mech_Ankle_01.fbx", body)
+        self.assertNotIn("->", body)
+
+    def test_it_lists_the_kit_pieces_that_fit(self):
+        self.assertIn("SM_Wep_Rifle_01.fbx", self.report())
+        self.assertIn("Right hand", self.report())
+
+    def test_a_warning_is_marked_so_it_is_not_skimmed_past(self):
+        self.assertIn("!", self.report())
+        self.assertIn("This file is a kit", self.report())
+
+    def test_a_long_material_list_is_cut_rather_than_dumped(self):
+        many = [{"name": "M_%d" % i, "summary": "flat colour, no texture"}
+                for i in range(30)]
+        body = self.report(materials=many)
+        self.assertIn("and 18 more", body)
+
+    def test_a_model_with_no_rig_does_not_claim_one(self):
+        body = self.report(rig={"family": "none", "label": "No rig",
+                                "bones": 0, "skinned": False})
+        self.assertNotIn("bones", body)
+
+    def test_a_file_with_no_measurable_size_omits_the_line(self):
+        body = self.report(authoredSize=None)
+        self.assertNotIn("as the artist built it", body)
+
+
+class RigCompatFormattingTest(BridgeTest):
+
+    def test_the_verdict_comes_first(self):
+        self.route("/rig_compat", RIG_REPORT)
+        body = self.body_of(
+            atlas_mcp.tool_rig_compatibility({"character": "a", "clip": "b"}))
+        self.assertTrue(body.startswith("No. Polygon and Sidekick"), body)
+
+    def test_it_shows_both_rigs_and_the_overlap(self):
+        self.route("/rig_compat", RIG_REPORT)
+        body = self.body_of(
+            atlas_mcp.tool_rig_compatibility({"character": "a", "clip": "b"}))
+        self.assertIn("Polygon, 52 bones", body)
+        self.assertIn("Sidekick, 121 bones", body)
+        self.assertIn("shared bones", body)
+
+    def test_rest_poses_that_cannot_be_compared_say_so(self):
+        # rigAxisDifference returns infinity for "no comparison possible",
+        # which crosses as null rather than as a number.
+        self.route("/rig_compat", RIG_REPORT)
+        body = self.body_of(
+            atlas_mcp.tool_rig_compatibility({"character": "a", "clip": "b"}))
+        self.assertIn("not comparable", body)
+
+    def test_a_degree_figure_is_printed_when_there_is_one(self):
+        body = dict(RIG_REPORT)
+        body["restPoseDifferenceDegrees"] = 37.42
+        self.route("/rig_compat", body)
+        text_body = self.body_of(
+            atlas_mcp.tool_rig_compatibility({"character": "a", "clip": "b"}))
+        self.assertIn("37.4 degrees apart", text_body)
+
+
+class RenderFormattingTest(BridgeTest):
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"pretend this is pixels"
+
+    def render(self, **overrides):
+        body = {"name": "SM_Crate_01.fbx", "path": "x", "width": 512,
+                "height": 512, "drawnFaces": 1200, "totalFaces": 2400,
+                "capped": False, "shape": "model",
+                "png": base64.b64encode(self.PNG).decode("ascii")}
+        body.update(overrides)
+        self.route("/render", body)
+        return atlas_mcp.tool_render_asset({"path": "x"})
+
+    def test_it_hands_back_the_picture_as_an_image(self):
+        result = self.render()
+        kinds = [part["type"] for part in result["content"]]
+        self.assertEqual(kinds, ["text", "image"])
+        self.assertEqual(result["content"][1]["mimeType"], "image/png")
+        self.assertEqual(base64.b64decode(result["content"][1]["data"]),
+                         self.PNG)
+
+    def test_the_caption_says_how_much_of_the_model_was_drawn(self):
+        caption = self.render()["content"][0]["text"]
+        self.assertIn("1,200 of 2,400 faces drawn", caption)
+
+    def test_hitting_the_face_limit_is_said_plainly(self):
+        caption = self.render(capped=True)["content"][0]["text"]
+        self.assertIn("face limit", caption)
+
+    def test_a_kit_says_it_was_drawn_one_variant_per_slot(self):
+        caption = self.render(shape="kit")["content"][0]["text"]
+        self.assertIn("one variant per slot", caption)
+
+    def test_a_picture_too_big_to_send_is_described_instead(self):
+        huge = base64.b64encode(b"\x89PNG" + b"0" * 1_600_000).decode("ascii")
+        result = self.render(png=huge)
+        kinds = [part["type"] for part in result["content"]]
+        self.assertEqual(kinds, ["text"])
+        self.assertIn("too large", result["content"][0]["text"])
+
+
+class BridgeToolRegistrationTest(unittest.TestCase):
+
+    def test_the_three_app_tools_are_registered(self):
+        names = [tool["name"] for tool in atlas_mcp.TOOLS]
+        for name in ("inspect_model", "rig_compatibility", "render_asset"):
+            self.assertIn(name, names)
+
+    def test_each_one_warns_that_it_needs_atlas_open(self):
+        # The client reads these descriptions to decide what to call, so the
+        # requirement belongs in them rather than only in a failure message.
+        for tool in atlas_mcp.TOOLS:
+            if tool["name"] in ("inspect_model", "rig_compatibility",
+                                "render_asset"):
+                self.assertIn("Atlas open", tool["description"])
+
+    def test_every_handler_has_a_schema_and_the_other_way_round(self):
+        self.assertEqual(sorted(atlas_mcp.HANDLERS),
+                         sorted(tool["name"] for tool in atlas_mcp.TOOL_SCHEMAS))
 
 
 if __name__ == "__main__":

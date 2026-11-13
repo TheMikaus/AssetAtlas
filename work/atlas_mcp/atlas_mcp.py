@@ -18,13 +18,17 @@ See assetMatchesSearch and AssetItem.effectiveType in lib/main.dart.
 """
 
 import base64
+import io
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 
 SERVER_NAME = "atlas"
@@ -79,15 +83,88 @@ def _default_importer_path():
     return None
 
 
+def _default_bridge_path():
+    """Where a running Atlas writes its port and token, beside the catalog."""
+    if not DB_PATH:
+        return None
+    return os.path.join(os.path.dirname(DB_PATH), "atlas_bridge.json")
+
+
 DB_PATH = os.environ.get("ATLAS_MCP_DB") or _default_db_path()
 IMPORTER_PATH = os.environ.get("ATLAS_MCP_IMPORTER") or _default_importer_path()
 CACHE_PATH = os.environ.get("ATLAS_MCP_CACHE") or os.path.join(
     os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
     "atlas-mcp", "summary-cache.json")
+BRIDGE_PATH = os.environ.get("ATLAS_MCP_BRIDGE") or _default_bridge_path()
+
+# Loading a 261,410-face mech takes twelve seconds, and the app may be busy.
+BRIDGE_TIMEOUT_SECONDS = 300
 
 
 class AtlasError(Exception):
     """Something the caller should be told about rather than a crash."""
+
+
+# ------------------------------------------------------------------ bridge
+
+ATLAS_NOT_RUNNING = (
+    "Atlas is not running, so this tool cannot answer. It reads geometry "
+    "through the app, which is where the texture resolution, the kit and "
+    "sheet classification and the rig comparison actually live -- restating "
+    "any of that here would be a second copy drifting out of step with the "
+    "one Atlas uses. Open Atlas and try again. Every other tool here reads "
+    "the catalog directly and works whether Atlas is open or not.")
+
+
+def bridge_endpoint():
+    """The port and token the running app wrote when it opened."""
+    if not BRIDGE_PATH or not os.path.exists(BRIDGE_PATH):
+        raise AtlasError(ATLAS_NOT_RUNNING)
+    try:
+        with io.open(BRIDGE_PATH, encoding="utf-8") as handle:
+            info = json.load(handle)
+        port = int(info["port"])
+        token = str(info["token"])
+    except (ValueError, KeyError, TypeError, OSError):
+        raise AtlasError(ATLAS_NOT_RUNNING)
+    return port, token
+
+
+def bridge_call(route, payload=None, timeout=BRIDGE_TIMEOUT_SECONDS):
+    """Asks the running app a question, as JSON over loopback."""
+    port, token = bridge_endpoint()
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        "http://127.0.0.1:%d%s" % (port, route), data=body,
+        headers={"X-Atlas-Token": token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # The app turns a question it cannot answer into a sentence; pass it
+        # through rather than reporting "HTTP 400".
+        raw = error.read().decode("utf-8", "replace")
+        try:
+            message = (json.loads(raw) or {}).get("error") or raw
+        except ValueError:
+            message = raw
+        raise AtlasError(message.strip() or "Atlas refused the request.")
+    except urllib.error.URLError as error:
+        # A descriptor left behind by a crash points at a dead port.
+        raise AtlasError("%s\n(%s)" % (ATLAS_NOT_RUNNING, error.reason))
+    except socket.timeout:
+        raise AtlasError(
+            "Atlas did not answer within %d seconds. A very large file can "
+            "take that long to read; try again, or inspect a smaller one."
+            % timeout)
+
+
+def bridge_version():
+    """The running app's version, or None when it is not running."""
+    try:
+        return bridge_call("/health", timeout=5).get("version")
+    except AtlasError:
+        return None
 
 
 # ----------------------------------------------------------------- catalog
@@ -935,9 +1012,15 @@ def tool_catalog_stats(arguments):
             "depend on it; backfill_rigs.py fills it in one pass with Atlas "
             "closed. Until then, inspect individual files instead -- "
             "get_asset reads the rig straight out of the FBX.")
+    running = bridge_version()
     lines += ["",
               "FBX reader: %s" % (IMPORTER_PATH or "not found"),
-              "read cache: %s" % CACHE_PATH]
+              "read cache: %s" % CACHE_PATH,
+              "Atlas itself: %s" % (
+                  "running, version %s -- inspect_model, rig_compatibility "
+                  "and render_asset are available" % running if running else
+                  "not running, so inspect_model, rig_compatibility and "
+                  "render_asset cannot answer")]
     return text("\n".join(lines))
 
 
@@ -1288,6 +1371,156 @@ def tool_export_assets(arguments):
     return text("\n".join(lines))
 
 
+def _count(value):
+    return "{:,}".format(int(value or 0))
+
+
+def _dimension_line(report):
+    size = report.get("authoredSize")
+    if not size or any(v is None for v in size):
+        return None
+    return ("  %-13s %.3g x %.3g x %.3g units, as the artist built it"
+            % ("real size", size[0], size[1], size[2]))
+
+
+SHAPE_WORDS = {
+    "model": "one model",
+    "sheet": "a sheet of several whole models",
+    "kit": "a kit of interchangeable parts",
+    "animation": "an animation, no geometry",
+}
+
+
+def tool_inspect_model(arguments):
+    report = bridge_call("/inspect", {"path": arguments.get("path")})
+
+    shape = report.get("shape") or "model"
+    # The archive is the pack here; "pack" is only the scanned root's name,
+    # which for this library is the unhelpful word "Synty" on 50,000 files.
+    where = report.get("archive") or report.get("pack")
+    head = [bit for bit in (report.get("name"), where,
+                            SHAPE_WORDS.get(shape, shape)) if bit]
+    lines = ["  ".join(head), "  %-13s %s" % ("path", report.get("path"))]
+
+    lines.append("  %-13s %s faces, %s vertices, %s objects"
+                 % ("geometry", _count(report.get("faces")),
+                    _count(report.get("vertices")),
+                    _count(report.get("objects"))))
+    dimensions = _dimension_line(report)
+    if dimensions:
+        lines.append(dimensions)
+
+    materials = report.get("materials") or []
+    resolved = report.get("texturesResolved") or 0
+    lines.append("  %-13s %d of %d materials textured"
+                 % ("textures", resolved, len(materials)))
+    for material in materials[:12]:
+        lines.append("                  %-24s %s"
+                     % (material.get("name") or "(unnamed)",
+                        material.get("summary")))
+    if len(materials) > 12:
+        lines.append("                  ... and %d more"
+                     % (len(materials) - 12))
+
+    rig = report.get("rig") or {}
+    if rig.get("family") and rig["family"] != "none":
+        detail = "%s, %s bones" % (rig.get("label"), _count(rig.get("bones")))
+        if rig.get("skinned"):
+            detail += ", skinned"
+        if rig.get("durationSeconds"):
+            detail += ", %.2fs of motion" % rig["durationSeconds"]
+        lines.append("  %-13s %s" % ("rig", detail))
+        for clip in (rig.get("clips") or [])[:8]:
+            lines.append("                  %s" % clip)
+
+    slots = report.get("slots") or []
+    if slots:
+        named = ", ".join("%s x%d" % (slot.get("label") or slot.get("key"),
+                                      slot.get("variants") or 0)
+                          for slot in slots[:8])
+        more = "" if len(slots) <= 8 else ", ... and %d more" % (len(slots) - 8)
+        lines.append("  %-13s %d: %s%s" % ("slots", len(slots), named, more))
+
+    attachments = report.get("attachments") or []
+    if attachments:
+        lines.append("  %-13s %d in this archive" % ("attachments",
+                                                     len(attachments)))
+        for piece in attachments[:10]:
+            point = piece.get("point")
+            if point:
+                lines.append("                  %-38s -> %s"
+                             % (piece.get("name"), point))
+            else:
+                lines.append("                  %s" % piece.get("name"))
+        if len(attachments) > 10:
+            lines.append("                  ... and %d more; find_attachments "
+                         "lists them all" % (len(attachments) - 10))
+
+    variants = report.get("textureVariants") or []
+    if variants:
+        one = len(variants) == 1
+        lines.append("  %-13s %d other texture%s in this archive fit%s it"
+                     % ("recolours", len(variants), "" if one else "s",
+                        "s" if one else ""))
+
+    for warning in report.get("warnings") or []:
+        lines.append("  !             %s" % warning)
+
+    return text("\n".join(lines))
+
+
+def tool_rig_compatibility(arguments):
+    report = bridge_call("/rig_compat", {
+        "character": arguments.get("character"),
+        "clip": arguments.get("clip"),
+    })
+    character = report.get("character") or {}
+    clip = report.get("clip") or {}
+    difference = report.get("restPoseDifferenceDegrees")
+    lines = [
+        report.get("verdict") or "",
+        "",
+        "  %-13s %s  (%s, %s bones)"
+        % ("character", character.get("name"), character.get("label"),
+           _count(character.get("bones"))),
+        "  %-13s %s  (%s, %s bones, %s frames)"
+        % ("clip", clip.get("name"), clip.get("label"),
+           _count(clip.get("bones")), _count(clip.get("frames"))),
+        "  %-13s %s" % ("shared bones", _count(report.get("sharedBones"))),
+        "  %-13s %s" % ("rest poses",
+                        "not comparable" if difference is None
+                        else "%.1f degrees apart" % difference),
+    ]
+    return text("\n".join(lines))
+
+
+def tool_render_asset(arguments):
+    size = int(arguments.get("size") or 512)
+    report = bridge_call("/render", {
+        "path": arguments.get("path"),
+        "size": size,
+        "yaw": arguments.get("yaw"),
+        "pitch": arguments.get("pitch"),
+    })
+    data = base64.b64decode(report["png"])
+    caption = "%s  %dx%d  %s of %s faces drawn" % (
+        report.get("name"), report.get("width"), report.get("height"),
+        _count(report.get("drawnFaces")), _count(report.get("totalFaces")))
+    if report.get("capped"):
+        caption += " (face limit reached; the rest is not drawn)"
+    if report.get("shape") == "kit":
+        caption += "\nA kit: drawn with one variant per slot, as Atlas draws it."
+    if len(data) > MAX_IMAGE_BYTES:
+        return text("%s\nThe picture came to %s, too large to hand over."
+                    % (caption, format_bytes(len(data))))
+    return {"content": [
+        {"type": "text", "text": caption},
+        {"type": "image",
+         "data": base64.b64encode(data).decode("ascii"),
+         "mimeType": "image/png"},
+    ]}
+
+
 TOOLS = [
     {
         "name": "search_assets",
@@ -1513,6 +1746,70 @@ TOOLS = [
         },
         "handler": tool_export_assets,
     },
+    {
+        "name": "inspect_model",
+        "description":
+            "Whether a model is actually usable, answered by the running "
+            "Atlas: which of its textures resolve and which are missing, "
+            "whether the file is one model or a sheet of several or a kit of "
+            "interchangeable parts, its real authored size in units, its rig, "
+            "the kit pieces in the same archive that fit it and the recolours "
+            "available. Needs Atlas open; the catalog tools do not.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string",
+                         "description":
+                             "Full asset path, or a file name if only one "
+                             "asset has it."},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_inspect_model,
+    },
+    {
+        "name": "rig_compatibility",
+        "description":
+            "Whether an animation clip will drive a particular character, "
+            "answered by the running Atlas: the rig family of each, how many "
+            "bones they share and how far apart their rest poses sit. The "
+            "Synty families share no bone names at all, so a clip from the "
+            "wrong one does nothing. Needs Atlas open.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "character": {"type": "string",
+                              "description": "Path of the skinned character."},
+                "clip": {"type": "string",
+                         "description": "Path of the animation FBX."},
+            },
+            "required": ["character", "clip"],
+        },
+        "handler": tool_rig_compatibility,
+    },
+    {
+        "name": "render_asset",
+        "description":
+            "Draws a model and hands back the picture, using Atlas's own "
+            "renderer, so it looks as it does in the app. A kit is drawn with "
+            "one variant per slot rather than every part at once. Use it to "
+            "check what something actually looks like before committing to "
+            "it. Needs Atlas open.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Full asset path."},
+                "size": {"type": "integer",
+                         "description": "Pixels square, 64 to 2048. Default 512."},
+                "yaw": {"type": "number",
+                        "description": "Turn, in radians. Default 0.6."},
+                "pitch": {"type": "number",
+                          "description": "Tilt, in radians. Default 0.35."},
+            },
+            "required": ["path"],
+        },
+        "handler": tool_render_asset,
+    },
 ]
 
 HANDLERS = {tool["name"]: tool["handler"] for tool in TOOLS}
@@ -1550,7 +1847,16 @@ build is only useful to that engine version.
 
 rig_family drives type='character' and find_animations' rig matching, and the
 catalog fills it in lazily, so it may be nearly empty; catalog_stats says how
-many files have it."""
+many files have it.
+
+Three tools ask the running Atlas rather than the catalog, because what they
+answer is not in the database and is not safe to restate: inspect_model (do
+this model's textures resolve, is it one model or a sheet of twelve or a kit
+of parts, how big is it really), rig_compatibility (will this clip drive that
+character) and render_asset (what does it look like). They need Atlas open and
+say so if it is not; everything else works either way. Before importing
+anything into a project, inspect_model is the tool that says whether it will
+arrive whole -- a name and a file size do not."""
 
 
 # ------------------------------------------------------------------ server
