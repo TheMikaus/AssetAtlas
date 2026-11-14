@@ -1,0 +1,301 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repository Shape
+
+This git repository is rooted at `woul/` (the parent `2026-07-08/` folder is not a repo). The only active code is the Flutter Windows desktop app **AssetAtlas** at `work/asset_atlas_native/`. Run all Flutter/Dart commands from that directory.
+
+- `work/asset_atlas_native/` — the app (all Dart code lives in a single `lib/main.dart`, ~15k lines)
+- `work/ROADMAP.md`, `work/AI_HANDOFF_LATEST.md` — plan and session handoff; the handoff is the intended first read each session and is expected to be updated at the end of a work session (git status/log snapshot, next steps, files touched, validation run)
+- `docs/TECH_SPEC_*.md` — architecture, rendering/FBX, build/release specs
+- `USER_MANUAL.md` — end-user behavior reference; useful for confirming intended UX before changing it
+- `work/asset-atlas/`, `work/asset-atlas-desktop/` — dead web/Electron prototypes, removed from git history; ignore them
+- `outputs/` — staged build artifacts
+
+## Commands
+
+From `work/asset_atlas_native/`:
+
+```bash
+flutter pub get
+flutter run -d windows
+flutter analyze
+flutter test
+```
+
+Run a single test file or a single test by name:
+
+```bash
+flutter test test/scan_fixture_test.dart
+```
+
+```bash
+flutter test --plain-name "FBX importer JSON pipeline decodes UVs and texture image"
+```
+
+`flutter analyze` + `flutter test` is the standing validation gate before any commit or handoff update.
+
+Packaging, installer, and version bump (PowerShell, from `work/asset_atlas_native/`):
+
+```bash
+pwsh -File .\scripts\package_windows.ps1
+```
+
+```bash
+pwsh -File .\scripts\create_windows_installer.ps1
+```
+
+```bash
+pwsh -File .\scripts\bump_version.ps1
+```
+
+`bump_version.ps1` rewrites **both** `pubspec.yaml` `version:` and the `const appVersion` literal in `lib/main.dart`, and throws if either pattern is missing — do not edit those by hand or reformat those lines. Repo convention is to bump the version whenever code changes. `create_windows_installer.ps1` needs Inno Setup 6 (`ISCC.exe`); output lands in `dist/installers/`.
+
+## Architecture
+
+### Two-process FBX pipeline
+
+FBX is never parsed in Dart. `windows/runner/mesh_importer.cpp` builds a **second executable**, `asset_atlas_mesh_importer.exe`, from the vendored `ufbx` (`windows/runner/third_party/ufbx/`). It is a separate `add_executable` target in `windows/runner/CMakeLists.txt` and is installed next to the app binary by `windows/CMakeLists.txt`. Dart shells out to it and consumes JSON on stdout:
+
+- `asset_atlas_mesh_importer <model.fbx>` — parse from disk
+- `asset_atlas_mesh_importer --stdin <label>` — parse bytes piped on stdin (this is how FBX entries inside ZIP archives are previewed without extracting)
+
+`meshImporterPath()` in `lib/main.dart` looks for the helper as a sibling of the running executable first, then falls back to `build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe` — that fallback exists because `flutter test` runs under the SDK's `flutter_tester.exe`. Consequence: **`test/native_fbx_importer_test.dart` self-skips unless a Windows Release build exists.** Build Windows before trusting a green native test run.
+
+`runMeshImporter` drains stdout and stderr **concurrently**, and starts both drains before writing stdin. Reading stdout to completion first deadlocks as soon as the child writes more to stderr than the pipe buffer holds — it blocks there, stops writing stdout, and this side waits forever; `ASSET_ATLAS_DEBUG_SPACES=1` writes a line per mesh, which a 215-node kit is enough to reach. Closing stdin is guarded too: a path-based call owes the child nothing, so a child that already exited left an `IOException` that used to read as "this FBX is unreadable". Changes to the JSON contract must be made on both sides at once: the emitter in `mesh_importer.cpp` and `meshModelFromImporterJson()` in `lib/main.dart`. Fields include `vertices`, `faces` (indices + material index + inline UVs), `uvSets` (named, per-face), `materials`, `textureFiles`, `sceneTextures`, `vertexColors`.
+
+### Atlas over MCP
+
+`work/atlas_mcp/` is a Model Context Protocol server over the same two things the app is built on: the catalog (SQLite, opened read-only -- the app owns that file) and `asset_atlas_mesh_importer.exe`. Fourteen tools. Eleven of them need nothing but the catalog and the importer: search_assets, get_asset, list_packs, browse, catalog_stats, find_animations, find_attachments, get_texture, find_packs, find_duplicates, export_assets. Three ask the running app — inspect_model, rig_compatibility, render_asset — see the bridge below. Six MCP *prompts* carry the call sequences; see below. Standard library only and hand-rolled JSON-RPC, because an MCP server that cannot start because a pip install went stale is worse than a hundred lines of protocol.
+
+The search semantics mirror `assetMatchesSearch` and `AssetItem.effectiveType` on purpose: a question answered there and in the Atlas window must not come back different. Two things are restated in Python and will drift if nobody is watching -- the `attachPoints` keywords and `rigFamilyFromMarkers` -- so `test_atlas_mcp.py` reads the Dart table back out of `lib/main.dart` and fails on a mismatch.
+
+The importer grew `--summary` for it: counts, bounds, units, node names, bone names, material names, texture references and animation names, in a few kilobytes. The full import of the mech is 106MB of JSON, which is the right shape for the renderer and the wrong shape for a question about what a file holds. `--probe` stays the cheap classification path.
+
+`rig_family` is the one thin column: Atlas fills it in lazily, as filters ask, so it was 7 of 27,652 FBX files. `work/atlas_mcp/backfill_rigs.py` fills it in one pass with Atlas closed, which fixes the app's own rig filter as much as the MCP's.
+
+**The bridge: three tools that ask the running app.** Some of what a model needs to know is not in the catalog and cannot be recomputed in Python without copying load-bearing logic — whether a model's textures actually resolve, whether a file is one model or a sheet of twelve or a kit of parts, whether a clip will drive a character. That logic is `resolveTextureReference`, `objectSlotsOf`, `materialsAreStackedVariants`, `rigBoneOverlap` and `rigAxisDifference`, all here in `lib/main.dart`, and a second copy of it in another language is precisely what the `attachPoints` guard test exists to prevent. So `AtlasBridge` answers instead: a loopback `HttpServer` the app starts with the catalog window, writing its port and a token to `atlas_bridge.json` beside the database, where the MCP reads them. Loopback is not a permission — any local process can reach a listening socket — hence the token, checked before anything is read or drawn.
+
+Three routes, three top-level builders (`bridgeInspect`, `bridgeRigCompat`, `bridgeRender`) kept out of the server so tests can call them directly. Two things to know when changing them. Every number crossing to JSON goes through `_jsonNumber`, because `rigAxisDifference` returns infinity for "no comparison possible" and an empty mesh has infinite bounds, and `jsonEncode` throws on both. And `bridgeRender` goes through `rasterizeSceneInIsolate` even for a small model: the bridge runs on the isolate that draws the window, and a mech rasterised in place freezes Atlas in front of someone who never asked for a picture. The report's `capped` means the face limit was hit, *not* `RasterResult.capped`, which is true whenever any face went undrawn — including the back half of every closed model, culled on purpose.
+
+**Prompts carry the sequences.** A tool description says what one tool does; it cannot say what order to call six of them in, and that is what a model gets wrong on this library — searching for files before asking which build of the pack it wants, importing a prop without ever asking how big the prop is. So `PROMPTS` serves six: `survey_the_library`, `set_up_a_level`, `import_a_model`, `animate_a_character`, `dress_a_character`, `choose_a_build`. Each is a numbered procedure with the traps named in the order they are met.
+
+Every argument is optional, because a client may offer a prompt with nothing filled in, and an absent one appears on its own labelled line saying what to do about itself rather than being interpolated mid-sentence — which is how "Get the assets for a the theme you want level" happened. Two tests pin that and the fact that a prompt names no tool this server lacks, since a renamed tool would otherwise leave a sequence that fails only when a model follows it. An unknown prompt name is a JSON-RPC `-32602`, not a tool-style `isError` result, which is what `JsonRpcError` and the `code` lookup in `serve` exist for.
+
+`bridgeFindAsset` refuses to guess: a name matching several files is an error listing them, because picking the first of three `SK_Dungeon_GoblinChief_01.fbx` would answer confidently about the wrong pack. The Dart side is tested in `test/bridge_test.dart` (token, routing, the descriptor's life cycle, the reports); the Python client against a stub app in `test_atlas_mcp.py`, including a descriptor left behind by a crash, which has to read as "Atlas is not running" rather than as a connection error.
+
+**Packs, builds and the second name-reading exception.** The intended consumer is a model assembling an Unreal project, and its first question is one no file answers: Synty ships each pack several times over -- the source files, and a built project per engine version -- and *which engine a build targets is recorded only in the archive name*. An `.uasset` does not say. So `parse_archive_name` reads it, and that is a declared exception to "nothing here reads a name" alongside the attachment table, for the same reason: the fact is not in the files. It yields family, pack, build kind (`source` / `unreal` / `unity`), engine version and pack version; `pack_key` is the grouping key, camel-split and singularised so `PolygonOffice_SourceFiles` and `POLYGON_Office_SourceFiles_v2` are one pack and `Dungeon_Realms` meets `Dungeons_Realms`. Over the 187 archives here that is 49 packs with nothing unclassified. Near-miss names are deliberately *not* fuzzily merged -- "Explorer" and "Explorer Kit" stay apart rather than become a guess. `find_packs` is the entry point and takes `engine=`; `search_assets` takes `build=` / `engine=`, resolved to the archives they mean rather than by a LIKE over the path, which would miss `Unreal_Project_4_22` and a bare `4_22`.
+
+**Half the library is duplicates**, so `search_assets` groups on name and size by default: 33,401 of 73,865 rows are redundant copies, 3.6GB, and left alone a search for a door returned the same door six times, making `limit: 40` really a limit of 20. The surviving row says how many copies and which other packs hold them; `distinct=false` restores every row, and `find_duplicates` reports the waste. Copies of a *source* asset are interchangeable; a copy from an unreal build is only useful to that engine version.
+
+`export_assets` is the one tool with a side effect: it writes assets out of their archives into a folder, keeping archive-relative paths so an Unreal build's `Content` tree lands ready to drop into a project. An archive is untrusted input, so `_safe_relative` refuses any entry that would climb out of the destination; existing files are kept unless `overwrite`, nothing is ever deleted, and a selection is required because exporting the whole catalog is never what anyone means.
+
+### Rendering
+
+Software rendering only. **Filled modes go through `rasterizeMesh`**, a depth-buffered rasteriser producing an RGBA buffer that `RasterModelView` shows; `MeshPainter` (canvas, per-face depth sort) is now used only for wireframe. Per-face sorting could not resolve interpenetrating or coplanar faces, which showed up as notches and slivers on low-poly models — `test/raster_depth_test.dart` pins the difference. The rasteriser is pure, so it runs on the UI isolate at half resolution while the camera moves and on a worker isolate (`rasterizeSceneInIsolate`) for the sharp frame once it settles. That needs the mesh flattened into typed arrays first: `RasterScene.fromMesh` does it, and `RasterModelView` caches one scene per mesh rather than rebuilding it per frame. Faces beyond `maxRenderedFaces` are capped by depth priority and the overlay says so (the budget is 400,000 -- it was 14,000, which drew 8,349 faces of a 261,410-face mech and showed a handful of disconnected fragments floating in space; the cap is a safety valve for something pathological, not a quality setting). Selecting the survivors is a histogram over the perspective divide, three linear passes: the old comparison sort over a boxed `List<int>` of every index made the *capped* render slower than the uncapped one, 576ms against 233ms, and the uncapped path now builds no index list at all. `test/face_cap_test.dart` pins both the budget and that the survivors are the nearest faces. **A mirrored instance is re-wound at import:** a node with a negative `geometry_to_world` determinant has its triangle corners emitted in reverse, whole corner at a time so UVs, colours and skin weights stay with their vertex -- ufbx transforms the points and leaves the winding, so the mech's two mirrored parts came out inside out. Backface culling is user-toggleable and its sign convention is pinned by `test/renderer_geometry_test.dart`. FBX imports go through `MeshLoadCache`, not `loadMesh` directly, so the preview and the diagnostics panel share one importer run. `RenderMode` is textured/solid/wireframe; `LightingMode` is corner/top/unlit. Texturing is perspective-correct across a triangle. Three channels are now sampled per pixel — base colour, normal map (tangent frame from position/UV derivatives), and emissive map (added, so an emissive surface does not go dark where the light misses it) — plus a Blinn-Phong specular lobe driven by `specularFactor` and `roughness`; the camera and light are both fixed, so the half vector is constant per face. Specular is skipped in `LightingMode.unlit`. Each channel — base texture, normal map, emissive, specular — has its own switch on `RasterRequest` and its own toggle in the preview toolbar (`ShadingChannelPanel`), shown only when the model carries that channel; the switches are part of `RasterModelView`'s frame cache key. The remaining channels (metalness, the flat emissive colour) are still approximate colour modifiers in `faceDiffuse`, not a PBR model. Don't push further toward engine parity without an explicit ask — see `docs/TECH_SPEC_RENDERING_FBX.md` non-goals. `test/raster_shading_test.dart` pins the emissive and specular behaviour; a specular test needs a face whose normal sits on the half vector, because a tight lobe misses everything else.
+
+**Palette faces.** Synty-style models pin all three UV corners of a face to a
+single texel; roughly half the faces of a typical model do this. Such a UV
+triangle has no invertible transform, so the per-triangle texture path cannot
+draw it — it used to bail out and leave the untextured base colour showing,
+which made half of every model render flat white. `isDegenerateUvTriangle`
+detects them and the painter fills them with the sampled texel instead
+(`MeshMaterial.sampleTexture`, which needs the CPU-side `texturePixels`
+readback). Runs of these are batched into one `drawVertices` call, which also
+removes the antialiasing seams that per-face `drawPath` left between triangles.
+If a model renders as flat untextured colour, check this path first.
+
+Texture resolution order: absolute path → relative to model dir → deterministic relink within the model's own container → deterministic relink *across* containers → fallback lookup → checker fallback. The cross-container pass is deliberately strict (`canRelinkAcrossContainers`): the basename must match exactly and the reference must name the other pack, which `texturePackHints` extracts while ignoring generic folder names (textures, materials, sourcefiles, …). Without both, a name like `Wall_01.png` would bind to whichever pack was scanned first.
+
+Within one container the scoring also falls back to shared *words*: `stripTextureNameNoise` removes an exporter prefix (`T_`, `TX_`), a duplicate-copy suffix (` 1`, ` (2)`, `_copy` — never a bare trailing `_01`, which is part of the name), and `textureNameTokens` drops single characters and the word "texture". A shared distinctive word scores; a shared number alone deliberately does not, or every `_01` in a pack would match. This is what connects `PolygonApocalypse_Texture_01_A 1.png` to the `T_PolygonApocalypse_01.png` its own archive ships.
+
+A material that named textures and resolved none is reported as such (`MeshMaterial.texturesMissing`, `materialSummaryLine`) rather than as "flat colour" — the two look identical on screen and mean opposite things. When nothing resolves at all, `TexturePickerButton` lets the user apply any scanned nearby texture by hand; `applyChosenTexture` puts it on every material and is deliberately *not* cached, since it is the user's choice rather than anything the file said.
+
+**Vertex colours.** They multiply the shaded surface, so a set that is entirely black — or entirely transparent — renders the whole mesh black however well its textures resolved. That is what an exporter writes for a colour layer nothing filled in: `PolygonSyntyCharacter.fbx` ships 14,688 vertex colours of `(0,0,0,0)`. `vertexColorSetIsUnusable` discards such a set at import. Deliberately all-or-nothing — black *parts* of a model are real art.
+
+**OBJ.** `parseObjMesh` keeps `vt` (flipping V — OBJ counts up, the sampler counts down), the `v/vt/vn` corner references, `usemtl` (which splits faces between materials) and `mtllib`. It used to keep none of that, so an OBJ could never be textured whatever else resolved. A corner with no texture coordinate makes the whole triangle untextured rather than half-textured. OBJ is in `_previewableModelExts`, so it reaches the texture discovery panel too.
+
+### Animation
+
+An FBX with a skeleton and no geometry is `FbxContentKind.animation`. The importer emits a `skeleton` object alongside the counts: the bone hierarchy once (`name` + `parent`, resolved to an index, `-1` for a root) and then the **world position of every bone at each sampled frame**, at 30fps capped to 120 frames. Positions rather than transforms because that is all a stick-figure preview draws; `ufbx_evaluate_scene` composes the hierarchy, so no curve evaluation or parent composition happens in Dart. `SkeletonAnimation.fromJson` reads it, `SkeletonPlayer` plays it, `SkeletonPainter` draws a line from each bone to its parent. Bounds come from the whole clip, not the current frame, or the figure breathes as it plays.
+
+A frame is `bones * 12` floats — a column-major 3x4 world matrix per bone, whose last column is the position. Positions alone were enough for the stick figure but skinning needs the rotation.
+
+**Skinning.** A skinned mesh also emits a `skin` object (bone names, a `bindInverse` 3x4 per bone, four `(bone, weight)` pairs per skinned vertex, and a per-emitted-vertex index into that table) plus its own rest pose as a one-frame `skeleton`. `bindInverse` is `geometry_to_bone` composed with the inverse of the mesh's `geometry_to_world`, because the emitted vertices are already in world space — without that second term a posed character lands in the wrong place. `poseSkinnedVertices` blends `clipBoneWorld * bindInverse` per vertex.
+
+The join between a clip and a character is the **bone name**: the Synty rig is `Root / Hips / Spine_01..03 / Clavicle_L,R / Hand_L,R / IndexFinger_01..04 / Thumb_01..` and the character files use the same names, so no mapping table is needed. A bone the clip lacks contributes nothing and the vertex keeps its bind position rather than collapsing to the origin.
+
+**The framing transform is part of the skin contract.** The importer recentres and rescales every mesh into a unit box so the viewer can frame it (`normalizeCenter` / `normalizeScale`), and that happens *after* the bind matrices are built. The importer folds the inverse into `bindInverse`, and the consumer must apply the forward transform again after blending. Skipping it leaves a character's mesh 0.89m from its own skeleton, which tears it apart — and it looks exactly like a bad rig, so it was blamed on retargeting for a long time. `test/skinning_test.dart` pins it.
+
+Two checks that matter, in order:
+1. **Identity test** — posing a character with its own rest skeleton must reproduce its vertices (7e-6 here). This validates the matrix conventions and units.
+2. **Extent test** — a posed character must be the same height as its bind pose. The identity test passes even when the framing transform is missing; only the extent test catches that. If a posed character is *taller* than its bind, suspect the framing, not the rig.
+
+**Bone matching** is by path from the root, normalised through `normalizeBonePath`. These rigs give both hands the same bone names (`IndexFinger_01` under `Hand_L` and `Hand_R`) and ufbx renames whichever it meets second to `IndexFinger_01_1` — and node order differs between files, so one file's `Hand_R/IndexFinger_01_1` is another's `Hand_R/IndexFinger_01`. Only a single trailing digit is stripped, so Synty's own two-digit numbering (`Spine_01`) survives. Matching on the bare name silently binds a right hand to a left one, so it remains only as a last resort.
+
+**Retargeting.** Two Synty rigs can share every bone name, parent and path and still be incompatible: the newer character packs re-oriented the joint axes, so `Hand_L` points 169 degrees away from where the animation rig puts it. `rigAxisDifference` measures the median; the older character rig sits at ~19 degrees and poses directly, the newer at ~89 and tears apart. Above `maxDirectPoseAngle` (40) the clip's transforms are not applied directly — `RetargetPlan` takes two things from the clip and nothing else. **Orientation**, in world space: `characterWorldRotation(t) = clipWorldRotation(t) * transpose(referenceWorldRotation) * characterBindWorldRotation`. World space is the one frame two rigs with different joint axes agree on. **Displacement**, as a delta: `clipLocalTranslation(t) - referenceLocalTranslation`, carried into the character's parent frame and added to the character's own bind offset, scaled by the height ratio. For every bone but the hips that delta is zero, so the character keeps its own bone lengths exactly.
+
+**Never compose a clip's local transforms onto another rig.** The obvious formulation — `characterLocal(t) = clipLocal(t) * inverse(referenceLocal) * characterBindLocal` — looks right and is not: a bone's local translation then becomes `clipRotation * inverse(referenceRotation) * (bindOffset - referenceOffset) + clipOffset`, which is the character's bone length only when the clip is not rotating that bone. `SM_Chr_Captain_Male_01` came out with one shoulder at 0.53x its length and fingers at 1.48x, while its overall height stayed within 1% — which is why the height check missed it for so long. It was invisible in testing because the *reference* character poses perfectly under that formula: when character and reference are the same rig the correction collapses to the identity. Any other character is mangled. `test/skinning_test.dart` pins the synthetic case (a turning parent must not change a child's bone length) and `test/corpus_skinning_test.dart` measures every bone of a real character.
+
+The reference pose matters and is easy to get wrong. A clip's *own* rest is wherever the animator left the rig — for a locomotion pack, a standing idle — so using it makes the correction cancel and the character stays in its bind: safe, never mangled, but never posed either. What is needed is the clip rig in the same *physical* pose the character is bound in, i.e. both T-posed. Animation packs ship a character on their own rig for this, so `findClipReferenceCharacters` looks for one in the same container as the clip and the caller measures each against the clip by bone overlap. No reference found means the character shows its bind pose and the UI says so.
+
+### The skeletons
+
+Three rigs appear across this library, and they are told apart by their bones — never by a file name, a folder name, or a filename prefix.
+
+| Family | Root chain | Bones | Case | Marker bones | Where it shows up |
+| --- | --- | --- | --- | --- | --- |
+| `polygon` | `Root / Hips / Spine_01 / UpperLeg_R` | 50 on a character, 52 on a clip | Capitalised | `Hips`, `UpperLeg_R`, `Clavicle_L`, `Spine_01` | Synty's own rig. Most character packs, and the `Animations/Polygon` clips. |
+| `sidekick` | `root / pelvis / spine_01 / thigh_l`, plus attachment and IK bones | 88 on a character, 121 on a clip | lowercase | `hipAttachFront`, `hipAttach_l`, `ik_hand_gun`, `ik_hand_root` | Synty's Sidekick characters and the `Animations/Sidekick` clips. |
+| `unreal` | `root / pelvis / spine_01 / thigh_l` | 44 on a Mini character | lowercase | `pelvis`, `thigh_l`, `clavicle_l`, `spine_01` | The plain Unreal mannequin. The **Mini Fantasy** characters are on it -- `SK_Pirates_Captain_01` is `root/pelvis/.../hand_r` with no `hipAttach*`, so it is `unreal`, not Sidekick. |
+| `none` | — | 0 | — | — | Props, collision hulls, anything with no skeleton. |
+
+**The Unreal *builds* of packs contribute no models.** They ship `.uasset` and `.umap` only — zero FBX across every `*Unreal*.zip` checked. Those files index as type `unreal` with their own sidebar filter and icon, listed so a pack that ships nothing else is not mistaken for an empty folder, but they are Unreal's serialised object format and carry no geometry anything outside the engine can read, so they are never previewed. (An earlier version of this file said nothing classified as `unreal`; that was wrong — the Mini Fantasy *source* pack is on the mannequin rig, and it was the attachments work that surfaced it.)
+
+**A rescan carries classification across.** `scanFolder` replaces a root's rows with fresh ones, and the first rescan after the Unreal rules landed threw away 27,511 probe results with them -- the Character and Animation filters read `0` until every FBX had been probed again. `carryClassification` copies `modelKind`, `rigFamily` and `ignored` from the old rows by id, which is built from the source root and relative path and so survives. (The one-off recovery was `--probe` over every FBX from Python, 12 workers, 53 seconds; the app's own lazy path would have taken an evening.)
+
+**The catalog records the rules it was scanned under** (`catalog.rules`, compared with `scanRulesVersion`). A catalog saved before a rule change is missing whatever the change added and would otherwise report `0` as if that were the truth about the library; the sidebar says so and offers a rescan. Bump `scanRulesVersion` whenever the extension sets change.
+
+Two things make this harder than it looks:
+
+- **Sidekick is a superset of Unreal.** It carries every mannequin bone plus attachment and IK bones, so testing for the mannequin first swallows it. `rigFamilyFromMarkers` checks Sidekick first, and the order is load-bearing.
+- **Polygon and Unreal differ only in case.** Both have a `spine_01`/`Spine_01`. The importer's marker comparison is exact and case-sensitive for exactly this reason.
+
+Polygon and Sidekick share **no bone names at all**, so a clip from one cannot drive a character from the other. `rigBoneOverlap` is what tells them apart, and `rigAxisDifference` returns `double.infinity` below `minimumRigOverlap` shared bones — returning 0 there made an unrelated rig look like a flawless reference and win the selection, which is why a reference is chosen by overlap rather than by angle.
+
+Same family does not mean same joint orientation. `SM_Chr_Captain_Male_01` and `PolygonSyntyCharacter` are both `polygon`, share all 50 bones and have identical bone lengths, and still sit 90 degrees apart: the Captain's bone axes are the reference's cycled x→y→z. Family decides *whether* a clip can drive a character; `rigAxisDifference` decides whether it needs retargeting to do it.
+
+### Attachments
+
+Every character pack ships kit -- helmets, beards, hair, capes, pauldrons -- and the files say nothing about where any of it goes. An attachment FBX is a bare mesh with no skeleton, no socket and no metadata; `SM_Chr_Attach_Helmet_01.fbx` is 524 triangles sitting at the origin. So this is the one rig question that *is* answered by the name, and the guessing is gathered in a single table, `attachPoints`, rather than spread through the code pretending to be inference.
+
+Each entry maps a set of words to a bone per rig family. Sidekick names its own sockets and so answers outright -- `headAttach`, `faceAttach`, `backAttach`, `shoulderAttach_l/r`, `elbowAttach_l/r`, `kneeAttach_l/r`, `hipAttachFront/Back/_l/_r`, `prop_l/r`. Polygon has none of those, so the anatomical bone is used instead (`Head`, `Jaw`, `Spine_03`, `Hand_R`). The first bone in the list that the character actually has wins, and a rig with none of them wears nothing rather than wearing it in the wrong place.
+
+**Match whole words, never substrings.** `cape` contains `cap`, which sent every cloak in the library onto a head; `prop` is the name of a bone and also the name of half of every pack's scenery, so as a filename keyword it claimed every `SM_Prop_*` barrel and crate. Names here are underscore-separated, so splitting on punctuation recovers the words the artist wrote. A trailing number is stripped as well, so `Helmet01` still reads as a helmet. Both bugs were caught by the tests in `test/attachment_test.dart` rather than by reading the table, which is the argument for having the table.
+
+**Placement is not guesswork.** The artist builds a helmet at the head joint's origin at the character's own scale -- confirmed by `ASSET_ATLAS_DEBUG_SPACES=1`, which shows the helmet's raw mesh at y -0.063..0.268 rather than at head height. So three steps put it back: undo the attachment's framing to recover the coordinates it was authored in, add the bone's rest **position**, and apply the character's framing so it lands in the same box the character is drawn in. Nothing is scaled to fit. `attachToCharacter` returns null rather than placing a piece badly when a step is missing.
+
+**Position, not orientation.** The first version carried the piece through the bone's full rest transform, and the helmet came out right by luck: `Head` happens to be the identity on these rigs. `Spine_03` is cycled x->y->z, and the cape swung out sideways. Synty authors a piece hanging the way it hangs on the character and expects it dropped at the socket with its orientation kept; in bind pose the socket is a place, not a direction. `test/attachment_test.dart` pins this with a turned bone.
+
+**Held pieces are the one exception, and it still uses only positions.** Every weapon and tool in these packs stands on its grip with the business end along +Y (`Prop_Sword_Broken_01` raw y -0.23..0.83; `SM_Wep_Sword_03` -0.12..0.74), so dropped at the hand unturned a sword stands straight up out of the fist and, in a T-pose, pokes past the head — which reads, at thumbnail size, like the torso is clipped. `AttachPoint.held` marks the Hand point, and a held piece is turned so its +Y runs from the bone's parent out through the bone: along the forearm, where a straight wrist points it. `_rotationTakingYTo` is Rodrigues about Y×d. Which way the edge faces is not knowable from the file and is not attempted.
+
+**Worn pieces are skinned to their socket.** `attachToCharacter` extends the character's `SkinBinding` with one influence block per new vertex, weight 1 on the socket bone, so the skinning loop moves a helmet like any other part of the head and the animation preview needs nothing special. A bone nothing on the body was weighted to -- often the jaw -- is appended with a bind matrix built from its rest pose, `inverse(restWorld) * denormalize`, which is what the importer would have written. The identity test (posing the dressed character against its own rest reproduces every vertex, helmet included) is what proves that matrix right.
+
+The outfit lives on `AnimationCharacter` (`animation.character.worn`, one path per line) so the clip preview dresses the character the same way; changing the outfit bumps `outfitRevision` and an open clip re-dresses. One piece per body part unless Shift is held, since that is what a body has room for.
+
+**FBX only.** Every piece ships with an OBJ twin, and the OBJ is in centimetres with nothing in the file to say so, where the FBX carries its units. Listing both put two identical chips in the panel, one of which silently did nothing.
+
+That needed the importer to emit `framingCenter` / `framingScale` for **every** mesh, not just skinned ones. The values were already there for skinned meshes, carried on the `skin` object, because posing needs them; a helmet has no skin to carry them on, and without them its size and origin are gone for good. `framingOf` prefers the direct field so a character and its hat are read the same way.
+
+Attachments are found by `findAttachmentCandidates`: models in the character's own container, not already known to have a rig of their own (that is another character, not a hat), whose folder or name says `attach` or whose name contains a word from the table.
+
+**Character sheets.** Every `Characters.fbx` in the library is a dozen bodies standing in one place, one per FBX node, named: `Chr_Hero_Female_01` ... `Chr_Undead_Knight_01` in Dungeon Realms (11), `Character_SportyMale_01` ... in Battle Royale (21), `SM_Chr_Captain_Male_01` ... in Ancient Empire (11). Drawn together they interpenetrate and read as z-fighting. The material seam separates one sheet in three -- Dungeon Realms gives each body its own material, Battle Royale packs twenty-one into five, Ancient Empire puts eleven in one -- so the importer now records which node each face came from (`objects` + `faceObjects`, `MeshFace.objectIndex`, `MeshModel.objectNames`) and the rasteriser can draw one node (`visibleObject`) exactly as it draws one material. `objectsAreStackedVariants` / `materialsAreStackedVariants` detect a sheet spatially rather than by name: a group covering the model's full width *and* height is not a part, it is another copy, and three or more is a stack. Parts fail the test, so an ordinary multi-material model is left alone.
+
+**Modular kits.** A character sheet is many models in one file; a kit is one model whose every part ships in the same file, each stacked at the joint it hangs from. `SK_PolygonMech_Main_Full.fbx` is 215 nodes in 70 name families -- eight heads, ten shoulder plates a side, twelve chest weapons a side -- so drawn whole it is eight mechs' worth of parts interpenetrating. `objectSlotsOf` groups the nodes into `ObjectSlot`s and the viewer draws one variant of each (`RasterRequest.hiddenObjects`, a byte per node, which crosses to the worker isolate without being rebuilt; `MeshPainter` honours it too, so wireframe shows the shape you picked). `SlotPickerPanel` is the picker, one row per slot, keyed by `ObjectSlot.key` so the assembly survives a texture change reloading the mesh.
+
+Grouping is in two steps because neither alone works. By name, `objectSlotFamily` takes everything before the *last* all-digit token, so `geo_l_shoulder_armor_07` and `geo_l_shoulder_armor_07_energyShields` land together while `SM_Mech_Cockpit_01_Monitor_04` keeps the `01` that belongs to the cockpit. But names cannot tell `geo_c_head_01..08` (eight whole heads) from `geo_l_index_01..03` (three segments of one finger), so the second step is spatial, in the same spirit as `objectsAreStackedVariants` and for the same reason: **variants of a slot all contain the joint they hang from, so their boxes overlap each other, while a row of parts is laid end to end.** Measured pairwise rather than against the family's full extent, because variants differ wildly in size -- a stub cannon and a long one share a socket and neither fills the box the pair of them spans. The margin on the real mech is wide: the lowest slot scores 0.52 (`geo_l_elbow_attach_weapon`, seven weapons on one socket) and the highest non-slot 0.17 (four cockpit monitors); fingers, toes and exhaust flaps score 0.00.
+
+A sheet passes the slot test too -- eleven bodies in one place are eleven variants of one place -- so `modelIsModularKit` asks `objectsAreStackedVariants` first and declines. Sheets keep the `visibleObject` path; kits get the picker. Hiding is never silent: the overlay says `assembled: N faces` whenever the mask is on, and the panel's **Draw every variant** switch turns it off.
+
+**Unpainted vertices are not black.** The sheets carry `(0,0,0,0)` on a quarter of their vertices -- what an exporter writes for a vertex nobody painted -- and taken as a colour that is black. `vertexColorSetIsUnusable` only discards a set that is *mostly* unusable, so a 27% sprinkling got through and turned whole bodies black, which looked like near-plane clipping. `averageFaceVertexColor` now skips alpha-zero corners: unpainted means untinted.
+
+**The variant grid has three modes** because there are three seams. By texture: one cell per palette swap of the atlas a material asks for -- a Synty character has one material and several colourways. By material and by object: one cell per material or per node, for the sheets. A file opens on whichever seam separates it (`naturalVariantMode`), the switch shows only the modes with more than one cell, and the grid **pages** rather than scrolls -- the viewport's wheel is the zoom, and a scrolling grid took the same wheel.
+
+### The viewport
+
+One `ViewportController` serves the model preview and the animation preview; they used to have two different sets of controls, and the animation one could not zoom or tilt at all, which is most of why it "felt wrong". Hold the left button to look (the cursor is hidden while held, so a drag can go as far as it likes), right or middle to pan, wheel to zoom, and W/S/A/D/Q/E while a button is held to fly. Dragging up tilts the model *towards* you — a hand on a globe — which is the opposite of the first version. `ViewportCamera` carries yaw, pitch, zoom and a pan in fractions of the shorter side, and `RasterRequest`, `MeshPainter` and `RasterModelView` all take the pan; it is part of the frame cache key.
+
+### Nothing here reads a name
+
+Every rig question is answered from file contents — with the single, declared exception of an attachment's attach point above, which no file records at all. This is not fastidiousness — the naming conventions in this library actively lie:
+
+- `SK_` is Unreal's *skeletal mesh* prefix, and Synty puts it on Polygon-rigged characters. It does not mean Sidekick.
+- `SM_` is Unreal's *static mesh* prefix, and `SM_Chr_Captain_Male_01.fbx` is fully skinned.
+- Sidekick characters are also `SK_*`, so the prefix separates nothing.
+- A pack's `Characters/` folder holds attachments too, and its clips can sit under `Export/Polygon/` or `Animations/Polygon/` depending on the pack's vintage.
+
+So the inputs are:
+
+| Question | Answered by | From |
+| --- | --- | --- |
+| Does this file have geometry or is it a clip? | `modelKind` (`mesh` / `animation`) | importer `--probe` |
+| Which skeleton is it on? | `rigFamily` | marker bones, `--probe` |
+| Which skeleton is a *loaded* clip on? | `rigFamilyOfSkeleton` | the bone names already in memory |
+| Is it a character rather than a prop? | `assetIsCharacterModel` | `rigFamily != none` |
+| Can this clip drive this character? | `rigFamiliesCompatible`, `rigBoneOverlap` | bone names on both sides |
+| Does it need retargeting? | `rigAxisDifference` vs `maxDirectPoseAngle` | bind and rest matrices |
+| Which container is it in? | `assetContainerKey` | the zip path, or the pack folder under a source root |
+
+The one exception is `assetContainerKey`, which is *about* location by definition: two files are in the same container when they came from the same zip, or the same top-level folder under a scanned source root. That is a fact about where a file lives, not a claim about what it is.
+
+`findClipReferenceCharacters` used to require `/character` in the path, which is a habit of two packs rather than a fact about files. It now scopes by container and filters by `modelKind` and `rigFamily`, both permissive when unknown — a file nothing has probed is offered rather than hidden. On a cold catalog a known rigged character shuts out the unprobed files entirely; without that, an animation pack's seven hundred unclassified clips would fill the candidate list before the alphabet reached its two characters. The caller then rejects anything that imports without skin, because a clip would otherwise score a perfect bone overlap and win with a rest pose that is just an idle. `test/rig_reference_test.dart` pins all of it.
+
+**How classification runs.** `--probe` walks the FBX node graph and reports which of `kRigMarkerBones` (in `mesh_importer.cpp`) it saw; `rigFamilyFromMarkers` turns that list into a family. Adding a rig means adding its marker bones there and a case to that function — those two lists are the whole rule set. The answer rides home from the classification isolate encoded by `FbxClassification` (`kind#rig` in one string) and lands in the `rig_family` column.
+
+Classification is lazy and persisted, which has bitten once: the scheduler skipped any FBX that already had a `modelKind`, so files classified before the `rig_family` column existed kept a kind, never got a rig, and were invisible to the character filter forever. It now probes when *either* fact is missing.
+
+**A failure of ours is not a verdict about someone's file**, and because classification is persisted and lazy the difference is permanent. `'unreadable'` is recorded only when the helper actually ran and rejected the file. When nothing was ever heard back — the helper could not be spawned, the pipe broke, the isolate message did not cross — `classifyFbxChunk` logs it and records *nothing*, so a later pass retries. Collapsing the two is what put 26,237 files in the catalog as unreadable when the launcher was an unsendable closure, and `_runFbxClassification`'s chunk-level handler has said so in a comment ever since; the per-asset path inside the chunk was still doing it. `test/classify_isolate_test.dart` pins both halves — an absent helper records nothing, a working one records a verdict — and the second test exists because "nothing recorded" is otherwise indistinguishable from a boundary that stopped crossing. The old version of that test asserted `'unreadable'` for a file no helper had run on, with the reason "the file itself cannot be judged", which is the contradiction in one line.
+
+A probe that fails says why: `probeFbxContentKindDetailed` returns `FbxProbeResult`, whose `detail` is empty on a verdict and carries the cause otherwise. `probeFbxContentKind` flattens it to the bare string the catalog stores. Assert on the detailed form in tests — `'unreadable'` is both a real answer and what every failure used to collapse to, so a red test said "expected animation, got unreadable" and nothing more.
+
+`assetPassesRigFilter` drives the sidebar's skeleton filter, including "works with my character", which keeps only files sharing the chosen animation character's family. A file nothing has probed yet is never hidden — that would assert something the catalog does not know.
+
+Each FBX also records its authoring path in `Original|FileName` (`U:\Synty\Animation\BaseLocomotion\...\Export\Polygon\...` for a clip, `E:\Individual_Characters\...` for a newer character). It is a useful forensic hint about which pipeline a file came from, but it is not used for matching — measuring the rigs is more reliable than parsing someone else's folder names.
+
+There is no standalone skeleton asset in these packs. Every `SK_Chr_*.fbx` (1,551 of them across the library) embeds its own copy of the rig and its own skin weights, so a character is matched to a clip directly with no shared avatar in between.
+
+Diagnostics: set `ASSET_ATLAS_DEBUG_SPACES=1` and the importer prints each mesh's raw extent and geometry-to-world on stderr. That is what finally showed the mesh standing at y 0..1.79 while the emitted vertices sat at ±0.88.
+
+`AnimationCharacter` (settings key `animation.character.path`, schema v6 `settings` table) holds the model clips play on; `AnimationCharacterButton` sets it, and only appears for a mesh that actually has skin weights.
+
+### Catalog and persistence
+
+`AssetAtlasDatabase` is a singleton over `sqflite_common_ffi`, DB file in the app support dir (or `initialize(databasePath:)` in tests), schema `version: 7` with tables `catalog_assets`, `catalog_sources`, `projects`, `project_assets`. `onUpgrade` exists and is tested — add a migration step there and mirror any DDL in `onCreate`, since `test/database_test.dart` asserts the two paths converge. Asset ids come from `buildAssetId()` (source root + relative path, content-independent); never build one inline.
+
+Assets inside `.zip` archives are indexed as virtual paths shaped `zip:<container>::<entry>`. Any code that touches a path must handle this: `isZipVirtualPath()` gates reads through `readZipVirtualAssetBytesByPath()` and an LRU-ish archive cache. ZIP entries are searchable, previewable (images, audio, OBJ and FBX), and copyable — the copy flow writes them out under their archive-relative path. Archives are read through their own central directory (`InputFileStream` + `ZipDecoder.decodeStream`), never loaded whole. That used to be the biggest hole in the catalog: slurping forced a 128MB byte cap, and an archive over it was skipped silently at scan, at read and at classification -- 49 Synty archives holding 66,441 indexable entries, 3,284 of them FBX, against the 73,865 rows the catalog did have. Only `maxZipEntriesToInspect` remains, as a safety valve. Reads come off an LRU cache of open archives (`maxZipArchiveCacheEntries`), because reopening one costs 20-40ms of directory parsing and scrolling a grid reads hundreds of entries; entries are inflated with `archiveEntryBytes`, which keeps nothing, since `ArchiveFile.content` caches what it inflates and would hand the saved memory straight back. **An open handle locks the file on Windows**, so the cache lets go `zipArchiveIdleTimeout` after the last read and `closeCachedArchives()` is called before a scan -- a browser that pinned the archives the user is trying to reorganise would be its own bug. Tests that delete a zip fixture must call `closeCachedArchives()` in teardown for the same reason.
+
+Type classification is driven by the top-level `const` sets in `lib/main.dart` (`imageExts`, `textureExts`, `audioExts`, `modelExts`, `archiveExts`, `unrealExts`) and `ignoredFolderNames` (`.git`, `.vs`, `Intermediate`, `Saved`, …). These are the authoritative rule set — changing them changes fixture test expectations in `test/fixtures/expected_results.json`.
+
+### Known structural constraints
+
+`lib/main.dart` is a deliberate monolith: UI widgets, scanning, ZIP handling, mesh import, renderer, and the database layer all live there. Prefer adding to the existing structure over speculative refactors unless the task is the refactor.
+
+Two things now run on worker isolates, and both follow the same rule: **the
+entry point and the launcher must be top-level**. A closure built inside a
+`State` method captures `this`, drags the widget tree into the isolate message,
+and fails with "object is unsendable" — see `runFbxClassifyChunk` and
+`scanWorkerEntry`. Folder scanning goes through `startFolderScan`, which
+returns a `ScanHandle` carrying progress and `cancel()`; FBX classification
+goes through `buildFbxClassifyChunks` + `runFbxClassifyChunk`. Model previews
+and thumbnails still import on the UI isolate, cached by `MeshLoadCache`.
+
+## Testing
+
+Tests are fixture-driven, under `test/`:
+
+- `scan_fixture_test.dart` — scan counts/classification against `test/fixtures/corpus` and `expected_results.json`
+- `copy_fixture_test.dart` — copy flow into temp dirs
+- `zip_introspection_test.dart` — ZIP virtual-path indexing
+- `fbx_texture_pipeline_test.dart` — importer-JSON → mesh → texture decode, using synthetic JSON (no native helper needed)
+- `native_fbx_importer_test.dart` — real `ufbx` helper against `test/fixtures/fbx/transformed_uv_embedded.fbx` (ASCII FBX with embedded PNG, transformed instances, two named UV sets); skips without a Windows build
+
+Tests import app code as `package:asset_atlas_native/main.dart`, so anything they exercise must be a top-level (non-private) declaration in `main.dart`.
+
+## Windows platform gotchas
+
+**Never put a `Tooltip` directly inside `ToggleButtons`.** It corrupts the
+Windows accessibility tree (`Failed to update ui::AXTree` on stderr at startup)
+and the app then hard-crashes inside `flutter_windows.dll` — exception
+`0xC000041D` — the next time the window is resized or maximised. Bisected and
+confirmed against this exact combination; `ToggleButtons` alone and
+`DropdownButton` alone are both fine, and `IconButton(tooltip: ...)` is safe and
+is what the toolbar uses instead.
+
+More generally: AX errors on stderr are not cosmetic here. A clean run prints
+none, so treat any `accessibility_bridge.cc` line as a crash waiting for a
+resize, and bisect the widget tree until it is silent.
+
+## Diagnostics
+
+FBX pipeline logging is on via `const enableFbxLogs = true` and writes to `work/asset_atlas_native/logs/asset_atlas_fbx.log` — importer launch/exit, JSON field counts, texture relink decisions, mesh/vertex-color summary. Read this log first when a model previews blank or untextured.
