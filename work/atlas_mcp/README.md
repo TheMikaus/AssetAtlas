@@ -128,6 +128,34 @@ file size do not say whether a model will arrive whole. It reports the real
 authored size too, which is the number that decides whether a prop lands in a
 level a hundred times too big.
 
+## Prompts: the sequences, written down
+
+A tool description says what one tool does. It does not say what order to
+call six of them in, and that is the part a model gets wrong here -- it will
+search for files before asking which build of the pack it wants, or import a
+prop without ever asking how big the prop is. So the six sequences this
+library gets asked for are served as MCP prompts:
+
+| Prompt | For |
+| --- | --- |
+| `survey_the_library` | Orientation. What is here, what the catalog knows, and the two things that mislead. |
+| `set_up_a_level` | `theme`, `engine` -- packs to exported files for a themed level. |
+| `import_a_model` | `asset` -- the check to run before spending an import. |
+| `animate_a_character` | `character`, `motion` -- the rig question, which is two questions. |
+| `dress_a_character` | `character` -- helmets, hair, capes, and what the attach point is not. |
+| `choose_a_build` | `pack`, `engine` -- source files or a built project. |
+
+Every argument is optional, because a client may offer a prompt with none of
+them filled in. An absent one reads as `Theme: (not given -- ask, or see the
+themes find_packs lists)` on its own labelled line, rather than being
+interpolated into the middle of a sentence -- which is how "Get the assets for
+a the theme you want level" happened, and is what
+`test_an_absent_argument_never_lands_inside_a_sentence` now pins.
+
+The prompts name tools, so they can drift when a tool is renamed. A test
+reads every tool name out of a rendered prompt and fails on one this server
+does not have.
+
 ## The rig_family gap
 
 Atlas fills `rig_family` in lazily — it reads a file when a filter needs the
@@ -151,7 +179,7 @@ It fixes the rig filter inside Atlas too, for the same reason.
 cd work/atlas_mcp && python -I -m unittest
 ```
 
-109 of them, over catalogs the tests build themselves — the protocol handshake,
+122 of them, over catalogs the tests build themselves — the protocol handshake,
 the search semantics, the folder walk, and a mirror test that reads the
 `attachPoints` table out of `lib/main.dart` and fails if the copy here has
 drifted from it. That table is restated in a second language, which is the kind

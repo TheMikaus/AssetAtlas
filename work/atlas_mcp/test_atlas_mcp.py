@@ -1130,5 +1130,123 @@ class BridgeToolRegistrationTest(unittest.TestCase):
                          sorted(tool["name"] for tool in atlas_mcp.TOOL_SCHEMAS))
 
 
+class PromptTest(unittest.TestCase):
+    """The prompts channel: the sequences, not the greetings."""
+
+    def test_the_server_advertises_the_prompts_capability(self):
+        # Without this a client will never call prompts/list, and the
+        # sequences might as well not exist.
+        result = atlas_mcp.handle_initialize({})
+        self.assertIn("prompts", result["capabilities"])
+
+    def test_prompts_list_returns_every_prompt(self):
+        result = atlas_mcp.dispatch("prompts/list", None)
+        names = [prompt["name"] for prompt in result["prompts"]]
+        self.assertEqual(sorted(names), sorted(atlas_mcp.PROMPT_BUILDERS))
+
+    def test_no_prompt_schema_leaks_its_builder(self):
+        # The builder is a Python function; json.dumps would die on it.
+        for prompt in atlas_mcp.PROMPT_SCHEMAS:
+            self.assertNotIn("builder", prompt)
+            json.dumps(prompt)
+
+    def test_every_prompt_declares_the_arguments_it_interpolates(self):
+        for prompt in atlas_mcp.PROMPT_SCHEMAS:
+            for argument in prompt["arguments"]:
+                self.assertIn("name", argument)
+                self.assertIn("description", argument)
+
+    def test_a_prompt_comes_back_as_a_user_message(self):
+        result = atlas_mcp.dispatch(
+            "prompts/get", {"name": "survey_the_library"})
+        message, = result["messages"]
+        self.assertEqual(message["role"], "user")
+        self.assertEqual(message["content"]["type"], "text")
+        self.assertIn("catalog_stats", message["content"]["text"])
+
+    def test_arguments_are_interpolated_into_the_text(self):
+        result = atlas_mcp.dispatch(
+            "prompts/get",
+            {"name": "set_up_a_level",
+             "arguments": {"theme": "frozen dungeon", "engine": "5.4"}})
+        body = result["messages"][0]["content"]["text"]
+        self.assertIn("frozen dungeon", body)
+        self.assertIn("5.4", body)
+
+    def test_a_missing_argument_leaves_a_readable_sentence(self):
+        # Every argument is optional, because a client may offer the prompt
+        # with none filled in. The result has to read as English either way
+        # rather than as a stray format placeholder.
+        for name in atlas_mcp.PROMPT_BUILDERS:
+            body = atlas_mcp.dispatch("prompts/get", {"name": name})
+            text = body["messages"][0]["content"]["text"]
+            self.assertNotIn("%s", text)
+            self.assertNotIn("None", text)
+            self.assertTrue(text.strip())
+
+    def test_a_blank_argument_is_treated_as_absent(self):
+        result = atlas_mcp.dispatch(
+            "prompts/get",
+            {"name": "import_a_model", "arguments": {"asset": "   "}})
+        self.assertIn("not given",
+                      result["messages"][0]["content"]["text"])
+
+    def test_an_absent_argument_never_lands_inside_a_sentence(self):
+        # "Get the assets for a the theme you want level" is what
+        # interpolating a fallback mid-sentence produced. The parameters sit
+        # on their own labelled lines so an absent one can say what to do
+        # about itself instead of pretending to be a noun.
+        for name, schema in zip(sorted(atlas_mcp.PROMPT_BUILDERS),
+                                sorted(atlas_mcp.PROMPT_SCHEMAS,
+                                       key=lambda p: p["name"])):
+            if not schema["arguments"]:
+                continue
+            text = atlas_mcp.dispatch(
+                "prompts/get", {"name": name})["messages"][0]["content"]["text"]
+            for line in text.splitlines():
+                if "(not " in line:
+                    self.assertRegex(line, r"^\w[\w ]*: *\(not ",
+                                     "%s: %r" % (name, line))
+
+    # Snake_case words in a prompt that are deliberately not tool names.
+    NOT_TOOLS = frozenset([
+        "rig_family", "listchanged", "no_such_prompt",
+    ])
+
+    def test_no_prompt_names_a_tool_this_server_does_not_have(self):
+        # A sequence that calls a tool that was renamed or never existed is
+        # worse than no sequence: the model follows it and gets an error, and
+        # nothing else in the repo would notice the drift.
+        for name in atlas_mcp.PROMPT_BUILDERS:
+            body = atlas_mcp.dispatch("prompts/get", {"name": name})
+            text = body["messages"][0]["content"]["text"]
+            tokens = set(re.findall(r"\b[a-z][a-z]+_[a-z_]+\b", text))
+            unknown = tokens - set(atlas_mcp.HANDLERS) - self.NOT_TOOLS
+            unknown -= set(atlas_mcp.PROMPT_BUILDERS)
+            self.assertEqual(unknown, set(),
+                             "%s names %s" % (name, sorted(unknown)))
+            self.assertTrue(tokens & set(atlas_mcp.HANDLERS),
+                            "%s names no tool at all" % name)
+
+    def test_an_unknown_prompt_is_a_bad_request_not_a_server_fault(self):
+        with self.assertRaises(atlas_mcp.JsonRpcError) as caught:
+            atlas_mcp.dispatch("prompts/get", {"name": "no_such_prompt"})
+        self.assertEqual(caught.exception.code, -32602)
+
+    def test_serve_reports_that_code_rather_than_an_internal_error(self):
+        request = json.dumps({"jsonrpc": "2.0", "id": 7,
+                              "method": "prompts/get",
+                              "params": {"name": "nope"}})
+        out = io.StringIO()
+        atlas_mcp.serve(stdin=io.StringIO(request + "\n"), stdout=out)
+        reply = json.loads(out.getvalue())
+        self.assertEqual(reply["error"]["code"], -32602)
+
+    def test_the_instructions_point_at_the_prompts(self):
+        # instructions is optional in the spec and some clients drop it, but
+        # a client that does read it should know the sequences are there.
+        self.assertIn("prompts", atlas_mcp.INSTRUCTIONS)
+
+
 if __name__ == "__main__":
     unittest.main()

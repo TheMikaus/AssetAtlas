@@ -1856,7 +1856,289 @@ of parts, how big is it really), rig_compatibility (will this clip drive that
 character) and render_asset (what does it look like). They need Atlas open and
 say so if it is not; everything else works either way. Before importing
 anything into a project, inspect_model is the tool that says whether it will
-arrive whole -- a name and a file size do not."""
+arrive whole -- a name and a file size do not.
+
+Six prompts hold the sequences this library gets asked for repeatedly --
+survey_the_library, set_up_a_level, import_a_model, animate_a_character,
+dress_a_character, choose_a_build. They are the order to call things in, with
+the traps named; read the relevant one before improvising a sequence."""
+
+
+# ----------------------------------------------------------------- prompts
+
+# A prompt here is a procedure, not a greeting. Each one is a sequence that
+# gets repeated against this library -- dress a level, check a model before
+# importing it, drive a character with a clip -- written down with the traps
+# named in the order they are met. The tool descriptions say what each tool
+# does; these say which order to call them in, which is the part a model
+# reliably gets wrong on a library whose names lie.
+
+
+class JsonRpcError(Exception):
+    """A protocol-level error, carrying the code to hand the client."""
+
+    def __init__(self, code, message):
+        Exception.__init__(self, message)
+        self.code = code
+
+
+def _arg(arguments, name, fallback):
+    value = (arguments or {}).get(name)
+    if isinstance(value, str):
+        value = value.strip()
+    return value or fallback
+
+
+def prompt_survey_the_library(arguments):
+    return """Find out what is here before asking for anything specific.
+
+1. catalog_stats -- totals by type, the pack count, whether Atlas is running
+   (the three model tools need it) and how many files have a rig family. Read
+   that last number: if it is near zero, type='character' and
+   find_animations' rig matching come back empty, and that is a gap in the
+   catalog rather than in the library.
+2. find_packs with no query -- every pack with the builds it ships. This is
+   the map. The file list is the territory and it is 74,000 rows.
+3. list_packs or browse to walk one pack.
+4. find_duplicates if the question is about disk space rather than content.
+
+Two things to carry into every later question. Names here are literal and the
+prefixes are unreliable: the nouns are good ('Barrel', 'Helmet',
+'RubbishBin'), while 'SK_' and 'SM_' sit on whatever the exporter felt like.
+And half the rows are duplicate files, so a match count is not a count of
+distinct assets unless the tool says it collapsed them."""
+
+
+def prompt_set_up_a_level(arguments):
+    theme = _arg(arguments, "theme",
+                 "(not given -- ask, or see the themes find_packs lists)")
+    engine = _arg(arguments, "engine",
+                  "(not given -- ask; it decides step 2)")
+    return """Gather the assets for a themed level and get them into an
+Unreal project.
+
+Theme:  %s
+Engine: %s
+
+1. find_packs with the theme as the query. Do this before searching for
+   files: a pack ships several times over -- source files, and a built
+   project per engine version -- and which copy you take decides everything
+   after it.
+2. Pick the build. An unreal build matching the engine exactly drops in with
+   its materials and blueprints intact and no import step, but carries no
+   geometry anything outside the engine can read. A source build is FBX and
+   OBJ: it imports anywhere, you choose the settings, and you redo the
+   materials. Take one, not both.
+3. search_assets with build= and engine= set, and type='model' for geometry.
+   Search the nouns. Style words do not appear in these names -- there is no
+   'grungy' or 'weathered' in the library's own vocabulary, only
+   'SM_Prop_RubbishBin_02'.
+4. inspect_model on the two or three you actually mean to place, before
+   exporting any of them. It is the only thing that says whether a model's
+   textures resolve and how big it really is. A prop that lands a hundred
+   times too large is the commonest way this goes wrong and the file name
+   does not say.
+5. export_assets with dest= and the paths you chose. An unreal build's
+   Content tree lands archive-relative, ready to drop into the project.""" % (
+        theme, engine)
+
+
+def prompt_import_a_model(arguments):
+    asset = _arg(arguments, "asset",
+                 "(not given -- ask, or shortlist with search_assets)")
+    return """Decide whether a model will arrive whole, before spending an
+import on it.
+
+Model: %s
+
+1. inspect_model on it. Needs Atlas open. Four things in the report matter:
+   - textures. "2 of 5 materials textured" means three draw flat. A material
+     that named textures and resolved none looks identical on screen to one
+     that was always flat colour and means the opposite thing.
+   - shape: model, sheet or kit. A sheet is a dozen bodies standing in one
+     place; a kit is one model whose every part ships in the same file, eight
+     heads and twenty shoulder plates. Import either whole and you get an
+     interpenetrating pile, not a mistake you will diagnose quickly.
+   - size, in the units the artist authored. This is the import scale. The
+     viewer fits a rivet and a cathedral into the same box, so nothing you
+     can see tells you this.
+   - rig: none for a prop, a family name for a character.
+2. render_asset if you want to look at it. For a kit it draws one variant per
+   slot rather than every part at once.
+3. get_asset for the node and material names you will meet in Unreal, and the
+   textures the file asks for by name.
+4. export_assets once you are satisfied. Prefer a source build's FBX unless
+   the project is on the exact engine an unreal build targets.""" % (asset,)
+
+
+def prompt_animate_a_character(arguments):
+    character = _arg(arguments, "character",
+                     "(not chosen -- step 1 finds one)")
+    motion = _arg(arguments, "motion",
+                  "(not given -- ask, or see what find_animations has)")
+    return """Drive a character with animation clips from this library.
+
+Character: %s
+Motion:    %s
+
+1. If the character is not chosen: search_assets type='character'. That
+   filter reads the rig_family column, which the catalog fills in lazily and
+   which may be nearly empty -- catalog_stats says how many files have it. If
+   it comes back empty, search type='model' and inspect candidates rather
+   than trusting a name: 'SK_' is Unreal's skeletal-mesh prefix and these
+   packs put it on three unrelated rigs.
+2. find_animations for the motion.
+3. rig_compatibility on one clip per pack before committing to that pack. It
+   answers two separate questions and both decide the outcome. Shared bone
+   count: zero means the clip cannot drive this character at all, and that is
+   the normal case across rig families -- Polygon and Sidekick share no bone
+   names whatsoever. Rest-pose difference in degrees: all bones shared but
+   around 90 degrees apart means the clip will play and the limbs will sit
+   wrong until something retargets it.
+4. Export the character and its clips together. A clip is only useful beside
+   a character on a rig it matches.""" % (character, motion)
+
+
+def prompt_dress_a_character(arguments):
+    character = _arg(arguments, "character",
+                     "(not given -- ask, or shortlist with search_assets)")
+    return """Find the kit -- helmets, hair, capes -- that fits a character.
+
+Character: %s
+
+1. find_attachments on it -- helmets, beards, hair, capes and pauldrons from
+   the character's own archive, each with the attach point it is guessed to
+   use.
+2. Treat that point as a suggestion. It is the one thing in this library
+   inferred from a file name, and deliberately so: an attachment FBX is a
+   bare mesh at the origin with no socket and no metadata, so nothing in the
+   file says where it goes.
+3. inspect_model on the pieces you want. The texture question applies to a
+   helmet exactly as it does to a building, and a piece whose textures do not
+   resolve arrives flat.
+4. Take the FBX, not the OBJ twin. Every piece ships both, and the OBJ is in
+   centimetres with nothing in the file to say so.""" % (character,)
+
+
+def prompt_choose_a_build(arguments):
+    pack = _arg(arguments, "pack",
+                "(not given -- find_packs lists them all)")
+    engine = _arg(arguments, "engine", "(not given -- ask)")
+    return """Decide which copy of a pack to take: source files, or a built
+Unreal project, and which engine version.
+
+Pack:   %s
+Engine: %s
+
+1. find_packs on the pack name and read its builds. Which engine a build
+   targets is recorded only in the archive name -- a .uasset does not say --
+   so this is the one place the fact exists.
+2. An unreal build on the exact version: no import step, materials and
+   blueprints intact, and nothing outside the engine can read the geometry.
+3. An unreal build on a different version: usually still opens, with a
+   conversion. Weigh it against the source build rather than assuming either
+   way.
+4. A source build: FBX and OBJ. Imports anywhere and you redo the materials.
+   It is also the only build inspect_model, rig_compatibility and
+   render_asset can say anything about, because the unreal builds carry no
+   geometry to read.
+5. Take one. Two copies of one pack in one project is the commonest
+   duplication here, which is why search_assets collapses identical copies in
+   its listings by default.""" % (pack, engine)
+
+
+PROMPTS = [
+    {
+        "name": "survey_the_library",
+        "description": "Orient yourself in the library before asking for "
+                       "anything specific: what is here, what the catalog "
+                       "knows, and the two things that mislead.",
+        "arguments": [],
+        "builder": prompt_survey_the_library,
+    },
+    {
+        "name": "set_up_a_level",
+        "description": "Assets for a themed level, from packs to exported "
+                       "files: pick the pack, pick the build, check before "
+                       "exporting.",
+        "arguments": [
+            {"name": "theme", "required": False,
+             "description": "What the level is -- dungeon, city street, "
+                            "sci-fi interior."},
+            {"name": "engine", "required": False,
+             "description": "The project's Unreal version, e.g. 5.4."},
+        ],
+        "builder": prompt_set_up_a_level,
+    },
+    {
+        "name": "import_a_model",
+        "description": "The check to run before importing a model: do its "
+                       "textures resolve, is it one model or a sheet or a "
+                       "kit, and how big is it really. Needs Atlas open.",
+        "arguments": [
+            {"name": "asset", "required": False,
+             "description": "The model's path or name."},
+        ],
+        "builder": prompt_import_a_model,
+    },
+    {
+        "name": "animate_a_character",
+        "description": "Match animation clips to a character: the rig "
+                       "question, which is two questions, and both of them "
+                       "decide whether it plays.",
+        "arguments": [
+            {"name": "character", "required": False,
+             "description": "The character's path or name."},
+            {"name": "motion", "required": False,
+             "description": "What it should do -- idle, walk, attack."},
+        ],
+        "builder": prompt_animate_a_character,
+    },
+    {
+        "name": "dress_a_character",
+        "description": "Find the helmets, hair, capes and other kit that fit "
+                       "a character, and what the attach point is and is not.",
+        "arguments": [
+            {"name": "character", "required": False,
+             "description": "The character's path or name."},
+        ],
+        "builder": prompt_dress_a_character,
+    },
+    {
+        "name": "choose_a_build",
+        "description": "Source files or a built Unreal project, and which "
+                       "engine version -- the question no file answers.",
+        "arguments": [
+            {"name": "pack", "required": False,
+             "description": "The pack's name."},
+            {"name": "engine", "required": False,
+             "description": "The project's Unreal version, e.g. 5.4."},
+        ],
+        "builder": prompt_choose_a_build,
+    },
+]
+
+PROMPT_BUILDERS = {prompt["name"]: prompt["builder"] for prompt in PROMPTS}
+PROMPT_SCHEMAS = [
+    {k: v for k, v in prompt.items() if k != "builder"} for prompt in PROMPTS
+]
+
+
+def handle_prompts_get(params):
+    name = (params or {}).get("name")
+    builder = PROMPT_BUILDERS.get(name)
+    if builder is None:
+        # Not a tool call, so there is no isError result to put this in: an
+        # unknown prompt is a bad request and has to come back as one.
+        raise JsonRpcError(-32602, "No such prompt: %s" % name)
+    arguments = (params or {}).get("arguments") or {}
+    schema = next(p for p in PROMPT_SCHEMAS if p["name"] == name)
+    return {
+        "description": schema["description"],
+        "messages": [{"role": "user",
+                      "content": {"type": "text",
+                                  "text": builder(arguments)}}],
+    }
 
 
 # ------------------------------------------------------------------ server
@@ -1867,7 +2149,8 @@ def handle_initialize(params):
     version = asked if asked in KNOWN_PROTOCOLS else DEFAULT_PROTOCOL
     return {
         "protocolVersion": version,
-        "capabilities": {"tools": {"listChanged": False}},
+        "capabilities": {"tools": {"listChanged": False},
+                         "prompts": {"listChanged": False}},
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": INSTRUCTIONS,
     }
@@ -1898,6 +2181,10 @@ def dispatch(method, params):
         return {"tools": TOOL_SCHEMAS}
     if method == "tools/call":
         return handle_tools_call(params)
+    if method == "prompts/list":
+        return {"prompts": PROMPT_SCHEMAS}
+    if method == "prompts/get":
+        return handle_prompts_get(params)
     if method == "ping":
         return {}
     raise KeyError(method)
@@ -1934,8 +2221,9 @@ def serve(stdin=None, stdout=None):
             log("dispatch failed: %r" % error)
             if identifier is None:
                 continue
+            code = getattr(error, "code", -32603)
             reply = {"jsonrpc": "2.0", "id": identifier,
-                     "error": {"code": -32603, "message": str(error)}}
+                     "error": {"code": code, "message": str(error)}}
             stdout.write(json.dumps(reply) + "\n")
             stdout.flush()
             continue
@@ -1955,6 +2243,7 @@ def main():
         print("catalog %s: %d assets" % (DB_PATH, total))
         print("importer: %s" % (IMPORTER_PATH or "NOT FOUND"))
         print("tools: %s" % ", ".join(sorted(HANDLERS)))
+        print("prompts: %s" % ", ".join(sorted(PROMPT_BUILDERS)))
         return 0
     log("atlas-mcp serving %s" % DB_PATH)
     serve()
