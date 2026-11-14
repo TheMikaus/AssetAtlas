@@ -89,7 +89,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.28';
+const appVersion = '1.10.29';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -11281,6 +11281,7 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
         probeOnly: true,
       );
       if (result.exitCode != 0) {
+        // The helper ran and said no: that is a verdict about the file.
         kinds[assetId] = 'unreadable';
         continue;
       }
@@ -11292,8 +11293,14 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
         kind: json['kind'] == 'animation' ? 'animation' : 'mesh',
         rig: rigFamilyFromMarkers(markers).name,
       ).encode();
-    } catch (_) {
-      kinds[assetId] = 'unreadable';
+    } catch (error) {
+      // Nothing was ever heard back, so nothing is known about this file.
+      // Writing 'unreadable' here would bake our own failure into the catalog
+      // as a verdict about someone's asset -- the mistake the chunk-level
+      // handler in _runFbxClassification exists to avoid, and which lazy
+      // classification makes permanent, since it skips anything that already
+      // has a kind. Leaving it out means a later pass tries again.
+      fbxLog('Probe failed for $assetPath: $error');
     }
   }
   try {
@@ -11353,17 +11360,44 @@ List<FbxClassifyChunk> buildFbxClassifyChunks({
 /// of bytes instead of megabytes, which is what makes classifying a whole
 /// catalog viable.
 ///
+/// A probe's verdict, and -- when there is not one -- why not.
+///
+/// 'unreadable' is both a real answer about a file and what every failure
+/// collapsed to, so the two were indistinguishable. A probe that fell over
+/// because the helper could not be spawned read exactly like a corrupt FBX,
+/// which made a flaky failure say "expected animation, got unreadable" and
+/// nothing more. [detail] is the difference.
+class FbxProbeResult {
+  const FbxProbeResult(this.kind, {this.detail = ''});
+
+  /// 'mesh', 'animation' or 'unreadable' -- the values the catalog stores.
+  final String kind;
+
+  /// Empty when the probe reached a verdict; otherwise what went wrong.
+  final String detail;
+
+  @override
+  String toString() => detail.isEmpty ? kind : "$kind ($detail)";
+}
+
 /// Returns 'mesh', 'animation', or 'unreadable'.
-Future<String> probeFbxContentKind(AssetItem asset) async {
-  if (asset.ext != 'fbx') return 'mesh';
+Future<String> probeFbxContentKind(AssetItem asset) async =>
+    (await probeFbxContentKindDetailed(asset)).kind;
+
+/// As [probeFbxContentKind], keeping the reason a probe reached no verdict.
+Future<FbxProbeResult> probeFbxContentKindDetailed(AssetItem asset) async {
+  if (asset.ext != 'fbx') return const FbxProbeResult('mesh');
   final helper = meshImporterPath();
-  if (!File(helper).existsSync()) return 'unreadable';
+  if (!File(helper).existsSync()) {
+    return FbxProbeResult('unreadable', detail: 'no helper at $helper');
+  }
   try {
     final bytes = isZipVirtualPath(asset.path)
         ? await readZipVirtualAssetBytesByPath(asset.path)
         : null;
     if (isZipVirtualPath(asset.path) && (bytes == null || bytes.isEmpty)) {
-      return 'unreadable';
+      return const FbxProbeResult('unreadable',
+          detail: 'no bytes for the archive entry');
     }
     final result = await runMeshImporter(
       helper,
@@ -11371,12 +11405,22 @@ Future<String> probeFbxContentKind(AssetItem asset) async {
       inputBytes: bytes,
       probeOnly: true,
     );
-    if (result.exitCode != 0) return 'unreadable';
+    if (result.exitCode != 0) {
+      return FbxProbeResult('unreadable',
+          detail: 'exit ${result.exitCode}: ${_firstLine(result.stderr)}');
+    }
     final json = jsonDecode(result.stdout) as Map<String, dynamic>;
-    return json['kind'] == 'animation' ? 'animation' : 'mesh';
-  } catch (_) {
-    return 'unreadable';
+    return FbxProbeResult(json['kind'] == 'animation' ? 'animation' : 'mesh');
+  } catch (error) {
+    return FbxProbeResult('unreadable', detail: '$error');
   }
+}
+
+String _firstLine(String text) {
+  final trimmed = text.trim();
+  if (trimmed.isEmpty) return 'no stderr';
+  final break_ = trimmed.indexOf('\n');
+  return break_ < 0 ? trimmed : trimmed.substring(0, break_);
 }
 
 /// Shares one in-flight mesh import between everything that needs it.
@@ -11566,12 +11610,32 @@ Future<MeshImporterResult> runMeshImporter(
     sourcePath,
   ];
   final process = await Process.start(helper, arguments);
-  if (inputBytes != null) {
-    process.stdin.add(inputBytes);
+
+  // Both pipes are drained at once, and the drains are started before
+  // anything is written. Reading stdout to completion and only then reading
+  // stderr deadlocks whenever the child writes more to stderr than the OS
+  // pipe buffer holds: it blocks on that write, stops writing stdout, and
+  // this side waits forever for a stdout that will never arrive. The debug
+  // path (ASSET_ATLAS_DEBUG_SPACES) writes a line per mesh, which on a
+  // 215-node kit is enough to reach it.
+  final stdoutDone = process.stdout.expand((chunk) => chunk).toList();
+  final stderrDone = process.stderr.expand((chunk) => chunk).toList();
+
+  // A path-based call writes nothing to stdin, so a child that has already
+  // exited leaves a closed pipe here. That is not a failure of the import and
+  // must not be reported as one -- and when bytes *were* owed, the exit code
+  // and stderr say so, which is the verdict that counts.
+  try {
+    if (inputBytes != null) {
+      process.stdin.add(inputBytes);
+    }
+    await process.stdin.close();
+  } on IOException catch (_) {
+    // The child is gone or no longer listening; the exit code decides.
   }
-  await process.stdin.close();
-  final stdoutBytes = await process.stdout.expand((chunk) => chunk).toList();
-  final stderrBytes = await process.stderr.expand((chunk) => chunk).toList();
+
+  final stdoutBytes = await stdoutDone;
+  final stderrBytes = await stderrDone;
   final exitCode = await process.exitCode;
   return MeshImporterResult(
     exitCode: exitCode,
@@ -15362,4 +15426,5 @@ Future<Map<String, Object?>> bridgeRender(
     'png': base64Encode(png),
   };
 }
+
 

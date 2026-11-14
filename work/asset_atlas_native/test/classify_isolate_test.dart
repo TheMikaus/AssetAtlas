@@ -102,13 +102,64 @@ void main() {
     final owner = _Owner();
     addTearDown(owner.dispose);
 
+    // Completing at all is the guard: an unsendable capture throws out of
+    // Isolate.run rather than coming back with the wrong answer.
     final kinds = await owner.classify(chunk);
 
-    expect(kinds.keys, ['id-1']);
+    // And nothing is recorded, because nothing was learned. The helper was
+    // never run, so there is no verdict about this file -- and 'unreadable'
+    // is a verdict. Writing it here is the second half of the bug above: the
+    // unsendable launcher is what made every chunk fail, and recording our
+    // own failure as the file's property is what turned that into 26,237
+    // permanently misclassified assets. Classification is lazy and skips
+    // anything that already has a kind, so such a row never heals. Absent
+    // means a later pass tries again.
     expect(
-      kinds['id-1'],
-      'unreadable',
-      reason: 'the helper is absent, so the file itself cannot be judged',
+      kinds,
+      isEmpty,
+      reason: 'a failure of ours is not a fact about the file',
     );
+  });
+
+  test('a chunk that crosses with a working helper comes back judged',
+      () async {
+    // Without this, the test above would keep passing if the message stopped
+    // crossing entirely: "nothing recorded" is what both a missing helper and
+    // a broken boundary look like. Here the helper exists, so a crossing that
+    // works has to produce a verdict.
+    final helper = File(
+      'build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe',
+    );
+    if (!helper.existsSync()) {
+      markTestSkipped('Build the Windows app before running native FBX tests.');
+      return;
+    }
+
+    final root = await Directory.systemTemp.createTemp('asset_atlas_iso_ok_');
+    addTearDown(() async {
+      closeCachedArchives();
+      if (root.existsSync()) await root.delete(recursive: true);
+    });
+
+    final zipPath = '${root.path}${Platform.pathSeparator}pack.zip';
+    final archive = Archive()
+      ..addFile(ArchiveFile('models/not_really.fbx', 4, [1, 2, 3, 4]));
+    await File(zipPath).writeAsBytes(ZipEncoder().encode(archive), flush: true);
+
+    final chunk = FbxClassifyChunk(
+      helperPath: helper.absolute.path,
+      containerPath: zipPath,
+      assetIds: const ['id-1'],
+      assetPaths: [buildZipVirtualPath(zipPath, 'models/not_really.fbx')],
+    );
+
+    final owner = _Owner();
+    addTearDown(owner.dispose);
+
+    final kinds = await owner.classify(chunk);
+
+    // Four bytes of nonsense is not an FBX, and this time something actually
+    // looked: the helper ran and rejected it, which is a real answer.
+    expect(kinds['id-1'], 'unreadable');
   });
 }

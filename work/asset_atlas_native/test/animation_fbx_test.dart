@@ -115,18 +115,92 @@ void main() {
       );
     }
 
-    expect(
-      await probeFbxContentKind(fixtureAsset('animation_only.fbx')),
-      'animation',
+    // Through the detailed form, so a failure says why rather than only
+    // reporting the word every failure collapses to. This test went red once
+    // in a full-suite run and green on its own, and 'unreadable' was all it
+    // had to say about it.
+    final animation = await probeFbxContentKindDetailed(
+      fixtureAsset('animation_only.fbx'),
     );
-    expect(
-      await probeFbxContentKind(fixtureAsset('transformed_uv_embedded.fbx')),
-      'mesh',
+    expect(animation.kind, 'animation', reason: '$animation');
+
+    final mesh = await probeFbxContentKindDetailed(
+      fixtureAsset('transformed_uv_embedded.fbx'),
     );
-    expect(
-      await probeFbxContentKind(fixtureAsset('does_not_exist.fbx')),
-      'unreadable',
+    expect(mesh.kind, 'mesh', reason: '$mesh');
+
+    // A file that is not there is the one case where 'unreadable' is the
+    // answer rather than a swallowed failure, so the reason is asserted too.
+    final missing = await probeFbxContentKindDetailed(
+      fixtureAsset('does_not_exist.fbx'),
     );
+    expect(missing.kind, 'unreadable');
+    expect(missing.detail, isNotEmpty,
+        reason: 'an unreadable verdict has to carry its cause');
+  });
+
+  group('a failed probe is not a verdict', () {
+    FbxClassifyChunk chunkFor(String helperPath, String assetPath) {
+      return FbxClassifyChunk(
+        helperPath: helperPath,
+        containerPath: null,
+        assetIds: const ['asset-1'],
+        assetPaths: [assetPath],
+      );
+    }
+
+    test('an asset nothing could be heard about is left unclassified',
+        () async {
+      // The helper cannot be spawned, so no verdict about this file was ever
+      // reached. Writing 'unreadable' would bake our own failure into the
+      // catalog as a fact about someone's asset, and lazy classification
+      // would never revisit it -- it skips anything that already has a kind.
+      // Absent means a later pass tries again.
+      final kinds = await classifyFbxChunk(
+        chunkFor(
+          r'C:\no\such\helper\asset_atlas_mesh_importer.exe',
+          File('test/fixtures/fbx/animation_only.fbx').absolute.path,
+        ),
+      );
+      expect(kinds.containsKey('asset-1'), isFalse,
+          reason: 'got ${kinds['asset-1']}');
+    });
+
+    test('a file the helper ran on and rejected is unreadable', () async {
+      final helper = File(
+        'build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe',
+      );
+      if (!helper.existsSync()) {
+        markTestSkipped('Build the Windows app before running native FBX tests.');
+        return;
+      }
+      // The other side of the line: the helper ran, exited non-zero, and that
+      // is a real answer about the file rather than a failure of ours.
+      final kinds = await classifyFbxChunk(
+        chunkFor(
+          helper.absolute.path,
+          File('test/fixtures/fbx/does_not_exist.fbx').absolute.path,
+        ),
+      );
+      expect(kinds['asset-1'], 'unreadable');
+    });
+
+    test('a probe that works still classifies', () async {
+      final helper = File(
+        'build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe',
+      );
+      if (!helper.existsSync()) {
+        markTestSkipped('Build the Windows app before running native FBX tests.');
+        return;
+      }
+      final kinds = await classifyFbxChunk(
+        chunkFor(
+          helper.absolute.path,
+          File('test/fixtures/fbx/animation_only.fbx').absolute.path,
+        ),
+      );
+      expect(kinds['asset-1'], startsWith('animation'));
+    });
   });
 
   test('the native importer reports a real animation clip', () async {
