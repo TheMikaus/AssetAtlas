@@ -9,3 +9,12 @@
 # Python bytecode from the MCP server and its tests.
 __pycache__/
 *.pyc
+
+# Downloaded SigLIP 2 weights for visual tagging: ~420MB, fetched by
+# hand (work/atlas_mcp/README.md says how) and reproducible from the
+# Hugging Face repo, so there is no reason to carry them in history.
+work/atlas_mcp/models/
+
+# Embedding vectors are a derived cache, rebuilt from the assets.
+*.f32
+embeddings_index.sqlite

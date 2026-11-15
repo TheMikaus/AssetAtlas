@@ -33,7 +33,9 @@ claude mcp add --scope user atlas -- python -I C:/Users/white/Documents/Codex/20
 
 Standard library only, on purpose. No virtualenv, no `pip install`, nothing to
 go stale — "pip install failed inside an MCP launch" is a worse failure than
-the hundred lines of JSON-RPC it would have saved.
+the hundred lines of JSON-RPC it would have saved. Visual tagging is the one
+thing that needs more than the standard library, and it is kept in a separate
+component for that reason — see "Visual tagging" below.
 
 Check it without a client:
 
@@ -172,6 +174,158 @@ python -I work/atlas_mcp/backfill_rigs.py
 ```
 
 It fixes the rig filter inside Atlas too, for the same reason.
+
+## Visual tagging: dependencies and installation
+
+Everything above runs on the standard library. Visual tagging does not: it
+embeds a render of a model, and a texture, into a vector space shared with
+text, so that "find grungy models" can be answered by similarity rather than
+by hoping the word appears in a file name. It appears in none — `grungy`
+matches 0 of 73,865 names here, `gray` matches 0.
+
+The vectors are stored by `embedding_store.py`, which *is* standard library
+only. The model that produces them is not, and lives outside the server. See
+`DECISIONS.md` EMB-001 and EMB-002 for why the split falls there.
+
+### Python packages
+
+| Package | Verified version | Licence | Needed for | In the installer? |
+| --- | --- | --- | --- | --- |
+| `onnxruntime` | 1.22.0 | MIT | running the model | No — the shipped app uses the C++ `onnxruntime.dll` |
+| `numpy` | 1.26.4 | BSD-3-Clause | pulled in by onnxruntime | No |
+| `Pillow` | 11.2.1 | MIT-CMU | decoding a rendered PNG in dev scripts | No — Atlas will hand the tagger raw pixels |
+| `sentencepiece` | 0.2.3 | Apache-2.0 | tokenising a **text query** | No — the tagger links SentencePiece in C++ |
+
+```bash
+python -m pip install onnxruntime sentencepiece
+```
+
+**A trap worth knowing.** The MCP server is launched as `python -I ...`, and
+`-I` implies `-s`, which drops the user `site-packages` — exactly where pip
+puts these on a Microsoft Store Python. So `python -I` cannot import
+onnxruntime even when it is installed. That is harmless for the server, which
+never imports it, but any tagging script must be run with plain `python`, or
+with `python -P` when it reads downloaded files (`-P` keeps the current
+directory off `sys.path` without hiding site-packages).
+
+### Model files
+
+SigLIP 2 base, patch16, 224px. Upstream
+[`google/siglip2-base-patch16-224`](https://huggingface.co/google/siglip2-base-patch16-224)
+is **apache-2.0** and not gated; the pre-exported ONNX copies come from
+[`onnx-community/siglip2-base-patch16-224-ONNX`](https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX).
+
+Fetch into `work/atlas_mcp/models/siglip2-base-patch16-224/`, which is
+gitignored:
+
+```bash
+BASE=https://huggingface.co/onnx-community/siglip2-base-patch16-224-ONNX/resolve/main
+curl -sSL -o vision_model_bnb4.onnx "$BASE/onnx/vision_model_bnb4.onnx"
+curl -sSL -o text_model_int8.onnx   "$BASE/onnx/text_model_int8.onnx"
+curl -sSL -o tokenizer.model        "$BASE/tokenizer.model"
+curl -sSL -o config.json            "$BASE/config.json"
+curl -sSL -o preprocessor_config.json "$BASE/preprocessor_config.json"
+```
+
+Verify by exact byte count — a truncated download is otherwise a model that
+loads and returns nonsense:
+
+| File | Bytes | Role |
+| --- | --- | --- |
+| `vision_model_bnb4.onnx` | 57,554,105 | embeds a render. **Fastest working.** |
+| `vision_model_q4f16.onnx` | 54,630,849 | smaller, slightly slower |
+| `vision_model_fp16.onnx` | 186,039,516 | reference quality |
+| `vision_model_int8.onnx` | 94,553,333 | **does not run — see below** |
+| `text_model_int8.onnx` | 283,438,275 | embeds a query |
+| `tokenizer.model` | 4,241,003 | SentencePiece vocabulary |
+| `config.json` | 435 | |
+| `preprocessor_config.json` | 394 | 224x224, mean 0.5, std 0.5, rescale 1/255 |
+
+The repository also holds fp32 and `q4` variants and a combined `model.onnx`;
+the whole repo is about 11GB and you need three files of it.
+
+### Verified behaviour
+
+Measured here on the CPU provider, onnxruntime 1.22.0:
+
+| Variant | Size | Loads | Batch of 8 | Output |
+| --- | --- | --- | --- | --- |
+| `vision_model_bnb4` | 57.6 MB | 199 ms | **74 ms/image** | `pooler_output` (1, 768) |
+| `vision_model_q4f16` | 54.6 MB | 445 ms | 90 ms/image | `pooler_output` (1, 768) |
+| `vision_model_fp16` | 186.0 MB | 455 ms | 93 ms/image | `pooler_output` (1, 768) |
+| `vision_model_int8` | 94.6 MB | **fails** | — | — |
+| `text_model_int8` | 283.4 MB | 734 ms | 120 ms/query | `pooler_output` (1, 768) |
+
+- **`vision_model_int8.onnx` does not run.** `NOT_IMPLEMENTED: Could not find
+  an implementation for ConvInteger(10)` — onnxruntime's CPU provider has no
+  kernel for the quantised patch-embedding convolution. `model_quantized` and
+  `model_uint8` are byte-identical to it and fail the same way. Use `bnb4`,
+  whose 4-bit `MatMulNBits` path is supported and which is also 37 MB smaller.
+- **Take `pooler_output`, not `last_hidden_state`.** The latter is (1, 196,
+  768) — one vector per patch. The embedding is the pooled (1, 768), and 768
+  is the dimension `embedding_store` must be created with.
+- 13,933 distinct FBX at 74 ms/image is about **17 min single-threaded** for a
+  full library pass, before import and render time.
+
+### Tokenising a query
+
+`tokenizer_config.json` says `GemmaTokenizer`, `do_lower_case: true`, and
+`model_input_names: ['input_ids']` — matching the graph, which takes ids and
+nothing else. It does **not** say whether SigLIP's convention appends `<eos>`,
+prepends `<bos>`, or pads to a fixed width, and getting that wrong does not
+raise: it returns a plausible vector that ranks badly.
+
+What is used, and verified below:
+
+1. lowercase, strip punctuation, collapse whitespace;
+2. `sentencepiece` encode against `tokenizer.model`;
+3. prepend `<bos>` (id 2), append `<eos>` (id 1);
+4. pad to exactly 64 with `<pad>` (id 0), truncating past that.
+
+All four combinations of `<bos>`/`<eos>` were measured against two renders
+whose subjects are known. Every one ranked both captions onto the right
+picture, and the margins sat between +0.2045 and +0.2108 — so the convention
+is not load-bearing here, which is worth knowing before anyone spends a day
+on it. The one above is used because it scored highest, by a margin inside
+the noise.
+
+### Verified ranking
+
+Two Atlas renders, a rubbish bin and the 215-node mech, embedded with
+`vision_model_bnb4`; captions through `text_model_int8`; cosine of
+L2-normalised `pooler_output`:
+
+| Query | vs bin | vs mech |
+| --- | --- | --- |
+| "a low poly rubbish bin" | **+0.1614** | +0.0656 |
+| "a giant robot mech with weapons" | +0.0458 | **+0.1608** |
+
+Content separates by roughly 2.5x. Absolute values are small because SigLIP
+trains with a sigmoid loss rather than a softmax over a batch; only the
+ranking is meaningful, so do not treat 0.16 as "16% similar".
+
+**Style words separate far more weakly than content words:**
+
+| Query | vs bin | vs mech |
+| --- | --- | --- |
+| "grungy and weathered" | +0.0610 | +0.0528 |
+| "clean and futuristic" | +0.0802 | +0.0840 |
+| "a character" | +0.0575 | +0.0878 |
+| "a building" | +0.0508 | +0.0583 |
+
+This is the measurement behind the design: a render carries shape, and style
+lives in the texture. A model whose materials did not resolve renders grey,
+and grey tells a style query nothing — which is why texture-derived tags are
+not a nicety here but the half that answers "grungy", propagated to the models
+that reference the texture. `inspect_model` already reports how many of a
+model's materials resolved, so the confidence of a render-derived style tag is
+knowable per asset.
+
+### What is not measured
+
+ the size of `onnxruntime.dll` alone. The published
+`onnxruntime-win-x64-1.32.0.zip` is 96,945,131 bytes, but that archive carries
+headers, import libraries and test data, and only the DLL would ship.
 
 ## Tests
 
