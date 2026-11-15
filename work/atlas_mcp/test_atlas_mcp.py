@@ -1130,6 +1130,66 @@ class BridgeToolRegistrationTest(unittest.TestCase):
                          sorted(tool["name"] for tool in atlas_mcp.TOOL_SCHEMAS))
 
 
+class ConsumerBriefTest(unittest.TestCase):
+    """AI_BRIEF.md is handed to another model, so a stale name misleads it.
+
+    The brief is the one document written for the consumer rather than the
+    maintainer. Nothing else would notice if a tool were renamed under it:
+    the brief would keep reading plausibly and send the model at a tool that
+    no longer exists.
+    """
+
+    # Snake_case words in the brief that are deliberately not tool names.
+    NOT_TOOLS = frozenset([
+        "rig_family", "backfill_rigs", "atlas_mcp", "asset_atlas",
+        "mcp_servers", "catalog_assets",
+    ])
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "AI_BRIEF.md")
+        with io.open(path, encoding="utf-8") as handle:
+            cls.brief = handle.read()
+        cls.quoted = set(re.findall(r"`([a-z][a-z_]{3,})`", cls.brief))
+
+    def test_the_brief_exists_and_is_not_a_stub(self):
+        self.assertGreater(len(self.brief), 2000)
+
+    def test_every_tool_is_named_in_the_brief(self):
+        # A consumer-facing list that silently omits a tool is a tool nobody
+        # calls.
+        missing = set(atlas_mcp.HANDLERS) - self.quoted
+        self.assertEqual(missing, set(),
+                         "AI_BRIEF.md names no %s" % sorted(missing))
+
+    def test_every_prompt_is_named_in_the_brief(self):
+        missing = set(atlas_mcp.PROMPT_BUILDERS) - self.quoted
+        self.assertEqual(missing, set(),
+                         "AI_BRIEF.md names no %s" % sorted(missing))
+
+    def test_the_brief_names_nothing_that_does_not_exist(self):
+        known = (set(atlas_mcp.HANDLERS) | set(atlas_mcp.PROMPT_BUILDERS)
+                 | self.NOT_TOOLS)
+        invented = {word for word in self.quoted
+                    if "_" in word and word not in known}
+        self.assertEqual(invented, set(),
+                         "AI_BRIEF.md names %s, which is not a tool, a "
+                         "prompt, or in NOT_TOOLS" % sorted(invented))
+
+    def test_it_says_which_tools_need_atlas_open(self):
+        # The single most common way this goes wrong for a consumer.
+        for name in ("inspect_model", "rig_compatibility", "render_asset"):
+            self.assertIn(name, self.quoted)
+        self.assertIn("Atlas open", self.brief)
+
+    def test_it_points_at_catalog_stats_first(self):
+        # Live state -- is Atlas up, is rig_family filled -- changes what is
+        # worth trying, and nothing else reports it.
+        self.assertIn("catalog_stats", self.quoted)
+        self.assertIn("Start here", self.brief)
+
+
 class PromptTest(unittest.TestCase):
     """The prompts channel: the sequences, not the greetings."""
 
