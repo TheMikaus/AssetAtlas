@@ -61,6 +61,68 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 Swap the second line's `name` and `arguments` for any other tool. To see every
 tool and its exact arguments, call `tools/list` the same way.
 
+## Starting Atlas, if it is not already up
+
+Eleven of the fourteen tools work whether or not the Atlas window is open.
+Three do not — `inspect_model`, `rig_compatibility` and `render_asset` — and
+they are the ones worth having, so get the window open first.
+
+**Do not test for the window by looking for its file.** Atlas writes
+`atlas_bridge.json` beside the catalog when it opens, and that file **survives
+the process**. A descriptor written on 13 November, naming a port and a pid,
+was still sitting there three days later with nothing listening on it. Its
+presence means Atlas ran once, not that it is running now.
+
+### Step 1 — ask
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"catalog_stats","arguments":{}}}' | python -I C:/Users/white/Documents/Codex/2026-07-08/woul/work/atlas_mcp/atlas_mcp.py
+```
+
+The last line of that report is the answer, and it is unambiguous:
+
+```
+Atlas itself: running, version 1.10.28 -- inspect_model, rig_compatibility and render_asset are available
+```
+
+or
+
+```
+Atlas itself: not running, so inspect_model, rig_compatibility and render_asset cannot answer
+```
+
+An MCP client calls `catalog_stats` instead of piping, for the same answer.
+
+### Step 2 — start it, if that said "not running"
+
+PowerShell, and **do not wait on the process** — it is a desktop application
+and will not return until the window closes:
+
+```powershell
+Start-Process -FilePath "C:\Users\white\Documents\Codex\2026-07-08\woul\work\asset_atlas_native\build\windows\x64\runner\Release\asset_atlas_native.exe"
+```
+
+The executable needs the files beside it — `flutter_windows.dll`,
+`sqlite3.dll`, `data\`, and `asset_atlas_mesh_importer.exe` — so launch it
+where it sits. Do not copy the `.exe` elsewhere.
+
+### Step 3 — wait for it, by asking again
+
+The bridge came up **1.5 seconds** after launch when this was measured. Poll
+`catalog_stats` every second or two and stop when its last line says
+`running`. Give up after about 60 seconds and report that Atlas would not
+start, rather than carrying on and reporting three tools as broken.
+
+Nothing else is a reliable readiness signal. The process existing is not one:
+the window has to reach the catalogue screen before the bridge is listening.
+
+### When you are finished
+
+**Leave Atlas running.** It belongs to the person at the keyboard, it may hold
+unsaved state, and closing it costs them a relaunch. Do not kill the process,
+and do not delete `atlas_bridge.json` — a stale descriptor is harmless,
+because the server probes the port rather than trusting the file.
+
 ## Start here, every time
 
 **`catalog_stats`.** It is the only tool that reports live state rather than
