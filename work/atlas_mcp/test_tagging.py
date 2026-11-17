@@ -203,6 +203,33 @@ class CandidateQueryTest(unittest.TestCase):
                  size=200)
         self.assertEqual(len(self.ids()), 2)
 
+    def test_the_representative_is_the_same_on_every_run(self):
+        # A bare id lets SQLite pick any row in the group, and it varies:
+        # 212 vectors had been written where only 101 counted as done,
+        # because a later run chose a different sibling and rendered it
+        # again. min(id) pins it.
+        self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
+        self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
+        self.assertEqual(self.ids(), self.ids())
+        self.assertEqual(self.ids(), ["a"])
+
+    def test_the_bare_columns_come_from_the_chosen_row(self):
+        # SQLite guarantees this only while exactly one min() or max() is in
+        # the select. If that ever stops holding, the path would describe a
+        # different file from the id and the wrong asset would be rendered
+        # under the right name.
+        self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
+        self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
+        row = tag_assets.candidates(self.connection)[0]
+        self.assertEqual(row["id"], "a")
+        self.assertEqual(row["path"], "zip:p1.zip::Barrel.fbx")
+
+    def test_every_id_in_the_group_comes_back(self):
+        self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
+        self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
+        row = tag_assets.candidates(self.connection)[0]
+        self.assertEqual(sorted(tag_assets.group_ids(row)), ["a", "b"])
+
     def test_the_copy_count_comes_back(self):
         self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
         self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
@@ -307,6 +334,27 @@ class ResumeTest(unittest.TestCase):
     def test_what_was_stored_is_no_longer_missing(self):
         self.store.append([("a", [1.0, 0.0, 0.0, 0.0], "render", 1)])
         self.assertEqual(self.store.missing(["a", "b"]), ["b"])
+
+    def test_a_vector_on_any_sibling_counts_for_the_group(self):
+        # The same file by name and size draws the same picture, so one
+        # vector answers for all of them -- and the queue then survives the
+        # representative changing.
+        row = {"id": "a", "sibling_ids": chr(10).join(["a", "b"])}
+        self.assertFalse(tag_assets.group_is_done(self.store, row))
+        self.store.append([("b", [1.0, 0.0, 0.0, 0.0], "render", 1)])
+        self.assertTrue(tag_assets.group_is_done(self.store, row))
+
+    def test_a_group_of_one_still_works(self):
+        row = {"id": "solo", "sibling_ids": "solo"}
+        self.assertFalse(tag_assets.group_is_done(self.store, row))
+        self.store.append([("solo", [0.0, 1.0, 0.0, 0.0], "render", 1)])
+        self.assertTrue(tag_assets.group_is_done(self.store, row))
+
+    def test_a_missing_sibling_list_falls_back_to_the_id(self):
+        # group_concat returns NULL for an empty group, and a row built by
+        # hand may not carry the column at all.
+        row = {"id": "solo", "sibling_ids": None}
+        self.assertEqual(tag_assets.group_ids(row), ["solo"])
 
     def test_the_order_of_the_remaining_work_is_kept(self):
         # candidates() returns archive order, and missing() has to preserve

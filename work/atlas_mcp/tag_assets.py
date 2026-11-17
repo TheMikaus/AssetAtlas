@@ -121,8 +121,23 @@ def candidates(connection, folder=None, pack=None, ext=None):
         # effective_type short-circuits before reading it: relying on the
         # order of those checks would make this break on a reordering
         # somewhere else entirely.
-        "SELECT id, path, name, relative_path, model_kind, type, "
-        "referenced_by_model, count(*) AS copies FROM catalog_assets WHERE %s "
+        # min(id), not a bare id, so the row standing for a duplicate group
+        # is the same row on every run. With a bare column SQLite may take it
+        # from any row in the group, and it does vary: 212 vectors had been
+        # written where only 101 counted as done, because later runs picked a
+        # different sibling and rendered it again. SQLite documents that when
+        # exactly one min() or max() is present, the other bare columns come
+        # from that same row, which is what keeps path and id agreeing here.
+        # sibling_ids carries every id in the group, newline-separated
+        # because a path may contain a comma. A group counts as done when any
+        # of its members has a vector: they are the same picture, so one is
+        # the answer for all of them, and the resume rule then survives a
+        # change of representative instead of silently re-rendering 212
+        # files the way this did.
+        "SELECT min(id) AS id, path, name, relative_path, model_kind, type, "
+        "referenced_by_model, count(*) AS copies, "
+        "group_concat(id, char(10)) AS sibling_ids "
+        "FROM catalog_assets WHERE %s "
         "GROUP BY lower(name), size ORDER BY path, relative_path"
         % " AND ".join(where), params).fetchall()
 
@@ -133,6 +148,24 @@ def candidates(connection, folder=None, pack=None, ext=None):
     # nothing has probed, which after a rescan is all of them.
     return [row for row in rows
             if atlas_mcp.effective_type(row) != "animation"]
+
+
+def group_ids(row):
+    """Every asset id in a candidate's duplicate group."""
+    joined = row["sibling_ids"] or row["id"]
+    return [asset_id for asset_id in joined.split("\n") if asset_id]
+
+
+def group_is_done(store, row):
+    """Whether any member of this duplicate group already has a vector.
+
+    Any member, not the chosen representative. They are the same file by name
+    and size and draw the same picture, so one vector answers for all of
+    them -- and the queue then survives the representative changing, which is
+    what cost 212 renders before min(id) made it stable.
+    """
+    return any(store.row_of(asset_id) is not None
+               for asset_id in group_ids(row))
 
 
 class EmbedderProcess:
@@ -245,15 +278,14 @@ def run(arguments, out):
         with atlas_mcp.open_catalog() as connection:
             rows = candidates(connection, folder=arguments.folder,
                               pack=arguments.pack, ext=arguments.ext)
-        by_id = {row["id"]: row for row in rows}
-        todo_ids = store.missing([row["id"] for row in rows])
-        todo = [by_id[asset_id] for asset_id in todo_ids]
+        todo = [row for row in rows if not group_is_done(store, row)]
+        already = len(rows) - len(todo)
         if arguments.limit:
             todo = todo[:arguments.limit]
 
         out.write(
             "%d distinct models selected, %d already embedded, %d to do\n"
-            % (len(rows), len(rows) - len(todo_ids), len(todo)))
+            % (len(rows), already, len(todo)))
         out.write("store         %s (%d vectors)\n"
                   % (store.vectors_path, store.count))
         out.write("priority      %s, %d embedder threads, %d ms pace\n"
