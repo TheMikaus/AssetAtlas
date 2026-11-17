@@ -1,34 +1,40 @@
-"""The visual tagging pass: render an asset, embed the render, store it.
+"""The visual tagging pass from a terminal: render, hand over, repeat.
+
+This is one of two drivers. The other is Atlas's own background queue, and
+they share everything that decides anything: which assets need work, what
+counts as done, what a failure means, and who writes the store. All of that
+lives behind `atlas_embed.py --serve` (see tagging.py), so the two cannot
+drift into disagreeing about the same library.
+
+What a driver does is narrow by design:
+
+    ask the worker what to render
+    render it, through Atlas's own renderer
+    hand the pictures back
+    repeat
 
 What this costs, measured on this library rather than guessed. The render is
-the whole job: 972 ms median walking one archive in order, 1,570 ms median
-jumping between archives, against 9 ms to embed. Everything below follows
-from that one number.
+the whole job -- 9 ms to embed against a few hundred milliseconds to a few
+seconds to draw -- so everything here follows from the render:
 
-    32,296 distinct models x 972 ms = about 8.7 hours, once.
+    31,495 distinct models, weighted across their real sizes: about 3.5 hours
 
-So this is an overnight job, not a progress bar to sit and watch, and three
-things fall out of that:
+An earlier estimate of 8.7 hours came from sampling one character pack, which
+is the expensive end; 15,422 of the candidates are under 32 KB and 78% are
+under 64 KB, where a render is a few hundred milliseconds.
 
-  * It must be resumable, and is -- the queue is derived from the store, not
-    kept anywhere. Whatever has no vector is what is left to do, so killing
-    this at any moment and starting it again loses at most one batch.
-  * It must be orderable, and is -- --folder and --pack take a slice, so the
-    packs you are actually building with can be tagged in minutes instead of
-    waiting behind 30,000 files you do not need yet.
-  * It must leave the machine usable, and does -- the embedder gets two
-    threads, this process drops its own priority, and --pace-ms puts a gap
-    between renders. The default settings deliberately do not saturate.
+So it is an overnight job, and three things follow:
 
-Duplicates are collapsed before anything is rendered. Half this library is the
-same file re-exported per engine version: 34,801 FBX rows are 18,948 distinct
-files by name and size. Only one of each is rendered, which is also how
-search_assets reports results, so nothing is lost and the pass is 45% shorter.
+  * It is resumable, and nothing records the queue -- whatever has no vector
+    is the work. Stopping loses at most the batch in flight, and that only
+    because the store publishes a batch at a time.
+  * It is sliceable: --folder, --pack and --ext take the packs you are
+    building with now instead of waiting behind 30,000 files you are not.
+  * It leaves the machine usable. The embedder gets two threads, this process
+    runs below normal priority, and --pace-ms puts a gap between renders.
 
-Atlas has to be running: the renderer being used is its own, over the loopback
-bridge. That is deliberate -- a silhouette drawn by a second renderer would
-not match what the app shows, and the whole point is that the picture being
-embedded is the picture you looked at.
+Atlas has to be running: the renderer is its own, deliberately, so the
+picture being embedded is the picture the app shows you.
 
 Run it with -P, for the reason in atlas_embed.py's docstring.
 """
@@ -52,157 +58,32 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import atlas_mcp                                    # noqa: E402
-import embedding_store                              # noqa: E402
-from atlas_embed import DIMS, MODEL_ID              # noqa: E402
-
-# Beside the catalog, like atlas_bridge.json: these are derived from it and a
-# catalog rebuilt from scratch should leave them obviously stale rather than
-# scattered somewhere unrelated.
-VECTORS_NAME = "embeddings.f32"
-INDEX_NAME = "embeddings_index.sqlite"
-
-# What is worth looking at. Audio has nothing to see; .uasset is unreadable
-# outside Unreal, so there is no geometry to draw.
-RENDERABLE_EXTS = ("fbx", "obj")
-
-# Renders are small -- 3.8 KB mean at 224 px -- so a batch costs nothing to
-# hold. Eight matches the embedder's fastest measured rate.
-DEFAULT_BATCH = 8
+import tagging                                      # noqa: E402
 
 # A run of failures this long means the problem is not the files. Atlas
 # answering but refusing everything looks exactly like 31,000 broken models
 # otherwise, and would retire all of them after three runs.
 GIVE_UP_AFTER_CONSECUTIVE = 25
 
-# 224 is the model's input size. Rendering larger would be thrown away by the
-# resize, and rendering smaller would lose detail the model can use.
-RENDER_SIZE = 224
 
-
-def store_paths():
-    catalog_dir = os.path.dirname(atlas_mcp.DB_PATH)
-    return (os.path.join(catalog_dir, VECTORS_NAME),
-            os.path.join(catalog_dir, INDEX_NAME))
-
-
-def open_or_create_store():
-    """The store, made on first use.
-
-    Opening with expect_model_id is what stops a vector from one model being
-    ranked against another's: the header carries the model and open() refuses
-    a mismatch instead of returning numbers that mean nothing.
-    """
-    vectors_path, index_path = store_paths()
-    if os.path.exists(vectors_path):
-        return embedding_store.EmbeddingStore.open(
-            vectors_path, index_path, expect_model_id=MODEL_ID)
-    return embedding_store.EmbeddingStore.create(
-        vectors_path, index_path, dims=DIMS, model_id=MODEL_ID)
-
-
-def candidates(connection, folder=None, pack=None, ext=None):
-    """One row per distinct renderable model, in archive order.
-
-    Grouped by name and size because that is what makes two files the same
-    file in this library, and ordered by path so consecutive renders hit the
-    same archive -- worth 600 ms an asset over a random walk.
-    """
-    where = ["ignored = 0",
-             "ext IN (%s)" % ", ".join(["?"] * len(RENDERABLE_EXTS))]
-    params = list(RENDERABLE_EXTS)
-
-    if ext:
-        where.append("ext = ?")
-        params.append(ext.lower().lstrip("."))
-    if folder:
-        where.append("lower(relative_path) LIKE ?")
-        params.append("%" + folder.lower().replace("\\", "/") + "%")
-    if pack:
-        where.append("lower(path) LIKE ?")
-        params.append("%" + pack.lower() + "%")
-
-    rows = connection.execute(
-        # referenced_by_model is selected although these are all models and
-        # effective_type short-circuits before reading it: relying on the
-        # order of those checks would make this break on a reordering
-        # somewhere else entirely.
-        # min(id), not a bare id, so the row standing for a duplicate group
-        # is the same row on every run. With a bare column SQLite may take it
-        # from any row in the group, and it does vary: 212 vectors had been
-        # written where only 101 counted as done, because later runs picked a
-        # different sibling and rendered it again. SQLite documents that when
-        # exactly one min() or max() is present, the other bare columns come
-        # from that same row, which is what keeps path and id agreeing here.
-        # sibling_ids carries every id in the group, newline-separated
-        # because a path may contain a comma. A group counts as done when any
-        # of its members has a vector: they are the same picture, so one is
-        # the answer for all of them, and the resume rule then survives a
-        # change of representative instead of silently re-rendering 212
-        # files the way this did.
-        "SELECT min(id) AS id, path, name, relative_path, model_kind, type, "
-        "referenced_by_model, count(*) AS copies, "
-        "group_concat(id, char(10)) AS sibling_ids "
-        "FROM catalog_assets WHERE %s "
-        "GROUP BY lower(name), size ORDER BY path, relative_path"
-        % " AND ".join(where), params).fetchall()
-
-    # Animation clips hold curves and no geometry, and the renderer says so
-    # rather than drawing anything: "has no geometry to draw: it is an
-    # animation". Left in, all 801 of them would be rendered, fail, and be
-    # retried on the next run for ever. The folder rule catches the ones
-    # nothing has probed, which after a rescan is all of them.
-    return [row for row in rows
-            if atlas_mcp.effective_type(row) != "animation"]
-
-
-def group_ids(row):
-    """Every asset id in a candidate's duplicate group."""
-    joined = row["sibling_ids"] or row["id"]
-    return [asset_id for asset_id in joined.split("\n") if asset_id]
-
-
-def group_is_done(store, row):
-    """Whether any member of this duplicate group already has a vector.
-
-    Any member, not the chosen representative. They are the same file by name
-    and size and draw the same picture, so one vector answers for all of
-    them -- and the queue then survives the representative changing, which is
-    what cost 212 renders before min(id) made it stable.
-    """
-    return any(store.row_of(asset_id) is not None
-               for asset_id in group_ids(row))
-
-
-def group_is_hopeless(row, failure_counts, max_attempts):
-    """Whether every member of this group has failed too often to try again.
-
-    Every member, not any: a group is only given up on when there is nothing
-    left in it worth rendering. One sibling failing says little -- the other
-    copy may well read fine.
-    """
-    if max_attempts <= 0:
-        return False
-    members = group_ids(row)
-    return all(failure_counts.get(asset_id, 0) >= max_attempts
-               for asset_id in members)
-
-
-class EmbedderProcess:
+class Worker:
     """atlas_embed.py --serve, as a child process over two pipes.
 
-    One child for the whole run: constructing the ONNX session costs about a
-    second, so a process per batch would spend more time loading the model
-    than using it.
+    One child for the whole run: the ONNX session costs about a second to
+    construct, so a process per batch would spend longer loading the model
+    than using it. It also holds the store, which is why there is exactly one
+    of these at a time.
     """
 
-    def __init__(self, threads):
+    def __init__(self, threads, vectors_path, index_path):
         self.process = subprocess.Popen(
             [sys.executable, "-P", os.path.join(HERE, "atlas_embed.py"),
-             "--serve", "--threads", str(threads)],
+             "--serve", "--threads", str(threads),
+             "--vectors", vectors_path, "--index", index_path],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=HERE, text=True, bufsize=1)
 
-    def ask(self, message):
+    def ask(self, **message):
         if self.process.poll() is not None:
             raise RuntimeError(
                 "the embedder exited with code %d. Its stderr:\n%s"
@@ -234,9 +115,9 @@ class EmbedderProcess:
 def be_polite():
     """Drop this process below normal priority.
 
-    The renders happen in Atlas and the matrix multiplies in the embedder, so
-    this process is mostly waiting -- but it is the parent of the embedder,
-    and on Windows a child inherits the parent's priority class.
+    The renders happen in Atlas and the matrix multiplies in the worker, so
+    this process is mostly waiting -- but it is the worker's parent, and on
+    Windows a child inherits the parent's priority class.
     """
     try:
         if hasattr(os, "nice"):
@@ -261,10 +142,10 @@ def be_polite():
         return "unchanged (%s)" % error
 
 
-def render(row):
-    """One PNG from Atlas's own renderer, or None with the reason logged."""
+def render(asset):
+    """One PNG from Atlas's own renderer."""
     report = atlas_mcp.bridge_call("/render", {
-        "path": row["path"], "size": RENDER_SIZE})
+        "path": asset["path"], "size": tagging.RENDER_SIZE})
     encoded = report.get("png")
     if not encoded:
         raise RuntimeError("the bridge returned no image")
@@ -277,6 +158,15 @@ def format_duration(seconds):
     if seconds < 5400:
         return "%.0f min" % (seconds / 60)
     return "%.1f h" % (seconds / 3600)
+
+
+def report_progress(out, done, total, started, failed):
+    elapsed = time.perf_counter() - started
+    rate = done / elapsed if elapsed else 0
+    remaining = (total - done) / rate if rate else 0
+    out.write("  %6d/%d  %.2f/s  %s left  %d failed\n"
+              % (done, total, rate, format_duration(remaining), len(failed)))
+    out.flush()
 
 
 def run(arguments, out):
@@ -292,58 +182,59 @@ def run(arguments, out):
     out.write("Atlas          running, version %s\n" % version)
 
     priority = be_polite()
-    store = open_or_create_store()
+    vectors_path, index_path = tagging.store_paths()
+    worker = Worker(arguments.threads, vectors_path, index_path)
     try:
-        with atlas_mcp.open_catalog() as connection:
-            rows = candidates(connection, folder=arguments.folder,
-                              pack=arguments.pack, ext=arguments.ext)
         if arguments.retry_failed:
-            forgotten = store.clear_failures()
+            forgotten = worker.ask(op="retry")["forgotten"]
             out.write("retry         %d previous failures forgotten\n"
                       % forgotten)
 
-        failure_counts = store.failure_counts()
-        outstanding = [row for row in rows if not group_is_done(store, row)]
-        already = len(rows) - len(outstanding)
-        todo = [row for row in outstanding
-                if not group_is_hopeless(row, failure_counts,
-                                         arguments.max_attempts)]
-        given_up = len(outstanding) - len(todo)
-        if arguments.limit:
-            todo = todo[:arguments.limit]
+        selection = {"folder": arguments.folder, "pack": arguments.pack,
+                     "ext": arguments.ext,
+                     "max_attempts": arguments.max_attempts}
+        work = worker.ask(op="next", limit=arguments.limit, **selection)
 
-        out.write(
-            "%d distinct models selected, %d already embedded, %d to do\n"
-            % (len(rows), already, len(todo)))
-        if given_up:
+        out.write("%d distinct models selected, %d already embedded, "
+                  "%d to do\n"
+                  % (work["selected"], work["done"], work["remaining"]))
+        out.write("store         %s\n" % vectors_path)
+        out.write("priority      %s, %d worker threads, %d ms pace\n"
+                  % (priority, arguments.threads, arguments.pace_ms))
+        if work["given_up"]:
             out.write("given up      %d after %d failed attempts each "
                       "(--retry-failed to try them again)\n"
-                      % (given_up, arguments.max_attempts))
-        out.write("store         %s (%d vectors)\n"
-                  % (store.vectors_path, store.count))
-        out.write("priority      %s, %d embedder threads, %d ms pace\n"
-                  % (priority, arguments.threads, arguments.pace_ms))
-        if not todo:
+                      % (work["given_up"], arguments.max_attempts))
+        if not work["assets"]:
             out.write("Nothing to do.\n")
             return 0
         if arguments.dry_run:
-            for row in todo[:20]:
-                out.write("  would render %s\n" % row["relative_path"])
-            if len(todo) > 20:
-                out.write("  ... and %d more\n" % (len(todo) - 20))
+            for asset in work["assets"][:20]:
+                out.write("  would render %s\n" % asset["relative_path"])
+            if len(work["assets"]) > 20:
+                out.write("  ... and %d more\n" % (len(work["assets"]) - 20))
             return 0
 
-        embedder = EmbedderProcess(arguments.threads)
+        total = work["remaining"]
         done = 0
         failed = []
         interrupted = None
         consecutive_failures = 0
         started = time.perf_counter()
         batch = []
+        pending = list(work["assets"])
+        # Every asset this run has taken off the queue. The worker answers
+        # `next` from the store, and a render that has not been handed over
+        # yet is not in the store -- so without this, topping up re-queues
+        # whatever is still in the batch and renders it twice. It did: ten
+        # assets produced twelve vectors.
+        taken = {asset["asset_id"] for asset in pending}
+
         try:
-            for row in todo:
+            while pending:
+                asset = pending.pop(0)
                 try:
-                    png = render(row)
+                    png = render(asset)
                 except Exception as error:          # noqa: BLE001
                     reason = str(error)
                     # Blaming the file is only right when the file is at
@@ -359,35 +250,39 @@ def run(arguments, out):
                         break
                     consecutive_failures += 1
                     if consecutive_failures >= GIVE_UP_AFTER_CONSECUTIVE:
-                        # Atlas answers but nothing renders. Whatever that
-                        # is, it is not 31,000 individually broken files.
                         interrupted = (
                             "%d renders failed in a row, so something "
                             "systemic is wrong and the rest were left alone"
                             % consecutive_failures)
                         break
-                    # A model Atlas cannot draw is not a reason to stop.
-                    # Recorded rather than only counted, so a file that can
-                    # never be drawn is eventually left alone instead of
-                    # being selected again on every run for ever.
-                    failed.append((row["relative_path"], reason[:120]))
-                    store.record_failure(row["id"], reason,
-                                         time.time() * 1000)
+                    failed.append((asset["relative_path"], reason[:120]))
+                    worker.ask(op="failed", entries=[
+                        {"asset_id": asset["asset_id"], "reason": reason}])
                     continue
                 consecutive_failures = 0
-                batch.append((row, png))
+                batch.append((asset, png))
                 if arguments.pace_ms:
                     time.sleep(arguments.pace_ms / 1000.0)
 
                 if len(batch) >= arguments.batch:
-                    done += flush(store, embedder, batch, out)
+                    done += flush(worker, batch, out)
                     batch = []
-                    report_progress(out, done, len(todo), started, failed)
+                    report_progress(out, done, total, started, failed)
+
+                # Topping up only when the queue is empty keeps this to one
+                # `next` per batch-of-batches rather than one per asset, and
+                # the answer stays current as vectors land.
+                if not pending and arguments.limit is None:
+                    more = worker.ask(op="next", limit=arguments.batch * 8,
+                                      **selection)
+                    pending = [item for item in more["assets"]
+                               if item["asset_id"] not in taken]
+                    taken.update(item["asset_id"] for item in pending)
+                    total = done + len(batch) + len(pending)
         except KeyboardInterrupt:
             interrupted = "Stopped"
         except RuntimeError as error:
-            # The embedder died. Same handling: keep what was rendered.
-            interrupted = "The embedder stopped: %s" % error
+            interrupted = "The worker stopped: %s" % error
 
         # Whatever is in hand gets written, on every path out. Discarding it
         # threw away up to seven renders, which on the larger models is a
@@ -395,98 +290,68 @@ def run(arguments, out):
         # partial batch exactly as safe as a full one.
         if batch:
             try:
-                done += flush(store, embedder, batch, out)
+                done += flush(worker, batch, out)
             except (RuntimeError, OSError, ValueError) as error:
                 out.write("  the last %d could not be embedded: %s\n"
                           % (len(batch), error))
-            # Only when there was something to flush. Reporting
-            # unconditionally printed the final line twice on a run whose
-            # work divided evenly into batches.
-            report_progress(out, done, len(todo), started, failed)
-        embedder.close()
+            report_progress(out, done, total, started, failed)
 
         if interrupted:
             out.write("\n%s. %d embedded this run and kept; rerun to "
                       "continue where it left off.\n" % (interrupted, done))
 
         elapsed = time.perf_counter() - started
-        out.write("\n%d embedded in %s (%.0f ms each), %d failed, %d vectors "
-                  "in the store\n"
+        out.write("\n%d embedded in %s (%.0f ms each), %d failed\n"
                   % (done, format_duration(elapsed),
-                     (elapsed * 1000 / done) if done else 0,
-                     len(failed), store.count))
+                     (elapsed * 1000 / done) if done else 0, len(failed)))
         for path, reason in failed[:10]:
             out.write("  failed  %s -- %s\n" % (path, reason))
         if len(failed) > 10:
             out.write("  ... and %d more failures\n" % (len(failed) - 10))
-
-        persistent = [row for row in store.failures(limit=5)
-                      if row[1] >= arguments.max_attempts > 0]
-        if persistent:
-            out.write("\nGiven up on these, and they will be skipped from "
-                      "now on:\n")
-            for asset_id, attempts, reason in persistent:
-                out.write("  %d attempts  %s\n"
-                          % (attempts, (reason or "")[:90]))
         return 0
     finally:
-        store.close()
+        worker.close()
 
 
-def flush(store, embedder, batch, out):
-    """Embed a batch and append it. Returns how many were stored."""
-    reply = embedder.ask({
-        "op": "images",
-        "entries": [{"asset_id": row["id"],
-                     "png": base64.b64encode(png).decode("ascii")}
-                    for row, png in batch]})
-    vectors = reply["vectors"]
-    if len(vectors) != len(batch):
-        out.write("  the embedder returned %d vectors for %d images; batch "
-                  "dropped\n" % (len(vectors), len(batch)))
-        return 0
-    now_ms = int(time.time() * 1000)
-    store.append([(row["id"], vector, "render", now_ms)
-                  for (row, _png), vector in zip(batch, vectors)])
-    # A file that failed twice and then worked must not keep the two attempts
-    # against it, or a later run would give up on something that is fine.
-    for row, _png in batch:
-        store.forget_failure(row["id"])
-    return len(batch)
-
-
-def report_progress(out, done, total, started, failed):
-    elapsed = time.perf_counter() - started
-    rate = done / elapsed if elapsed else 0
-    remaining = (total - done) / rate if rate else 0
-    out.write("  %6d/%d  %.2f/s  %s left  %d failed\n"
-              % (done, total, rate, format_duration(remaining), len(failed)))
-    out.flush()
+def flush(worker, batch, out):
+    """Hand a batch over. The worker embeds and keeps it; this counts."""
+    reply = worker.ask(op="images", entries=[
+        {"asset_id": asset["asset_id"],
+         "png": base64.b64encode(png).decode("ascii")}
+        for asset, png in batch])
+    stored = reply.get("stored", 0)
+    if stored != len(batch):
+        out.write("  the worker kept %d of %d; the rest will be retried\n"
+                  % (stored, len(batch)))
+    return stored
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Render and embed Atlas assets. Atlas must be running.")
     parser.add_argument("--folder", help="only paths containing this folder")
-    parser.add_argument("--pack", help="only assets from archives matching this")
+    parser.add_argument("--pack",
+                        help="only assets from archives matching this")
     parser.add_argument("--ext", help="only this extension (fbx or obj)")
     parser.add_argument("--limit", type=int,
                         help="stop after this many, for a first taste")
-    parser.add_argument("--batch", type=int, default=DEFAULT_BATCH,
-                        help="images per embedder call (default %d)"
-                             % DEFAULT_BATCH)
+    parser.add_argument("--batch", type=int, default=tagging.DEFAULT_BATCH,
+                        help="images per worker call (default %d)"
+                             % tagging.DEFAULT_BATCH)
     parser.add_argument("--threads", type=int, default=2,
-                        help="embedder threads (default 2, kept low so the "
+                        help="worker threads (default 2, kept low so the "
                              "machine stays usable)")
     parser.add_argument("--pace-ms", type=int, default=0,
                         help="pause between renders, to give Atlas and the "
                              "rest of the machine room")
-    parser.add_argument("--max-attempts", type=int, default=3,
+    parser.add_argument("--max-attempts", type=int,
+                        default=tagging.DEFAULT_MAX_ATTEMPTS,
                         help="give up on an asset after this many failed "
-                             "renders (default 3; 0 means never give up)")
+                             "renders (default %d; 0 means never give up)"
+                             % tagging.DEFAULT_MAX_ATTEMPTS)
     parser.add_argument("--retry-failed", action="store_true",
-                        help="forget every recorded failure and try them all "
-                             "again")
+                        help="forget every recorded failure and try them "
+                             "all again")
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would be rendered and stop")
     arguments = parser.parse_args(argv)

@@ -26,6 +26,7 @@ if HERE not in sys.path:
 import atlas_embed
 import embedding_store
 import tag_assets
+import tagging
 
 
 def models_present():
@@ -61,7 +62,7 @@ class EmbedderContractTest(unittest.TestCase):
 
     def test_the_dimensions_match_what_the_pass_writes(self):
         self.assertEqual(atlas_embed.DIMS, 768)
-        self.assertEqual(tag_assets.DIMS, atlas_embed.DIMS)
+        self.assertEqual(tagging.DIMS, atlas_embed.DIMS)
 
     def test_the_vision_model_is_not_the_int8_build(self):
         # vision_model_int8.onnx contains ConvInteger(10), for which
@@ -71,12 +72,12 @@ class EmbedderContractTest(unittest.TestCase):
 
     def test_the_render_size_is_the_model_input_size(self):
         # Rendering larger is thrown away by the resize; smaller loses detail.
-        self.assertEqual(tag_assets.RENDER_SIZE, atlas_embed.IMAGE_SIZE)
+        self.assertEqual(tagging.RENDER_SIZE, atlas_embed.IMAGE_SIZE)
 
     def test_only_formats_with_geometry_are_rendered(self):
         # Audio has nothing to see and .uasset is unreadable outside Unreal,
         # so neither can produce a picture to embed.
-        self.assertEqual(set(tag_assets.RENDERABLE_EXTS), {"fbx", "obj"})
+        self.assertEqual(set(tagging.RENDERABLE_EXTS), {"fbx", "obj"})
 
     def test_the_default_thread_count_leaves_the_machine_usable(self):
         # The whole point of the queue is that it runs behind an interactive
@@ -186,7 +187,7 @@ class CandidateQueryTest(unittest.TestCase):
 
     def ids(self, **kwargs):
         return [row["id"] for row in
-                tag_assets.candidates(self.connection, **kwargs)]
+                tagging.candidates(self.connection, **kwargs)]
 
     def test_identical_copies_collapse_to_one_render(self):
         # Same name and size in two engine builds is the same picture. This
@@ -220,20 +221,20 @@ class CandidateQueryTest(unittest.TestCase):
         # under the right name.
         self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
         self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
-        row = tag_assets.candidates(self.connection)[0]
+        row = tagging.candidates(self.connection)[0]
         self.assertEqual(row["id"], "a")
         self.assertEqual(row["path"], "zip:p1.zip::Barrel.fbx")
 
     def test_every_id_in_the_group_comes_back(self):
         self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
         self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
-        row = tag_assets.candidates(self.connection)[0]
-        self.assertEqual(sorted(tag_assets.group_ids(row)), ["a", "b"])
+        row = tagging.candidates(self.connection)[0]
+        self.assertEqual(sorted(tagging.group_ids(row)), ["a", "b"])
 
     def test_the_copy_count_comes_back(self):
         self.add("a", "Barrel.fbx", "zip:p1.zip::Barrel.fbx", "p1/Barrel.fbx")
         self.add("b", "Barrel.fbx", "zip:p2.zip::Barrel.fbx", "p2/Barrel.fbx")
-        rows = tag_assets.candidates(self.connection)
+        rows = tagging.candidates(self.connection)
         self.assertEqual(rows[0]["copies"], 2)
 
     def test_ignored_assets_are_not_rendered(self):
@@ -340,21 +341,21 @@ class ResumeTest(unittest.TestCase):
         # vector answers for all of them -- and the queue then survives the
         # representative changing.
         row = {"id": "a", "sibling_ids": chr(10).join(["a", "b"])}
-        self.assertFalse(tag_assets.group_is_done(self.store, row))
+        self.assertFalse(tagging.group_is_done(self.store, row))
         self.store.append([("b", [1.0, 0.0, 0.0, 0.0], "render", 1)])
-        self.assertTrue(tag_assets.group_is_done(self.store, row))
+        self.assertTrue(tagging.group_is_done(self.store, row))
 
     def test_a_group_of_one_still_works(self):
         row = {"id": "solo", "sibling_ids": "solo"}
-        self.assertFalse(tag_assets.group_is_done(self.store, row))
+        self.assertFalse(tagging.group_is_done(self.store, row))
         self.store.append([("solo", [0.0, 1.0, 0.0, 0.0], "render", 1)])
-        self.assertTrue(tag_assets.group_is_done(self.store, row))
+        self.assertTrue(tagging.group_is_done(self.store, row))
 
     def test_a_missing_sibling_list_falls_back_to_the_id(self):
         # group_concat returns NULL for an empty group, and a row built by
         # hand may not carry the column at all.
         row = {"id": "solo", "sibling_ids": None}
-        self.assertEqual(tag_assets.group_ids(row), ["solo"])
+        self.assertEqual(tagging.group_ids(row), ["solo"])
 
     def test_the_order_of_the_remaining_work_is_kept(self):
         # candidates() returns archive order, and missing() has to preserve
@@ -415,18 +416,18 @@ class FailureRecordTest(unittest.TestCase):
         # One sibling failing says little -- the other copy may read fine.
         counts = {"a": 3}
         row = self.row("a", ["a", "b"])
-        self.assertFalse(tag_assets.group_is_hopeless(row, counts, 3))
+        self.assertFalse(tagging.group_is_hopeless(row, counts, 3))
         counts["b"] = 3
-        self.assertTrue(tag_assets.group_is_hopeless(row, counts, 3))
+        self.assertTrue(tagging.group_is_hopeless(row, counts, 3))
 
     def test_below_the_limit_it_is_still_tried(self):
         row = self.row("a")
-        self.assertFalse(tag_assets.group_is_hopeless(row, {"a": 2}, 3))
-        self.assertTrue(tag_assets.group_is_hopeless(row, {"a": 3}, 3))
+        self.assertFalse(tagging.group_is_hopeless(row, {"a": 2}, 3))
+        self.assertTrue(tagging.group_is_hopeless(row, {"a": 3}, 3))
 
     def test_zero_attempts_means_never_give_up(self):
         row = self.row("a")
-        self.assertFalse(tag_assets.group_is_hopeless(row, {"a": 99}, 0))
+        self.assertFalse(tagging.group_is_hopeless(row, {"a": 99}, 0))
 
     def test_success_clears_the_record(self):
         # A file that failed twice and then worked must not keep the two
@@ -486,26 +487,66 @@ class InterruptedRunTest(unittest.TestCase):
         max_attempts = 3
         retry_failed = False
 
-    class FakeEmbedder:
-        """Stands in for atlas_embed.py --serve.
+    class FakeWorker:
+        """Stands in for the child process, not for the queue.
 
-        Vectors are the model's real width, because the store this writes to
-        is the real one and its header refuses anything else -- which is the
-        guard working, not a nuisance to design around.
+        Everything that decides anything -- which assets are outstanding,
+        what counts as done, what a failure costs -- is delegated to the real
+        store and the real tagging.work_list, so these tests exercise the
+        queue rather than a reimplementation of it. Only the model is faked,
+        because loading it would make every test below take a second.
         """
 
-        def __init__(self, *_args, **_kwargs):
-            self.calls = 0
+        def __init__(self, _threads, vectors_path, index_path):
+            self.store = tagging.open_or_create_store(vectors_path,
+                                                      index_path)
+            self.image_calls = 0
 
-        def ask(self, message):
-            self.calls += 1
-            entries = message.get("entries") or []
-            return {"ok": True,
-                    "vectors": [[float(index)] + [0.0] * (atlas_embed.DIMS - 1)
-                                for index, _ in enumerate(entries)]}
+        def ask(self, op, **message):
+            if op == "next":
+                limit = message.get("limit")
+                with tagging.open_catalog_readonly() as connection:
+                    work = tagging.work_list(
+                        self.store, connection,
+                        folder=message.get("folder"),
+                        pack=message.get("pack"),
+                        ext=message.get("ext"),
+                        max_attempts=int(
+                            message.get("max_attempts")
+                            or tagging.DEFAULT_MAX_ATTEMPTS),
+                        limit=None if limit is None else int(limit))
+                reply = {"ok": True}
+                reply.update(work.as_dict())
+                return reply
+            if op == "images":
+                self.image_calls += 1
+                entries = message.get("entries") or []
+                now = 0
+                # The real width, because the store's header refuses
+                # anything else -- which is the guard working.
+                self.store.append([
+                    (entry["asset_id"],
+                     [float(index)] + [0.0] * (atlas_embed.DIMS - 1),
+                     "render", now)
+                    for index, entry in enumerate(entries)])
+                for entry in entries:
+                    self.store.forget_failure(entry["asset_id"])
+                return {"ok": True, "stored": len(entries),
+                        "count": self.store.count, "ms": 0}
+            if op == "failed":
+                for entry in message.get("entries") or []:
+                    self.store.record_failure(
+                        entry["asset_id"], entry.get("reason") or "", 0)
+                return {"ok": True,
+                        "recorded": len(message.get("entries") or [])}
+            if op == "retry":
+                return {"ok": True,
+                        "forgotten": self.store.clear_failures()}
+            raise AssertionError("the driver asked for an op nobody "
+                                 "implements: %r" % op)
 
         def close(self):
-            pass
+            self.store.close()
 
     def setUp(self):
         import atlas_mcp
@@ -529,14 +570,14 @@ class InterruptedRunTest(unittest.TestCase):
 
         self.previous_version = atlas_mcp.bridge_version
         self.previous_render = tag_assets.render
-        self.previous_embedder = tag_assets.EmbedderProcess
+        self.previous_worker = tag_assets.Worker
         atlas_mcp.bridge_version = lambda: "test"
-        tag_assets.EmbedderProcess = self.FakeEmbedder
+        tag_assets.Worker = self.FakeWorker
 
     def tearDown(self):
         self.atlas_mcp.bridge_version = self.previous_version
         tag_assets.render = self.previous_render
-        tag_assets.EmbedderProcess = self.previous_embedder
+        tag_assets.Worker = self.previous_worker
         self.atlas_mcp.DB_PATH = self.previous_db
 
     def set_render(self, behaviour):
@@ -548,7 +589,7 @@ class InterruptedRunTest(unittest.TestCase):
         return code, out.getvalue()
 
     def stored(self):
-        store = tag_assets.open_or_create_store()
+        store = tagging.open_or_create_store()
         try:
             return store.count, store.failure_counts()
         finally:
@@ -562,7 +603,7 @@ class InterruptedRunTest(unittest.TestCase):
             state["calls"] += 1
             if state["calls"] > count:
                 raise error
-            return b"png-%s" % row["id"].encode("ascii")
+            return b"png-%s" % row["asset_id"].encode("ascii")
 
         return behaviour
 
@@ -607,11 +648,14 @@ class InterruptedRunTest(unittest.TestCase):
         # It dies in flush(), which is where EmbedderProcess.ask raises, not
         # in render(). Injecting it through render() was what exposed the
         # blame bug below, but it is not how this actually happens.
-        class DyingEmbedder(InterruptedRunTest.FakeEmbedder):
-            def ask(self, message):
+        class DyingWorker(InterruptedRunTest.FakeWorker):
+            def ask(self, op, **message):
+                if op == "next":
+                    return InterruptedRunTest.FakeWorker.ask(
+                        self, op, **message)
                 raise RuntimeError("the embedder stopped answering")
 
-        tag_assets.EmbedderProcess = DyingEmbedder
+        tag_assets.Worker = DyingWorker
         self.set_render(lambda row: b"png")
         code, body = self.run_pass()
         self.assertEqual(code, 0)
@@ -631,7 +675,7 @@ class InterruptedRunTest(unittest.TestCase):
         self.atlas_mcp.bridge_version = lambda: "test" if state["alive"] else None
 
         def dies_after_six(row):
-            if len(state) > 1 or row["id"] >= "id:06":
+            if len(state) > 1 or row["asset_id"] >= "id:06":
                 state["alive"] = False
                 raise RuntimeError("connection refused")
             return b"png"
@@ -651,7 +695,7 @@ class InterruptedRunTest(unittest.TestCase):
         self.atlas_mcp.bridge_version = lambda: "test" if state["alive"] else None
 
         def dies_after_six(row):
-            if row["id"] >= "id:06":
+            if row["asset_id"] >= "id:06":
                 state["alive"] = False
                 raise RuntimeError("connection refused")
             return b"png"
@@ -689,7 +733,7 @@ class InterruptedRunTest(unittest.TestCase):
         # The guards must not swallow the ordinary case they were built
         # around: one unreadable file in a working library.
         def one_bad(row):
-            if row["id"] == "id:03":
+            if row["asset_id"] == "id:03":
                 raise RuntimeError("has no geometry to draw")
             return b"png"
 
@@ -715,7 +759,7 @@ class InterruptedRunTest(unittest.TestCase):
         seen = []
 
         def counting(row):
-            seen.append(row["id"])
+            seen.append(row["asset_id"])
             return b"png"
 
         self.set_render(counting)
@@ -733,7 +777,7 @@ class InterruptedRunTest(unittest.TestCase):
 
     def test_a_render_failure_is_recorded_and_the_run_continues(self):
         def flaky(row):
-            if row["id"] == "id:03":
+            if row["asset_id"] == "id:03":
                 raise RuntimeError("has no geometry to draw")
             return b"png"
 
@@ -746,7 +790,7 @@ class InterruptedRunTest(unittest.TestCase):
 
     def test_a_failure_is_retried_until_the_limit_then_dropped(self):
         def always_fails(row):
-            if row["id"] == "id:03":
+            if row["asset_id"] == "id:03":
                 raise RuntimeError("broken")
             return b"png"
 
@@ -762,7 +806,7 @@ class InterruptedRunTest(unittest.TestCase):
 
     def test_retry_failed_puts_them_back_in_the_queue(self):
         def always_fails(row):
-            if row["id"] == "id:03":
+            if row["asset_id"] == "id:03":
                 raise RuntimeError("broken")
             return b"png"
 
@@ -782,7 +826,7 @@ class InterruptedRunTest(unittest.TestCase):
         state = {"fail": True}
 
         def recovers(row):
-            if row["id"] == "id:03" and state["fail"]:
+            if row["asset_id"] == "id:03" and state["fail"]:
                 raise RuntimeError("busy")
             return b"png"
 
@@ -827,36 +871,47 @@ class StorePathTest(unittest.TestCase):
         # Two modules compute these paths. Disagreeing would mean the pass
         # writes vectors the server never finds, with no error anywhere.
         import atlas_mcp
-        self.assertEqual(tag_assets.store_paths(),
+        self.assertEqual(tagging.store_paths(),
                          atlas_mcp.embedding_store_paths())
 
     def test_it_sits_beside_the_catalog(self):
         import atlas_mcp
-        vectors_path, index_path = tag_assets.store_paths()
+        vectors_path, index_path = tagging.store_paths()
         catalog_dir = os.path.dirname(atlas_mcp.DB_PATH)
         self.assertEqual(os.path.dirname(vectors_path), catalog_dir)
         self.assertEqual(os.path.dirname(index_path), catalog_dir)
 
 
 class ServeProtocolTest(unittest.TestCase):
-    """The protocol tag_assets.py drives, exercised without the model.
+    """The protocol both drivers speak, exercised without the model.
 
     A driver blocked on a pipe that will never answer is the worst failure
-    mode here, so the rule under test is that every line gets a reply.
+    mode here, so the first rule is that every line gets a reply -- a
+    malformed one, an unknown op, or a handler that raised.
     """
 
     class FakeEmbedder:
         numpy = None
 
         def embed_images(self, pngs):
-            return [[0.0] * 4 for _ in pngs]
+            return [[0.0] * atlas_embed.DIMS for _ in pngs]
 
         def embed_text(self, phrases):
-            return [[1.0] * 4 for _ in phrases]
+            return [[1.0] * atlas_embed.DIMS for _ in phrases]
 
-    def serve(self, lines):
+    def setUp(self):
+        self.directory = tempfile.mkdtemp(prefix="atlas-serve-test-")
+
+    def serve(self, lines, with_store=False):
         out = io.StringIO()
-        atlas_embed.run_serve(self.FakeEmbedder(), iter(lines), out)
+        paths = {}
+        if with_store:
+            paths = {
+                "vectors_path": os.path.join(self.directory, "v.f32"),
+                "index_path": os.path.join(self.directory, "i.sqlite"),
+            }
+        atlas_embed.run_serve(
+            self.FakeEmbedder(), iter(lines), out, **paths)
         return [json.loads(line) for line in
                 out.getvalue().strip().splitlines()]
 
@@ -895,15 +950,63 @@ class ServeProtocolTest(unittest.TestCase):
         replies = self.serve(['{"op": "text", "phrases": []}'])
         self.assertFalse(replies[0]["ok"])
 
-    def test_asset_ids_come_back_with_their_vectors(self):
-        # The driver pairs them by position; returning one without the other
-        # would attach vectors to the wrong assets.
+    def test_an_entry_with_no_asset_id_is_refused(self):
+        # The worker stores these itself, so a picture with no name to store
+        # it under is not something to guess at.
+        replies = self.serve(
+            [json.dumps({"op": "images",
+                         "entries": [{"png": "aGk="}]})],
+            with_store=True)
+        self.assertFalse(replies[0]["ok"])
+        self.assertIn("asset_id", replies[0]["error"])
+
+    def test_the_store_ops_refuse_without_a_store(self):
+        # The worker owns the store but does not guess where the catalog is,
+        # and saying so beats inventing a path beside the script.
+        for op in ("next", "images", "failed", "retry"):
+            with self.subTest(op=op):
+                replies = self.serve([json.dumps(
+                    {"op": op, "entries": [{"asset_id": "a",
+                                            "png": "aGk="}]})])
+                self.assertFalse(replies[0]["ok"])
+                self.assertIn("--vectors", replies[0]["error"])
+
+    def test_ping_says_whether_it_has_a_store(self):
+        # A driver can then fail usefully at startup instead of on its first
+        # batch, twenty minutes of rendering later.
+        self.assertFalse(self.serve(['{"op": "ping"}'])[0]["store"])
+        self.assertTrue(
+            self.serve(['{"op": "ping"}'], with_store=True)[0]["store"])
+
+    def test_images_appends_rather_than_returning_vectors(self):
+        # The store is only crash-safe while one writer keeps an ordering
+        # that spans two files, so the worker holds the pen and a driver
+        # never sees the numbers.
         replies = self.serve([json.dumps({
             "op": "images",
             "entries": [{"asset_id": "a", "png": "aGk="},
-                        {"asset_id": "b", "png": "aGk="}]})])
-        self.assertEqual(replies[0]["asset_ids"], ["a", "b"])
-        self.assertEqual(len(replies[0]["vectors"]), 2)
+                        {"asset_id": "b", "png": "aGk="}]})],
+            with_store=True)
+        self.assertTrue(replies[0]["ok"])
+        self.assertEqual(replies[0]["stored"], 2)
+        self.assertEqual(replies[0]["count"], 2)
+        self.assertNotIn("vectors", replies[0])
+
+    def test_a_failure_is_recorded_and_can_be_forgotten(self):
+        replies = self.serve([
+            json.dumps({"op": "failed",
+                        "entries": [{"asset_id": "a", "reason": "boom"}]}),
+            json.dumps({"op": "retry"}),
+        ], with_store=True)
+        self.assertEqual(replies[0]["recorded"], 1)
+        self.assertEqual(replies[1]["forgotten"], 1)
+
+    def test_text_needs_no_store(self):
+        # A search embeds a phrase and writes nothing, so it must work
+        # against a library that has never been tagged.
+        replies = self.serve(['{"op": "text", "phrases": ["grungy"]}'])
+        self.assertTrue(replies[0]["ok"])
+        self.assertEqual(len(replies[0]["vectors"][0]), atlas_embed.DIMS)
 
 
 class ModelRunTest(unittest.TestCase):

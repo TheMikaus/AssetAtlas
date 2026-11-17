@@ -403,81 +403,204 @@ def run_text(embedder, phrase, out):
 # same order -- the same shape as the MCP's own transport, for the same reason:
 # it needs no framing and survives being read by a human.
 #
+#   {"op": "ping"}
+#       -> {"ok": true, "model_id": "...", "dims": 768, "store": true}
+#   {"op": "next", "limit": 8, "pack": "POLYGON_Town"}
+#       -> {"ok": true, "selected": 31495, "done": 264, "given_up": 0,
+#           "remaining": 8, "assets": [{"asset_id": .., "path": ..}, ..]}
 #   {"op": "images", "entries": [{"asset_id": "...", "png": "<base64>"}]}
-#       -> {"ok": true, "vectors": [[...], ...], "ms": 612}
+#       -> {"ok": true, "stored": 8, "count": 272, "ms": 612}
+#   {"op": "failed", "entries": [{"asset_id": "...", "reason": "..."}]}
+#       -> {"ok": true, "recorded": 1}
 #   {"op": "text", "phrases": ["grungy"]}
 #       -> {"ok": true, "vectors": [[...]]}
-#   {"op": "ping"}  -> {"ok": true, "model_id": "..."}
 #
-# Vectors come back rather than being written here: whoever is driving owns
-# the store, so one writer holds it and the crash-safe append order in
-# embedding_store.py stays meaningful.
+# `images` appends rather than returning vectors. The store is only crash-safe
+# while one writer keeps an ordering that spans the vector file and its index,
+# and a second writer in another language is how that gets broken -- so a
+# driver renders pictures and this holds the pen. A driver that genuinely
+# wants the numbers asks for `text`, which writes nothing.
+#
+# Serving the store needs --vectors and --index; without them the three ops
+# that touch it refuse and say so, rather than quietly inventing a path.
 
 
-def _serve_images(embedder, message):
+class _Session:
+    """What one --serve run holds open: the model, the store, the catalog.
+
+    All three are expensive to construct and cheap to keep, which is the
+    whole reason this is a process rather than a script per batch.
+    """
+
+    def __init__(self, embedder, vectors_path=None, index_path=None):
+        self.embedder = embedder
+        self.vectors_path = vectors_path
+        self.index_path = index_path
+        self._store = None
+        self._tagging = None
+
+    @property
+    def tagging(self):
+        if self._tagging is None:
+            sys.path.insert(0, HERE)
+            import tagging
+            self._tagging = tagging
+        return self._tagging
+
+    @property
+    def store(self):
+        if self._store is None:
+            if not self.vectors_path or not self.index_path:
+                raise EmbedError(
+                    "this needs --vectors and --index. The worker owns the "
+                    "store, but it does not guess where the catalog is.")
+            self._store = self.tagging.open_or_create_store(
+                self.vectors_path, self.index_path)
+        return self._store
+
+    def close(self):
+        if self._store is not None:
+            self._store.close()
+            self._store = None
+
+
+def _serve_ping(session, message):
+    return {"ok": True, "model_id": MODEL_ID, "dims": DIMS,
+            "store": bool(session.vectors_path and session.index_path)}
+
+
+def _serve_next(session, message):
+    """What to render next. The queue, answered from the store."""
+    limit = message.get("limit")
+    limit = None if limit is None else max(1, int(limit))
+    tagging = session.tagging
+    with tagging.open_catalog_readonly() as connection:
+        work = tagging.work_list(
+            session.store, connection,
+            folder=message.get("folder"),
+            pack=message.get("pack"),
+            ext=message.get("ext"),
+            max_attempts=int(message.get("max_attempts")
+                             or tagging.DEFAULT_MAX_ATTEMPTS),
+            limit=limit)
+    reply = {"ok": True}
+    reply.update(work.as_dict())
+    return reply
+
+
+def _serve_images(session, message):
+    """Embed these pictures and keep them."""
     entries = message.get("entries") or []
+    if not entries:
+        return {"ok": True, "stored": 0, "count": session.store.count,
+                "ms": 0}
     pngs = []
     for entry in entries:
         encoded = entry.get("png")
         if not encoded:
             raise EmbedError("an entry has no png")
+        if not entry.get("asset_id"):
+            raise EmbedError("an entry has no asset_id to store it under")
         pngs.append(base64.b64decode(encoded))
+
     started = time.perf_counter()
-    vectors = embedder.embed_images(pngs)
-    return {"ok": True,
-            "asset_ids": [entry.get("asset_id") for entry in entries],
-            "vectors": [[float(value) for value in vector]
-                        for vector in vectors],
+    vectors = embedder_vectors(session.embedder, pngs, len(entries))
+    now_ms = int(time.time() * 1000)
+    session.store.append(
+        [(entry["asset_id"], vector, entry.get("source") or "render", now_ms)
+         for entry, vector in zip(entries, vectors)])
+    # A file that failed twice and then worked must not keep the attempts
+    # against it, or a later run gives up on something that is fine.
+    for entry in entries:
+        session.store.forget_failure(entry["asset_id"])
+    return {"ok": True, "stored": len(entries),
+            "count": session.store.count,
             "ms": round((time.perf_counter() - started) * 1000)}
 
 
-def _serve_text(embedder, message):
+def embedder_vectors(embedder, pngs, expected):
+    vectors = embedder.embed_images(pngs)
+    if len(vectors) != expected:
+        raise EmbedError(
+            "the model returned %d vectors for %d images, so none of them "
+            "can be trusted to belong to the right asset"
+            % (len(vectors), expected))
+    return vectors
+
+
+def _serve_failed(session, message):
+    """Record renders that could not be produced, so they are not retried
+    for ever. The driver decides what counts as the file's fault."""
+    entries = message.get("entries") or []
+    now_ms = int(time.time() * 1000)
+    for entry in entries:
+        asset_id = entry.get("asset_id")
+        if not asset_id:
+            raise EmbedError("a failure has no asset_id")
+        session.store.record_failure(
+            asset_id, entry.get("reason") or "unknown", now_ms)
+    return {"ok": True, "recorded": len(entries)}
+
+
+def _serve_retry(session, message):
+    return {"ok": True, "forgotten": session.store.clear_failures()}
+
+
+def _serve_text(session, message):
     phrases = message.get("phrases") or []
     if not phrases:
         raise EmbedError("no phrases given")
-    vectors = embedder.embed_text(phrases)
+    vectors = session.embedder.embed_text(phrases)
     return {"ok": True,
             "vectors": [[float(value) for value in vector]
                         for vector in vectors]}
 
 
 _OPERATIONS = {
+    "ping": _serve_ping,
+    "next": _serve_next,
     "images": _serve_images,
+    "failed": _serve_failed,
+    "retry": _serve_retry,
     "text": _serve_text,
-    "ping": lambda embedder, message: {"ok": True, "model_id": MODEL_ID,
-                                       "dims": DIMS},
 }
 
 
-def run_serve(embedder, stdin, out):
-    for line in stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            message = json.loads(line)
-        except ValueError as error:
-            reply = {"ok": False, "error": "unreadable line: %s" % error}
-        else:
-            handler = _OPERATIONS.get(message.get("op"))
-            if handler is None:
-                reply = {"ok": False,
-                         "error": "no such op %r; expected one of %s"
-                                  % (message.get("op"),
-                                     ", ".join(sorted(_OPERATIONS)))}
+def run_serve(embedder, stdin, out, vectors_path=None, index_path=None):
+    session = _Session(embedder, vectors_path, index_path)
+    try:
+        for line in stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError as error:
+                reply = {"ok": False, "error": "unreadable line: %s" % error}
             else:
-                try:
-                    reply = handler(embedder, message)
-                except EmbedError as error:
-                    reply = {"ok": False, "error": str(error)}
-                except Exception as error:          # noqa: BLE001
-                    # A driver waiting on a reply must get one. Dying here
-                    # leaves it blocked on a pipe that will never answer.
+                handler = _OPERATIONS.get(message.get("op"))
+                if handler is None:
                     reply = {"ok": False,
-                             "error": "%s: %s" % (type(error).__name__, error)}
-        out.write(json.dumps(reply) + "\n")
-        out.flush()
-    return 0
+                             "error": "no such op %r; expected one of %s"
+                                      % (message.get("op"),
+                                         ", ".join(sorted(_OPERATIONS)))}
+                else:
+                    try:
+                        reply = handler(session, message)
+                    except EmbedError as error:
+                        reply = {"ok": False, "error": str(error)}
+                    except Exception as error:      # noqa: BLE001
+                        # A driver waiting on a reply must get one. Dying
+                        # here leaves it blocked on a pipe that will never
+                        # answer.
+                        reply = {"ok": False,
+                                 "error": "%s: %s"
+                                          % (type(error).__name__, error)}
+            out.write(json.dumps(reply) + "\n")
+            out.flush()
+        return 0
+    finally:
+        session.close()
 
 
 def main(argv=None):
@@ -519,7 +642,9 @@ def main(argv=None):
                 embedder, sys.stdout, arguments.vectors, arguments.index,
                 phrase=arguments.search,
                 like_asset_id=arguments.search_like, top=arguments.top)
-        return run_serve(embedder, sys.stdin, sys.stdout)
+        return run_serve(embedder, sys.stdin, sys.stdout,
+                         vectors_path=arguments.vectors,
+                         index_path=arguments.index)
     except EmbedError as error:
         sys.stderr.write("%s\n" % error)
         return 2
