@@ -132,7 +132,25 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.37';
+
+/// How many bytes of decoded texture to keep.
+///
+/// Decoded means raw RGBA, so the size on disk is no guide: this library's
+/// packs use 2048x2048 atlases (16MB each) and 4096x4096 ones (64MB each),
+/// and ten models out of POLYGON_SciFi_Horror between them wanted 128MB in
+/// two textures. 256MB would hold that pack and little more, so the budget
+/// is 512MB: the failure mode of a cache too small is evicting a texture
+/// just before the next asset asks for it, which costs the read it was meant
+/// to save. Atlas sits around 500MB with the catalog loaded, so this is a
+/// real increase and a deliberate one.
+///
+/// It is a cache of bytes, not of images: nothing here holds a file handle or
+/// a GPU resource, so the only cost is the memory.
+///
+/// Not const only so tests can shrink it and watch eviction happen without
+/// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
+var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
+const appVersion = '1.10.38';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -10133,6 +10151,175 @@ Set<String> tokenSet(String value) {
       .toSet();
 }
 
+/// One texture, read and decoded once: its pixels, its size, its average.
+///
+/// Pixels rather than a [ui.Image], deliberately. The image a material holds
+/// is displayed, and widgets dispose what they are given, so handing the same
+/// [ui.Image] to every material that wants this texture would be a
+/// use-after-dispose waiting to happen. Each caller gets a fresh image built
+/// from these pixels instead, which is a copy of some megabytes against the
+/// hundreds of milliseconds that reading and decoding the file cost.
+class TextureBitmap {
+  const TextureBitmap({
+    required this.rgba,
+    required this.width,
+    required this.height,
+    required this.averageColor,
+  });
+
+  final Uint8List rgba;
+  final int width;
+  final int height;
+  final Color? averageColor;
+
+  int get byteCount => rgba.lengthInBytes;
+}
+
+final _textureBitmapCache = <String, TextureBitmap>{};
+final _textureBitmapInFlight = <String, Future<TextureBitmap?>>{};
+var _textureBitmapBytes = 0;
+
+/// Forgets every decoded texture. Test visibility, and for a settings change
+/// that should take effect without a restart.
+void clearTextureBitmapCache() {
+  _textureBitmapCache.clear();
+  _textureBitmapBytes = 0;
+}
+
+/// Test visibility: how many textures are held, and how much they weigh.
+int get textureBitmapCacheCount => _textureBitmapCache.length;
+int get textureBitmapCacheBytes => _textureBitmapBytes;
+
+/// Identifies the bytes a decoded texture came from.
+///
+/// A texture inside an archive is identified by the archive's own state, the
+/// same way the archive cache does it, because that is what changes when the
+/// pack is replaced on disk.
+String? _textureStateKey(String path) {
+  try {
+    final zip = parseZipVirtualPath(path);
+    if (zip != null) {
+      final archive = _archiveStateKey(zip.zipPath);
+      if (archive == null) return null;
+      return 'zip:$archive:${zip.entryPath}';
+    }
+    final stat = File(path).statSync();
+    if (stat.type == FileSystemEntityType.notFound) return null;
+    return '${stat.size}:${stat.modified.millisecondsSinceEpoch}';
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Reads and decodes [path], or hands back what a previous read decoded.
+///
+/// Every asset in a pack names the same atlas, and the whole of it used to be
+/// read off disk and decoded again for each one. On this library the largest
+/// textures cost 300-1,700 ms each in read and decode, so a pass over a pack
+/// paid that per asset for bytes it had already had.
+///
+/// Returns null when the file cannot be read or decoded, and remembers
+/// nothing in that case, so a texture that only becomes readable later is not
+/// written off permanently.
+Future<TextureBitmap?> textureBitmap(String path) async {
+  final state = _textureStateKey(path);
+  // Unreadable or gone: fall through to the uncached read, which fails the
+  // same way it always did rather than differently.
+  if (state == null) return _readTextureBitmap(path);
+
+  final key = '${normalizePathKey(path)}|$state';
+  final cached = _textureBitmapCache[key];
+  if (cached != null) {
+    // Promote for LRU eviction, as the archive cache does.
+    _textureBitmapCache.remove(key);
+    _textureBitmapCache[key] = cached;
+    return cached;
+  }
+
+  // Four render lanes asking for one pack's atlas at the same moment would
+  // otherwise each read and decode their own copy of it.
+  final inFlight = _textureBitmapInFlight[key];
+  if (inFlight != null) return inFlight;
+
+  final work = _readTextureBitmap(path);
+  _textureBitmapInFlight[key] = work;
+  try {
+    final bitmap = await work;
+    if (bitmap == null) return null;
+    // One texture bigger than the whole budget is used and not kept, rather
+    // than emptying the cache to hold it alone.
+    if (bitmap.byteCount <= maxTextureBitmapCacheBytes) {
+      _textureBitmapCache[key] = bitmap;
+      _textureBitmapBytes += bitmap.byteCount;
+      while (_textureBitmapBytes > maxTextureBitmapCacheBytes &&
+          _textureBitmapCache.isNotEmpty) {
+        final oldest = _textureBitmapCache.keys.first;
+        final evicted = _textureBitmapCache.remove(oldest);
+        _textureBitmapBytes -= evicted?.byteCount ?? 0;
+      }
+    }
+    return bitmap;
+  } finally {
+    _textureBitmapInFlight.remove(key);
+  }
+}
+
+Future<TextureBitmap?> _readTextureBitmap(String path) async {
+  try {
+    final bytes = await readAssetBytes(path);
+    if (bytes == null || bytes.isEmpty) return null;
+    final image = await decodeImage(bytes);
+    final width = image.width;
+    final height = image.height;
+    final byteData = await image.toByteData(
+      format: ui.ImageByteFormat.rawRgba,
+    );
+    image.dispose();
+    if (byteData == null) return null;
+    final rgba = byteData.buffer.asUint8List();
+    return TextureBitmap(
+      rgba: rgba,
+      width: width,
+      height: height,
+      averageColor: averageColorOfRgba(rgba),
+    );
+  } catch (error) {
+    fbxLog('Texture decode failed: $path ($error)');
+    return null;
+  }
+}
+
+/// A [ui.Image] over [rgba], which is a copy rather than a decode.
+Future<ui.Image> imageFromRgba(Uint8List rgba, int width, int height) {
+  final done = Completer<ui.Image>();
+  ui.decodeImageFromPixels(
+    rgba,
+    width,
+    height,
+    ui.PixelFormat.rgba8888,
+    done.complete,
+  );
+  return done.future;
+}
+
+Future<TextureBitmap?> firstTextureBitmap(List<String> paths) async {
+  for (final path in paths) {
+    if (!imageExts.contains(extensionOf(path))) continue;
+    final bitmap = await textureBitmap(path);
+    if (bitmap != null) {
+      fbxLog('Texture bitmap: $path (${bitmap.width}x${bitmap.height})');
+      return bitmap;
+    }
+    // Try the next texture candidate.
+  }
+  if (paths.isNotEmpty) {
+    fbxLog(
+      'No decodable texture image found in candidates: ${paths.join('; ')}',
+    );
+  }
+  return null;
+}
+
 Future<Color?> firstTextureAverageColor(List<String> paths) async {
   for (final path in paths) {
     if (!imageExts.contains(extensionOf(path))) continue;
@@ -10143,25 +10330,9 @@ Future<Color?> firstTextureAverageColor(List<String> paths) async {
 }
 
 Future<ui.Image?> firstTextureImage(List<String> paths) async {
-  for (final path in paths) {
-    if (!imageExts.contains(extensionOf(path))) continue;
-    try {
-      final bytes = await readAssetBytes(path);
-      if (bytes == null || bytes.isEmpty) continue;
-      final image = await decodeImage(bytes);
-      fbxLog('Decoded texture image: $path (${image.width}x${image.height})');
-      return image;
-    } catch (error) {
-      fbxLog('Texture decode failed: $path ($error)');
-      // Try the next texture candidate.
-    }
-  }
-  if (paths.isNotEmpty) {
-    fbxLog(
-      'No decodable texture image found in candidates: ${paths.join('; ')}',
-    );
-  }
-  return null;
+  final bitmap = await firstTextureBitmap(paths);
+  if (bitmap == null) return null;
+  return imageFromRgba(bitmap.rgba, bitmap.width, bitmap.height);
 }
 
 Future<ui.Image> createCheckerboardTextureImage({
@@ -10188,32 +10359,31 @@ Future<ui.Image> createCheckerboardTextureImage({
   return picture.toImage(size, size);
 }
 
-Future<Color?> averageImageColor(String path) async {
-  try {
-    final bytes = await readAssetBytes(path);
-    if (bytes == null || bytes.isEmpty) return null;
-    final image = await decodeImage(bytes);
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    image.dispose();
-    if (byteData == null) return null;
-    final data = byteData.buffer.asUint8List();
-    var r = 0;
-    var g = 0;
-    var b = 0;
-    var samples = 0;
-    final stride = math.max(4, (data.length / 256).floor() ~/ 4 * 4);
-    for (var index = 0; index + 3 < data.length; index += stride) {
-      if (data[index + 3] < 16) continue;
-      r += data[index];
-      g += data[index + 1];
-      b += data[index + 2];
-      samples += 1;
-    }
-    if (samples == 0) return null;
-    return Color.fromARGB(255, r ~/ samples, g ~/ samples, b ~/ samples);
-  } catch (_) {
-    return null;
+/// The average colour of raw RGBA pixels, ignoring the nearly transparent.
+///
+/// Sampled on a stride rather than read in full: 256 samples describe an
+/// atlas well enough to tint a thumbnail, and reading every texel of a 4K
+/// texture to produce one colour would cost more than the decode did.
+Color? averageColorOfRgba(Uint8List data) {
+  var r = 0;
+  var g = 0;
+  var b = 0;
+  var samples = 0;
+  final stride = math.max(4, (data.length / 256).floor() ~/ 4 * 4);
+  for (var index = 0; index + 3 < data.length; index += stride) {
+    if (data[index + 3] < 16) continue;
+    r += data[index];
+    g += data[index + 1];
+    b += data[index + 2];
+    samples += 1;
   }
+  if (samples == 0) return null;
+  return Color.fromARGB(255, r ~/ samples, g ~/ samples, b ~/ samples);
+}
+
+Future<Color?> averageImageColor(String path) async {
+  final bitmap = await textureBitmap(path);
+  return bitmap?.averageColor;
 }
 
 Future<ui.Image> decodeImage(Uint8List bytes) {
@@ -12753,8 +12923,12 @@ Future<MeshModel> meshModelFromImporterJson(
     fbxLog(
       'Material ${(material['name'] as String?) ?? 'Material'} refs=${textureRefs.length} resolved=${resolvedTextures.length}',
     );
+    // Both of these read through the texture cache, so the atlas this
+    // material names is read off disk and decoded once however many
+    // materials and however many assets in the pack point at it.
     final textureColor = await firstTextureAverageColor(resolvedTextures);
     ui.Image? textureImage;
+    Uint8List? texturePixels;
     if (embeddedTextureBase64.isNotEmpty) {
       try {
         textureImage = await decodeImage(base64Decode(embeddedTextureBase64));
@@ -12762,22 +12936,27 @@ Future<MeshModel> meshModelFromImporterJson(
           'Decoded embedded texture for ${(material['name'] as String?) ?? 'Material'} '
           '(${textureImage.width}x${textureImage.height})',
         );
-      } catch (error) {
-        fbxLog('Embedded texture decode failed: $error');
-      }
-    }
-    textureImage ??= await firstTextureImage(resolvedTextures);
-
-    // Read the texture back once so single-texel faces can be filled directly.
-    Uint8List? texturePixels;
-    if (textureImage != null) {
-      try {
+        // Not cached: this one arrives inside the model rather than from a
+        // path, so there is nothing to key it on.
         final data = await textureImage.toByteData(
           format: ui.ImageByteFormat.rawRgba,
         );
         texturePixels = data?.buffer.asUint8List();
       } catch (error) {
-        fbxLog('Texture readback failed: $error');
+        fbxLog('Embedded texture decode failed: $error');
+      }
+    }
+    if (textureImage == null) {
+      // The pixels come from the cache, so single-texel faces can be filled
+      // directly without reading the image back per asset.
+      final bitmap = await firstTextureBitmap(resolvedTextures);
+      if (bitmap != null) {
+        textureImage = await imageFromRgba(
+          bitmap.rgba,
+          bitmap.width,
+          bitmap.height,
+        );
+        texturePixels = bitmap.rgba;
       }
     }
 
@@ -12797,14 +12976,14 @@ Future<MeshModel> meshModelFromImporterJson(
       );
       if (resolvedNormal != null) {
         try {
-          final normalImage = await firstTextureImage([resolvedNormal]);
-          if (normalImage != null) {
-            final data = await normalImage.toByteData(
-              format: ui.ImageByteFormat.rawRgba,
-            );
-            normalPixels = data?.buffer.asUint8List();
-            normalWidth = normalImage.width;
-            normalHeight = normalImage.height;
+          // Pixels only: shading reads these on the CPU and nothing displays
+          // a normal map, so no ui.Image is built for it. The one that used
+          // to be built here was never disposed.
+          final normal = await firstTextureBitmap([resolvedNormal]);
+          if (normal != null) {
+            normalPixels = normal.rgba;
+            normalWidth = normal.width;
+            normalHeight = normal.height;
             fbxLog(
               'Normal map for ${(material['name'] as String?) ?? 'Material'}: '
               '$resolvedNormal (${normalWidth}x$normalHeight)',
@@ -12833,14 +13012,12 @@ Future<MeshModel> meshModelFromImporterJson(
       );
       if (resolvedEmissive != null) {
         try {
-          final emissiveImage = await firstTextureImage([resolvedEmissive]);
-          if (emissiveImage != null) {
-            final data = await emissiveImage.toByteData(
-              format: ui.ImageByteFormat.rawRgba,
-            );
-            emissivePixels = data?.buffer.asUint8List();
-            emissiveWidth = emissiveImage.width;
-            emissiveHeight = emissiveImage.height;
+          // Pixels only, for the same reason as the normal map.
+          final emissive = await firstTextureBitmap([resolvedEmissive]);
+          if (emissive != null) {
+            emissivePixels = emissive.rgba;
+            emissiveWidth = emissive.width;
+            emissiveHeight = emissive.height;
           }
         } catch (error) {
           fbxLog('Emissive decode failed: $error');
