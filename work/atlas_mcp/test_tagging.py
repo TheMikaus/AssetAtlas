@@ -223,6 +223,32 @@ class CandidateQueryTest(unittest.TestCase):
                  "p/Built.uasset", ext="uasset")
         self.assertEqual(self.ids(), ["a"])
 
+    def test_animation_clips_are_not_rendered(self):
+        # The renderer refuses them -- "has no geometry to draw: it is an
+        # animation" -- so left in, all 801 would fail every run for ever.
+        self.add("a", "SM_Barrel.fbx", "zip:p.zip::SM_Barrel.fbx",
+                 "p/Models/SM_Barrel.fbx")
+        self.add("b", "A_Run.fbx", "zip:p.zip::A_Run.fbx",
+                 "p/Animations/A_Run.fbx")
+        self.assertEqual(self.ids(), ["a"])
+
+    def test_a_probed_mesh_in_an_animation_folder_is_still_rendered(self):
+        # The folder rule is a fallback; a probed answer outranks it.
+        self.connection.execute(
+            "INSERT INTO catalog_assets (id, name, path, relative_path, ext,"
+            " type, size, ignored, model_kind, tags_json)"
+            " VALUES ('a','SM_Hull.fbx','zip:p.zip::SM_Hull.fbx',"
+            "'p/Animations/SM_Hull.fbx','fbx','model',100,0,'mesh','[]')")
+        self.assertEqual(self.ids(), ["a"])
+
+    def test_a_probed_clip_outside_an_animation_folder_is_skipped(self):
+        self.connection.execute(
+            "INSERT INTO catalog_assets (id, name, path, relative_path, ext,"
+            " type, size, ignored, model_kind, tags_json)"
+            " VALUES ('a','Run.fbx','zip:p.zip::Run.fbx',"
+            "'p/Models/Run.fbx','fbx','model',100,0,'animation','[]')")
+        self.assertEqual(self.ids(), [])
+
     def test_obj_is_rendered_too(self):
         self.add("a", "Thing.obj", "zip:p.zip::Thing.obj", "p/Thing.obj",
                  ext="obj")

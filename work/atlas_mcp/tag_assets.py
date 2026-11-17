@@ -116,11 +116,23 @@ def candidates(connection, folder=None, pack=None, ext=None):
         where.append("lower(path) LIKE ?")
         params.append("%" + pack.lower() + "%")
 
-    return connection.execute(
-        "SELECT id, path, name, relative_path, count(*) AS copies "
-        "FROM catalog_assets WHERE %s "
+    rows = connection.execute(
+        # referenced_by_model is selected although these are all models and
+        # effective_type short-circuits before reading it: relying on the
+        # order of those checks would make this break on a reordering
+        # somewhere else entirely.
+        "SELECT id, path, name, relative_path, model_kind, type, "
+        "referenced_by_model, count(*) AS copies FROM catalog_assets WHERE %s "
         "GROUP BY lower(name), size ORDER BY path, relative_path"
         % " AND ".join(where), params).fetchall()
+
+    # Animation clips hold curves and no geometry, and the renderer says so
+    # rather than drawing anything: "has no geometry to draw: it is an
+    # animation". Left in, all 801 of them would be rendered, fail, and be
+    # retried on the next run for ever. The folder rule catches the ones
+    # nothing has probed, which after a rescan is all of them.
+    return [row for row in rows
+            if atlas_mcp.effective_type(row) != "animation"]
 
 
 class EmbedderProcess:

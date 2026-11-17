@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:isolate';
 import 'dart:collection';
 import 'dart:convert';
@@ -89,7 +89,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.29';
+const appVersion = '1.10.30';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -1254,7 +1254,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       setState(() {
         status = ScanStatus(
           report.failedCount > 0 ? 'Copied with errors' : 'Copied assets',
-          '${report.summaryLine} · target: $target',
+          '${report.summaryLine} Â· target: $target',
         );
       });
     } catch (error) {
@@ -1744,7 +1744,7 @@ class _HeaderTitle extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Asset Atlas Native · v$appVersion',
+              'Asset Atlas Native Â· v$appVersion',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
             ),
             Text(
@@ -4297,15 +4297,15 @@ class _ModelPreviewState extends State<ModelPreview> {
                                   );
                                   final capped = shown > maxRenderedFaces;
                                   final summary =
-                                      '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
+                                      '${mesh.name} Â· ${mesh.vertices.length} verts Â· $total faces';
                                   // Hiding geometry is never silent, slots
                                   // included: say how much is on screen.
                                   final assembled = shown == total
                                       ? ''
-                                      : ' · assembled: $shown faces';
+                                      : ' Â· assembled: $shown faces';
                                   if (!capped) return Text('$summary$assembled');
                                   return Text(
-                                    '$summary$assembled · face cap: showing '
+                                    '$summary$assembled Â· face cap: showing '
                                     '$maxRenderedFaces nearest',
                                     style: const TextStyle(
                                       color: Color(0xffb3540a),
@@ -4583,11 +4583,11 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     );
     _boneWorld = Float32List(rest.bones.length * 12);
     _retargetNote = reference == null
-        ? 'This rig sits ${difference.round()}° from the clip and no '
+        ? 'This rig sits ${difference.round()}Â° from the clip and no '
               'matching reference character was found beside it, so only its '
               'own bind pose can be shown.'
         : 'Retargeted through ${referenceAsset!.name}: this rig sits '
-              '${difference.round()}° from the clip.';
+              '${difference.round()}Â° from the clip.';
   }
 
   Future<void> _loadCharacter() async {
@@ -4808,7 +4808,7 @@ class AnimationClipPreview extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
             child: Text(
-              '${skeleton.bones.length} bones · $_duration · '
+              '${skeleton.bones.length} bones Â· $_duration Â· '
               '${mesh.animationNames.join(", ")}',
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 12, color: Colors.black54),
@@ -5109,8 +5109,8 @@ class _RasterModelViewState extends State<RasterModelView> {
 /// A software rasteriser with a depth buffer.
 ///
 /// The canvas painter sorts whole faces by depth and draws them back to front.
-/// That cannot resolve geometry that interpenetrates or sits coplanar — window
-/// frames flush with a wall, roof details flush with a roof — because the
+/// That cannot resolve geometry that interpenetrates or sits coplanar â€” window
+/// frames flush with a wall, roof details flush with a roof â€” because the
 /// answer differs *within* a face. Those cases showed up as notches and stray
 /// slivers along polygon edges. Depth per pixel is the only thing that fixes
 /// it, so this walks the triangles itself and keeps a z value per pixel.
@@ -7050,7 +7050,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
                       : 'Texture discovery...',
                   message: combined.isEmpty
                       ? 'No texture references and no nearby candidates.'
-                      : '${referenced.length} model references · '
+                      : '${referenced.length} model references Â· '
                             '${nearby.length} nearby scanned candidates.',
                   entries: combined,
                   onActivateAsset: onActivateAsset,
@@ -10277,7 +10277,7 @@ class CopyReport {
     if (failedCount > 0) {
       parts.add('$failedCount failed');
     }
-    return parts.join(' · ');
+    return parts.join(' Â· ');
   }
 }
 
@@ -15786,5 +15786,6 @@ Future<Map<String, Object?>> bridgeRender(
     'png': base64Encode(png),
   };
 }
+
 
 
