@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:isolate';
 import 'dart:collection';
 import 'dart:convert';
@@ -89,7 +89,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.30';
+const appVersion = '1.10.31';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -212,9 +212,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   /// Scans every source again, in order. What a catalog saved under older
   /// rules needs, and otherwise a long way round to the Scan button.
-  Future<void> _rescanAllSources() async {
+  /// Walk every source again, keeping what is still true.
+  ///
+  /// `force` discards every probed classification and starts over, which is
+  /// hours of importer runs for this library -- so it is a separate button,
+  /// not the default.
+  Future<void> _rescanAllSources({bool force = false}) async {
     for (final root in sourceRoots.toList()) {
-      await scanFolder(root);
+      await scanFolder(root, force: force);
     }
   }
   final searchController = TextEditingController();
@@ -1132,7 +1137,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     await scanFolder(path);
   }
 
-  Future<void> scanFolder(String rootPath) async {
+  /// Walk a folder and fold the result into the catalog.
+  ///
+  /// `force` re-derives every classification instead of carrying the ones
+  /// whose files have not changed. For when the derivation changed, not the
+  /// files.
+  Future<void> scanFolder(String rootPath, {bool force = false}) async {
     if (scanning) return;
     setState(() {
       scanning = true;
@@ -1172,21 +1182,27 @@ class _CatalogScreenState extends State<CatalogScreen> {
     }
 
     if (!mounted) return;
+    CarryTally carried = const CarryTally(unchanged: 0, changed: 0, added: 0);
     setState(() {
       _activeScan = null;
       sourceRoots.add(rootPath);
       // What a file *is* does not change because the folder was walked
-      // again. Classification is an importer run per FBX -- 27,000 of them
+      // again. Classification is an importer run per FBX -- 34,801 of them
       // in this library -- and the first rescan after it landed threw every
       // one away, which emptied the Character and Animation filters until
       // the whole lot had been probed a second time. Ids are content
-      // independent, so the answers carry across by id.
+      // independent, so the answers carry across by id -- but only for the
+      // files that have not changed, or the catalog would be repeating
+      // something that was true of a different file.
       final remembered = <String, AssetItem>{
         for (final asset in assets)
           if (asset.sourceRoot == rootPath) asset.id: asset,
       };
+      carried = tallyCarry(result.assets, remembered, force: force);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
-      assets.addAll(carryClassification(result.assets, remembered));
+      assets.addAll(
+        carryClassification(result.assets, remembered, force: force),
+      );
       MeshLoadCache.clear();
       ModelThumbnailCache.clear();
       catalogRevision += 1;
@@ -1203,8 +1219,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _pruneHistoryToVisibleAssets();
       scanning = false;
       status = ScanStatus(
-        'Scan complete',
-        '${result.assets.length} cataloged, ${result.skippedUnsupported} skipped, ${result.skippedBinaryObj} binary OBJ ignored',
+        force ? 'Rescan complete (forced)' : 'Scan complete',
+        '${result.assets.length} cataloged (${carried.summary}), '
+            '${result.skippedUnsupported} skipped, '
+            '${result.skippedBinaryObj} binary OBJ ignored',
       );
     });
     if (modelTextureFilter != 'all') {
@@ -1254,7 +1272,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       setState(() {
         status = ScanStatus(
           report.failedCount > 0 ? 'Copied with errors' : 'Copied assets',
-          '${report.summaryLine} Â· target: $target',
+          '${report.summaryLine} · target: $target',
         );
       });
     } catch (error) {
@@ -1523,6 +1541,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           setState(() => folderTreeFilter = value),
                       catalogRulesStale: catalogRulesStale,
                       onRescanAll: _rescanAllSources,
+                      onForceRescanAll: () =>
+                          unawaited(_rescanAllSources(force: true)),
                     ),
                     VerticalResizeHandle(
                       onDrag: (delta) {
@@ -1744,7 +1764,7 @@ class _HeaderTitle extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Asset Atlas Native Â· v$appVersion',
+              'Asset Atlas Native · v$appVersion',
               style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
             ),
             Text(
@@ -2129,6 +2149,7 @@ class FilterPanel extends StatelessWidget {
     required this.onFolderFilterChanged,
     required this.catalogRulesStale,
     required this.onRescanAll,
+    required this.onForceRescanAll,
     super.key,
   });
 
@@ -2158,6 +2179,7 @@ class FilterPanel extends StatelessWidget {
   final ValueChanged<String> onFolderFilterChanged;
   final bool catalogRulesStale;
   final VoidCallback onRescanAll;
+  final VoidCallback onForceRescanAll;
   final ValueChanged<bool> onHideIgnoredChanged;
   final ValueChanged<bool> onHideZipAssetsChanged;
   final ValueChanged<String> onRemoveSource;
@@ -2195,6 +2217,21 @@ class FilterPanel extends StatelessWidget {
                       FilledButton.tonal(
                         onPressed: onRescanAll,
                         child: const Text('Rescan all folders'),
+                      ),
+                      const SizedBox(height: 4),
+                      // Separate, and named for what it costs. The ordinary
+                      // rescan keeps every probe result whose file has not
+                      // changed; this one throws them away, which for this
+                      // library is hours of importer runs. Worth having --
+                      // the probe itself improves sometimes, and no
+                      // comparison of timestamps can detect that -- but not
+                      // worth reaching for by accident.
+                      TextButton(
+                        onPressed: onForceRescanAll,
+                        child: const Text(
+                          'Force full rescan (re-probes everything)',
+                          style: TextStyle(fontSize: 11),
+                        ),
                       ),
                     ],
                   ),
@@ -4297,15 +4334,15 @@ class _ModelPreviewState extends State<ModelPreview> {
                                   );
                                   final capped = shown > maxRenderedFaces;
                                   final summary =
-                                      '${mesh.name} Â· ${mesh.vertices.length} verts Â· $total faces';
+                                      '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
                                   // Hiding geometry is never silent, slots
                                   // included: say how much is on screen.
                                   final assembled = shown == total
                                       ? ''
-                                      : ' Â· assembled: $shown faces';
+                                      : ' · assembled: $shown faces';
                                   if (!capped) return Text('$summary$assembled');
                                   return Text(
-                                    '$summary$assembled Â· face cap: showing '
+                                    '$summary$assembled · face cap: showing '
                                     '$maxRenderedFaces nearest',
                                     style: const TextStyle(
                                       color: Color(0xffb3540a),
@@ -4583,11 +4620,11 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     );
     _boneWorld = Float32List(rest.bones.length * 12);
     _retargetNote = reference == null
-        ? 'This rig sits ${difference.round()}Â° from the clip and no '
+        ? 'This rig sits ${difference.round()}° from the clip and no '
               'matching reference character was found beside it, so only its '
               'own bind pose can be shown.'
         : 'Retargeted through ${referenceAsset!.name}: this rig sits '
-              '${difference.round()}Â° from the clip.';
+              '${difference.round()}° from the clip.';
   }
 
   Future<void> _loadCharacter() async {
@@ -4808,7 +4845,7 @@ class AnimationClipPreview extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
             child: Text(
-              '${skeleton.bones.length} bones Â· $_duration Â· '
+              '${skeleton.bones.length} bones · $_duration · '
               '${mesh.animationNames.join(", ")}',
               textAlign: TextAlign.center,
               style: const TextStyle(fontSize: 12, color: Colors.black54),
@@ -7050,7 +7087,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
                       : 'Texture discovery...',
                   message: combined.isEmpty
                       ? 'No texture references and no nearby candidates.'
-                      : '${referenced.length} model references Â· '
+                      : '${referenced.length} model references · '
                             '${nearby.length} nearby scanned candidates.',
                   entries: combined,
                   onActivateAsset: onActivateAsset,
@@ -7196,24 +7233,102 @@ bool assetIsCharacterModel(AssetItem asset) {
   return rig != null && rig != RigFamily.none.name;
 }
 
+/// Whether a rescan found the same file it saw last time.
+///
+/// Modified time and size together. Either alone is too weak: a re-export can
+/// land on the same byte count, and copying a file about changes its timestamp
+/// without changing a thing inside it. Both matching is the signal that
+/// everything already learned about it still holds.
+bool assetLooksUnchanged(AssetItem fresh, AssetItem known) =>
+    fresh.size == known.size &&
+    fresh.modified.millisecondsSinceEpoch ==
+        known.modified.millisecondsSinceEpoch;
+
 /// The fresh scan results with what an earlier catalog already knew about the
-/// same files copied across: the kind and rig a probe found, and whether the
-/// user had ignored the file. Matched by id, which is built from the source
-/// root and relative path and so survives a rescan. A file that has grown or
-/// changed is not distinguished here; a probe result is cheap to be wrong
-/// about compared with the cost of redoing all of them.
+/// same files copied across. Matched by id, which is built from the source
+/// root and relative path and so survives a rescan.
+///
+/// Only for files that have not changed. What is carried is all *derived from
+/// the bytes* -- which kind of model it is, which rig, which images it
+/// asks for -- so a file that has been re-exported has to be re-derived or
+/// the catalog states something about it that was true of a different file.
+/// An earlier version carried it regardless, reasoning that a probe is cheap
+/// to be wrong about; it is not, because classification is persisted and only
+/// ever computed when absent, so one wrong answer never heals.
+///
+/// `ignored` is carried either way. That is the user's decision about a path,
+/// not a fact about the bytes, and re-exporting a file they hid is no reason
+/// to put it back in front of them.
+///
+/// Pass `force` to re-derive everything. That is for when the *derivation*
+/// has changed rather than the files -- a better probe, a new rig family --
+/// which no comparison of timestamps can detect.
 List<AssetItem> carryClassification(
   List<AssetItem> fresh,
-  Map<String, AssetItem> remembered,
-) {
+  Map<String, AssetItem> remembered, {
+  bool force = false,
+}) {
   for (final asset in fresh) {
     final known = remembered[asset.id];
     if (known == null) continue;
+    // Deliberately not conditional: an ignore is about the path.
+    if (known.ignored) asset.ignored = true;
+    if (force || !assetLooksUnchanged(asset, known)) continue;
     asset.modelKind ??= known.modelKind;
     asset.rigFamily ??= known.rigFamily;
-    if (known.ignored) asset.ignored = true;
+    // The link between a texture and the models that use it, learned only by
+    // importing a model. Dropping it meant re-importing the library.
+    asset.referencedByModel =
+        asset.referencedByModel || known.referencedByModel;
   }
   return fresh;
+}
+
+/// How much a rescan was able to keep, for the status line.
+///
+/// Worth reporting rather than inferring: "4 changed" is the difference
+/// between a rescan that cost nothing and one that has just thrown away a
+/// day of probing.
+class CarryTally {
+  const CarryTally({
+    required this.unchanged,
+    required this.changed,
+    required this.added,
+  });
+
+  final int unchanged;
+  final int changed;
+  final int added;
+
+  String get summary {
+    final parts = <String>[
+      if (unchanged > 0) '$unchanged unchanged',
+      if (changed > 0) '$changed changed',
+      if (added > 0) '$added new',
+    ];
+    return parts.isEmpty ? 'nothing to compare' : parts.join(', ');
+  }
+}
+
+CarryTally tallyCarry(
+  List<AssetItem> fresh,
+  Map<String, AssetItem> remembered, {
+  bool force = false,
+}) {
+  var unchanged = 0;
+  var changed = 0;
+  var added = 0;
+  for (final asset in fresh) {
+    final known = remembered[asset.id];
+    if (known == null) {
+      added += 1;
+    } else if (!force && assetLooksUnchanged(asset, known)) {
+      unchanged += 1;
+    } else {
+      changed += 1;
+    }
+  }
+  return CarryTally(unchanged: unchanged, changed: changed, added: added);
 }
 
 /// Whether an asset passes the rig filter.
@@ -10277,7 +10392,7 @@ class CopyReport {
     if (failedCount > 0) {
       parts.add('$failedCount failed');
     }
-    return parts.join(' Â· ');
+    return parts.join(' · ');
   }
 }
 

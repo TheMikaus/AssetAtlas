@@ -6,6 +6,30 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Read and write UTF-8 explicitly, whichever PowerShell is running this.
+#
+# The defaults differ: PowerShell 7 reads and writes UTF-8, but Windows
+# PowerShell 5.1 reads the ANSI code page and its `-Encoding UTF8` adds a BOM.
+# Run under 5.1 this script read lib/main.dart as cp1252 and wrote it back as
+# UTF-8, so every non-ASCII character in it was double-encoded -- the middle
+# dot in the window title, ten times over -- and both files gained a BOM.
+# Nothing notices until a widget test fails with "Found 0 widgets" and says
+# nothing about encoding.
+#
+# UTF8Encoding($false) is UTF-8 without a BOM; Set-Content cannot express that
+# in 5.1, so the writes go through .NET instead.
+$Utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+function Read-Utf8Text {
+    param([string]$Path)
+    return [System.IO.File]::ReadAllText($Path, $Utf8NoBom)
+}
+
+function Write-Utf8Text {
+    param([string]$Path, [string]$Text)
+    [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)
+}
+
 function Write-Step {
     param([string]$Message)
     Write-Host "[asset_atlas_native] $Message"
@@ -29,7 +53,7 @@ if (-not (Test-Path $mainDartPath)) {
     throw "lib/main.dart not found at: $mainDartPath"
 }
 
-$content = Get-Content -Path $pubspecPath -Raw
+$content = Read-Utf8Text -Path $pubspecPath
 $pattern = '(?m)^version:\s*([0-9]+)\.([0-9]+)\.([0-9]+)\+([0-9]+)\s*$'
 $match = [regex]::Match($content, $pattern)
 
@@ -72,11 +96,11 @@ if ($DryRun) {
 }
 
 $updated = [regex]::Replace($content, $pattern, $newLine)
-Set-Content -Path $pubspecPath -Value $updated -Encoding UTF8
+Write-Utf8Text -Path $pubspecPath -Text $updated
 
 Write-Step "Updated $pubspecPath"
 
-$mainContent = Get-Content -Path $mainDartPath -Raw
+$mainContent = Read-Utf8Text -Path $mainDartPath
 $appVersionPattern = "(?m)^const appVersion = '[0-9]+\.[0-9]+\.[0-9]+';\s*$"
 if (-not [regex]::IsMatch($mainContent, $appVersionPattern)) {
     throw "Could not find appVersion constant in: $mainDartPath"
@@ -87,6 +111,6 @@ $updatedMain = [regex]::Replace(
     $appVersionPattern,
     "const appVersion = '$visibleVersion';"
 )
-Set-Content -Path $mainDartPath -Value $updatedMain -Encoding UTF8
+Write-Utf8Text -Path $mainDartPath -Text $updatedMain
 
 Write-Step "Updated visible app version in $mainDartPath"

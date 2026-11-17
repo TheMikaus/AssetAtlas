@@ -69,6 +69,11 @@ RENDERABLE_EXTS = ("fbx", "obj")
 # hold. Eight matches the embedder's fastest measured rate.
 DEFAULT_BATCH = 8
 
+# A run of failures this long means the problem is not the files. Atlas
+# answering but refusing everything looks exactly like 31,000 broken models
+# otherwise, and would retire all of them after three runs.
+GIVE_UP_AFTER_CONSECUTIVE = 25
+
 # 224 is the model's input size. Rendering larger would be thrown away by the
 # resize, and rendering smaller would lose detail the model can use.
 RENDER_SIZE = 224
@@ -166,6 +171,20 @@ def group_is_done(store, row):
     """
     return any(store.row_of(asset_id) is not None
                for asset_id in group_ids(row))
+
+
+def group_is_hopeless(row, failure_counts, max_attempts):
+    """Whether every member of this group has failed too often to try again.
+
+    Every member, not any: a group is only given up on when there is nothing
+    left in it worth rendering. One sibling failing says little -- the other
+    copy may well read fine.
+    """
+    if max_attempts <= 0:
+        return False
+    members = group_ids(row)
+    return all(failure_counts.get(asset_id, 0) >= max_attempts
+               for asset_id in members)
 
 
 class EmbedderProcess:
@@ -278,14 +297,28 @@ def run(arguments, out):
         with atlas_mcp.open_catalog() as connection:
             rows = candidates(connection, folder=arguments.folder,
                               pack=arguments.pack, ext=arguments.ext)
-        todo = [row for row in rows if not group_is_done(store, row)]
-        already = len(rows) - len(todo)
+        if arguments.retry_failed:
+            forgotten = store.clear_failures()
+            out.write("retry         %d previous failures forgotten\n"
+                      % forgotten)
+
+        failure_counts = store.failure_counts()
+        outstanding = [row for row in rows if not group_is_done(store, row)]
+        already = len(rows) - len(outstanding)
+        todo = [row for row in outstanding
+                if not group_is_hopeless(row, failure_counts,
+                                         arguments.max_attempts)]
+        given_up = len(outstanding) - len(todo)
         if arguments.limit:
             todo = todo[:arguments.limit]
 
         out.write(
             "%d distinct models selected, %d already embedded, %d to do\n"
             % (len(rows), already, len(todo)))
+        if given_up:
+            out.write("given up      %d after %d failed attempts each "
+                      "(--retry-failed to try them again)\n"
+                      % (given_up, arguments.max_attempts))
         out.write("store         %s (%d vectors)\n"
                   % (store.vectors_path, store.count))
         out.write("priority      %s, %d embedder threads, %d ms pace\n"
@@ -303,6 +336,8 @@ def run(arguments, out):
         embedder = EmbedderProcess(arguments.threads)
         done = 0
         failed = []
+        interrupted = None
+        consecutive_failures = 0
         started = time.perf_counter()
         batch = []
         try:
@@ -310,12 +345,36 @@ def run(arguments, out):
                 try:
                     png = render(row)
                 except Exception as error:          # noqa: BLE001
-                    # A model Atlas cannot draw is not a reason to stop. It
-                    # keeps no vector, so the next run tries it again -- which
-                    # is right for a transient failure and merely wasteful for
-                    # a permanently broken file.
-                    failed.append((row["relative_path"], str(error)[:120]))
+                    reason = str(error)
+                    # Blaming the file is only right when the file is at
+                    # fault. If Atlas has gone -- closed mid-run, or the
+                    # machine got busy enough to drop the connection -- then
+                    # every remaining asset would be charged a failed
+                    # attempt for something that is not about it, and three
+                    # such runs would permanently skip thousands of good
+                    # files. So check who is actually broken.
+                    if atlas_mcp.bridge_version() is None:
+                        interrupted = ("Atlas stopped answering, so the rest "
+                                       "were left alone rather than blamed")
+                        break
+                    consecutive_failures += 1
+                    if consecutive_failures >= GIVE_UP_AFTER_CONSECUTIVE:
+                        # Atlas answers but nothing renders. Whatever that
+                        # is, it is not 31,000 individually broken files.
+                        interrupted = (
+                            "%d renders failed in a row, so something "
+                            "systemic is wrong and the rest were left alone"
+                            % consecutive_failures)
+                        break
+                    # A model Atlas cannot draw is not a reason to stop.
+                    # Recorded rather than only counted, so a file that can
+                    # never be drawn is eventually left alone instead of
+                    # being selected again on every run for ever.
+                    failed.append((row["relative_path"], reason[:120]))
+                    store.record_failure(row["id"], reason,
+                                         time.time() * 1000)
                     continue
+                consecutive_failures = 0
                 batch.append((row, png))
                 if arguments.pace_ms:
                     time.sleep(arguments.pace_ms / 1000.0)
@@ -324,17 +383,31 @@ def run(arguments, out):
                     done += flush(store, embedder, batch, out)
                     batch = []
                     report_progress(out, done, len(todo), started, failed)
-            if batch:
-                done += flush(store, embedder, batch, out)
-                report_progress(out, done, len(todo), started, failed)
         except KeyboardInterrupt:
-            # The store's append order survives this: vectors, then the count
-            # that publishes them, then the index. Nothing half-written is
-            # ever visible, so stopping here is safe and resuming is free.
-            out.write("\nStopped. %d embedded this run; rerun to continue.\n"
-                      % done)
-        finally:
-            embedder.close()
+            interrupted = "Stopped"
+        except RuntimeError as error:
+            # The embedder died. Same handling: keep what was rendered.
+            interrupted = "The embedder stopped: %s" % error
+
+        # Whatever is in hand gets written, on every path out. Discarding it
+        # threw away up to seven renders, which on the larger models is a
+        # minute of work, for no reason -- the store's append order makes a
+        # partial batch exactly as safe as a full one.
+        if batch:
+            try:
+                done += flush(store, embedder, batch, out)
+            except (RuntimeError, OSError, ValueError) as error:
+                out.write("  the last %d could not be embedded: %s\n"
+                          % (len(batch), error))
+            # Only when there was something to flush. Reporting
+            # unconditionally printed the final line twice on a run whose
+            # work divided evenly into batches.
+            report_progress(out, done, len(todo), started, failed)
+        embedder.close()
+
+        if interrupted:
+            out.write("\n%s. %d embedded this run and kept; rerun to "
+                      "continue where it left off.\n" % (interrupted, done))
 
         elapsed = time.perf_counter() - started
         out.write("\n%d embedded in %s (%.0f ms each), %d failed, %d vectors "
@@ -346,6 +419,15 @@ def run(arguments, out):
             out.write("  failed  %s -- %s\n" % (path, reason))
         if len(failed) > 10:
             out.write("  ... and %d more failures\n" % (len(failed) - 10))
+
+        persistent = [row for row in store.failures(limit=5)
+                      if row[1] >= arguments.max_attempts > 0]
+        if persistent:
+            out.write("\nGiven up on these, and they will be skipped from "
+                      "now on:\n")
+            for asset_id, attempts, reason in persistent:
+                out.write("  %d attempts  %s\n"
+                          % (attempts, (reason or "")[:90]))
         return 0
     finally:
         store.close()
@@ -366,6 +448,10 @@ def flush(store, embedder, batch, out):
     now_ms = int(time.time() * 1000)
     store.append([(row["id"], vector, "render", now_ms)
                   for (row, _png), vector in zip(batch, vectors)])
+    # A file that failed twice and then worked must not keep the two attempts
+    # against it, or a later run would give up on something that is fine.
+    for row, _png in batch:
+        store.forget_failure(row["id"])
     return len(batch)
 
 
@@ -395,6 +481,12 @@ def main(argv=None):
     parser.add_argument("--pace-ms", type=int, default=0,
                         help="pause between renders, to give Atlas and the "
                              "rest of the machine room")
+    parser.add_argument("--max-attempts", type=int, default=3,
+                        help="give up on an asset after this many failed "
+                             "renders (default 3; 0 means never give up)")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="forget every recorded failure and try them all "
+                             "again")
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would be rendered and stop")
     arguments = parser.parse_args(argv)

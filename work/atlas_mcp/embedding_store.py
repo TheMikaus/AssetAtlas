@@ -26,6 +26,12 @@ vectors that do not exist, which is a wrong answer rather than a missing one.
 every vector in the file. Opening with a mismatched id reports zero usable
 rows rather than silently comparing vectors from two different spaces.
 
+The index also records what could not be embedded. The queue that feeds this
+store is derived from it -- whatever has no vector is the work -- so without
+somewhere to write a failure, a file that can never be rendered is retried on
+every run and the pass never reaches "nothing to do". A count is kept rather
+than a flag, because the usual failure is transient.
+
 Standard library only, like the rest of this directory: the MCP server has to
 start without a working pip.
 """
@@ -142,6 +148,16 @@ class EmbeddingStore:
                 "  source TEXT NOT NULL,"
                 "  computed_ms INTEGER NOT NULL)")
             self._index.commit()
+        # Created unconditionally, not only on create: a store written before
+        # this table existed must gain it on open rather than raise on the
+        # first failure it has to record.
+        self._index.execute(
+            "CREATE TABLE IF NOT EXISTS embedding_failures ("
+            "  asset_id TEXT PRIMARY KEY,"
+            "  attempts INTEGER NOT NULL,"
+            "  reason TEXT,"
+            "  last_ms INTEGER NOT NULL)")
+        self._index.commit()
 
     # ------------------------------------------------------------- writing
 
@@ -265,6 +281,59 @@ class EmbeddingStore:
         """Which of `asset_ids` still need embedding. Drives the queue."""
         return [asset_id for asset_id in asset_ids
                 if self.row_of(asset_id) is None]
+
+    # ------------------------------------------------------------ failures
+
+    def record_failure(self, asset_id, reason, when_ms):
+        """Note that this asset could not be embedded, and count the attempt.
+
+        Committed one at a time on purpose. A failure recorded only at the
+        end of a run would be lost by the interruption that caused it.
+        """
+        self._index.execute(
+            "INSERT INTO embedding_failures (asset_id, attempts, reason, "
+            "last_ms) VALUES (?, 1, ?, ?) "
+            "ON CONFLICT(asset_id) DO UPDATE SET "
+            "  attempts = attempts + 1, reason = excluded.reason, "
+            "  last_ms = excluded.last_ms",
+            (asset_id, (reason or "")[:500], int(when_ms)))
+        self._index.commit()
+
+    def failure_counts(self):
+        """asset_id -> attempts, for everything that has ever failed."""
+        return {asset_id: attempts for asset_id, attempts
+                in self._index.execute(
+                    "SELECT asset_id, attempts FROM embedding_failures")}
+
+    def failures(self, limit=50):
+        """The worst offenders, for reporting: (asset_id, attempts, reason)."""
+        return self._index.execute(
+            "SELECT asset_id, attempts, reason FROM embedding_failures "
+            "ORDER BY attempts DESC, asset_id LIMIT ?", (int(limit),)
+        ).fetchall()
+
+    def clear_failures(self, asset_ids=None):
+        """Forget failures, so they are tried again. All of them, or some.
+
+        Returns how many rows were forgotten.
+        """
+        if asset_ids is None:
+            cursor = self._index.execute("DELETE FROM embedding_failures")
+        else:
+            asset_ids = list(asset_ids)
+            if not asset_ids:
+                return 0
+            cursor = self._index.executemany(
+                "DELETE FROM embedding_failures WHERE asset_id = ?",
+                [(asset_id,) for asset_id in asset_ids])
+        self._index.commit()
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    def forget_failure(self, asset_id):
+        """Drop one failure record, for an asset that has now succeeded."""
+        self._index.execute(
+            "DELETE FROM embedding_failures WHERE asset_id = ?", (asset_id,))
+        self._index.commit()
 
     # ------------------------------------------------------------- closing
 

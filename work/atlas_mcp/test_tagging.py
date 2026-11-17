@@ -364,6 +364,445 @@ class ResumeTest(unittest.TestCase):
                          ["a", "c", "d"])
 
 
+class FailureRecordTest(unittest.TestCase):
+    """Why a failure has to be written down at all.
+
+    The queue is derived from the store: whatever has no vector is the work.
+    With nowhere to record a failure, a file that can never be rendered is
+    selected on every run for ever, and the pass never reaches "nothing to
+    do" -- which over an overnight job restarted a few times is the
+    difference between finishing and not.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp(prefix="atlas-fail-test-")
+        self.store = embedding_store.EmbeddingStore.create(
+            os.path.join(self.directory, "v.f32"),
+            os.path.join(self.directory, "i.sqlite"),
+            dims=4, model_id="test-model")
+
+    def tearDown(self):
+        self.store.close()
+
+    def row(self, asset_id, siblings=None):
+        return {"id": asset_id,
+                "sibling_ids": chr(10).join(siblings or [asset_id])}
+
+    def test_nothing_has_failed_to_begin_with(self):
+        self.assertEqual(self.store.failure_counts(), {})
+
+    def test_a_failure_is_counted(self):
+        self.store.record_failure("a", "boom", 1)
+        self.assertEqual(self.store.failure_counts(), {"a": 1})
+
+    def test_attempts_accumulate_across_runs(self):
+        # Each run is a separate process, so this has to survive reopening.
+        for _ in range(3):
+            self.store.record_failure("a", "boom", 1)
+        self.assertEqual(self.store.failure_counts()["a"], 3)
+
+    def test_the_reason_is_kept_and_the_latest_wins(self):
+        self.store.record_failure("a", "first reason", 1)
+        self.store.record_failure("a", "second reason", 2)
+        rows = self.store.failures()
+        self.assertEqual(rows[0][2], "second reason")
+
+    def test_a_very_long_reason_does_not_bloat_the_index(self):
+        self.store.record_failure("a", "x" * 5000, 1)
+        self.assertLessEqual(len(self.store.failures()[0][2]), 500)
+
+    def test_a_group_is_given_up_on_only_when_every_member_has(self):
+        # One sibling failing says little -- the other copy may read fine.
+        counts = {"a": 3}
+        row = self.row("a", ["a", "b"])
+        self.assertFalse(tag_assets.group_is_hopeless(row, counts, 3))
+        counts["b"] = 3
+        self.assertTrue(tag_assets.group_is_hopeless(row, counts, 3))
+
+    def test_below_the_limit_it_is_still_tried(self):
+        row = self.row("a")
+        self.assertFalse(tag_assets.group_is_hopeless(row, {"a": 2}, 3))
+        self.assertTrue(tag_assets.group_is_hopeless(row, {"a": 3}, 3))
+
+    def test_zero_attempts_means_never_give_up(self):
+        row = self.row("a")
+        self.assertFalse(tag_assets.group_is_hopeless(row, {"a": 99}, 0))
+
+    def test_success_clears_the_record(self):
+        # A file that failed twice and then worked must not keep the two
+        # attempts against it, or a later run gives up on something fine.
+        self.store.record_failure("a", "boom", 1)
+        self.store.record_failure("a", "boom", 2)
+        self.store.forget_failure("a")
+        self.assertEqual(self.store.failure_counts(), {})
+
+    def test_retrying_forgets_every_failure(self):
+        self.store.record_failure("a", "boom", 1)
+        self.store.record_failure("b", "boom", 1)
+        self.assertEqual(self.store.clear_failures(), 2)
+        self.assertEqual(self.store.failure_counts(), {})
+
+    def test_the_table_appears_on_a_store_written_without_it(self):
+        # A store from before this existed has to gain the table on open,
+        # rather than raise on the first failure it has to record.
+        vectors_path, index_path = self.store.vectors_path, self.store.index_path
+        self.store.record_failure("a", "boom", 1)
+        self.store.close()
+        reopened = embedding_store.EmbeddingStore.open(
+            vectors_path, index_path, expect_model_id="test-model")
+        try:
+            self.assertEqual(reopened.failure_counts(), {"a": 1})
+        finally:
+            reopened.close()
+        self.store = embedding_store.EmbeddingStore.open(
+            vectors_path, index_path, expect_model_id="test-model")
+
+
+class InterruptedRunTest(unittest.TestCase):
+    """What survives stopping the pass part way through.
+
+    The whole design rests on this: an 8-hour job nobody can resume is a job
+    nobody will start. Driven with fakes rather than signals -- `timeout -s
+    INT` under Git Bash never reached the Python child and the run completed
+    all forty, which would have made this test a no-op.
+    """
+
+    SCHEMA = (
+        "CREATE TABLE catalog_assets ("
+        " id TEXT PRIMARY KEY, name TEXT, path TEXT, relative_path TEXT,"
+        " ext TEXT, type TEXT, size INTEGER, ignored INTEGER DEFAULT 0,"
+        " model_kind TEXT, rig_family TEXT, referenced_by_model INTEGER"
+        " DEFAULT 0, tags_json TEXT)")
+
+    TOTAL = 10
+
+    class Arguments:
+        folder = pack = ext = None
+        limit = None
+        batch = 4
+        threads = 1
+        pace_ms = 0
+        dry_run = False
+        max_attempts = 3
+        retry_failed = False
+
+    class FakeEmbedder:
+        """Stands in for atlas_embed.py --serve.
+
+        Vectors are the model's real width, because the store this writes to
+        is the real one and its header refuses anything else -- which is the
+        guard working, not a nuisance to design around.
+        """
+
+        def __init__(self, *_args, **_kwargs):
+            self.calls = 0
+
+        def ask(self, message):
+            self.calls += 1
+            entries = message.get("entries") or []
+            return {"ok": True,
+                    "vectors": [[float(index)] + [0.0] * (atlas_embed.DIMS - 1)
+                                for index, _ in enumerate(entries)]}
+
+        def close(self):
+            pass
+
+    def setUp(self):
+        import atlas_mcp
+        self.atlas_mcp = atlas_mcp
+        self.directory = tempfile.mkdtemp(prefix="atlas-interrupt-test-")
+        self.previous_db = atlas_mcp.DB_PATH
+        atlas_mcp.DB_PATH = os.path.join(self.directory, "catalog.db")
+
+        connection = sqlite3.connect(atlas_mcp.DB_PATH)
+        connection.execute(self.SCHEMA)
+        for index in range(self.TOTAL):
+            name = "SM_Thing_%02d.fbx" % index
+            connection.execute(
+                "INSERT INTO catalog_assets (id, name, path, relative_path,"
+                " ext, type, size, tags_json)"
+                " VALUES (?,?,?,?,'fbx','model',?, '[]')",
+                ("id:%02d" % index, name, "K:/lib/" + name,
+                 "pack/" + name, 100 + index))
+        connection.commit()
+        connection.close()
+
+        self.previous_version = atlas_mcp.bridge_version
+        self.previous_render = tag_assets.render
+        self.previous_embedder = tag_assets.EmbedderProcess
+        atlas_mcp.bridge_version = lambda: "test"
+        tag_assets.EmbedderProcess = self.FakeEmbedder
+
+    def tearDown(self):
+        self.atlas_mcp.bridge_version = self.previous_version
+        tag_assets.render = self.previous_render
+        tag_assets.EmbedderProcess = self.previous_embedder
+        self.atlas_mcp.DB_PATH = self.previous_db
+
+    def set_render(self, behaviour):
+        tag_assets.render = behaviour
+
+    def run_pass(self):
+        out = io.StringIO()
+        code = tag_assets.run(self.Arguments(), out)
+        return code, out.getvalue()
+
+    def stored(self):
+        store = tag_assets.open_or_create_store()
+        try:
+            return store.count, store.failure_counts()
+        finally:
+            store.close()
+
+    def renders_then(self, count, error):
+        """A render that works `count` times, then raises `error`."""
+        state = {"calls": 0}
+
+        def behaviour(row):
+            state["calls"] += 1
+            if state["calls"] > count:
+                raise error
+            return b"png-%s" % row["id"].encode("ascii")
+
+        return behaviour
+
+    # ------------------------------------------------------- the baseline
+
+    def test_an_uninterrupted_run_stores_everything(self):
+        self.set_render(lambda row: b"png")
+        code, body = self.run_pass()
+        self.assertEqual(code, 0)
+        count, failures = self.stored()
+        self.assertEqual(count, self.TOTAL)
+        self.assertEqual(failures, {})
+        self.assertIn("%d embedded" % self.TOTAL, body)
+
+    def test_the_final_progress_line_is_not_printed_twice(self):
+        # 8 divides by a batch of 4, so the loop flushes the last batch and
+        # the tail had nothing left to do.
+        self.Arguments.limit = 8
+        try:
+            self.set_render(lambda row: b"png")
+            _code, body = self.run_pass()
+            lines = [line for line in body.splitlines() if "8/8" in line]
+            self.assertEqual(len(lines), 1, body)
+        finally:
+            self.Arguments.limit = None
+
+    # ---------------------------------------------------- the interruption
+
+    def test_ctrl_c_keeps_the_batch_in_flight(self):
+        # This is the point. Six renders into a batch of four means one full
+        # batch flushed and two in hand; discarding those two threw away work
+        # for no reason, since a partial batch is exactly as safe to append.
+        self.set_render(self.renders_then(6, KeyboardInterrupt()))
+        code, body = self.run_pass()
+        self.assertEqual(code, 0)
+        count, _failures = self.stored()
+        self.assertEqual(count, 6)
+        self.assertIn("Stopped", body)
+        self.assertIn("rerun to continue", body)
+
+    def test_a_dead_embedder_is_handled_like_an_interruption(self):
+        # It dies in flush(), which is where EmbedderProcess.ask raises, not
+        # in render(). Injecting it through render() was what exposed the
+        # blame bug below, but it is not how this actually happens.
+        class DyingEmbedder(InterruptedRunTest.FakeEmbedder):
+            def ask(self, message):
+                raise RuntimeError("the embedder stopped answering")
+
+        tag_assets.EmbedderProcess = DyingEmbedder
+        self.set_render(lambda row: b"png")
+        code, body = self.run_pass()
+        self.assertEqual(code, 0)
+        self.assertIn("embedder stopped", body)
+        # Nothing was stored, and crucially nothing was blamed: the files
+        # were never the problem.
+        count, failures = self.stored()
+        self.assertEqual(count, 0)
+        self.assertEqual(failures, {})
+
+    def test_atlas_vanishing_mid_run_blames_nothing(self):
+        # The bug this exists for: a render failure was charged to the file
+        # whatever the cause, so Atlas being closed half way through would
+        # charge every remaining asset an attempt, and three such runs would
+        # retire thousands of files that are perfectly fine.
+        state = {"alive": True}
+        self.atlas_mcp.bridge_version = lambda: "test" if state["alive"] else None
+
+        def dies_after_six(row):
+            if len(state) > 1 or row["id"] >= "id:06":
+                state["alive"] = False
+                raise RuntimeError("connection refused")
+            return b"png"
+
+        self.set_render(dies_after_six)
+        code, body = self.run_pass()
+        self.assertEqual(code, 0)
+        self.assertIn("Atlas stopped answering", body)
+        count, failures = self.stored()
+        self.assertEqual(count, 6)
+        self.assertEqual(failures, {},
+                         "no asset should carry an attempt for this")
+
+    def test_the_six_already_rendered_are_still_kept(self):
+        # Stopping without blame must not also mean stopping without saving.
+        state = {"alive": True}
+        self.atlas_mcp.bridge_version = lambda: "test" if state["alive"] else None
+
+        def dies_after_six(row):
+            if row["id"] >= "id:06":
+                state["alive"] = False
+                raise RuntimeError("connection refused")
+            return b"png"
+
+        self.set_render(dies_after_six)
+        self.run_pass()
+        self.assertEqual(self.stored()[0], 6)
+
+        # And the next run picks up exactly where it left off.
+        state["alive"] = True
+        self.set_render(lambda row: b"png")
+        _code, body = self.run_pass()
+        self.assertIn("6 already embedded", body)
+        self.assertEqual(self.stored()[0], self.TOTAL)
+
+    def test_a_long_run_of_failures_stops_rather_than_retiring_everything(self):
+        # Atlas answering but refusing everything looks exactly like a
+        # library of broken models. It is not, and the difference matters
+        # because the wrong reading is permanent.
+        # The real threshold is 25, which this fixture is too small to
+        # reach; lowering it here tests the mechanism rather than the number.
+        previous = tag_assets.GIVE_UP_AFTER_CONSECUTIVE
+        tag_assets.GIVE_UP_AFTER_CONSECUTIVE = 4
+        try:
+            self.set_render(self.renders_then(0, RuntimeError("refused")))
+            code, body = self.run_pass()
+            self.assertEqual(code, 0)
+            self.assertIn("systemic", body)
+            # Fewer than the whole run were blamed: it stopped early.
+            self.assertLess(len(self.stored()[1]), self.TOTAL)
+        finally:
+            tag_assets.GIVE_UP_AFTER_CONSECUTIVE = previous
+
+    def test_a_single_bad_file_among_good_ones_is_still_blamed(self):
+        # The guards must not swallow the ordinary case they were built
+        # around: one unreadable file in a working library.
+        def one_bad(row):
+            if row["id"] == "id:03":
+                raise RuntimeError("has no geometry to draw")
+            return b"png"
+
+        self.set_render(one_bad)
+        self.run_pass()
+        count, failures = self.stored()
+        self.assertEqual(count, self.TOTAL - 1)
+        self.assertEqual(list(failures), ["id:03"])
+
+    def test_an_interrupted_run_resumes_where_it_stopped(self):
+        self.set_render(self.renders_then(6, KeyboardInterrupt()))
+        self.run_pass()
+        self.assertEqual(self.stored()[0], 6)
+
+        self.set_render(lambda row: b"png")
+        _code, body = self.run_pass()
+        self.assertIn("6 already embedded", body)
+        self.assertEqual(self.stored()[0], self.TOTAL)
+
+    def test_nothing_is_rendered_twice_across_the_two_runs(self):
+        self.set_render(self.renders_then(6, KeyboardInterrupt()))
+        self.run_pass()
+        seen = []
+
+        def counting(row):
+            seen.append(row["id"])
+            return b"png"
+
+        self.set_render(counting)
+        self.run_pass()
+        self.assertEqual(len(seen), self.TOTAL - 6)
+        self.assertEqual(len(set(seen)), len(seen))
+
+    def test_a_second_run_after_a_complete_one_does_nothing(self):
+        self.set_render(lambda row: b"png")
+        self.run_pass()
+        _code, body = self.run_pass()
+        self.assertIn("Nothing to do", body)
+
+    # -------------------------------------------------------- the failures
+
+    def test_a_render_failure_is_recorded_and_the_run_continues(self):
+        def flaky(row):
+            if row["id"] == "id:03":
+                raise RuntimeError("has no geometry to draw")
+            return b"png"
+
+        self.set_render(flaky)
+        _code, body = self.run_pass()
+        count, failures = self.stored()
+        self.assertEqual(count, self.TOTAL - 1)
+        self.assertEqual(list(failures), ["id:03"])
+        self.assertIn("1 failed", body)
+
+    def test_a_failure_is_retried_until_the_limit_then_dropped(self):
+        def always_fails(row):
+            if row["id"] == "id:03":
+                raise RuntimeError("broken")
+            return b"png"
+
+        self.set_render(always_fails)
+        for expected_attempts in (1, 2, 3):
+            self.run_pass()
+            self.assertEqual(self.stored()[1].get("id:03"), expected_attempts)
+
+        # Three strikes: it is no longer selected, and the run says so.
+        _code, body = self.run_pass()
+        self.assertEqual(self.stored()[1].get("id:03"), 3)
+        self.assertIn("given up", body)
+
+    def test_retry_failed_puts_them_back_in_the_queue(self):
+        def always_fails(row):
+            if row["id"] == "id:03":
+                raise RuntimeError("broken")
+            return b"png"
+
+        self.set_render(always_fails)
+        for _ in range(3):
+            self.run_pass()
+        self.Arguments.retry_failed = True
+        try:
+            _code, body = self.run_pass()
+            self.assertIn("forgotten", body)
+            # Tried again, and failed again, so it is back to one attempt.
+            self.assertEqual(self.stored()[1].get("id:03"), 1)
+        finally:
+            self.Arguments.retry_failed = False
+
+    def test_a_failure_that_later_succeeds_loses_its_record(self):
+        state = {"fail": True}
+
+        def recovers(row):
+            if row["id"] == "id:03" and state["fail"]:
+                raise RuntimeError("busy")
+            return b"png"
+
+        self.set_render(recovers)
+        self.run_pass()
+        self.assertEqual(self.stored()[1].get("id:03"), 1)
+        state["fail"] = False
+        self.run_pass()
+        self.assertEqual(self.stored()[1], {})
+        self.assertEqual(self.stored()[0], self.TOTAL)
+
+    def test_atlas_being_closed_is_reported_rather_than_crashed(self):
+        self.atlas_mcp.bridge_version = lambda: None
+        self.set_render(lambda row: b"png")
+        code, body = self.run_pass()
+        self.assertEqual(code, 2)
+        self.assertIn("not running", body)
+        self.assertEqual(self.stored()[0], 0)
+
+
 class DurationTest(unittest.TestCase):
     """Progress reporting, which is the only window into an 8.7 hour job."""
 
