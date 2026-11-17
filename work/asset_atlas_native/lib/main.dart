@@ -456,9 +456,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
     required String? cachedKey,
     required void Function(List<AssetItem>, String) store,
   }) {
-    final lower = query.trim().toLowerCase();
+    final parsed = parseAssetQuery(query);
     final cacheKey = [
-      lower,
+      query.trim().toLowerCase(),
       typeFilter,
       rigFilter,
       AnimationCharacter.instance.rigFamily ?? '',
@@ -473,6 +473,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
     if (cache != null && cachedKey == cacheKey) return cache;
 
     final matches = sortedAssets.where((asset) {
+      // A query that cannot be read matches nothing, rather than matching
+      // everything: the box says what is wrong with it, and a list that
+      // quietly ignored the scoping would be worse than an empty one.
+      if (!parsed.isValid) return false;
       if (hideIgnored && asset.ignored) return false;
       if (folderFilter != null &&
           !isUnderFolder(asset.relativePath, folderFilter!)) {
@@ -490,17 +494,16 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
         if (!assetIsCharacterModel(asset)) return false;
       } else if (typeFilter == 'animation') {
-        // Only a parse can tell an animation clip from a mesh, so ask for one
-        // and leave the asset out of the list until the answer arrives.
-        if (asset.type == 'model' && asset.ext == 'fbx') {
-          if (asset.modelKind == null) {
-            _scheduleModelKindClassification([asset]);
-            return false;
-          }
-          if (asset.modelKind != 'animation') return false;
-        } else if (asset.effectiveType != 'animation') {
-          return false;
+        // A parse is still the authority, and is still asked for. But the
+        // list no longer waits on it: effectiveType falls back to the folder
+        // name, so a rescan that empties modelKind no longer empties this
+        // filter. Before this, it showed nothing and queued 34,801 probes.
+        if (asset.type == 'model' &&
+            asset.ext == 'fbx' &&
+            asset.modelKind == null) {
+          _scheduleModelKindClassification([asset]);
         }
+        if (asset.effectiveType != 'animation') return false;
       } else if (typeFilter != 'all' && asset.effectiveType != typeFilter) {
         return false;
       }
@@ -522,8 +525,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
           return false;
         }
       }
-      if (lower.isEmpty) return true;
-      return assetMatchesSearch(asset.searchText, lower);
+      if (parsed.isEmpty) return true;
+      return assetMatchesQuery(parsed, asset.queryValue);
     }).toList();
 
     store(matches, cacheKey);
@@ -2468,7 +2471,15 @@ class SearchAndSummary extends StatelessWidget {
                   controller: controller,
                   decoration: InputDecoration(
                     prefixIcon: const Icon(Icons.search),
-                    hintText: 'Search name, folder, or tag',
+                    hintText: 'Search, or scope it: tag=grungy name=door',
+                    // Parsed here rather than plumbed down from the list,
+                    // because a refusal is a property of the text in the box
+                    // and nothing else. parseAssetQuery is a scan of a short
+                    // string, and build already runs on every keystroke.
+                    errorText: parseAssetQuery(controller.text).error,
+                    helperText: controller.text.trim().isEmpty
+                        ? 'name, path, tag, type, ext, rig -- `or` to widen'
+                        : null,
                     border: const OutlineInputBorder(),
                     isDense: true,
                     suffixIcon: controller.text.isEmpty
@@ -7332,17 +7343,337 @@ bool rigFamiliesCompatible(RigFamily a, RigFamily b) {
   return a == b;
 }
 
-/// Whether an asset matches a search box that treats spaces as "and".
+// --- The filter grammar, shared with the MCP -----------------------------
+//
+// `tag=grungy name=door` scopes each term to one field; a plain word still
+// searches name, path and tags together, which is what the box did before and
+// is still what most searches are. Spaces mean and, `or` groups the terms
+// either side of it, and there are no parentheses -- so `a or b c` is
+// (a or b) and c, which is how it reads aloud.
+//
+// work/atlas_mcp/fixtures/search_queries.json holds the cases this and
+// parse_asset_query in atlas_mcp.py are both tested against. The app and the
+// MCP have to answer a search identically, so neither side owns the grammar:
+// the fixture does, and a case added there fails on whichever side has not
+// caught up.
+
+/// The fields a term can name. A plain word gets the internal field 'any',
+/// which is deliberately not spellable: `any=dog` is a typo, and saying so is
+/// more use than accepting it.
+const assetQueryNamedFields = <String>[
+  'name',
+  'path',
+  'tag',
+  'type',
+  'ext',
+  'rig',
+];
+
+/// Fields holding one value out of a fixed set, where a substring would
+/// mislead: `type=mod` must not quietly mean every model.
+const assetQueryExactFields = <String>{'type', 'ext', 'rig'};
+
+/// Recognised only so the refusal can say what it is waiting for. A field
+/// that is going to exist deserves a different answer from one that never
+/// will, and "unknown field" would send someone looking for a typo.
+const assetQueryReservedFields = <String, String>{
+  'look':
+      'look= is reserved for visual search -- finding assets that look '
+      'grungy or gray rather than ones named that. Ask find_similar '
+      'instead: ranking by appearance needs a cutoff to become a filter, '
+      'and a ranked list is the more useful answer. It reads the vectors '
+      'the tagging pass writes (tag_assets.py).',
+};
+
+/// What `type=` accepts: [AssetItem.effectiveType], which is the type the
+/// list and the dropdown both show.
+const assetQueryTypeValues = <String>{
+  'model',
+  'animation',
+  'image',
+  'texture',
+  'audio',
+  'unreal',
+  'other',
+};
+
+const _assetQueryQuotes = <String>{'"', "'"};
+
+/// One term: a field to look in, and the text to find there.
+class AssetQueryTerm {
+  const AssetQueryTerm(this.field, this.value);
+
+  /// One of [assetQueryNamedFields], or 'any' for a plain word.
+  final String field;
+
+  /// Lowercased, and normalised for the field it belongs to.
+  final String value;
+
+  bool matches(String Function(String field) valueOf) {
+    final actual = valueOf(field);
+    return assetQueryExactFields.contains(field)
+        ? actual == value
+        : actual.contains(value);
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is AssetQueryTerm && other.field == field && other.value == value;
+
+  @override
+  int get hashCode => Object.hash(field, value);
+
+  @override
+  String toString() => '$field=$value';
+}
+
+/// A read query: clauses that all have to hold, each holding the alternatives
+/// an `or` collected.
+class AssetQuery {
+  const AssetQuery(this.clauses) : error = null;
+
+  /// A query that could not be read, carrying what to say about it. The
+  /// clauses are empty, so matching on one by mistake lets everything
+  /// through rather than nothing -- callers check [isValid] first.
+  const AssetQuery.rejected(String message)
+    : clauses = const <List<AssetQueryTerm>>[],
+      error = message;
+
+  final List<List<AssetQueryTerm>> clauses;
+
+  /// Why the query could not be read, in words to put under the box.
+  final String? error;
+
+  bool get isValid => error == null;
+  bool get isEmpty => clauses.isEmpty;
+}
+
+/// One token of a query: its text, plus which characters came from inside
+/// quotes.
 ///
-/// "Jump Fem" finds `A_Jump_Running_Femn.fbx` without the words being adjacent
-/// or in that order, which matters when the thing you remember about a file is
-/// two pieces of its name rather than a substring of it.
-bool assetMatchesSearch(String searchText, String query) {
-  final terms = query.toLowerCase().split(' ').where((t) => t.isNotEmpty);
-  for (final term in terms) {
-    if (!searchText.contains(term)) return false;
+/// Keeping the origin of every character is the whole point. `"name=dog"` and
+/// `name="dog"` produce the same letters and mean different things, and the
+/// only thing separating them is where the quotes sat.
+class _QueryToken {
+  final StringBuffer _text = StringBuffer();
+  final StringBuffer _mask = StringBuffer();
+
+  void add(String chunk, {required bool fromQuote}) {
+    _text.write(chunk);
+    _mask.write((fromQuote ? 'q' : '.') * chunk.length);
+  }
+
+  String get body => _text.toString();
+
+  bool get hasQuote => _mask.toString().contains('q');
+
+  /// Where an unquoted `=` splits field from value, or -1 for none. Only the
+  /// first one splits, so `name=a=b` searches names for `a=b`.
+  int get unquotedEquals {
+    final text = body;
+    final mask = _mask.toString();
+    for (var index = 0; index < text.length; index += 1) {
+      if (text[index] == '=' && mask[index] == '.') return index;
+    }
+    return -1;
+  }
+}
+
+bool _isQuerySpace(String character) => character.trim().isEmpty;
+
+/// Split a query into tokens, keeping quoted runs whole.
+List<_QueryToken> _scanAssetQuery(String text) {
+  final tokens = <_QueryToken>[];
+  var index = 0;
+  while (index < text.length) {
+    if (_isQuerySpace(text[index])) {
+      index += 1;
+      continue;
+    }
+    final token = _QueryToken();
+    while (index < text.length && !_isQuerySpace(text[index])) {
+      final quote = text[index];
+      if (_assetQueryQuotes.contains(quote)) {
+        index += 1;
+        final start = index;
+        while (index < text.length && text[index] != quote) {
+          index += 1;
+        }
+        if (index >= text.length) {
+          throw const FormatException(
+            'Unclosed quote in the search. Close it, or drop both quotes.',
+          );
+        }
+        token.add(text.substring(start, index), fromQuote: true);
+        index += 1;
+      } else {
+        final start = index;
+        while (index < text.length &&
+            !_isQuerySpace(text[index]) &&
+            !_assetQueryQuotes.contains(text[index])) {
+          index += 1;
+        }
+        token.add(text.substring(start, index), fromQuote: false);
+      }
+    }
+    tokens.add(token);
+  }
+  return tokens;
+}
+
+/// One normalised term, or a [FormatException] saying why not.
+AssetQueryTerm _assetQueryTerm(String? rawField, String rawValue) {
+  var field = 'any';
+  if (rawField != null) {
+    field = rawField.trim().toLowerCase();
+    if (field.isEmpty) {
+      throw const FormatException(
+        'A search term cannot start with `=`. Write field=value, or a plain '
+        'word to search everything.',
+      );
+    }
+    final reserved = assetQueryReservedFields[field];
+    if (reserved != null) throw FormatException(reserved);
+    if (!assetQueryNamedFields.contains(field)) {
+      throw FormatException(
+        "Unknown search field '$field'. Use one of: "
+        "${assetQueryNamedFields.join(', ')} -- or a plain word, which "
+        'searches name, path and tags together.',
+      );
+    }
+  }
+
+  var value = rawValue.trim().toLowerCase();
+  if (field == 'ext') {
+    value = value.replaceFirst(RegExp(r'^\.+'), '');
+  } else if (field == 'path') {
+    // A path typed with Windows separators has to find the forward slashes
+    // the catalog stores.
+    value = value.replaceAll('\\', '/');
+  }
+  if (value.isEmpty) {
+    throw FormatException(
+      '$field= has no value, so it would match everything. Give it one, or '
+      'remove it.',
+    );
+  }
+  if (field == 'type' && !assetQueryTypeValues.contains(value)) {
+    throw FormatException(
+      "Unknown type '$value' in type=. Use one of: "
+      "${assetQueryTypeValues.join(', ')}.",
+    );
+  }
+  return AssetQueryTerm(field, value);
+}
+
+/// Read a filter box into something that can be matched.
+///
+/// Mirrors parse_asset_query in atlas_mcp.py, including the wording of every
+/// refusal. An empty query is no constraint, which is a reasonable thing to
+/// ask for and not an error.
+AssetQuery parseAssetQuery(String text) {
+  final List<_QueryToken> tokens;
+  try {
+    tokens = _scanAssetQuery(text);
+  } on FormatException catch (error) {
+    return AssetQuery.rejected(error.message);
+  }
+
+  const danglingOr = AssetQuery.rejected(
+    '`or` needs a search term either side of it.',
+  );
+  final clauses = <List<AssetQueryTerm>>[];
+  var pendingOr = false;
+
+  for (final token in tokens) {
+    final body = token.body;
+    final split = token.unquotedEquals;
+    final word = body.trim().toLowerCase();
+
+    // `and` is a noise word, kept for people who type what they mean.
+    // Quoting escapes both, so "or" stays a searchable term.
+    if (split < 0 && !token.hasQuote && (word == 'and' || word == 'or')) {
+      if (pendingOr || (word == 'or' && clauses.isEmpty)) return danglingOr;
+      pendingOr = word == 'or';
+      continue;
+    }
+
+    final AssetQueryTerm term;
+    try {
+      term = _assetQueryTerm(
+        split < 0 ? null : body.substring(0, split),
+        split < 0 ? body : body.substring(split + 1),
+      );
+    } on FormatException catch (error) {
+      return AssetQuery.rejected(error.message);
+    }
+
+    if (pendingOr) {
+      clauses.last.add(term);
+      pendingOr = false;
+    } else {
+      clauses.add(<AssetQueryTerm>[term]);
+    }
+  }
+
+  if (pendingOr) return danglingOr;
+  return AssetQuery(clauses);
+}
+
+/// Whether an asset passes a parsed query.
+///
+/// Mirrors query_matches in atlas_mcp.py. [valueOf] hands back the text for
+/// one field, so this stays a function of the grammar rather than of
+/// [AssetItem] -- which is what makes it testable against the fixture.
+bool assetMatchesQuery(
+  AssetQuery query,
+  String Function(String field) valueOf,
+) {
+  for (final clause in query.clauses) {
+    var passed = false;
+    for (final term in clause) {
+      if (term.matches(valueOf)) {
+        passed = true;
+        break;
+      }
+    }
+    if (!passed) return false;
   }
   return true;
+}
+
+/// A directory named for animation, for a file nothing has probed yet.
+///
+/// Mirrors looks_like_animation in atlas_mcp.py, and is a guess: the probe
+/// outranks it wherever there is a probed answer. Measured against the probe
+/// on 100 sampled FBX -- 98% precision, 100% recall, the single miss being
+/// the reference character mesh that ships inside the animation pack.
+///
+/// Built from what is in the library rather than guessed. Every FBX path
+/// containing "anim" comes to two real directories, `Animations` (784 files)
+/// and `ANIMATION_Base_Locomotion_SourceFiles_v3.zip!` (721), against
+/// filenames like `SM_Prop_Hunting_Animal_Head_01.fbx`. Hence both halves:
+/// only directories are read, because every false positive in the library is
+/// a filename; and `anim`/`anims` must be the whole segment while
+/// `animation` may be a prefix, or `Props/Animal_Pen.fbx` reads as a clip.
+final _animationSegment = RegExp(r'^(anims?$|animation)', caseSensitive: false);
+
+/// Collision hulls ship beside the clips they belong to, and a hull is a mesh
+/// however it is filed.
+final _notAnimationSegment = RegExp(
+  r'^(collision|collider)',
+  caseSensitive: false,
+);
+
+bool looksLikeAnimation(String relativePath) {
+  final parts = relativePath.replaceAll('\\', '/').split('/');
+  // Drop the filename: the directories are the evidence.
+  final folders = parts.length > 1 ? parts.sublist(0, parts.length - 1)
+      : const <String>[];
+  for (final folder in folders) {
+    if (_notAnimationSegment.hasMatch(folder)) return false;
+  }
+  return folders.any(_animationSegment.hasMatch);
 }
 
 /// Model formats the preview can import and therefore introspect.
@@ -14183,6 +14514,13 @@ class AssetItem {
   /// is an animation, not a model, but only a parse can tell you that.
   String get effectiveType {
     if (modelKind == 'animation') return 'animation';
+    // Only where the probe has not spoken: modelKind == 'mesh' is a real
+    // answer and outranks any folder name.
+    if (modelKind == null &&
+        type == 'model' &&
+        looksLikeAnimation(relativePath)) {
+      return 'animation';
+    }
     if (type == 'image' &&
         (referencedByModel || looksLikeTextureLocation(relativePath))) {
       return 'texture';
@@ -14190,12 +14528,34 @@ class AssetItem {
     return type;
   }
 
+  String? _searchName;
+  String? _searchPath;
+  String? _searchTags;
   String? _searchText;
 
-  /// Name, path and tags folded to lowercase once, on first use. Search
-  /// used to lowercase all three for every asset on every keystroke.
-  String get searchText => _searchText ??=
-      '$name\u0000$relativePath\u0000${tags.join(' ')}'.toLowerCase();
+  /// The three fields a query can name, folded to lowercase once on first
+  /// use. Search used to lowercase all three for every asset on every
+  /// keystroke.
+  String get searchName => _searchName ??= name.toLowerCase();
+  String get searchPath => _searchPath ??= relativePath.toLowerCase();
+  String get searchTags => _searchTags ??= tags.join(' ').toLowerCase();
+
+  /// All three at once, for a plain word. The NUL separators are what stop a
+  /// term straddling two fields and matching something that is in neither.
+  String get searchText =>
+      _searchText ??= '$searchName\u0000$searchPath\u0000$searchTags';
+
+  /// The text a query sees for one field. Mirrors row_search_values in
+  /// atlas_mcp.py, field for field.
+  String queryValue(String field) => switch (field) {
+    'name' => searchName,
+    'path' => searchPath,
+    'tag' => searchTags,
+    'type' => effectiveType,
+    'ext' => ext.toLowerCase(),
+    'rig' => rigFamily ?? '',
+    _ => searchText,
+  };
 }
 
 class ScanResult {

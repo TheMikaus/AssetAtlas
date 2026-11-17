@@ -267,7 +267,8 @@ class AttachPointTest(unittest.TestCase):
         dart = os.path.join(here, os.pardir, "asset_atlas_native", "lib", "main.dart")
         if not os.path.exists(dart):
             self.skipTest("lib/main.dart is not beside this checkout")
-        source = io.open(dart, encoding="utf-8").read()
+        with io.open(dart, encoding="utf-8") as handle:
+            source = handle.read()
         start = source.index("const attachPoints =")
         block = source[start:source.index("\n];", start)]
         from_dart = {}
@@ -282,7 +283,8 @@ class AttachPointTest(unittest.TestCase):
         dart = os.path.join(here, os.pardir, "asset_atlas_native", "lib", "main.dart")
         if not os.path.exists(dart):
             self.skipTest("lib/main.dart is not beside this checkout")
-        source = io.open(dart, encoding="utf-8").read()
+        with io.open(dart, encoding="utf-8") as handle:
+            source = handle.read()
         start = source.index("const attachPoints =")
         block = source[start:source.index("\n];", start)]
         names = re.findall(r"name: '([^']+)',\s*keywords:", block)
@@ -1130,6 +1132,522 @@ class BridgeToolRegistrationTest(unittest.TestCase):
                          sorted(tool["name"] for tool in atlas_mcp.TOOL_SCHEMAS))
 
 
+def _query_fixture():
+    """fixtures/search_queries.json, the grammar written down once."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", "search_queries.json")
+    with io.open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _row_for(asset):
+    """A catalog row whose effective_type comes out as the fixture says.
+
+    The fixture names the type a person sees, which is the effective one; the
+    catalog stores something narrower. 'texture' is an image in a textures
+    folder, 'animation' is a model the probe called a clip.
+    """
+    stored, model_kind = asset["type"], None
+    if stored == "texture":
+        stored = "image"
+    elif stored == "animation":
+        stored, model_kind = "model", "animation"
+    return {
+        "name": asset["name"],
+        "relative_path": asset["relative_path"],
+        "tags_json": json.dumps(asset["tags"]),
+        "type": stored,
+        "ext": asset["ext"],
+        "rig_family": asset["rig"],
+        "model_kind": model_kind,
+        "referenced_by_model": 0,
+    }
+
+
+class QueryGrammarTest(unittest.TestCase):
+    """The filter grammar, against the fixture the app is also tested on.
+
+    Two implementations of one grammar is the arrangement that always drifts,
+    so neither side owns it: fixtures/search_queries.json does, and both
+    suites read that same file. A case added there fails on whichever side
+    has not caught up.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = _query_fixture()
+
+    def test_the_fixture_is_not_empty(self):
+        # A fixture that silently stopped loading would pass every loop below.
+        self.assertGreater(len(self.fixture["parse"]), 20)
+        self.assertGreater(len(self.fixture["match"]), 20)
+
+    def test_the_field_list_matches_the_code(self):
+        # Adding a field to one side and not the other is the drift this
+        # catches, and it catches it in both directions.
+        self.assertEqual(tuple(self.fixture["fields"]),
+                         atlas_mcp.QUERY_FIELDS)
+        self.assertEqual(frozenset(self.fixture["exact_fields"]),
+                         atlas_mcp.QUERY_EXACT_FIELDS)
+        self.assertEqual(sorted(self.fixture["reserved_fields"]),
+                         sorted(atlas_mcp.QUERY_RESERVED_FIELDS))
+
+    def test_parse_cases(self):
+        for case in self.fixture["parse"]:
+            query = case["query"]
+            with self.subTest(query=query, why=case["why"]):
+                if "error_contains" in case:
+                    with self.assertRaises(atlas_mcp.QueryError) as caught:
+                        atlas_mcp.parse_asset_query(query)
+                    self.assertIn(case["error_contains"].lower(),
+                                  str(caught.exception).lower())
+                else:
+                    expected = [[tuple(term) for term in clause]
+                                for clause in case["clauses"]]
+                    self.assertEqual(atlas_mcp.parse_asset_query(query),
+                                     expected)
+
+    def test_match_cases(self):
+        for case in self.fixture["match"]:
+            asset = self.fixture["assets"][case["asset"]]
+            with self.subTest(query=case["query"], asset=case["asset"],
+                              why=case["why"]):
+                clauses = atlas_mcp.parse_asset_query(case["query"])
+                values = atlas_mcp.row_search_values(_row_for(asset))
+                self.assertEqual(
+                    atlas_mcp.query_matches(clauses, values), case["matches"])
+
+    def test_the_fixture_assets_resolve_to_the_type_they_claim(self):
+        # _row_for has to be right, or every type= match case is vacuous.
+        for name, asset in self.fixture["assets"].items():
+            with self.subTest(asset=name):
+                self.assertEqual(atlas_mcp.effective_type(_row_for(asset)),
+                                 asset["type"])
+
+    def test_a_query_error_is_a_tool_error_not_a_crash(self):
+        # QueryError is an AtlasError, so the server reports it to the caller
+        # instead of dying mid-stream.
+        self.assertTrue(issubclass(atlas_mcp.QueryError, atlas_mcp.AtlasError))
+
+    def test_every_type_value_has_a_prefilter(self):
+        for value in atlas_mcp.QUERY_TYPE_VALUES:
+            self.assertIn(value, atlas_mcp._TYPE_PREFILTER)
+
+    def test_every_field_but_type_has_sql(self):
+        # type= is the one field SQL cannot settle, which is why the sieve
+        # exists. Any other field missing its SQL would be a KeyError at
+        # query time, on a search that had just parsed cleanly.
+        for field in atlas_mcp.QUERY_FIELDS:
+            if field != "type":
+                self.assertIn(field, atlas_mcp._FIELD_SQL)
+
+    def test_only_an_unresolvable_type_asks_for_the_sieve(self):
+        # Whether an image is a texture turns on a regex over the path, so
+        # those two have to be sieved. Every other type prefilters exactly,
+        # and sieving one anyway cost 1,177 ms on type=unreal to confirm a
+        # count SQL already had right.
+        for query in ("tag=grungy name=door", "type=audio",
+                      "type=unreal", "type=other",
+                      "name=x or type=audio"):
+            with self.subTest(query=query):
+                self.assertFalse(atlas_mcp.query_needs_sieve(
+                    atlas_mcp.parse_asset_query(query)))
+        # model and animation joined the sieved set when an unprobed clip
+        # became recognisable from its folder: the two overlap in SQL and
+        # only effective_type can separate them.
+        for query in ("type=texture", "type=image", "name=x or type=image",
+                      "type=model", "type=animation"):
+            with self.subTest(query=query):
+                self.assertTrue(atlas_mcp.query_needs_sieve(
+                    atlas_mcp.parse_asset_query(query)))
+
+    def test_the_sieved_types_are_the_ones_effective_type_can_move(self):
+        # Four values need the sieve, each for its own reason:
+        #   image, texture  -- a regex over the path decides which one it is
+        #   animation       -- an unprobed clip is only its folder name
+        #   model           -- and must not also count as that clip
+        # Every other prefilter is exact, which means guarding it against a
+        # model the probe called a clip.
+        self.assertEqual(
+            atlas_mcp._TYPE_NEEDS_SIEVE,
+            frozenset(["image", "texture", "animation", "model"]))
+        for value, clause in atlas_mcp._TYPE_PREFILTER.items():
+            if value in atlas_mcp._TYPE_NEEDS_SIEVE:
+                continue
+            with self.subTest(value=value):
+                self.assertIn("model_kind", clause)
+
+    def test_an_exact_total_is_only_asked_for_when_it_differs(self):
+        self.assertFalse(atlas_mcp.needs_exact_total("all", None))
+        self.assertFalse(atlas_mcp.needs_exact_total("audio", None))
+        # These three the old type= argument counted from the prefilter, so
+        # it overstated every one of them.
+        for kind in ("texture", "animation", "model"):
+            with self.subTest(kind=kind):
+                self.assertTrue(atlas_mcp.needs_exact_total(kind, None))
+        self.assertTrue(
+            atlas_mcp.needs_exact_total("all", [[("type", "texture")]]))
+
+    def test_a_sieve_over_fetches_so_a_page_can_still_fill(self):
+        # Sieving after LIMIT hands back a short page and calls it the end.
+        self.assertEqual(atlas_mcp.sieve_fetch(40, "all", None), 40)
+        self.assertGreater(
+            atlas_mcp.sieve_fetch(40, "all", [[("type", "model")]]), 40)
+        self.assertGreater(atlas_mcp.sieve_fetch(40, "texture", None), 40)
+
+
+class AnimationRuleTest(unittest.TestCase):
+    """The folder rule, against the shared fixture.
+
+    This is a guess standing in for a probe, which makes it exactly the kind
+    of thing that drifts between two implementations without anyone noticing:
+    the app and the MCP would quietly disagree about what is a clip. The
+    fixture is the contract; the app's suite reads the same cases.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cases = _query_fixture()["animation_paths"]
+
+    def test_the_fixture_has_both_answers_in_it(self):
+        # All-true cases would pass for a rule that always said yes.
+        answers = {case["animation"] for case in self.cases}
+        self.assertEqual(answers, {True, False})
+
+    def test_every_case(self):
+        for case in self.cases:
+            with self.subTest(path=case["path"], why=case["why"]):
+                self.assertEqual(
+                    atlas_mcp.looks_like_animation(case["path"]),
+                    case["animation"])
+
+    def test_a_probed_mesh_outranks_the_folder(self):
+        # The rule is a fallback, not an override. A file the importer has
+        # read and called a mesh is a mesh wherever it is filed.
+        row = {"model_kind": "mesh", "type": "model",
+               "relative_path": "pack/Animations/SM_Thing.fbx",
+               "referenced_by_model": 0}
+        self.assertEqual(atlas_mcp.effective_type(row), "model")
+
+    def test_a_probed_clip_is_a_clip_wherever_it_sits(self):
+        row = {"model_kind": "animation", "type": "model",
+               "relative_path": "pack/Models/SM_Thing.fbx",
+               "referenced_by_model": 0}
+        self.assertEqual(atlas_mcp.effective_type(row), "animation")
+
+    def test_an_unprobed_file_falls_back_to_the_folder(self):
+        row = {"model_kind": None, "type": "model",
+               "relative_path": "pack/Animations/A_Run.fbx",
+               "referenced_by_model": 0}
+        self.assertEqual(atlas_mcp.effective_type(row), "animation")
+
+    def test_the_rule_only_applies_to_models(self):
+        # An image in an Animations folder is still an image: the rule reads
+        # model rows only, so nothing else can be dragged into 'animation'.
+        row = {"model_kind": None, "type": "image",
+               "relative_path": "pack/Animations/T_Thing.png",
+               "referenced_by_model": 0}
+        self.assertEqual(atlas_mcp.effective_type(row), "image")
+
+    def test_model_and_animation_do_not_overlap(self):
+        # Both filters are permissive in SQL and separated by the sieve. If
+        # either forgot, a guessed clip would count twice and the totals
+        # would exceed the library.
+        for value in ("model", "animation"):
+            self.assertIn(value, atlas_mcp._TYPE_NEEDS_SIEVE)
+        self.assertIn("animation", atlas_mcp.SIEVED_KINDS)
+        self.assertIn("model", atlas_mcp.SIEVED_KINDS)
+
+
+class QueryGrammarSqlTest(CatalogTest):
+    """The same grammar through SQLite, which is what actually runs.
+
+    query_matches agreeing with the fixture settles the semantics; this
+    settles that the SQL expresses them, which can be wrong on its own -- a
+    LIKE pattern, a missing lower(), the tags blob.
+    """
+
+    def names_for(self, query, **extra):
+        extra["query"] = query
+        with atlas_mcp.open_catalog() as connection:
+            rows, _total, _kind = atlas_mcp.rows_for(connection, extra, 500, 0)
+            return sorted(row["name"] for row in rows)
+
+    def every_row(self):
+        with atlas_mcp.open_catalog() as connection:
+            return connection.execute(
+                "SELECT * FROM catalog_assets WHERE ignored = 0").fetchall()
+
+    def test_a_scoped_name_term_ignores_the_path(self):
+        # Every fixture row sits under a folder, so a path word must be
+        # findable bare and unfindable through name=.
+        folder = self.every_row()[0]["relative_path"].replace(
+            chr(92), "/").split("/")[0].lower()
+        self.assertNotEqual(self.names_for(folder), [])
+        self.assertEqual(self.names_for("name=" + folder), [])
+
+    def test_a_tag_term_finds_a_tag_and_not_the_name(self):
+        for row in self.every_row():
+            tags = json.loads(row["tags_json"] or "[]")
+            if tags:
+                self.assertIn(row["name"], self.names_for("tag=" + tags[0]))
+                break
+        else:
+            self.fail("no row in the fixture catalog carries a tag")
+        # '.fbx' is in plenty of names and is never a tag on its own.
+        self.assertEqual(self.names_for("tag=.fbx"), [])
+
+    def test_the_tags_blob_punctuation_is_not_searchable(self):
+        # Matching tags_json raw let a search for the comma between two tags
+        # return every multi-tag file in the library.
+        self.assertEqual(self.names_for("tag=,"), [])
+        self.assertEqual(self.names_for("tag=["), [])
+
+    def test_an_ext_term_is_exact(self):
+        self.assertNotEqual(self.names_for("ext=fbx"), [])
+        self.assertEqual(self.names_for("ext=fb"), [])
+
+    def test_a_type_term_matches_exactly_the_rows_of_that_type(self):
+        # Against ground truth rather than the other code path: the prefilter
+        # must never exclude a row the sieve would have kept.
+        rows = self.every_row()
+        for kind in atlas_mcp.QUERY_TYPE_VALUES:
+            expected = sorted(row["name"] for row in rows
+                              if atlas_mcp.effective_type(row) == kind)
+            with self.subTest(kind=kind):
+                self.assertEqual(self.names_for("type=" + kind), expected)
+
+    def test_type_image_follows_the_app_and_excludes_textures(self):
+        # effectiveType in the app resolves an image under Textures/ to
+        # 'texture', so type=image is the images that are not textures. The
+        # older type="image" argument does not draw that line; the grammar
+        # follows the app, because the app is what it has to agree with.
+        images = self.names_for("type=image")
+        textures = self.names_for("type=texture")
+        self.assertNotEqual(textures, [])
+        self.assertEqual(set(images) & set(textures), set())
+
+    def test_the_total_counts_what_matched_not_what_was_pruned(self):
+        # count(*) over a prefiltered WHERE clause said 39,123 for
+        # type=texture on the real library, where 4,205 match. A total that
+        # overstates is worse than a slow one: it reports pages that are not
+        # there.
+        with atlas_mcp.open_catalog() as connection:
+            rows = connection.execute(
+                "SELECT * FROM catalog_assets WHERE ignored = 0").fetchall()
+            for kind in ("texture", "image"):
+                truth = sum(1 for row in rows
+                            if atlas_mcp.effective_type(row) == kind)
+                with self.subTest(kind=kind):
+                    _rows, total, _k = atlas_mcp.rows_for(
+                        connection, {"query": "type=" + kind}, 1, 0)
+                    self.assertEqual(total, truth)
+
+    def test_the_grouped_total_is_sieved_too(self):
+        # search_assets collapses duplicates by default, so the grouped total
+        # is the number a caller actually reads.
+        with atlas_mcp.open_catalog() as connection:
+            rows = connection.execute(
+                "SELECT * FROM catalog_assets WHERE ignored = 0").fetchall()
+
+            def groups(predicate):
+                return {((row["name"] or "").lower(), row["size"])
+                        for row in rows if predicate(row)}
+
+            textures = groups(
+                lambda row: atlas_mcp.effective_type(row) == "texture")
+            images = groups(lambda row: row["type"] == "image")
+            # Without an image that is not a texture, the assertion below
+            # would hold for a sieve that did nothing at all.
+            self.assertGreater(len(images), len(textures))
+
+            _rows, total, _kind, _dupes = atlas_mcp.grouped_rows_for(
+                connection, {"query": "type=texture"}, 1, 0)
+            self.assertEqual(total, len(textures))
+
+    def test_an_unprobed_clip_is_findable(self):
+        # The hole this closed: model_kind is filled lazily and a rescan
+        # empties it, so type=animation matched 0 of 34,801 FBX where 801 are
+        # clips. Nothing is the worst of the available answers.
+        with atlas_mcp.open_catalog() as connection:
+            rows = connection.execute(
+                "SELECT * FROM catalog_assets WHERE ignored = 0").fetchall()
+            unprobed = [row for row in rows if row["model_kind"] is None
+                        and atlas_mcp.looks_like_animation(
+                            row["relative_path"])]
+            if not unprobed:
+                self.skipTest("the fixture catalog has no unprobed clip")
+            self.assertIn(unprobed[0]["name"], self.names_for("type=animation"))
+
+    def test_the_two_model_filters_partition_the_models(self):
+        with atlas_mcp.open_catalog() as connection:
+            rows = connection.execute(
+                "SELECT * FROM catalog_assets WHERE ignored = 0").fetchall()
+            models = {row["name"] for row in rows
+                      if atlas_mcp.effective_type(row) == "model"}
+            clips = {row["name"] for row in rows
+                     if atlas_mcp.effective_type(row) == "animation"}
+        self.assertEqual(models & clips, set())
+        self.assertEqual(set(self.names_for("type=model")), models)
+        self.assertEqual(set(self.names_for("type=animation")), clips)
+
+    def test_or_widens_and_a_space_narrows(self):
+        fbx = self.names_for("ext=fbx")
+        png = self.names_for("ext=png")
+        self.assertNotEqual(fbx, [])
+        self.assertNotEqual(png, [])
+        self.assertEqual(self.names_for("ext=fbx or ext=png"),
+                         sorted(fbx + png))
+        self.assertEqual(self.names_for("ext=fbx ext=png"), [])
+
+    def test_a_scoped_search_still_pages(self):
+        body = self.call("search_assets", query="ext=fbx", limit=1)
+        self.assertIn("FBX", body.upper())
+
+    def test_a_rejected_query_reaches_the_caller_as_an_error(self):
+        result = self.call_raw("search_assets", query="colour=red")
+        self.assertTrue(result.get("isError"))
+        self.assertIn("colour", result["content"][0]["text"])
+
+    def test_look_says_what_it_is_waiting_for(self):
+        # Not "unknown field": the field is going to exist, and the useful
+        # answer names the pass it needs.
+        result = self.call_raw("search_assets", query="look=grungy")
+        self.assertTrue(result.get("isError"))
+        self.assertIn("tagging", result["content"][0]["text"])
+
+
+class TagsSqlTest(unittest.TestCase):
+    """_TAGS_SQL has to agree with tags_words, which parses properly.
+
+    The SQL is a replace chain because json_each cost 708 ms more per search,
+    and a replace chain is only as good as the encodings it was written for.
+    This is the check that says which those are.
+    """
+
+    ENCODINGS = (
+        ("dart jsonEncode", lambda tags: json.dumps(tags, separators=(",", ":"))),
+        ("python json.dumps", json.dumps),
+    )
+
+    CASES = (
+        ["model", "fbx", "grungy"],
+        ["model"],
+        [],
+        ["single"],
+        ["a", "b", "c", "d", "e"],
+        ["MixedCase", "UPPER"],
+    )
+
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+
+    def tearDown(self):
+        self.connection.close()
+
+    def sql_words(self, blob):
+        expression = atlas_mcp._TAGS_SQL.replace("tags_json", "?")
+        return self.connection.execute(
+            "SELECT " + expression, (blob,)).fetchone()[0]
+
+    def test_the_sql_agrees_with_parsing_for_every_encoding(self):
+        for label, encode in self.ENCODINGS:
+            for tags in self.CASES:
+                blob = encode(tags)
+                with self.subTest(encoding=label, blob=blob):
+                    self.assertEqual(self.sql_words(blob).split(),
+                                     atlas_mcp.tags_words(blob).split())
+
+    def test_a_missing_or_broken_blob_is_empty_rather_than_null(self):
+        # A NULL here would propagate through the || in _SEARCH_SQL and make
+        # every term fail to match, silently, for that row alone.
+        for blob in (None, "", "[]"):
+            with self.subTest(blob=blob):
+                self.assertEqual(self.sql_words(blob), "")
+                self.assertEqual(atlas_mcp.tags_words(blob), "")
+
+    def test_a_blob_that_is_not_a_list_is_no_tags(self):
+        for blob in ("{}", "null", "not json at all", '"a string"'):
+            with self.subTest(blob=blob):
+                self.assertEqual(atlas_mcp.tags_words(blob), "")
+
+    def test_the_punctuation_itself_is_gone(self):
+        blob = json.dumps(["model", "fbx"], separators=(",", ":"))
+        words = self.sql_words(blob)
+        for junk in ("[", "]", chr(34), ","):
+            self.assertNotIn(junk, words)
+
+    def test_case_is_folded_on_both_paths(self):
+        blob = json.dumps(["MixedCase"])
+        self.assertEqual(self.sql_words(blob).strip(), "mixedcase")
+        self.assertEqual(atlas_mcp.tags_words(blob), "mixedcase")
+
+
+class QueryGrammarMirrorTest(unittest.TestCase):
+    """lib/main.dart has to hold the same grammar, under the same names.
+
+    The app and the MCP are required to answer a search identically and are
+    separate implementations, so the only things stopping them drifting are
+    the shared fixture and this: a check that the Dart side still has the
+    pieces the fixture names.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        here = os.path.dirname(os.path.abspath(__file__))
+        dart = os.path.join(here, os.pardir, "asset_atlas_native", "lib",
+                            "main.dart")
+        if not os.path.exists(dart):
+            raise unittest.SkipTest("lib/main.dart is not beside this checkout")
+        with io.open(dart, encoding="utf-8") as handle:
+            cls.dart = handle.read()
+        cls.fixture = _query_fixture()
+
+    def present(self, needle, why):
+        # assertIn would print all 15,000 lines of main.dart on failure.
+        self.assertTrue(needle in self.dart,
+                        "lib/main.dart has no %s: %s" % (needle, why))
+
+    def test_the_app_has_the_parser_and_the_matcher(self):
+        for name in ("parseAssetQuery", "assetMatchesQuery", "AssetQuery"):
+            self.present(name, "the app must parse the grammar, not just the "
+                               "MCP")
+
+    def test_the_app_lists_the_same_fields(self):
+        match = re.search(r"assetQueryNamedFields\s*=\s*<String>\[([^]]*)\]",
+                          self.dart)
+        self.assertIsNotNone(match, "no assetQueryNamedFields in main.dart")
+        found = re.findall(r"'([a-z]+)'", match.group(1))
+        self.assertEqual(found, [f for f in self.fixture["fields"]
+                                 if f != "any"])
+
+    def test_the_app_knows_the_same_fields_are_exact(self):
+        # A field moving between exact and substring on one side only is a
+        # silent behaviour change: the box and the MCP would then disagree
+        # about whether type=mod finds models.
+        match = re.search(r"assetQueryExactFields\s*=\s*<String>\{([^}]*)\}",
+                          self.dart)
+        self.assertIsNotNone(match, "no assetQueryExactFields in main.dart")
+        self.assertEqual(set(re.findall(r"'([a-z]+)'", match.group(1))),
+                         set(self.fixture["exact_fields"]))
+
+    def test_the_app_reserves_the_same_fields(self):
+        for field in self.fixture["reserved_fields"]:
+            self.present("'%s'" % field,
+                         "a reserved field has to be reserved on both sides")
+
+    def test_the_app_reads_the_same_fixture(self):
+        # If the Dart suite stopped reading it, this file would be the only
+        # thing holding the grammar and the guard above would be theatre.
+        here = os.path.dirname(os.path.abspath(__file__))
+        suite = os.path.join(here, os.pardir, "asset_atlas_native", "test",
+                             "search_terms_test.dart")
+        if not os.path.exists(suite):
+            self.skipTest("the app's search test is not beside this checkout")
+        with io.open(suite, encoding="utf-8") as handle:
+            self.assertIn("search_queries.json", handle.read())
+
+
 class ConsumerBriefTest(unittest.TestCase):
     """AI_BRIEF.md is handed to another model, so a stale name misleads it.
 
@@ -1141,8 +1659,9 @@ class ConsumerBriefTest(unittest.TestCase):
 
     # Snake_case words in the brief that are deliberately not tool names.
     NOT_TOOLS = frozenset([
-        "rig_family", "backfill_rigs", "atlas_mcp", "asset_atlas",
-        "mcp_servers", "catalog_assets",
+        "rig_family", "model_kind", "backfill_rigs", "atlas_mcp",
+        "asset_atlas", "mcp_servers", "catalog_assets", "tag_assets",
+        "atlas_embed", "like_path",
     ])
 
     @classmethod

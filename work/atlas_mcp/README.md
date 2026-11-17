@@ -323,18 +323,95 @@ knowable per asset.
 
 ### What is not measured
 
- the size of `onnxruntime.dll` alone. The published
+The runtime's disk footprint, if it were ever shipped beside the app, which
+would be the size of `onnxruntime.dll` alone. The published
 `onnxruntime-win-x64-1.32.0.zip` is 96,945,131 bytes, but that archive carries
 headers, import libraries and test data, and only the DLL would ship.
+
+## Running the tagging pass
+
+Nothing can be ranked by appearance until something has looked at it. The pass
+renders each model through Atlas's own renderer and embeds the picture:
+
+```bash
+python -P work/atlas_mcp/tag_assets.py --pack POLYGON_Town --limit 200
+```
+
+**Atlas has to be running** — the renderer being used is its own, deliberately,
+so the picture being embedded is the picture the app shows you. The script
+checks by probing the bridge port, not by looking for `atlas_bridge.json`,
+which outlives the process.
+
+### What it costs
+
+The render is the whole job. Measured on this library:
+
+| | |
+| --- | --- |
+| render, walking one archive in order | **972 ms** median |
+| render, jumping between archives | 1,570 ms median |
+| embed, batches of eight | **9 ms** per image |
+| distinct models to do | **32,296** |
+| the whole library, once | **about 8.7 hours** |
+
+So it is an overnight job, and three things follow:
+
+- **It is resumable.** Nothing records what is left — whatever has no vector is
+  the work. Ctrl-C and rerun loses at most the batch in flight, because the
+  store publishes vectors, then the count, then the index, in that order.
+- **It is sliceable.** `--folder`, `--pack` and `--ext` take a slice, so the
+  packs you are building with now get tagged in minutes instead of queueing
+  behind 30,000 files you do not need yet.
+- **It stays out of the way.** The embedder gets two threads, the process runs
+  below normal priority, and `--pace-ms` puts a gap between renders. The
+  defaults do not saturate the machine on purpose.
+
+Duplicates are collapsed before anything is rendered: 34,801 FBX rows are
+18,948 distinct files by name and size, so the pass is 45% shorter than the
+row count suggests.
+
+`--dry-run` lists what it would render and stops.
+
+### Then searching it
+
+```bash
+python -P work/atlas_mcp/atlas_embed.py --probe
+```
+
+checks both towers load. Over MCP, `find_similar` is the tool:
+
+- `text="a grungy metal barrel"` ranks by appearance against words.
+- `like_path=...` ranks by appearance against another asset.
+
+Read the order, never the magnitude. Text-to-image cosines land around 0.05 to
+0.18 and image-to-image around 0.9 — the same "closest thing there is", an
+order of magnitude apart, because text and image vectors occupy different
+regions of the space. A threshold that looked sensible for one throws away
+every answer for the other.
+
+Only embedded assets can be returned, and the tool says how many it searched.
+That number is the real limit on its answer.
 
 ## Tests
 
 ```bash
-cd work/atlas_mcp && python -I -m unittest
+cd work/atlas_mcp && python -m unittest
 ```
 
-122 of them, over catalogs the tests build themselves — the protocol handshake,
-the search semantics, the folder walk, and a mirror test that reads the
-`attachPoints` table out of `lib/main.dart` and fails if the copy here has
-drifted from it. That table is restated in a second language, which is the kind
-of duplication that goes quietly wrong.
+255 of them, over catalogs and stores the tests build themselves — the protocol
+handshake, the search semantics, the folder walk, the store's crash windows,
+the tagging pass's candidate query and resume rule.
+
+Not `-I` here, despite the rule elsewhere in this file: `-I` implies `-s`,
+which hides the user site-packages where numpy, Pillow, onnxruntime and
+sentencepiece live, and the tests that need them would quietly skip. The tests
+that load the SigLIP files skip themselves when the files are absent, so a
+checkout without the 420 MB of weights still runs the rest.
+
+Two of these guard against duplication that goes quietly wrong, both being
+restatements in a second language:
+
+- the `attachPoints` table, read out of `lib/main.dart`;
+- the **search grammar**, which the app and this server both implement. Neither
+  owns it: `fixtures/search_queries.json` does, and both suites read that same
+  file. A case added there fails on whichever side has not caught up.

@@ -11,7 +11,7 @@ that cannot speak MCP, and for briefing a person.
 
 ## What it is
 
-A catalogue of ~74,000 local game assets — Synty POLYGON packs and others — as
+A catalogue of ~221,000 local game assets — Synty POLYGON packs and others — as
 FBX and OBJ models, animation clips, texture atlases, audio, and built Unreal
 assets. Most of it lives inside zip archives that are read in place and never
 extracted.
@@ -143,12 +143,13 @@ Atlas is open:
 | --- | --- |
 | `catalog_stats` | totals, scanned roots, live state. Start here. |
 | `find_packs` | packs and the builds each ships. Takes `engine="5.4"`. |
-| `search_assets` | the main search. Filters by type, build, engine, pack. |
+| `search_assets` | the main search. Plain words, or `tag=`-style scoping. |
 | `get_asset` | reads one file: rig, bone names, node names, bounds, units, textures. |
 | `list_packs`, `browse` | walk the library by pack or folder. |
 | `find_animations` | clips, optionally matched to a character's rig. |
 | `find_attachments` | helmets, hair, capes and other kit for a character. |
 | `get_texture` | a texture image. |
+| `find_similar` | ranks assets by how they **look**. The only one that can. |
 | `find_duplicates` | redundant copies and the space they cost. |
 | `export_assets` | writes assets out of their archives into a folder. |
 
@@ -164,6 +165,39 @@ Six prompts hold the sequences worth following rather than improvising:
 `survey_the_library`, `set_up_a_level`, `import_a_model`,
 `animate_a_character`, `dress_a_character`, `choose_a_build`.
 
+## Scoping a search
+
+A plain query matches the name, the path and the tags together, which is right
+most of the time and wrong when a word is common. `barrel` finds the barrel and
+also everything in a folder called Barrels. A term can name its field instead:
+
+```
+tag=grungy name=door
+type=model rig=polygon ext=fbx
+name=dog or name=cat type=model
+```
+
+- Fields: `name`, `path`, `tag`, `type`, `ext`, `rig`. Anything else is
+  refused by name rather than ignored.
+- `name`, `path` and `tag` match a substring. `type`, `ext` and `rig` are
+  exact, so `ext=fb` finds nothing and `type=mod` is refused.
+- A space means and. `or` groups the terms either side of it and binds
+  tighter, so the third example above is (dog or cat) and model. There are no
+  parentheses.
+- Quote a value to keep a space or an `=` inside it: `name="rubbish bin"`.
+- `path=` sees the folders, which a plain term also does; `name=` is the way
+  to exclude them.
+- `type=` takes the resolved type -- `texture` is an image that a model uses
+  or that sits in a textures folder, and `image` is the images that are not
+  textures. The older `type` argument draws that one line differently:
+  `type="image"` includes textures, where `type=image` excludes them. Every
+  other value agrees between the two, `animation` included.
+- `type=animation` works without a probe, from the folder name. See the data
+  gaps at the end: it is a guess, and a good one.
+
+The filter box in Atlas reads the same grammar, from the same shared fixture,
+so a query that works in one works in the other.
+
 ## Six things that will produce wrong answers if you do not know them
 
 **1. Names in this library lie.** `SK_` is Unreal's skeletal-mesh prefix and
@@ -172,9 +206,24 @@ and sits on fully skinned characters. Prefer what `get_asset` reads out of the
 file over what a name suggests. The *nouns* are reliable — `Barrel`, `Helmet`,
 `RubbishBin` — the prefixes are not.
 
-**2. Style words are not in the vocabulary.** `grungy` matches 0 of 73,865
-names; `gray` matches 0. Search for what a thing *is*, not what it looks like.
-Asking for a mood returns nothing, or a handful of accidents.
+**2. Style words are not in the vocabulary of any *name*.** `grungy` matches 0
+of 221,183 names; `gray` matches 0. So `search_assets` cannot answer "find me
+something grungy", and asking it to returns nothing or a handful of accidents.
+
+**Use `find_similar` for appearance.** It embeds a rendered picture of each
+model and ranks them against your words, so an adjective nobody indexed still
+works. Two things about it:
+
+- It only sees assets that have been **rendered and embedded**. That pass is
+  about 8.7 hours of background work for the whole library and is run a slice
+  at a time, so coverage is partial — the tool says how many vectors it
+  searched, and that number is the real limit on its answer.
+- The scores are cosines from a sigmoid-trained model. Real matches sit around
+  **0.05 to 0.18**. Read the order; a score of 0.12 is not a bad match and
+  thresholding these numbers will throw away the right answer.
+
+For *what a thing is*, keep using `search_assets` — the nouns in these names
+are reliable.
 
 **3. Each pack ships several times over** — the source files, and a built
 project per engine version — and which engine a build targets is recorded only
@@ -187,8 +236,9 @@ take one build, not two:
   project of that exact version with materials intact, and carries no geometry
   anything outside the engine can read.
 
-**4. Half the library is duplicate files.** 33,401 of 73,865 rows are
-redundant copies. `search_assets` collapses identical ones by default and says
+**4. A great deal of the library is duplicate files.** 34,801 FBX rows are
+18,948 distinct files by name and size, and the same holds across the other
+formats. `search_assets` collapses identical ones by default and says
 how many there were, so a match count is not a count of distinct assets unless
 the tool says it collapsed them. Copies of a *source* asset are
 interchangeable; a copy from an unreal build is only useful to that engine
@@ -210,18 +260,35 @@ Polygon and Sidekick rigs share no bone names whatsoever. *Rest-pose
 difference in degrees*: all bones shared but around 90 degrees apart means the
 clip plays and the limbs sit wrong until something retargets it.
 
-## Known gaps in the data, as of 2026-11-14
+## Known gaps in the data, as of 2026-11-16
 
-Neither is a bug in the tools; both change what the answers are worth.
+Not bugs in the tools; they change what the answers are worth.
 
-- **`rig_family` is filled in for 7 of 27,652 FBX files.** Atlas fills it
-  lazily, as filters ask. So `search_assets type="character"` and
-  `find_animations`' rig matching come back near-empty. Until
-  `backfill_rigs.py` has been run, inspect candidates individually —
-  `get_asset` reads the rig straight out of the file.
-- **The catalogue was scanned under older rules than the app now uses.** 49
-  archives holding 66,441 entries are not indexed, including both INTERFACE
-  HUD sprite packs — 3,310 UI sprites. A rescan in Atlas picks them up. Until
-  then, UI and engine-version coverage is thinner than the library really is.
+- **`rig_family` and `model_kind` are filled in for 0 of 34,801 FBX files.**
+  Atlas fills both lazily, as filters ask, and the last rescan emptied them.
+  So `search_assets type="character"`, `type="mesh"` and `find_animations`'
+  rig matching come back **empty** — not thin, empty. Until
+  `backfill_rigs.py` has been run, inspect candidates individually:
+  `get_asset` reads the rig straight out of the file, which is the authority
+  anyway.
 
-`catalog_stats` reports the current state of both.
+- **`type="animation"` is the exception, and does work.** Where `model_kind`
+  is unset the folder decides: an FBX under a directory named `Animations`,
+  `Anim`, `Anims`, or beginning `Animation`, is taken to be a clip. That
+  finds **801** where the column alone found none. Checked against the
+  importer on 100 sampled files — right 98% of the time, and it misses none;
+  the one error was a reference character mesh shipped inside an animation
+  pack. Two limits follow from it being a guess: a probed answer always wins
+  over it, and it says nothing about bones, so `rig_compatibility` still
+  needs a real probe and will tell you when it has not got one.
+
+- **Visual coverage is partial and will be for a while.** `find_similar` can
+  only rank what has been rendered and embedded, and the full pass is about
+  8.7 hours of background work run a slice at a time. The tool reports how
+  many vectors it searched; treat that as the real scope of its answer.
+
+`catalog_stats` reports the current state of these.
+
+The older gap in this file — 49 unindexed archives, including both INTERFACE
+HUD sprite packs — **is closed.** A rescan has happened: the catalogue holds
+221,183 rows across 341 archives, and the UI sprites are in it.

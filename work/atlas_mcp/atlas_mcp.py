@@ -190,9 +190,48 @@ def looks_like_texture_location(relative_path):
     return bool(_TEXTURE_FOLDER.search((relative_path or "").replace("\\", "/")))
 
 
+# A directory named for animation. Built from what is actually in the
+# library rather than guessed: every FBX path containing "anim" was listed,
+# and it comes to two real directories -- `Animations` (784 files) and
+# `ANIMATION_Base_Locomotion_SourceFiles_v3.zip!` (721) -- against filenames
+# like SM_Prop_Hunting_Animal_Head_01.fbx and Unity_SK_Animals_Dog_01.fbx.
+#
+# Hence both halves of the rule. Only directories are read, because every
+# false positive in the library is a *filename*; and "animal" is excluded by
+# requiring the whole word `anim`/`anims` or a prefix of `animation`, which
+# an earlier version matching any segment starting "anim" got wrong on
+# Props/Animal_Pen.fbx.
+# `anim`/`anims` must be the whole segment; `animation` may be a prefix, so
+# ANIMATION_Base_Locomotion_SourceFiles_v3.zip! counts. Without the $ on the
+# first branch, "Animal" matches on its first four letters.
+_ANIMATION_SEGMENT = re.compile(r"^(anims?$|animation)", re.I)
+
+# Collision hulls ship beside the clips they belong to, and a hull is a mesh
+# however it is filed. These were the only two misses in the sample.
+_NOT_ANIMATION_SEGMENT = re.compile(r"^(collision|collider)", re.I)
+
+
+def looks_like_animation(relative_path):
+    """Whether a path says "clip", for a file nothing has probed yet.
+
+    Mirrors looksLikeAnimation in lib/main.dart. A guess, and consulted only
+    where there is no probed answer to prefer.
+    """
+    # [:-1] drops the filename: the directories are the evidence.
+    folders = (relative_path or "").replace("\\", "/").split("/")[:-1]
+    if any(_NOT_ANIMATION_SEGMENT.match(folder) for folder in folders):
+        return False
+    return any(_ANIMATION_SEGMENT.match(folder) for folder in folders)
+
+
 def effective_type(row):
     """Mirrors AssetItem.effectiveType in lib/main.dart."""
     if row["model_kind"] == "animation":
+        return "animation"
+    # Only where the probe has not spoken: model_kind == 'mesh' is a real
+    # answer and outranks any folder name.
+    if (row["model_kind"] is None and row["type"] == "model"
+            and looks_like_animation(row["relative_path"])):
         return "animation"
     if row["type"] == "image" and (
             row["referenced_by_model"] or
@@ -342,17 +381,318 @@ def describe_build(info):
     return label
 
 
+# tags_json is stored as a JSON array, so matching it raw lets a term hit the
+# punctuation between tags -- '","' sits in every multi-tag row, and a search
+# for it returned 40,000 files. Unwrapping it to space-separated words is also
+# what makes this agree with the app, where the same text is tags.join(' ').
+# Both spacings, because the separator an encoder picks is not something to
+# depend on: Dart's jsonEncode writes '","' and Python's json.dumps writes
+# '", "', and a search that silently changed meaning with the writer would be
+# very hard to notice. json_each would cover every encoding exactly and cost
+# 708 ms more per search on this library (1,241 ms against 533 ms for the same
+# 609 hits), so the exact path is kept for the sieve -- see tags_words -- and
+# TagsSqlTest holds the two to the same answer.
+_TAGS_SQL = (
+    "replace(replace(replace(replace(replace("
+    "lower(coalesce(tags_json, '[]')), "
+    "'\", \"', ' '), '\",\"', ' '), '[\"', ''), '\"]', ''), '[]', '')")
+
 # The search text Atlas builds per asset: name, path and tags, lowercased,
 # with separators so a term cannot straddle two fields.
 _SEARCH_SQL = (
-    "(lower(name) || char(10) || lower(relative_path) || char(10) "
-    "|| lower(tags_json))")
+    "(lower(name) || char(10) || lower(relative_path) || char(10) || "
+    + _TAGS_SQL + ")")
+
+
+# --- The filter grammar, shared with the app -----------------------------
+#
+# `tag=grungy name=door` scopes each term to one field; a plain word still
+# searches name, path and tags together. Spaces mean and, `or` groups the
+# terms either side of it, and there are no parentheses -- so `a or b c` is
+# (a or b) and c, which is how it reads aloud.
+#
+# fixtures/search_queries.json holds the cases this and assetMatchesQuery in
+# lib/main.dart are both tested against, so neither can drift from the other.
+
+# 'any' is the field a plain word gets. It is deliberately not spellable:
+# any=dog is a typo, and saying so is more use than accepting it.
+QUERY_FIELDS = ("any", "name", "path", "tag", "type", "ext", "rig")
+QUERY_NAMED_FIELDS = tuple(f for f in QUERY_FIELDS if f != "any")
+
+# Fields holding one value out of a fixed set, where a substring would
+# mislead: type=mod must not quietly mean every model.
+QUERY_EXACT_FIELDS = frozenset(["type", "ext", "rig"])
+
+# Recognised only so the refusal can say what it is waiting for. A field that
+# will exist deserves a different answer from one that never will.
+QUERY_RESERVED_FIELDS = {
+    "look": (
+        "look= is reserved for visual search -- finding assets that look "
+        "grungy or gray rather than ones named that. Ask find_similar "
+        "instead: ranking by appearance needs a cutoff to become a filter, "
+        "and a ranked list is the more useful answer. It reads the vectors "
+        "the tagging pass writes (tag_assets.py)."),
+}
+
+# The effective-type vocabulary, which is what type= matches. 'image' and
+# 'texture' turn on a regex over the path that SQL cannot express, so a query
+# naming any type is sieved in Python afterwards by effective_type.
+QUERY_TYPE_VALUES = ("model", "animation", "image", "texture", "audio",
+                     "unreal", "other")
+
+# SQL keeping every row whose effective type could be this, and pruning the
+# rest. Permissive on purpose: the sieve is what decides.
+_NOT_A_CLIP = "(model_kind IS NULL OR model_kind != 'animation')"
+
+_TYPE_PREFILTER = {
+    # Permissive for both: a guessed clip is a model row, so each has to
+    # keep the other's rows and let the sieve separate them. Without that
+    # the two filters overlap and their totals exceed the library.
+    "model": "type = 'model'",
+    "animation": "model_kind = 'animation' OR (model_kind IS NULL "
+                 "AND type = 'model')",
+    "image": "type = 'image' AND " + _NOT_A_CLIP,
+    "texture": "type = 'image' AND " + _NOT_A_CLIP,
+    "audio": "type = 'audio' AND " + _NOT_A_CLIP,
+    "unreal": "type = 'unreal' AND " + _NOT_A_CLIP,
+    "other": "type = 'other' AND " + _NOT_A_CLIP,
+}
+
+# The two whose prefilter is only a prefilter: whether an image is a texture
+# turns on referenced_by_model or a regex over the path, and SQL has neither.
+# Every other value above is exact, which is worth the distinction -- sieving
+# the 108,080 rows of type=unreal cost 1,177 ms to confirm a number SQL had
+# already counted correctly.
+_TYPE_NEEDS_SIEVE = frozenset(["image", "texture", "animation", "model"])
+
+_QUOTE_CHARS = "'" + '"'
+
+
+class QueryError(AtlasError):
+    """A search the person can fix, quoted back rather than guessed at."""
+
+
+def _scan_query(text):
+    """Split a query into tokens, keeping quoted runs whole.
+
+    A token is a list of (chunk, came_from_quote). Remembering where every
+    character came from is the whole point: `"name=dog"` and `name="dog"`
+    produce the same letters and mean different things, and only the position
+    of the quotes separates them.
+    """
+    tokens = []
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index].isspace():
+            index += 1
+            continue
+        segments = []
+        while index < length and not text[index].isspace():
+            quote = text[index]
+            if quote in _QUOTE_CHARS:
+                index += 1
+                start = index
+                while index < length and text[index] != quote:
+                    index += 1
+                if index >= length:
+                    raise QueryError(
+                        "Unclosed quote in the search. Close it, or drop both "
+                        "quotes.")
+                segments.append((text[start:index], True))
+                index += 1
+            else:
+                start = index
+                while (index < length and not text[index].isspace()
+                       and text[index] not in _QUOTE_CHARS):
+                    index += 1
+                segments.append((text[start:index], False))
+        tokens.append(segments)
+    return tokens
+
+
+def _split_field(segments):
+    """(field, value), or (None, whole) when no unquoted = splits the token."""
+    before = []
+    for position, (chunk, from_quote) in enumerate(segments):
+        if not from_quote and "=" in chunk:
+            head, _, tail = chunk.partition("=")
+            rest = [tail] + [piece for piece, _ in segments[position + 1:]]
+            return "".join(before) + head, "".join(rest)
+        before.append(chunk)
+    return None, "".join(before)
+
+
+def _query_term(field, value):
+    """One normalised (field, value), or a QueryError saying why not."""
+    if field is None:
+        field = "any"
+    else:
+        field = field.strip().lower()
+        if not field:
+            raise QueryError(
+                "A search term cannot start with `=`. Write field=value, or a "
+                "plain word to search everything.")
+        if field in QUERY_RESERVED_FIELDS:
+            raise QueryError(QUERY_RESERVED_FIELDS[field])
+        if field not in QUERY_NAMED_FIELDS:
+            raise QueryError(
+                "Unknown search field %r. Use one of: %s -- or a plain word, "
+                "which searches name, path and tags together."
+                % (field, ", ".join(QUERY_NAMED_FIELDS)))
+
+    value = value.strip().lower()
+    if field == "ext":
+        value = value.lstrip(".")
+    elif field == "path":
+        value = value.replace(chr(92), "/")
+    if not value:
+        raise QueryError(
+            "%s= has no value, so it would match everything. Give it one, or "
+            "remove it." % field)
+    if field == "type" and value not in QUERY_TYPE_VALUES:
+        raise QueryError(
+            "Unknown type %r in type=. Use one of: %s."
+            % (value, ", ".join(QUERY_TYPE_VALUES)))
+    return (field, value)
+
+
+def parse_asset_query(text):
+    """The filter grammar: clauses ANDed, terms inside one clause ORed.
+
+    Returns [[(field, value), ...], ...]. An empty query is no constraint,
+    which is a reasonable thing to ask for and not an error.
+    """
+    clauses = []
+    pending_or = False
+    for segments in _scan_query(text or ""):
+        field, value = _split_field(segments)
+        quoted = any(from_quote for _, from_quote in segments)
+        word = value.strip().lower()
+
+        # `and` is a noise word, kept for people who type what they mean.
+        # Quoting escapes both, so "or" is a searchable term.
+        if field is None and not quoted and word in ("and", "or"):
+            if pending_or or (word == "or" and not clauses):
+                raise QueryError(
+                    "`or` needs a search term either side of it.")
+            pending_or = word == "or"
+            continue
+
+        term = _query_term(field, value)
+        if pending_or:
+            clauses[-1].append(term)
+            pending_or = False
+        else:
+            clauses.append([term])
+
+    if pending_or:
+        raise QueryError("`or` needs a search term either side of it.")
+    return clauses
+
+
+_FIELD_SQL = {
+    "any": _SEARCH_SQL + " LIKE ?",
+    "name": "lower(name) LIKE ?",
+    "path": "lower(relative_path) LIKE ?",
+    "tag": _TAGS_SQL + " LIKE ?",
+    "ext": "ext = ?",
+    "rig": "lower(coalesce(rig_family, '')) = ?",
+}
+
+
+def query_sql(clauses):
+    """(sql, params) for a parsed query: exact, unless type= appears.
+
+    A type term contributes a prefilter that cannot exclude a real match, so
+    the SQL is safe to use alone for any query without one.
+    """
+    sql = []
+    params = []
+    for clause in clauses:
+        parts = []
+        for field, value in clause:
+            if field == "type":
+                parts.append("(%s)" % _TYPE_PREFILTER[value])
+            elif field in QUERY_EXACT_FIELDS:
+                parts.append(_FIELD_SQL[field])
+                params.append(value)
+            else:
+                parts.append(_FIELD_SQL[field])
+                params.append("%" + value + "%")
+        sql.append("(%s)" % " OR ".join(parts))
+    return " AND ".join(sql), params
+
+
+def query_needs_sieve(clauses):
+    """Whether SQL settled it, or effective_type still has to be consulted."""
+    return any(field == "type" and value in _TYPE_NEEDS_SIEVE
+               for clause in clauses for field, value in clause)
+
+
+def tags_words(blob):
+    """A row's tags as one space-separated string, by parsing rather than
+    pattern-matching. _TAGS_SQL is the fast approximation of this."""
+    try:
+        tags = json.loads(blob or "[]")
+    except ValueError:
+        return ""
+    if not isinstance(tags, list):
+        return ""
+    return " ".join(str(tag) for tag in tags).lower()
+
+
+def row_search_values(row):
+    """The text a query sees for one row. Mirrors AssetItem's own getters.
+
+    The 'any' separator is a newline here and a NUL in the app. Neither can
+    occur in a name, a path or a tag, so the only property that matters --
+    that a term cannot straddle two fields -- holds either way.
+    """
+    name = (row["name"] or "").lower()
+    path = (row["relative_path"] or "").lower()
+    joined = tags_words(row["tags_json"])
+    return {
+        "any": name + chr(10) + path + chr(10) + joined,
+        "name": name,
+        "path": path,
+        "tag": joined,
+        "type": effective_type(row) or "",
+        "ext": (row["ext"] or "").lower(),
+        "rig": (row["rig_family"] or "").lower(),
+    }
+
+
+def query_matches(clauses, values):
+    """Mirrors assetMatchesQuery in lib/main.dart."""
+    for clause in clauses:
+        for field, value in clause:
+            actual = values.get(field, "")
+            hit = (actual == value if field in QUERY_EXACT_FIELDS
+                   else value in actual)
+            if hit:
+                break
+        else:
+            return False
+    return True
+
+
+def sieve_fetch(limit, kind, sieve):
+    """How many rows to ask SQL for, when some will be dropped afterwards."""
+    if kind in SIEVED_KINDS or sieve:
+        return max(limit * 4, 200)
+    return limit
 
 TYPE_FILTERS = {
     "all": None,
     "model": "type = 'model' AND (model_kind IS NULL OR model_kind != 'animation')",
     "mesh": "model_kind = 'mesh'",
-    "animation": "model_kind = 'animation'",
+    # A prefilter now, not an answer: an unprobed clip is a plain model row
+    # and only its path gives it away. 'mesh' above stays strict on purpose,
+    # because "probed, and found to hold geometry" is a different claim from
+    # "not a clip".
+    "animation": "model_kind = 'animation' OR (model_kind IS NULL "
+                 "AND type = 'model')",
     "character": "model_kind = 'mesh' AND rig_family IS NOT NULL AND rig_family != 'none'",
     "image": "type = 'image'",
     "audio": "type = 'audio'",
@@ -360,6 +700,9 @@ TYPE_FILTERS = {
     # Resolved in Python, because it depends on a regex over the path.
     "texture": "type = 'image'",
 }
+
+
+SIEVED_KINDS = frozenset(["texture", "animation", "model"])
 
 
 def build_query(arguments):
@@ -375,10 +718,11 @@ def build_query(arguments):
     if TYPE_FILTERS[kind]:
         clauses.append("(%s)" % TYPE_FILTERS[kind])
 
-    query = (arguments.get("query") or "").strip().lower()
-    for term in [t for t in query.split(" ") if t]:
-        clauses.append("%s LIKE ?" % _SEARCH_SQL)
-        params.append("%" + term + "%")
+    parsed = parse_asset_query(arguments.get("query"))
+    if parsed:
+        query_where, query_params = query_sql(parsed)
+        clauses.append(query_where)
+        params.extend(query_params)
 
     for field, column in (("pack", "relative_path"), ("folder", "relative_path")):
         value = (arguments.get(field) or "").strip().lower()
@@ -391,7 +735,54 @@ def build_query(arguments):
         clauses.append("ext = ?")
         params.append(ext)
 
-    return " AND ".join(clauses), params, kind
+    # type= rides on effective_type, which needs a regex over the path, so
+    # the SQL above only pruned and this is what decides. None means SQL
+    # settled it, which is every query that does not name a type.
+    sieve = parsed if query_needs_sieve(parsed) else None
+    return " AND ".join(clauses), params, kind, sieve
+
+
+# Everything a query can look at. Narrower than SELECT * because the count
+# below reads one row per match and never needs the rest.
+_SIEVE_COLUMNS = ("name, relative_path, tags_json, type, ext, rig_family, "
+                  "model_kind, referenced_by_model")
+
+
+def needs_exact_total(kind, sieve):
+    """Whether count(*) over the WHERE clause is the real answer."""
+    return kind in SIEVED_KINDS or sieve is not None
+
+
+def sieve_total(connection, where, params, kind, sieve, grouped=False):
+    """The true number of matches when SQL could only prune.
+
+    count(*) over a prefiltered WHERE clause is not the answer: it said
+    39,123 for type=texture where 4,205 match. Reached only for image and
+    texture, and it costs one pass over the prefiltered rows -- 560 ms for
+    type=texture on this library, against 39,123 rows.
+    """
+    sql = "SELECT %s FROM catalog_assets WHERE %s" % (_SIEVE_COLUMNS, where)
+    if grouped:
+        # One row per duplicate group, matching how the rows were selected.
+        sql += " GROUP BY lower(name), size"
+    total = 0
+    for row in connection.execute(sql, params):
+        if kind in SIEVED_KINDS and effective_type(row) != kind:
+            continue
+        if sieve and not query_matches(sieve, row_search_values(row)):
+            continue
+        total += 1
+    return total
+
+
+def sieve_rows(rows, kind, sieve):
+    """Drop the rows SQL could not judge: a sieved kind, and any type=."""
+    if kind in SIEVED_KINDS:
+        rows = [row for row in rows if effective_type(row) == kind]
+    if sieve:
+        rows = [row for row in rows
+                if query_matches(sieve, row_search_values(row))]
+    return rows
 
 
 MAX_EXPORT_FILES = 5000
@@ -461,20 +852,24 @@ def grouped_rows_for(connection, arguments, limit, offset):
     are the same file in practice -- and the surviving row says how many
     copies there are and where the others live.
     """
-    where, params, kind = build_query(arguments)
+    where, params, kind, sieve = build_query(arguments)
     extra, extra_params = archive_clause(connection, arguments)
     if extra:
         where += " AND " + extra
         params = params + extra_params
 
-    fetch = limit if kind != "texture" else max(limit * 4, 200)
+    fetch = sieve_fetch(limit, kind, sieve)
     groups = connection.execute(
         "SELECT min(path) AS rep, count(*) AS copies FROM catalog_assets "
         "WHERE %s GROUP BY lower(name), size ORDER BY min(name) LIMIT ? OFFSET ?"
         % where, params + [fetch, offset]).fetchall()
-    total = connection.execute(
-        "SELECT count(*) FROM (SELECT 1 FROM catalog_assets WHERE %s "
-        "GROUP BY lower(name), size)" % where, params).fetchone()[0]
+    if needs_exact_total(kind, sieve):
+        total = sieve_total(connection, where, params, kind, sieve,
+                            grouped=True)
+    else:
+        total = connection.execute(
+            "SELECT count(*) FROM (SELECT 1 FROM catalog_assets WHERE %s "
+            "GROUP BY lower(name), size)" % where, params).fetchone()[0]
 
     copies = {row["rep"]: row["copies"] for row in groups}
     if not copies:
@@ -483,8 +878,7 @@ def grouped_rows_for(connection, arguments, limit, offset):
     rows = connection.execute(
         "SELECT * FROM catalog_assets WHERE path IN (%s)" % placeholders,
         list(copies)).fetchall()
-    if kind == "texture":
-        rows = [row for row in rows if effective_type(row) == "texture"]
+    rows = sieve_rows(rows, kind, sieve)
     rows = sorted(rows, key=lambda row: (row["name"] or "").lower())[:limit]
 
     # Where the other copies live, for the rows actually being shown.
@@ -504,16 +898,17 @@ def grouped_rows_for(connection, arguments, limit, offset):
 
 
 def rows_for(connection, arguments, limit, offset):
-    where, params, kind = build_query(arguments)
-    # The texture filter needs the path regex, so over-fetch and sieve.
-    fetch = limit if kind != "texture" else max(limit * 4, 200)
+    where, params, kind, sieve = build_query(arguments)
+    # The texture filter and type= need the path regex, so over-fetch.
+    fetch = sieve_fetch(limit, kind, sieve)
     sql = ("SELECT * FROM catalog_assets WHERE %s ORDER BY name LIMIT ? OFFSET ?"
            % where)
     rows = connection.execute(sql, params + [fetch, offset]).fetchall()
-    if kind == "texture":
-        rows = [r for r in rows if effective_type(r) == "texture"][:limit]
-    total = connection.execute(
-        "SELECT count(*) FROM catalog_assets WHERE %s" % where, params).fetchone()[0]
+    rows = sieve_rows(rows, kind, sieve)[:limit]
+    total = (sieve_total(connection, where, params, kind, sieve)
+             if needs_exact_total(kind, sieve) else connection.execute(
+                 "SELECT count(*) FROM catalog_assets WHERE %s" % where,
+                 params).fetchone()[0])
     return rows, total, kind
 
 
@@ -738,7 +1133,7 @@ def tool_search_assets(arguments):
             rows, total, kind, dupes = grouped_rows_for(
                 connection, arguments, limit, offset)
         else:
-            where, params, kind = build_query(arguments)
+            where, params, kind, sieve = build_query(arguments)
             extra, extra_params = archive_clause(connection, arguments)
             if extra:
                 where += " AND " + extra
@@ -747,11 +1142,12 @@ def tool_search_assets(arguments):
                 "SELECT * FROM catalog_assets WHERE %s ORDER BY name "
                 "LIMIT ? OFFSET ?" % where,
                 params + [limit, offset]).fetchall()
-            if kind == "texture":
-                rows = [r for r in rows if effective_type(r) == "texture"]
-            total = connection.execute(
-                "SELECT count(*) FROM catalog_assets WHERE %s" % where,
-                params).fetchone()[0]
+            rows = sieve_rows(rows, kind, sieve)
+            total = (sieve_total(connection, where, params, kind, sieve)
+                     if needs_exact_total(kind, sieve)
+                     else connection.execute(
+                         "SELECT count(*) FROM catalog_assets WHERE %s"
+                         % where, params).fetchone()[0])
             dupes = {}
 
     if not rows:
@@ -1305,7 +1701,7 @@ def tool_export_assets(arguments):
                     "Give paths, or a selection (query / pack / folder / ext / "
                     "engine / build). Exporting the whole catalog is never "
                     "what anyone means.")
-            where, params, kind = build_query(arguments)
+            where, params, kind, sieve = build_query(arguments)
             extra, extra_params = archive_clause(connection, arguments)
             if extra:
                 where += " AND " + extra
@@ -1313,8 +1709,7 @@ def tool_export_assets(arguments):
             rows = connection.execute(
                 "SELECT * FROM catalog_assets WHERE %s ORDER BY relative_path "
                 "LIMIT ?" % where, params + [limit + 1]).fetchall()
-            if kind == "texture":
-                rows = [row for row in rows if effective_type(row) == "texture"]
+            rows = sieve_rows(rows, kind, sieve)
 
     if not rows:
         return text("Nothing matched, so nothing was written.")
@@ -1494,6 +1889,191 @@ def tool_rig_compatibility(arguments):
     return text("\n".join(lines))
 
 
+# ------------------------------------------------------- visual search
+
+EMBED_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "atlas_embed.py")
+EMBED_TIMEOUT_SECONDS = 180
+
+# Beside the catalog, written by tag_assets.py. Derived data: deleting these
+# costs a re-run, never a loss.
+VECTORS_NAME = "embeddings.f32"
+EMBED_INDEX_NAME = "embeddings_index.sqlite"
+
+NO_VECTORS = (
+    "There are no visual embeddings yet, so nothing can be ranked by how it "
+    "looks. Someone has to run the tagging pass first:\n"
+    "    python -P work/atlas_mcp/tag_assets.py --pack POLYGON_Town\n"
+    "It renders each model in Atlas and embeds the picture. The whole "
+    "library is about 8.7 hours of background work; a single pack is "
+    "minutes, and it is resumable, so a slice is a reasonable place to start.")
+
+
+def embedding_store_paths():
+    folder = os.path.dirname(DB_PATH)
+    return (os.path.join(folder, VECTORS_NAME),
+            os.path.join(folder, EMBED_INDEX_NAME))
+
+
+def embeddings_present():
+    """Whether a store exists at all. Cheap: one stat, no model load."""
+    vectors_path, _index_path = embedding_store_paths()
+    return bool(vectors_path) and os.path.exists(vectors_path)
+
+
+def run_visual_search(phrase=None, like_asset_id=None, top=20):
+    """Ask atlas_embed.py to rank the store. Returns its parsed reply."""
+    vectors_path, index_path = embedding_store_paths()
+    if not os.path.exists(vectors_path):
+        raise AtlasError(NO_VECTORS)
+
+    command = [sys.executable, "-P", EMBED_SCRIPT,
+               "--vectors", vectors_path, "--index", index_path,
+               "--top", str(int(top))]
+    if like_asset_id:
+        command += ["--search-like", like_asset_id]
+    else:
+        command += ["--search", phrase or ""]
+
+    try:
+        finished = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=EMBED_TIMEOUT_SECONDS,
+            cwd=os.path.dirname(EMBED_SCRIPT))
+    except subprocess.TimeoutExpired:
+        raise AtlasError(
+            "The embedder did not answer within %d seconds. Loading the text "
+            "model takes about 1.6 s normally; this long usually means the "
+            "machine is under heavy load."
+            % EMBED_TIMEOUT_SECONDS)
+    except OSError as error:
+        raise AtlasError("Could not start the embedder: %s" % error)
+
+    output = finished.stdout.decode("utf-8", "replace").strip()
+    errors = finished.stderr.decode("utf-8", "replace").strip()
+    if not output:
+        raise AtlasError(
+            "The embedder said nothing. Its error output was:\n%s"
+            % (errors or "(none)"))
+    try:
+        reply = json.loads(output.splitlines()[-1])
+    except ValueError:
+        raise AtlasError(
+            "The embedder's reply was not JSON:\n%s" % output[:500])
+    if not reply.get("ok"):
+        raise AtlasError(reply.get("error") or "the embedder refused")
+    return reply
+
+
+def tool_find_similar(arguments):
+    """Rank assets by how they look, not by what they are called.
+
+    This is the only tool in the set that can answer a question about
+    appearance. Everything else matches text, and the style words people
+    reach for -- grungy, gray, ornate -- appear in none of the 221,183 names.
+    """
+    phrase = (arguments.get("text") or "").strip()
+    like = (arguments.get("like_path") or "").strip()
+    top = max(1, min(int(arguments.get("limit") or 20), 100))
+    if not phrase and not like:
+        raise AtlasError(
+            "Give text to look for, or like_path to find more of the same.")
+    if phrase and like:
+        raise AtlasError(
+            "Give text or like_path, not both: they are two different "
+            "questions and the answers would not be comparable.")
+
+    like_asset_id = None
+    like_name = None
+    if like:
+        with open_catalog() as connection:
+            row = _find_row(connection, like)
+            like_asset_id = row["id"]
+            # Its own re-exports have to go too, not just the row asked
+            # about. A model re-exported for another rig is a different file
+            # with the same picture, so left in it takes the top place and
+            # answers "more like this" with "this".
+            like_name = (row["name"] or "").lower()
+
+    reply = run_visual_search(phrase=phrase, like_asset_id=like_asset_id,
+                              top=top)
+    results = reply.get("results") or []
+    if not results:
+        return text("Nothing to rank: the store holds %d vectors."
+                    % reply.get("searched", 0))
+
+    wanted = [item["asset_id"] for item in results]
+    with open_catalog() as connection:
+        placeholders = ", ".join(["?"] * len(wanted))
+        rows = {row["id"]: row for row in connection.execute(
+            "SELECT * FROM catalog_assets WHERE id IN (%s)" % placeholders,
+            wanted).fetchall()}
+
+    # One picture is one answer. The pass embeds per file and is right to:
+    # Characters/X.fbx and Characters/Unreal_Characters/X.fbx are different
+    # files, re-exported for a different rig. They draw the same silhouette,
+    # so showing both spends a place in the ranking to say nothing.
+    collapsed = []
+    seen = {}
+    for item in results:
+        row = rows.get(item["asset_id"])
+        key = (row["name"] or "").lower() if row is not None else None
+        if like_name is not None and key == like_name:
+            continue
+        if key is not None and key in seen:
+            seen[key]["repeats"] += 1
+            continue
+        entry = {"item": item, "row": row, "repeats": 0}
+        if key is not None:
+            seen[key] = entry
+        collapsed.append(entry)
+
+    lines = [
+        "%d of %d embedded assets, ranked by how they look%s"
+        % (len(collapsed), reply.get("searched", 0),
+           " like that one" if like else ""),
+        # Said every time, because the instinct on seeing 0.12 is to call it
+        # a bad match. It is not a probability; the order is the answer.
+        # The two ranges differ by an order of magnitude and quoting the
+        # wrong one is worse than quoting neither: text and image embeddings
+        # sit in separate regions of the space -- SigLIP's modality gap -- so
+        # a text query's best match scores near 0.15 where an image query's
+        # scores near 0.95, and both mean "the closest thing there is".
+        ("Scores are cosines against another picture: a close match runs "
+         "around 0.9. Read the order, not the magnitude."
+         if like else
+         "Scores are cosines from a sigmoid-trained model, and text and "
+         "image vectors sit in different regions of it: real matches sit "
+         "around 0.05 to 0.18. Read the order, not the magnitude."),
+        "",
+    ]
+    for position, entry in enumerate(collapsed, start=1):
+        item, row = entry["item"], entry["row"]
+        if row is None:
+            # The catalog was rescanned since the vector was computed.
+            lines.append("%2d. %.4f  (no longer in the catalog)"
+                         % (position, item["score"]))
+            continue
+        repeats = ""
+        if entry["repeats"]:
+            repeats = "  (+%d copy%s elsewhere)" % (
+                entry["repeats"], "" if entry["repeats"] == 1 else "ies")
+        lines.append("%2d. %.4f  %s%s"
+                     % (position, item["score"], row["name"], repeats))
+        lines.append("          %s  %s"
+                     % (container_of(row), row["relative_path"]))
+
+    lines.append("")
+    # No denominator: the only honest one is a count of what could be
+    # embedded, and that needs a GROUP BY over the whole catalog on every
+    # query. The number that matters is how much was searched.
+    lines.append("Ranked over the %d assets that have been rendered and "
+                 "embedded so far -- nothing else can appear here, however "
+                 "well it would have matched. Run tag_assets.py for more."
+                 % reply.get("searched", 0))
+    return text("\n".join(lines))
+
+
 def tool_render_asset(arguments):
     size = int(arguments.get("size") or 512)
     report = bridge_call("/render", {
@@ -1527,12 +2107,26 @@ TOOLS = [
         "description":
             "Search the Atlas catalog. Terms are ANDed and matched against the "
             "file name, its path and its tags, exactly as the Atlas search box "
-            "does, so 'jump fem' finds A_Jump_Running_Femn.fbx.",
+            "does, so 'jump fem' finds A_Jump_Running_Femn.fbx. Scope a term to "
+            "one field with name=, path=, tag=, type=, ext= or rig=.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string",
-                          "description": "Space-separated terms; all must match."},
+                          "description":
+                              "Space-separated terms, all of which must match, over the "
+                              "file name, path and tags together -- so "
+                              "'jump fem' finds A_Jump_Running_Femn.fbx. "
+                              "A term can name one field instead: "
+                              "name=, path=, tag=, type=, ext=, rig=, as "
+                              "in 'tag=grungy name=door'. name/path/tag "
+                              "match a substring; type/ext/rig are exact. "
+                              "`or` groups the terms either side of it and "
+                              "binds tighter than a space, so 'name=dog "
+                              "or name=cat type=model' is (dog or cat) and "
+                              "model. There are no parentheses. Quote a "
+                              "value to keep spaces or an = in it. The box "
+                              "in Atlas reads the same grammar."},
                 "type": {"type": "string",
                          "enum": sorted(TYPE_FILTERS),
                          "description":
@@ -1661,6 +2255,34 @@ TOOLS = [
         "handler": tool_find_attachments,
     },
     {
+        "name": "find_similar",
+        "description":
+            "Rank assets by how they LOOK, from a rendered picture of each: "
+            "the only tool here that can answer a question about appearance. "
+            "Give text ('a grungy metal barrel', 'something gray and "
+            "industrial') or like_path to find more of the same shape. Every "
+            "other search matches names, and style words appear in none of "
+            "them. Needs the tagging pass to have been run; it says so when "
+            "it has not, and only embedded assets can be returned.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string",
+                         "description":
+                             "What it should look like. A description of "
+                             "appearance, not a filename."},
+                "like_path": {"type": "string",
+                              "description":
+                                  "An asset path; returns others that look "
+                                  "like it. Use instead of text."},
+                "limit": {"type": "integer",
+                          "description": "How many to rank (default 20, "
+                                         "max 100)."},
+            },
+        },
+        "handler": tool_find_similar,
+    },
+    {
         "name": "get_texture",
         "description":
             "Hand back an image from the catalog -- a palette atlas, a pack "
@@ -1728,7 +2350,11 @@ TOOLS = [
                           "description":
                               "Exact asset paths to write. Otherwise give a "
                               "selection below."},
-                "query": {"type": "string", "description": "Search terms."},
+                "query": {"type": "string",
+                          "description":
+                              "Search terms, same grammar as search_assets: "
+                              "plain words, or name=/path=/tag=/type=/ext=/"
+                              "rig= to scope one."},
                 "pack": {"type": "string", "description": "Restrict to a pack."},
                 "folder": {"type": "string",
                            "description": "Restrict to paths containing this folder."},
