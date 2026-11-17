@@ -22,7 +22,47 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'visual_tag_queue.dart';
 import 'visual_tagging.dart';
 
-Future<void> main() async {
+/// What the command line asked for.
+///
+/// The strip's button needs somebody to press it, which is fine for a pass
+/// over one newly scanned folder and no use for the whole library: that is
+/// an 18-hour job that wants to run with nobody watching.
+class StartupOptions {
+  const StartupOptions({this.tagAll = false, this.renderLanes});
+
+  /// Start tagging the whole library as soon as the catalog is restored.
+  final bool tagAll;
+
+  /// Renders in flight at once, or null to leave the queue's own default.
+  final int? renderLanes;
+}
+
+/// Reads `--tag-all` and `--tag-lanes=N`.
+///
+/// A bad value is ignored rather than fatal. The alternative is an app that
+/// refuses to open because of a typo in a flag, and the flag is a
+/// convenience: anything it cannot understand leaves the default in place.
+StartupOptions parseStartupOptions(List<String> arguments) {
+  const lanesFlag = '--tag-lanes=';
+  var tagAll = false;
+  int? lanes;
+  for (final argument in arguments) {
+    if (argument == '--tag-all') {
+      tagAll = true;
+      continue;
+    }
+    if (argument.startsWith(lanesFlag)) {
+      final value = int.tryParse(argument.substring(lanesFlag.length).trim());
+      // Capped rather than trusted. Each lane is a subprocess and an
+      // isolate, and a mistyped 400 would ask the machine for 400 of each.
+      if (value != null && value >= 1 && value <= 32) lanes = value;
+    }
+  }
+  return StartupOptions(tagAll: tagAll, renderLanes: lanes);
+}
+
+Future<void> main(List<String> arguments) async {
+  final options = parseStartupOptions(arguments);
   WidgetsFlutterBinding.ensureInitialized();
   initializeFbxLogPath();
   if (enableFbxLogs) {
@@ -36,7 +76,7 @@ Future<void> main() async {
   // Restoring this before the first frame keeps a clip from briefly showing
   // the stick figure when a character was already chosen.
   await AnimationCharacter.instance.load();
-  runApp(const AssetAtlasApp());
+  runApp(AssetAtlasApp(options: options));
 }
 
 const imageExts = {'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'psd'};
@@ -92,7 +132,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.34';
+const appVersion = '1.10.35';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -168,9 +208,14 @@ void initializeFbxLogPath() {
 }
 
 class AssetAtlasApp extends StatelessWidget {
-  const AssetAtlasApp({this.enablePersistence = true, super.key});
+  const AssetAtlasApp({
+    this.enablePersistence = true,
+    this.options = const StartupOptions(),
+    super.key,
+  });
 
   final bool enablePersistence;
+  final StartupOptions options;
 
   @override
   Widget build(BuildContext context) {
@@ -184,15 +229,23 @@ class AssetAtlasApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: CatalogScreen(enablePersistence: enablePersistence),
+      home: CatalogScreen(
+        enablePersistence: enablePersistence,
+        options: options,
+      ),
     );
   }
 }
 
 class CatalogScreen extends StatefulWidget {
-  const CatalogScreen({this.enablePersistence = true, super.key});
+  const CatalogScreen({
+    this.enablePersistence = true,
+    this.options = const StartupOptions(),
+    super.key,
+  });
 
   final bool enablePersistence;
+  final StartupOptions options;
 
   @override
   State<CatalogScreen> createState() => _CatalogScreenState();
@@ -277,6 +330,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
       // There is no bridge in the way here -- the renderer is in this
       // process -- so the only way it "stops" is the app shutting down.
       isRendererAlive: () async => mounted,
+      renderConcurrency:
+          widget.options.renderLanes ?? VisualTagQueue.defaultRenderLanes,
       onProgress: (progress) {
         if (!mounted) return;
         setState(() => _tagProgress = progress);
@@ -857,6 +912,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
           status = const ScanStatus('Ready', 'Choose a folder to catalog.');
         }
       });
+      // Here rather than in initState: tagging needs the catalog, and
+      // before the restore finishes there is nothing to render.
+      if (widget.options.tagAll &&
+          widget.enablePersistence &&
+          assets.isNotEmpty) {
+        unawaited(_startVisualTagging(const TagScope()));
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {

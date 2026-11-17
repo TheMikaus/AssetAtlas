@@ -12,12 +12,16 @@
 /// embedding store, whose crash-safety depends on one writer keeping an
 /// ordering across two files, only ever has that one writer.
 ///
-/// What this file owns is pacing. The measured cost is a render of a few
-/// hundred milliseconds to a few seconds, almost all of it in the external
-/// importer and a raster isolate, and the whole library is about 3.5 hours.
-/// Nobody watches that, so it has to stay out of the way: a gap between
-/// renders, few worker threads, and a stop that loses at most the batch in
-/// flight.
+/// What this file owns is pacing. A render measures about 2 s per asset and
+/// the whole library is 18 hours, so nobody watches it and it has to stay out
+/// of the way: a handful of renders in flight, and a stop that loses at most
+/// the batch being embedded.
+///
+/// The 2 s is not where it was assumed to be. The importer subprocess is
+/// 27 ms and the raster has its own isolate; what is left is per-asset work
+/// on the calling isolate -- inflating an archive entry (83% of the library
+/// lives inside zips), decoding the importer's JSON, decoding textures,
+/// encoding a PNG. That part does not parallelise, so it sets the floor.
 library;
 
 import 'dart:async';

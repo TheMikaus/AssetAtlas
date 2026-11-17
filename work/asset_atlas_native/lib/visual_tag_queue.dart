@@ -24,7 +24,8 @@ class VisualTagQueue {
     this.onProgress,
     this.threads = 2,
     this.batchSize = 8,
-    this.paceMs = 250,
+    this.paceMs = 0,
+    this.renderConcurrency = defaultRenderLanes,
     this.renderSize = 224,
     this.maxAttempts = 3,
     this.isRendererAlive,
@@ -45,9 +46,24 @@ class VisualTagQueue {
   final int threads;
   final int batchSize;
 
-  /// A gap between renders. The whole reason this queue exists is to leave
-  /// the machine usable, and a render saturates a core in the importer.
+  /// A gap between renders, off by default.
+  ///
+  /// It was 250 ms, on the belief that a render saturates a core. It does
+  /// not: the importer subprocess measures 27 ms and the raster runs on its
+  /// own isolate, so the gap was 12% of a job measured at 18 hours and was
+  /// buying politeness the machine did not need. Kept as a dial rather than
+  /// deleted, because a slower machine may want it back.
   final int paceMs;
+
+  /// How many renders are in flight at once.
+  ///
+  /// Each render is an importer subprocess and a fresh raster isolate, so
+  /// that part genuinely spreads across cores. What cannot spread is the
+  /// work this isolate does per asset -- inflating the archive entry,
+  /// decoding the importer's JSON, decoding textures, encoding the PNG --
+  /// which the event loop serialises however high this is set. That is the
+  /// ceiling, and it is why this is a handful rather than the core count.
+  final int renderConcurrency;
 
   final int renderSize;
   final int maxAttempts;
@@ -58,6 +74,13 @@ class VisualTagQueue {
 
   /// A seam for tests: the real one starts a Python child process.
   final TagWorkerStarter startWorker;
+
+  /// Renders in flight when nothing says otherwise.
+  ///
+  /// Four, not twenty: the per-asset work that cannot leave this isolate
+  /// sets the ceiling, so the extra lanes would queue behind each other
+  /// while making the window stutter. `--tag-lanes=N` overrides it.
+  static const defaultRenderLanes = 4;
 
   /// A run of failures this long means the problem is not the files. A
   /// renderer that answers and refuses everything looks exactly like a
@@ -70,6 +93,32 @@ class VisualTagQueue {
   Completer<void>? _resume;
   bool _stopping = false;
   Future<void>? _running;
+
+  /// Requests to the worker, one at a time.
+  ///
+  /// [TagWorker.ask] reads replies in order off a single pipe, so two
+  /// overlapping asks would each take the other's answer. With renders
+  /// running in parallel the overlap is no longer hypothetical: a lane
+  /// reporting a failure and a lane handing over a batch want the worker in
+  /// the same instant. Every ask goes through this chain so the pipe still
+  /// sees one request at a time.
+  Future<void> _askChain = Future<void>.value();
+
+  Future<Map<String, Object?>> _ask(
+    TagWorker worker,
+    String op, [
+    Map<String, Object?> extra = const {},
+  ]) {
+    final answer = Completer<Map<String, Object?>>();
+    _askChain = _askChain.then((_) async {
+      try {
+        answer.complete(await worker.ask(op, extra));
+      } catch (error, trace) {
+        answer.completeError(error, trace);
+      }
+    });
+    return answer.future;
+  }
 
   bool get isRunning => _running != null;
 
@@ -153,7 +202,7 @@ class VisualTagQueue {
         await _waitWhilePaused();
         if (_stopping) break;
 
-        final work = await worker.ask('next', {
+        final work = await _ask(worker, 'next', {
           'limit': batchSize * 8,
           'max_attempts': maxAttempts,
           ...scope.asRequest,
@@ -174,59 +223,103 @@ class VisualTagQueue {
             .toList();
         if (assets.isEmpty) break;
 
-        for (final asset in assets) {
-          if (_stopping) break;
-          await _waitWhilePaused();
-          if (_stopping) break;
+        // One shared cursor rather than a slice each, so a lane that
+        // draws a mech does not leave its share waiting while the others
+        // finish early on crates.
+        var cursor = 0;
 
-          final assetId = asset['asset_id'] as String;
-          taken.add(assetId);
-          _emit(_progress.copyWith(current: asset['name'] as String?));
+        Future<void> renderLane() async {
+          while (true) {
+            if (_stopping) return;
+            await _waitWhilePaused();
+            if (_stopping) return;
 
-          final Uint8List png;
-          try {
-            png = await renderAsset(asset['path'] as String, renderSize);
-          } catch (error) {
-            // Charging the asset is only right when the asset is at fault.
-            // If the renderer has gone, every remaining file would be
-            // charged an attempt for something that is not about it, and
-            // three such runs would permanently skip thousands of models.
-            if (!await _rendererStillThere()) {
-              stoppedBecause = 'The renderer stopped, so the rest were left '
-                  'alone rather than blamed';
-              _stopping = true;
-              break;
+            // Reading and advancing the cursor happens in one synchronous
+            // step, with no await between, so two lanes cannot claim the
+            // same asset. The same reasoning covers `batch` below.
+            if (cursor >= assets.length) return;
+            final asset = assets[cursor];
+            cursor += 1;
+
+            final assetId = asset['asset_id'] as String;
+            if (!taken.add(assetId)) continue;
+            _emit(_progress.copyWith(current: asset['name'] as String?));
+
+            final Uint8List png;
+            try {
+              png = await renderAsset(asset['path'] as String, renderSize);
+            } catch (error) {
+              // Charging the asset is only right when the asset is at fault.
+              // If the renderer has gone, every remaining file would be
+              // charged an attempt for something that is not about it, and
+              // three such runs would permanently skip thousands of models.
+              if (!await _rendererStillThere()) {
+                stoppedBecause = 'The renderer stopped, so the rest were left '
+                    'alone rather than blamed';
+                _stopping = true;
+                _releasePause();
+                return;
+              }
+              consecutive += 1;
+              if (consecutive >= consecutiveFailureLimit) {
+                stoppedBecause =
+                    '$consecutive renders failed in a row, so something '
+                    'systemic is wrong and the rest were left alone';
+                _stopping = true;
+                _releasePause();
+                return;
+              }
+              failures += 1;
+              await _ask(worker, 'failed', {
+                'entries': [
+                  {'asset_id': assetId, 'reason': '$error'},
+                ],
+              });
+              _emit(_progress.copyWith(failed: failures));
+              continue;
             }
-            consecutive += 1;
-            if (consecutive >= consecutiveFailureLimit) {
-              stoppedBecause =
-                  '$consecutive renders failed in a row, so something '
-                  'systemic is wrong and the rest were left alone';
-              _stopping = true;
-              break;
+
+            consecutive = 0;
+            batch.add({'asset_id': assetId, 'png': base64Encode(png)});
+
+            if (batch.length >= batchSize) {
+              // Emptied in the same synchronous step it is read, so two
+              // lanes cannot hand over the same renders. Taking a copy and
+              // clearing after the await produced twelve vectors from ten
+              // assets in the other driver.
+              final slice = List<Map<String, Object?>>.of(batch);
+              batch.clear();
+              // Not `embedded += await ...`: that reads `embedded` before
+              // the await, so two lanes finishing together both add to the
+              // same stale value and one hand-over vanishes from the count.
+              final stored = await _handOver(worker, slice);
+              embedded += stored;
+              _emit(_progress.copyWith(embeddedThisRun: embedded));
             }
-            failures += 1;
-            await worker.ask('failed', {
-              'entries': [
-                {'asset_id': assetId, 'reason': '$error'},
-              ],
-            });
-            _emit(_progress.copyWith(failed: failures));
-            continue;
-          }
-
-          consecutive = 0;
-          batch.add({'asset_id': assetId, 'png': base64Encode(png)});
-
-          if (batch.length >= batchSize) {
-            embedded += await _handOver(worker, batch);
-            batch.clear();
-            _emit(_progress.copyWith(embeddedThisRun: embedded));
-          }
-          if (paceMs > 0) {
-            await Future<void>.delayed(Duration(milliseconds: paceMs));
+            if (paceMs > 0) {
+              await Future<void>.delayed(Duration(milliseconds: paceMs));
+            }
           }
         }
+
+        // A lane keeps its own failure to itself rather than throwing
+        // through Future.wait, which reports the first error and drops the
+        // rest -- and a dropped TagWorkerException would lose the reason the
+        // run stopped.
+        Future<void> lane() async {
+          try {
+            await renderLane();
+          } on TagWorkerException catch (error) {
+            stoppedBecause ??= error.message;
+            _stopping = true;
+            _releasePause();
+          }
+        }
+
+        final lanes = renderConcurrency < 1 ? 1 : renderConcurrency;
+        await Future.wait(
+          List<Future<void>>.generate(lanes, (_) => lane()),
+        );
       }
     } on TagWorkerException catch (error) {
       stoppedBecause = error.message;
@@ -236,7 +329,8 @@ class VisualTagQueue {
       // and discarding it would throw away real renders for nothing.
       if (batch.isNotEmpty) {
         try {
-          embedded += await _handOver(worker, batch);
+          final stored = await _handOver(worker, batch);
+          embedded += stored;
         } on TagWorkerException catch (_) {
           // The worker is gone and these renders are lost. They kept no
           // vector, so the next run simply does them again.
@@ -259,7 +353,7 @@ class VisualTagQueue {
     TagWorker worker,
     List<Map<String, Object?>> batch,
   ) async {
-    final reply = await worker.ask('images', {'entries': batch});
+    final reply = await _ask(worker, 'images', {'entries': batch});
     return _asInt(reply['stored']);
   }
 

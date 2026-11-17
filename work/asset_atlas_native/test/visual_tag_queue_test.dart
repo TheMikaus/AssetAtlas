@@ -23,6 +23,14 @@ class FakeWorker implements TagWorker {
   int handOvers = 0;
   bool closed = false;
 
+  /// Makes `ask` yield partway through, so an overlapping call is visible.
+  Duration askDelay = Duration.zero;
+
+  /// How many asks were in flight at once. Anything above one means two
+  /// requests shared one pipe and each could take the other's reply.
+  int askesInFlight = 0;
+  int peakAskesInFlight = 0;
+
   /// Set to make the next `ask` throw, as a dead child process would.
   String? dieWith;
 
@@ -32,6 +40,22 @@ class FakeWorker implements TagWorker {
     Map<String, Object?> extra = const {},
   ]) async {
     ops.add(op);
+    askesInFlight += 1;
+    peakAskesInFlight = peakAskesInFlight > askesInFlight
+        ? peakAskesInFlight
+        : askesInFlight;
+    try {
+      return await _answer(op, extra);
+    } finally {
+      askesInFlight -= 1;
+    }
+  }
+
+  Future<Map<String, Object?>> _answer(
+    String op,
+    Map<String, Object?> extra,
+  ) async {
+    if (askDelay > Duration.zero) await Future<void>.delayed(askDelay);
     final dying = dieWith;
     if (dying != null && op != 'next') {
       throw TagWorkerException(dying);
@@ -102,6 +126,7 @@ void main() {
     RenderAsset? render,
     Future<bool> Function()? alive,
     int batchSize = 4,
+    int renderConcurrency = 4,
     void Function(TagProgress)? onProgress,
   }) => VisualTagQueue(
     python: 'python',
@@ -109,6 +134,7 @@ void main() {
     vectorsPath: 'v.f32',
     indexPath: 'i.sqlite',
     batchSize: batchSize,
+    renderConcurrency: renderConcurrency,
     // No pacing in tests: it is the one thing here that is pure waiting.
     paceMs: 0,
     isRendererAlive: alive,
@@ -354,7 +380,12 @@ void main() {
           return Uint8List.fromList([1]);
         },
       ).start(const TagScope());
-      expect(worker.stored.length, 6);
+      // Six renders preceded the failure, and the lanes that were already
+      // drawing when it happened finish and are kept too -- which is the
+      // point of the test. What matters is that the run stopped there
+      // rather than working through the other fourteen.
+      expect(worker.stored.length, greaterThanOrEqualTo(6));
+      expect(worker.stored.length, lessThan(12));
     });
 
     test('an asset that fails three times drops out of the queue', () async {
@@ -464,6 +495,135 @@ void main() {
         {'folder': 'Characters'},
       );
       expect(const TagScope().asRequest, isEmpty);
+    });
+  });
+
+  group('renders in parallel', () {
+    /// A render that takes long enough to still be running when the next
+    /// one starts, reporting how many were ever in flight together.
+    ({RenderAsset render, List<String> seen, int Function() peak})
+        overlapping() {
+      final seen = <String>[];
+      var inFlight = 0;
+      var peak = 0;
+      Future<Uint8List> render(String path, int size) async {
+        seen.add(path);
+        inFlight += 1;
+        peak = peak > inFlight ? peak : inFlight;
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+        inFlight -= 1;
+        return Uint8List.fromList([1, 2, 3]);
+      }
+
+      return (render: render, seen: seen, peak: () => peak);
+    }
+
+    test('several renders really do overlap', () async {
+      final worker = FakeWorker(libraryOf(12));
+      final probe = overlapping();
+      await queueFor(worker, render: probe.render, renderConcurrency: 4)
+          .start(const TagScope());
+      expect(probe.peak(), greaterThan(1));
+      expect(worker.stored.length, 12);
+    });
+
+    test('and never more than the dial allows', () async {
+      final worker = FakeWorker(libraryOf(12));
+      final probe = overlapping();
+      await queueFor(worker, render: probe.render, renderConcurrency: 3)
+          .start(const TagScope());
+      expect(probe.peak(), lessThanOrEqualTo(3));
+    });
+
+    test('a dial of one is still sequential', () async {
+      // The old behaviour has to remain reachable: a slower machine may
+      // want it, and a test that could not ask for it would not notice if
+      // the dial stopped being honoured.
+      final worker = FakeWorker(libraryOf(8));
+      final probe = overlapping();
+      await queueFor(worker, render: probe.render, renderConcurrency: 1)
+          .start(const TagScope());
+      expect(probe.peak(), 1);
+      expect(worker.stored.length, 8);
+    });
+
+    test('nothing is rendered twice', () async {
+      // The hazard parallel lanes add: a render not yet handed over is not
+      // in the store, so two lanes asking what is left both hear about it.
+      final worker = FakeWorker(libraryOf(20));
+      final probe = overlapping();
+      await queueFor(worker, render: probe.render, batchSize: 3)
+          .start(const TagScope());
+      expect(probe.seen.length, 20);
+      expect(probe.seen.toSet().length, 20);
+      expect(worker.stored.length, 20);
+    });
+
+    test('and nothing is embedded twice', () async {
+      // Two lanes seeing a full batch at the same moment would hand over
+      // the same renders, which is how ten assets became twelve vectors in
+      // the other driver.
+      final worker = FakeWorker(libraryOf(16));
+      final probe = overlapping();
+      final queue = queueFor(worker, render: probe.render, batchSize: 2);
+      await queue.start(const TagScope());
+      expect(queue.progress.embeddedThisRun, 16);
+    });
+
+    test('the worker is never asked two things at once', () async {
+      // Replies come back in order off one pipe, so an overlap means each
+      // ask can take the other's answer.
+      final worker = FakeWorker(libraryOf(16))
+        ..askDelay = const Duration(milliseconds: 2);
+      final probe = overlapping();
+      await queueFor(worker, render: probe.render, batchSize: 2)
+          .start(const TagScope());
+      expect(worker.peakAskesInFlight, 1);
+      expect(worker.stored.length, 16);
+    });
+
+    test('a failing render still blames only itself', () async {
+      final worker = FakeWorker(libraryOf(10));
+      var calls = 0;
+      Future<Uint8List> render(String path, int size) async {
+        calls += 1;
+        await Future<void>.delayed(const Duration(milliseconds: 2));
+        if (path.endsWith('04.fbx')) throw StateError('no geometry');
+        return Uint8List.fromList([1, 2, 3]);
+      }
+
+      final queue = queueFor(
+        worker,
+        render: render,
+        alive: () async => true,
+        batchSize: 3,
+      );
+      await queue.start(const TagScope());
+      expect(calls, greaterThanOrEqualTo(10));
+      expect(worker.failures.keys.length, 1);
+      expect(worker.stored.length, 9);
+    });
+
+    test('stopping mid-flight keeps what was already drawn', () async {
+      final worker = FakeWorker(libraryOf(40));
+      late VisualTagQueue queue;
+      var rendered = 0;
+      Future<Uint8List> render(String path, int size) async {
+        rendered += 1;
+        if (rendered == 6) queue.stop();
+        await Future<void>.delayed(const Duration(milliseconds: 2));
+        return Uint8List.fromList([1, 2, 3]);
+      }
+
+      queue = queueFor(worker, render: render, batchSize: 8);
+      await queue.start(const TagScope());
+      // Everything drawn before the stop is written, and nothing after it
+      // is drawn: a partial batch is as safe as a full one, so discarding
+      // it would throw away real renders for nothing.
+      expect(worker.stored.length, greaterThan(0));
+      expect(worker.stored.length, lessThan(40));
+      expect(queue.progress.state, TagState.paused);
+      expect(worker.closed, isTrue);
     });
   });
 }
