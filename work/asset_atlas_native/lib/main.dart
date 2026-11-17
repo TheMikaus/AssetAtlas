@@ -92,7 +92,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.33';
+const appVersion = '1.10.34';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -7943,7 +7943,37 @@ class VisualTaggingStrip extends StatelessWidget {
       );
     }
 
-    if (progress.state == TagState.idle) return const SizedBox.shrink();
+    // Idle still shows a row, because the button to leave idle lives in it.
+    // Returning an empty box here made the only way to start visual tagging
+    // unreachable: the strip appeared once a run was going, which is after
+    // the point at which anyone needed it.
+    if (progress.state == TagState.idle) {
+      return _bar(
+        background: const Color(0xfff7f8fa),
+        border: const Color(0xffdfe3ea),
+        child: Row(
+          children: [
+            const Icon(Icons.auto_awesome, size: 14, color: Color(0xff6b7a8d)),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text(
+                'Visual tagging has not been started. It renders each model '
+                'and learns what it looks like, in the background.',
+                style: TextStyle(fontSize: 11, color: Color(0xff55606e)),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            TextButton(
+              onPressed: onStart,
+              child: const Text(
+                'Start visual tagging',
+                style: TextStyle(fontSize: 11),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
 
     final fraction = progress.fraction;
     return _bar(
