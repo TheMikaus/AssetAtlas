@@ -132,7 +132,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.35';
+const appVersion = '1.10.36';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -9668,96 +9668,245 @@ bool canRelinkAcrossContainers({
   return hints.any((hint) => candidateLower.contains(hint));
 }
 
-/// The candidate textures for one model, split by container.
+/// Whether [asset] sits in the same container as the model described by
+/// [modelPathLower] and [zipModel].
 ///
-/// Partitioning the catalog is the expensive part of relinking: it walks every
-/// asset, parsing zip virtual paths as it goes. A model with twelve materials
-/// asks for thirty-odd textures and each one repeated the whole walk, which on
-/// a 26,000-asset catalog cost about a second of frozen UI per model. The
-/// split depends only on the model and the catalog, so it is done once.
-class _RelinkCandidates {
-  const _RelinkCandidates(
-    this.sameContainer,
-    this.otherContainers,
-    this.otherByBaseName,
-  );
-
-  final List<AssetItem> sameContainer;
-  final List<AssetItem> otherContainers;
-
-  /// Assets outside the model's container, keyed by file name without its
-  /// extension.
-  ///
-  /// Crossing containers demands an exact name match, so this turns a walk of
-  /// the whole catalog per reference into a lookup. With 26,000 assets and a
-  /// model asking for thirty textures, that walk was the load.
-  final Map<String, List<AssetItem>> otherByBaseName;
+/// This is the definition of "beside the model" that the index below encodes,
+/// and the one the equivalence test holds it to.
+bool _textureSitsBeside(
+  AssetItem asset,
+  String modelPathLower,
+  ZipVirtualPath? zipModel,
+) {
+  if (zipModel != null) {
+    final zipCandidate = parseZipVirtualPath(asset.path);
+    return zipCandidate != null &&
+        normalizePathKey(zipCandidate.zipPath) ==
+            normalizePathKey(zipModel.zipPath);
+  }
+  if (isZipVirtualPath(asset.path)) return false;
+  final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
+  return modelPathLower.startsWith(sourceLower);
 }
 
-String? _relinkCacheModelPath;
-int? _relinkCacheAssets;
-_RelinkCandidates? _relinkCache;
-
-/// Partitions [allAssets] for [modelPath], reusing the last answer.
+/// Which container [asset] lives in, or null when it lives in none.
 ///
-/// One entry is enough: every reference in a model is resolved back to back,
-/// so the cache is hot for exactly as long as it is useful.
-_RelinkCandidates _relinkCandidatesFor(
-  String modelPath,
-  List<AssetItem> allAssets,
-) {
-  final assetsIdentity = identityHashCode(allAssets) ^ allAssets.length;
-  final cached = _relinkCache;
-  if (cached != null &&
-      _relinkCacheModelPath == modelPath &&
-      _relinkCacheAssets == assetsIdentity) {
-    return cached;
+/// A `zip:` path that parses to nothing is in no container rather than in
+/// every one, which is what the walk this replaced did with it.
+String? _textureContainerKey(AssetItem asset) {
+  if (isZipVirtualPath(asset.path)) {
+    final zip = parseZipVirtualPath(asset.path);
+    if (zip == null) return null;
+    return 'zip:${normalizePathKey(zip.zipPath)}';
   }
+  return 'root:${asset.sourceRoot.toLowerCase().replaceAll('\\', '/')}';
+}
 
-  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
-  final zipModel = parseZipVirtualPath(modelPath);
-  final same = <AssetItem>[];
-  final other = <AssetItem>[];
-  final otherByBaseName = <String, List<AssetItem>>{};
-  for (final asset in allAssets) {
+/// The textures in one container, and where each sat in the catalog.
+class _ContainerTextures {
+  _ContainerTextures(this.assets, this.catalogIndices);
+
+  final List<AssetItem> assets;
+
+  /// Read only when a model sits under several nested source roots, where the
+  /// buckets have to be merged back into the order the catalog had them in.
+  final List<int> catalogIndices;
+}
+
+/// Every texture in the catalog, bucketed by container and by name.
+///
+/// Relinking used to partition the catalog per model, keeping one cached
+/// answer keyed on the model path. That is the right trade for somebody
+/// clicking through models, and the wrong one for a run that renders the
+/// library: every asset is a different model, so every model paid a walk of
+/// the whole catalog. The walk cost 169 ms at 26,000 assets, which is what
+/// the catalog held when that cache was written, and 2,032 ms at the 221,183
+/// it holds now -- the whole of the two seconds a render took.
+///
+/// Nothing in the partition depended on the model path, only on which
+/// container the model is in, so it is built once per catalog and every model
+/// after the first reads it instead of rebuilding it.
+class _TextureIndex {
+  _TextureIndex(this.byContainer, this.byBaseName, this.sourceRootKeys);
+
+  final Map<String, _ContainerTextures> byContainer;
+
+  /// File name without its extension -> the textures carrying that name.
+  ///
+  /// Crossing containers demands an exact name match, so this is the whole of
+  /// that search rather than a filter over the catalog.
+  final Map<String, List<AssetItem>> byBaseName;
+
+  /// The distinct source roots of the textures outside archives, normalized
+  /// the way [_textureSitsBeside] compares them.
+  final List<String> sourceRootKeys;
+}
+
+int? _textureIndexIdentity;
+_TextureIndex? _textureIndexCache;
+
+_TextureIndex _textureIndexOf(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _textureIndexCache;
+  if (cached != null && _textureIndexIdentity == identity) return cached;
+
+  final byContainer = <String, _ContainerTextures>{};
+  final byBaseName = <String, List<AssetItem>>{};
+  final roots = <String>{};
+  for (var index = 0; index < allAssets.length; index += 1) {
+    final asset = allAssets[index];
     if (!textureExts.contains(asset.ext)) continue;
-    bool isSame;
-    if (zipModel != null) {
-      final zipCandidate = parseZipVirtualPath(asset.path);
-      isSame =
-          zipCandidate != null &&
-          normalizePathKey(zipCandidate.zipPath) ==
-              normalizePathKey(zipModel.zipPath);
-    } else if (isZipVirtualPath(asset.path)) {
-      isSame = false;
-    } else {
-      final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
-      isSame = modelPathLower.startsWith(sourceLower);
-    }
-    if (isSame) {
-      same.add(asset);
-    } else {
-      other.add(asset);
-      final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
-      (otherByBaseName[base] ??= <AssetItem>[]).add(asset);
-    }
+    final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
+    (byBaseName[base] ??= <AssetItem>[]).add(asset);
+    final key = _textureContainerKey(asset);
+    if (key == null) continue;
+    if (key.startsWith('root:')) roots.add(key.substring('root:'.length));
+    final bucket =
+        byContainer[key] ??= _ContainerTextures(<AssetItem>[], <int>[]);
+    bucket.assets.add(asset);
+    bucket.catalogIndices.add(index);
   }
 
-  final result = _RelinkCandidates(same, other, otherByBaseName);
-  _relinkCacheModelPath = modelPath;
-  _relinkCacheAssets = assetsIdentity;
-  _relinkCache = result;
+  final result = _TextureIndex(byContainer, byBaseName, roots.toList());
+  _textureIndexIdentity = identity;
+  _textureIndexCache = result;
   return result;
 }
 
+/// The containers a model belongs to.
+///
+/// More than one only where source roots nest: a deeper root and the root
+/// above it both prefix the model's path, and the walk this replaced counted
+/// the textures under both as sitting beside the model.
+List<String> _modelContainerKeys(String modelPath, _TextureIndex index) {
+  final zipModel = parseZipVirtualPath(modelPath);
+  if (zipModel != null) {
+    return <String>['zip:${normalizePathKey(zipModel.zipPath)}'];
+  }
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  return <String>[
+    for (final root in index.sourceRootKeys)
+      if (modelPathLower.startsWith(root)) 'root:$root',
+  ];
+}
+
+String? _sameContainerCacheKey;
+int? _sameContainerCacheIdentity;
+List<AssetItem>? _sameContainerCache;
+
+/// The textures that sit beside [modelPath], in the order the catalog has
+/// them.
+///
+/// Cached on the container rather than on the model, which is the whole
+/// point: a pass over one pack asks about hundreds of models and answers all
+/// of them from the same list.
+List<AssetItem> _sameContainerTextures(
+  String modelPath,
+  List<AssetItem> allAssets,
+) {
+  final index = _textureIndexOf(allAssets);
+  final keys = _modelContainerKeys(modelPath, index);
+  if (keys.isEmpty) return const <AssetItem>[];
+
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final signature = keys.join('|');
+  final cached = _sameContainerCache;
+  if (cached != null &&
+      _sameContainerCacheKey == signature &&
+      _sameContainerCacheIdentity == identity) {
+    return cached;
+  }
+
+  List<AssetItem> resolved;
+  if (keys.length == 1) {
+    resolved = index.byContainer[keys.first]?.assets ?? const <AssetItem>[];
+  } else {
+    final merged = <(int, AssetItem)>[];
+    for (final key in keys) {
+      final bucket = index.byContainer[key];
+      if (bucket == null) continue;
+      for (var slot = 0; slot < bucket.assets.length; slot += 1) {
+        merged.add((bucket.catalogIndices[slot], bucket.assets[slot]));
+      }
+    }
+    merged.sort((first, second) => first.$1.compareTo(second.$1));
+    resolved = [for (final entry in merged) entry.$2];
+  }
+
+  _sameContainerCacheKey = signature;
+  _sameContainerCacheIdentity = identity;
+  _sameContainerCache = resolved;
+  return resolved;
+}
+
+/// The textures named [requestedBase] that do not sit beside [modelPath].
+List<AssetItem> _otherContainerTextures(
+  String modelPath,
+  String requestedBase,
+  List<AssetItem> allAssets,
+) {
+  final index = _textureIndexOf(allAssets);
+  final named = index.byBaseName[requestedBase];
+  if (named == null) return const <AssetItem>[];
+  final beside = _modelContainerKeys(modelPath, index);
+  return [
+    for (final asset in named)
+      if (!beside.contains(_textureContainerKey(asset))) asset,
+  ];
+}
+
+/// [_sameContainerTextures] by walking the catalog instead of indexing it.
+///
+/// Kept because it is the definition the index has to agree with: the
+/// equivalence test runs both over awkward catalogs and compares. Reached
+/// from the app only through `byScan`, which nothing in the app passes.
+List<AssetItem> relinkSameContainerByScan(
+  String modelPath,
+  List<AssetItem> allAssets,
+) {
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
+  return [
+    for (final asset in allAssets)
+      if (textureExts.contains(asset.ext) &&
+          _textureSitsBeside(asset, modelPathLower, zipModel))
+        asset,
+  ];
+}
+
+/// [_otherContainerTextures] by walking the catalog. The reference the index
+/// is checked against.
+List<AssetItem> relinkOtherContainersByScan(
+  String modelPath,
+  String requestedBase,
+  List<AssetItem> allAssets,
+) {
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
+  return [
+    for (final asset in allAssets)
+      if (textureExts.contains(asset.ext) &&
+          !_textureSitsBeside(asset, modelPathLower, zipModel) &&
+          asset.name.toLowerCase().replaceAll(_extensionPattern, '') ==
+              requestedBase)
+        asset,
+  ];
+}
+
+/// Pass `byScan: true` to answer from a walk of the catalog rather than from
+/// the index. It exists so the equivalence test can compare the two end to
+/// end -- the question that matters is not whether the partitions match but
+/// whether the same texture still wins.
 String? findDeterministicTextureRelink(
   String modelPath,
   String texturePath,
-  List<AssetItem> allAssets,
-) {
+  List<AssetItem> allAssets, {
+  bool byScan = false,
+}) {
   if (allAssets.isEmpty) return null;
-  final candidates = _relinkCandidatesFor(modelPath, allAssets);
-  final sourceCandidates = candidates.sameContainer;
+  final sourceCandidates = byScan
+      ? relinkSameContainerByScan(modelPath, allAssets)
+      : _sameContainerTextures(modelPath, allAssets);
 
   final requestedBase = texturePath
       .split(_pathSeparatorPattern)
@@ -9860,8 +10009,9 @@ String? findDeterministicTextureRelink(
       [
         // Only a name that already matches can qualify, so the rest of the
         // catalog is never visited.
-        for (final asset
-            in candidates.otherByBaseName[requestedBase] ?? const <AssetItem>[])
+        for (final asset in byScan
+            ? relinkOtherContainersByScan(modelPath, requestedBase, allAssets)
+            : _otherContainerTextures(modelPath, requestedBase, allAssets))
           if (canRelinkAcrossContainers(
             texturePath: texturePath,
             candidatePath: asset.path,
