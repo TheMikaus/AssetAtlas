@@ -19,6 +19,9 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
+import 'visual_tag_queue.dart';
+import 'visual_tagging.dart';
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   initializeFbxLogPath();
@@ -89,7 +92,7 @@ const maxZipArchiveCacheEntries = 8;
 /// browser to lock the file they are trying to reorganise, so the handles are
 /// dropped shortly after the reading stops.
 const zipArchiveIdleTimeout = Duration(seconds: 5);
-const appVersion = '1.10.31';
+const appVersion = '1.10.33';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -217,6 +220,72 @@ class _CatalogScreenState extends State<CatalogScreen> {
   /// `force` discards every probed classification and starts over, which is
   /// hours of importer runs for this library -- so it is a separate button,
   /// not the default.
+  /// Start tagging [scope], or report why it cannot be.
+  Future<void> _startVisualTagging(TagScope scope) async {
+    if (_tagQueue?.isRunning ?? false) return;
+    final script = embedderScriptPath();
+    if (script == null) {
+      setState(() => _tagUnavailable =
+          'atlas_embed.py was not found beside the app. Visual tagging needs '
+          'work/atlas_mcp next to the executable.');
+      return;
+    }
+    setState(() {
+      _tagUnavailable = null;
+      _tagProgress = const TagProgress(state: TagState.starting);
+    });
+    final python = await findEmbedderPython(script: script);
+    if (!mounted) return;
+    if (python == null) {
+      setState(() {
+        _tagUnavailable =
+            'No Python on PATH could run the embedder. It needs onnxruntime, '
+            'Pillow, numpy and sentencepiece -- see '
+            'work/atlas_mcp/README.md.';
+        _tagProgress = const TagProgress(state: TagState.idle);
+      });
+      return;
+    }
+
+    final folder = db.catalogDirectory;
+    if (folder == null) {
+      setState(() => _tagUnavailable =
+          'The catalog is not open yet, and the embedding store lives beside '
+          'it.');
+      return;
+    }
+    final separator = Platform.pathSeparator;
+    final queue = VisualTagQueue(
+      python: python,
+      script: script,
+      vectorsPath: '$folder${separator}embeddings.f32',
+      indexPath: '$folder${separator}embeddings_index.sqlite',
+      // The app's own renderer, which is the point: what gets embedded is
+      // what the app shows.
+      renderAsset: (path, size) async {
+        final asset = assets.firstWhere(
+          (candidate) => candidate.path == path,
+          orElse: () => throw StateError('$path is no longer catalogued'),
+        );
+        final drawn = await renderAsset(
+          asset,
+          allAssets: assets,
+          size: size,
+        );
+        return drawn.png;
+      },
+      // There is no bridge in the way here -- the renderer is in this
+      // process -- so the only way it "stops" is the app shutting down.
+      isRendererAlive: () async => mounted,
+      onProgress: (progress) {
+        if (!mounted) return;
+        setState(() => _tagProgress = progress);
+      },
+    );
+    _tagQueue = queue;
+    await queue.start(scope);
+  }
+
   Future<void> _rescanAllSources({bool force = false}) async {
     for (final root in sourceRoots.toList()) {
       await scanFolder(root, force: force);
@@ -246,6 +315,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
   final expandedFolders = <String>{};
   Timer? _searchDebounce;
   ScanHandle? _activeScan;
+
+  /// Visual tagging, running behind everything else.
+  ///
+  /// Created on demand, because it starts a Python child process holding
+  /// 325 MB of model and most sessions never ask for one.
+  VisualTagQueue? _tagQueue;
+  TagProgress _tagProgress = const TagProgress(state: TagState.idle);
+  String? _tagUnavailable;
 
   /// Bumped whenever something that affects filtering changes without the
   /// catalog itself changing: an ignore toggle, a texture validation result, an
@@ -1229,6 +1306,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _scheduleModelTextureValidation(result.assets);
     }
     await _persistCatalog();
+    // Directive: point Atlas at a folder and the tagging queues itself.
+    // Only for a folder with something new in it, so a rescan that changed
+    // nothing does not start an hours-long job unasked.
+    if (carried.added > 0 && widget.enablePersistence) {
+      unawaited(_startVisualTagging(TagScope(folder: rootPath)));
+    }
   }
 
   void removeSource(String rootPath) {
@@ -1616,6 +1699,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
                     ),
                   ],
                 ),
+              ),
+              // Last in the column, so it sits along the bottom edge: a job
+              // that runs for hours should be glanceable and never in the
+              // way of the thing being looked at.
+              VisualTaggingStrip(
+                progress: _tagProgress,
+                unavailable: _tagUnavailable,
+                onPause: () => _tagQueue?.pause(),
+                onResume: () => _tagQueue?.resumeRun(),
+                onStop: () => _tagQueue?.stop(),
+                onStart: () =>
+                    unawaited(_startVisualTagging(const TagScope())),
               ),
             ],
           ),
@@ -7803,6 +7898,132 @@ const _previewableModelExts = {'fbx', 'obj'};
 /// "Is this model textured?" is a question a swatch answers instantly, and a
 /// list of paths does not: a model can resolve its atlas correctly and still
 /// look grey, because that is the part of the atlas it uses.
+/// The tagging strip: one line, and only when there is something to say.
+///
+/// Visual tagging runs for hours and is meant to be forgotten about, so this
+/// is deliberately small and deliberately silent when idle. It appears when
+/// a run starts, and when something is wrong that the person can act on.
+class VisualTaggingStrip extends StatelessWidget {
+  const VisualTaggingStrip({
+    required this.progress,
+    required this.unavailable,
+    required this.onPause,
+    required this.onResume,
+    required this.onStop,
+    required this.onStart,
+    super.key,
+  });
+
+  final TagProgress progress;
+
+  /// Why tagging cannot run -- no Python, no script -- or null.
+  final String? unavailable;
+
+  final VoidCallback onPause;
+  final VoidCallback onResume;
+  final VoidCallback onStop;
+  final VoidCallback onStart;
+
+  @override
+  Widget build(BuildContext context) {
+    final problem = unavailable;
+    if (problem != null) {
+      return _bar(
+        background: const Color(0xfffff4e0),
+        border: const Color(0xffe0c080),
+        child: Row(
+          children: [
+            const Icon(Icons.info_outline, size: 15),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(problem, style: const TextStyle(fontSize: 11)),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (progress.state == TagState.idle) return const SizedBox.shrink();
+
+    final fraction = progress.fraction;
+    return _bar(
+      background: const Color(0xfff2f6fb),
+      border: const Color(0xffc8d6e5),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 120,
+            child: LinearProgressIndicator(
+              value: progress.isBusy ? fraction : (fraction ?? 0),
+              minHeight: 4,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              progress.summary,
+              style: const TextStyle(fontSize: 11),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (progress.failed > 0 || progress.givenUp > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Text(
+                [
+                  if (progress.failed > 0) '${progress.failed} failed',
+                  if (progress.givenUp > 0) '${progress.givenUp} skipped',
+                ].join(', '),
+                style: const TextStyle(fontSize: 11, color: Color(0xff8a6d3b)),
+              ),
+            ),
+          // Two IconButtons rather than ToggleButtons: a Tooltip placed as a
+          // direct child of ToggleButtons corrupts the Windows accessibility
+          // tree and the app hard-crashes inside flutter_windows.dll on the
+          // next window resize.
+          if (progress.state == TagState.running)
+            IconButton(
+              tooltip: 'Pause visual tagging',
+              icon: const Icon(Icons.pause, size: 16),
+              onPressed: onPause,
+            ),
+          if (progress.state == TagState.paused && progress.remaining > 0)
+            IconButton(
+              tooltip: 'Resume visual tagging',
+              icon: const Icon(Icons.play_arrow, size: 16),
+              onPressed: onResume,
+            ),
+          if (progress.isBusy)
+            IconButton(
+              tooltip: 'Stop after the current batch',
+              icon: const Icon(Icons.stop, size: 16),
+              onPressed: onStop,
+            ),
+          if (!progress.isBusy && progress.state != TagState.finished)
+            IconButton(
+              tooltip: 'Start visual tagging',
+              icon: const Icon(Icons.auto_awesome, size: 16),
+              onPressed: onStart,
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bar({
+    required Color background,
+    required Color border,
+    required Widget child,
+  }) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+    decoration: BoxDecoration(
+      color: background,
+      border: Border(top: BorderSide(color: border)),
+    ),
+    child: child,
+  );
+}
+
 /// The one-line status under a material's swatch.
 ///
 /// "flat colour" and "asked for a texture and did not get one" look identical
@@ -12532,6 +12753,67 @@ Future<MeshModel> meshModelFromImporterJson(
   );
 }
 
+/// Where `atlas_embed.py` lives, relative to the app.
+///
+/// Packaged beside the executable in a release; two directories up in a
+/// development checkout, where the app runs from build/windows/.../Release
+/// and the MCP sits in work/atlas_mcp.
+String? embedderScriptPath() {
+  final separator = Platform.pathSeparator;
+  // Walked up from the executable, not from the working directory: a GUI
+  // process is started with whatever directory the launcher happened to be
+  // in, so relative candidates resolve somewhere arbitrary. The first
+  // version of this looked for 'work/atlas_mcp/...' and found nothing.
+  var directory = File(Platform.resolvedExecutable).parent;
+  // Five levels covers build/windows/x64/runner/Release; a few more cost
+  // nothing and survive the layout changing.
+  for (var depth = 0; depth < 8; depth += 1) {
+    for (final relative in <String>[
+      'atlas_mcp${separator}atlas_embed.py',
+      'work${separator}atlas_mcp${separator}atlas_embed.py',
+    ]) {
+      final candidate = File('${directory.path}$separator$relative');
+      if (candidate.existsSync()) return candidate.path;
+    }
+    final parent = directory.parent;
+    if (parent.path == directory.path) break;
+    directory = parent;
+  }
+  return null;
+}
+
+/// The Python that can run the embedder, or null if none of them can.
+///
+/// Probed rather than assumed, and the probe is the embedder's own --
+/// `--probe` loads both towers, so a Python that exists but is missing
+/// onnxruntime is rejected here rather than twenty minutes into a run.
+/// Cached: the probe costs a few seconds.
+String? _cachedPython;
+bool _pythonProbed = false;
+
+Future<String?> findEmbedderPython({String? script}) async {
+  if (_pythonProbed) return _cachedPython;
+  _pythonProbed = true;
+  final target = script ?? embedderScriptPath();
+  if (target == null) return null;
+  for (final candidate in const ['python', 'python3', 'py']) {
+    try {
+      final probe = await Process.run(candidate, [
+        '-P',
+        target,
+        '--probe',
+      ], workingDirectory: File(target).parent.path);
+      if (probe.exitCode == 0) {
+        _cachedPython = candidate;
+        return candidate;
+      }
+    } on ProcessException catch (_) {
+      // Not on PATH under that name; try the next.
+    }
+  }
+  return null;
+}
+
 String meshImporterPath() {
   final executableDir = File(Platform.resolvedExecutable).parent.path;
   final packaged =
@@ -14726,6 +15008,20 @@ class AssetAtlasDatabase {
         'ON project_assets(project_id)',
   ];
 
+  /// Where the catalog ended up, once [initialize] has run.
+  ///
+  /// Kept because other things belong beside it -- atlas_bridge.json, and
+  /// the embedding store the tagging queue writes. Re-deriving the support
+  /// directory would be right in production and wrong under the test seam
+  /// below, which is exactly the kind of divergence that is invisible until
+  /// a test writes into the real one.
+  String? catalogPath;
+
+  String? get catalogDirectory {
+    final resolved = catalogPath;
+    return resolved == null ? null : File(resolved).parent.path;
+  }
+
   /// [databasePath] is a test seam; production passes nothing and the database
   /// lives in the app support directory.
   Future<void> initialize({String? databasePath}) async {
@@ -14740,6 +15036,7 @@ class AssetAtlasDatabase {
       dbPath =
           '${supportDir.path}${Platform.pathSeparator}asset_atlas_native.db';
     }
+    catalogPath = dbPath;
     _db = await databaseFactory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
@@ -15830,17 +16127,41 @@ Future<Map<String, Object?>> bridgeRigCompat(
 /// so the picture a model is shown is the picture a person would see. A kit is
 /// drawn one variant per slot rather than every part at once, for the same
 /// reason the viewer does it: all of them together is an unreadable pile.
-Future<Map<String, Object?>> bridgeRender(
-  Map<String, Object?> payload,
-  List<AssetItem> assets,
-) async {
-  final asset = bridgeFindAsset(payload['path'] as String?, assets);
-  final size = (payload['size'] as num?)?.toInt() ?? 512;
+/// A drawn asset: the picture, and what went into it.
+class RenderedAsset {
+  const RenderedAsset({
+    required this.asset,
+    required this.mesh,
+    required this.raster,
+    required this.png,
+  });
+
+  final AssetItem asset;
+  final MeshModel mesh;
+  final RasterResult raster;
+  final Uint8List png;
+}
+
+/// Draw one asset. The single place a picture of a model is produced.
+///
+/// Both callers matter and they have to agree. The bridge answers
+/// `render_asset` with this, and the visual tagging queue embeds it -- and
+/// the embedding is only meaningful if what was embedded is what the app
+/// shows. One function is the only way to be sure of that; two that are
+/// meant to match would drift the first time either was tuned.
+Future<RenderedAsset> renderAsset(
+  AssetItem asset, {
+  required List<AssetItem> allAssets,
+  int size = 512,
+  double yaw = 0.6,
+  double pitch = 0.35,
+  double zoom = 1.0,
+}) async {
   if (size < 64 || size > 2048) {
     throw const BridgeRequestException('size must be between 64 and 2048.');
   }
 
-  final mesh = await loadMesh(asset, allAssets: assets);
+  final mesh = await loadMesh(asset, allAssets: allAssets);
   if (mesh.faces.isEmpty) {
     throw BridgeRequestException(
       '${asset.name} has no geometry to draw'
@@ -15858,15 +16179,16 @@ Future<Map<String, Object?>> bridgeRender(
       : null;
 
   // On a worker isolate even for a small model. [rasterizeMesh] is
-  // synchronous, and the bridge runs on the isolate that draws the window: a
-  // mech rasterised in place freezes Atlas for as long as it takes, in front
-  // of a user who did not ask for a picture and cannot see why it stopped.
+  // synchronous, and both callers run on the isolate that draws the window:
+  // a mech rasterised in place freezes Atlas for as long as it takes, in
+  // front of a user who did not ask for a picture and cannot see why it
+  // stopped. It matters more for the queue, which draws 31,000 of them.
   final raster = await rasterizeSceneInIsolate(
     RasterRequest(
       scene: RasterScene.fromMesh(mesh),
-      yaw: (payload['yaw'] as num?)?.toDouble() ?? 0.6,
-      pitch: (payload['pitch'] as num?)?.toDouble() ?? 0.35,
-      zoom: (payload['zoom'] as num?)?.toDouble() ?? 1.0,
+      yaw: yaw,
+      pitch: pitch,
+      zoom: zoom,
       width: size,
       height: size,
       renderMode: RenderMode.textured,
@@ -15882,11 +16204,31 @@ Future<Map<String, Object?>> bridgeRender(
     bytes: raster.pixels.buffer,
     numChannels: 4,
   );
-  final png = img.encodePng(image);
+  return RenderedAsset(
+    asset: asset,
+    mesh: mesh,
+    raster: raster,
+    png: Uint8List.fromList(img.encodePng(image)),
+  );
+}
+
+Future<Map<String, Object?>> bridgeRender(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final drawn = await renderAsset(
+    bridgeFindAsset(payload['path'] as String?, assets),
+    allAssets: assets,
+    size: (payload['size'] as num?)?.toInt() ?? 512,
+    yaw: (payload['yaw'] as num?)?.toDouble() ?? 0.6,
+    pitch: (payload['pitch'] as num?)?.toDouble() ?? 0.35,
+    zoom: (payload['zoom'] as num?)?.toDouble() ?? 1.0,
+  );
+  final raster = drawn.raster;
 
   return {
-    'name': asset.name,
-    'path': asset.path,
+    'name': drawn.asset.name,
+    'path': drawn.asset.path,
     'width': raster.width,
     'height': raster.height,
     'drawnFaces': raster.drawnFaces,
@@ -15897,8 +16239,8 @@ Future<Map<String, Object?>> bridgeRender(
     // the caller distrust a picture of the whole thing.
     'capped': raster.totalFaces > maxRenderedFaces,
     'faceLimit': maxRenderedFaces,
-    'shape': bridgeModelShape(mesh),
-    'png': base64Encode(png),
+    'shape': bridgeModelShape(drawn.mesh),
+    'png': base64Encode(drawn.png),
   };
 }
 
