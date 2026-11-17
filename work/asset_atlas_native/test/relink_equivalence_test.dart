@@ -282,6 +282,62 @@ void main() {
     });
   });
 
+  group('resolving a reference inside an archive', () {
+    // The membership test that used to walk the catalog. It is an exact
+    // equality check, so a map answers it identically -- but the map is
+    // cached on the catalog, and that is worth holding to.
+    List<AssetItem> archiveCatalog() => [
+      assetAt('zip:Z:/Zips/PackS.zip::Models/SM_Hut.fbx',
+          sourceRoot: 'Z:/Zips'),
+      assetAt('zip:Z:/Zips/PackS.zip::Textures/T_Hut_BC.png',
+          sourceRoot: 'Z:/Zips'),
+    ];
+
+    test('a sibling entry in the same archive resolves to its virtual path',
+        () {
+      expect(
+        resolveTextureReference(
+          'zip:Z:/Zips/PackS.zip::Models/SM_Hut.fbx',
+          '../Textures/T_Hut_BC.png',
+          allAssets: archiveCatalog(),
+          allowFallbackLookup: false,
+        ),
+        'zip:Z:/Zips/PackS.zip::Textures/T_Hut_BC.png',
+      );
+    });
+
+    test('an entry the archive does not hold does not resolve to it', () {
+      final resolved = resolveTextureReference(
+        'zip:Z:/Zips/PackS.zip::Models/SM_Hut.fbx',
+        '../Textures/T_Absent_BC.png',
+        allAssets: archiveCatalog(),
+        allowFallbackLookup: false,
+      );
+      expect(resolved, isNot('zip:Z:/Zips/PackS.zip::Textures/T_Absent_BC.png'));
+    });
+
+    test('and a second catalog is not answered from the first', () {
+      const model = 'zip:Z:/Zips/PackS.zip::Models/SM_Hut.fbx';
+      const reference = '../Textures/T_Hut_BC.png';
+      expect(
+        resolveTextureReference(model, reference,
+            allAssets: archiveCatalog(), allowFallbackLookup: false),
+        'zip:Z:/Zips/PackS.zip::Textures/T_Hut_BC.png',
+      );
+      final withoutTexture = [
+        for (final asset in archiveCatalog())
+          if (asset.name != 'T_Hut_BC.png') asset,
+      ];
+      expect(withoutTexture, hasLength(1));
+      expect(
+        resolveTextureReference(model, reference,
+            allAssets: withoutTexture, allowFallbackLookup: false),
+        isNull,
+        reason: 'the texture is no longer in the archive',
+      );
+    });
+  });
+
   group('the partition itself', () {
     final catalog = [
       assetAt('Z:/Assets/PackP/Models/SM_Thing.fbx',
