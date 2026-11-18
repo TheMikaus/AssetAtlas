@@ -277,6 +277,24 @@ class EmbeddingStore:
                 names[row] = asset_id
         return names
 
+    def sources_by_row(self):
+        """Row -> what the vector was made from, for every published row.
+
+        "render" is a picture drawn from a model; "image" is a file that was
+        already a picture. A search uses this to answer about one kind only:
+        asked for a material, ranking a model's silhouette alongside it is
+        noise, and the other way round for a shape.
+
+        None for a row the index does not name, exactly as asset_ids_by_row,
+        so the two are the same length and can be read together.
+        """
+        sources = [None] * self._committed
+        for source, row in self._index.execute(
+                "SELECT source, row FROM embedding_index"):
+            if 0 <= row < self._committed:
+                sources[row] = source
+        return sources
+
     def missing(self, asset_ids):
         """Which of `asset_ids` still need embedding. Drives the queue."""
         return [asset_id for asset_id in asset_ids
@@ -334,6 +352,58 @@ class EmbeddingStore:
         self._index.execute(
             "DELETE FROM embedding_failures WHERE asset_id = ?", (asset_id,))
         self._index.commit()
+
+    def refresh(self):
+        """Pick up rows another process published since this store opened.
+
+        `open` reads the count once, which is right for a pass that owns the
+        file and wrong for a search process that outlives one: a server that
+        holds a store for an hour while a tagging pass runs would keep
+        answering out of the library as it was when it started.
+
+        Safe to call at any time because of the order `append` writes in --
+        vectors, then the count, then the index -- so a count read here names
+        only rows whose bytes are already on disk. The on-disk clamp stays
+        for the same reason `open` has it: a write cut short leaves the count
+        ahead of the bytes.
+
+        Returns how many rows were gained, and drops the mapping when there
+        are any: a mapping covers the length the file had when it was made,
+        so the new rows are not in it.
+        """
+        if getattr(self, "_model_mismatch", False):
+            return 0
+        try:
+            with open(self.vectors_path, "rb") as handle:
+                raw = handle.read(HEADER_BYTES)
+            on_disk = max(os.path.getsize(self.vectors_path) - HEADER_BYTES, 0)
+        except OSError:
+            return 0
+        if len(raw) < HEADER_BYTES:
+            return 0
+        magic, version, dims, count, _model, _spare = _HEADER_STRUCT.unpack(
+            raw)
+        # A header that no longer agrees with this object is not something to
+        # paper over by carrying on with the old count: the file was replaced
+        # under us, and saying zero leaves the caller with what it had.
+        if magic != MAGIC or version != FORMAT_VERSION or dims != self.dims:
+            return 0
+        published = min(count, on_disk // self._stride)
+        if published <= self._committed:
+            return 0
+        gained = published - self._committed
+        self._committed = published
+        self._release_map()
+        return gained
+
+    def unmap(self):
+        """Drop the mapping but stay open.
+
+        For a process that searches now and then rather than in one pass:
+        `matrix` remakes the mapping in microseconds, and not holding one
+        between searches leaves the file to whoever is appending to it.
+        """
+        self._release_map()
 
     # ------------------------------------------------------------- closing
 

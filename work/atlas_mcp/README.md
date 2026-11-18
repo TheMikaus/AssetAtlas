@@ -161,12 +161,15 @@ does not have.
 ## The rig_family gap
 
 Atlas fills `rig_family` in lazily — it reads a file when a filter needs the
-answer. That is right for an app, and it leaves the column nearly empty: 7 of
-27,652 FBX files at the time of writing. `search_assets type=character` and
-`find_animations rig=...` lean on it, and `catalog_stats` says so.
+answer. That is right for an app, and it leaves the column nearly empty, which
+is what `search_assets type=character` and `find_animations rig=...` lean on.
+Every rescan empties it again, and `catalog_stats` says which state it is in.
 
-`backfill_rigs.py` fills it in one pass, about a minute over the whole library.
-**Close Atlas first** — it writes to the database Atlas owns.
+`backfill_rigs.py` fills it in one pass, a few minutes over the whole library
+with twelve workers. Run over all 34,801 FBX files it read every one and found
+2,019 on a recognised rig — 1,204 sidekick, 474 polygon, 341 unreal — with
+32,782 static meshes carrying no rig at all, which is what most of a prop
+library is. **Close Atlas first** — it writes to the database Atlas owns.
 
 ```bash
 python -I work/atlas_mcp/backfill_rigs.py --dry-run
@@ -330,29 +333,68 @@ headers, import libraries and test data, and only the DLL would ship.
 
 ## Running the tagging pass
 
-Nothing can be ranked by appearance until something has looked at it. The pass
-renders each model through Atlas's own renderer and embeds the picture:
+Nothing can be ranked by appearance until something has looked at it. There
+are two passes, over one store.
+
+**Models** are rendered through Atlas's own renderer and the picture is
+embedded:
 
 ```bash
 python -P work/atlas_mcp/tag_assets.py --pack POLYGON_Town --limit 200
 ```
 
-**Atlas has to be running** — the renderer being used is its own, deliberately,
-so the picture being embedded is the picture the app shows you. The script
-checks by probing the bridge port, not by looking for `atlas_bridge.json`,
-which outlives the process.
+**Atlas has to be running** for that one — the renderer being used is its own,
+deliberately, so the picture being embedded is the picture the app shows you.
+The script checks by probing the bridge port, not by looking for
+`atlas_bridge.json`, which outlives the process.
+
+**Images** need no renderer, because the file already is the picture, so this
+one runs with Atlas closed:
+
+```bash
+python -I work/atlas_mcp/tag_images.py --pack POLYGON_Town
+```
+
+Both are resumable, sliceable the same way, and write through the same worker,
+so they cannot disagree about what is done.
 
 ### What it costs
 
-The render is the whole job. Measured on this library:
+For models the render is the whole job. Measured on this library:
 
 | | |
 | --- | --- |
 | render, walking one archive in order | **972 ms** median |
 | render, jumping between archives | 1,570 ms median |
 | embed, batches of eight | **9 ms** per image |
-| distinct models to do | **32,296** |
-| the whole library, once | **about 8.7 hours** |
+| distinct models to do | **31,495** |
+| the completed pass | **12.9 h** of work over 17.3 h |
+
+That pass is **done**: 31,491 embedded, and the four that are not are an OBJ
+with no geometry and three animation-only FBX files.
+
+For images the decode is the job, and the model is a third of it:
+
+| | |
+| --- | --- |
+| decode a 2048x2048 PNG | **95 ms** |
+| prepare it for the model (composite, resize) | ~190 ms more |
+| embed | 9 ms |
+| distinct images to do | **32,088** |
+| measured rate, four threads | **3 to 5 an second** |
+
+`_pixels` composites and converts at full resolution before the resize throws
+almost all of it away, which is why preparing costs twice the decode. It is
+left alone deliberately: the 31,491 model vectors were prepared that way, and
+a vector prepared differently cannot be ranked against them. What is
+parallelised instead is the batch, which does not change a pixel.
+
+2,898 images are excluded: a Unity project's `PackageCache` and
+`Documentation~` folders are in the catalog because the scan walked the whole
+project, and they are not assets. The first texture query run against the
+store answered with three render-pipeline documentation figures and two
+film-grain overlays, because a photograph of a scuffed floor beats a tiling
+texture of one at looking like a scuffed floor.
 
 So it is an overnight job, and three things follow:
 
@@ -382,6 +424,11 @@ checks both towers load. Over MCP, `find_similar` is the tool:
 
 - `text="a grungy metal barrel"` ranks by appearance against words.
 - `like_path=...` ranks by appearance against another asset.
+- `kind=model` ranks only pictures drawn from models, `kind=image` only the
+  texture, atlas and sprite files themselves. A material lives in the texture
+  and a shape in the model, so asking for one keeps the other out of the way.
+- `folder=` and `pack=` narrow it, which matters most for images: 28,490 of
+  the 34,986 are one icon pack.
 
 Read the order, never the magnitude. Text-to-image cosines land around 0.05 to
 0.18 and image-to-image around 0.9 — the same "closest thing there is", an
@@ -391,6 +438,24 @@ every answer for the other.
 
 Only embedded assets can be returned, and the tool says how many it searched.
 That number is the real limit on its answer.
+
+### What a search costs
+
+The server keeps one `atlas_embed.py --serve` child alive and asks it, rather
+than starting one per question. The text tower is a 283 MB int8 file and
+building a session over it takes about 1.6 s, which a process per query paid
+every time:
+
+| | |
+| --- | --- |
+| first question of a session | **7.7 s** (the model loads) |
+| every question after it | **390 ms** |
+| before, every question | 5 to 11 s |
+
+The child notices rows that appeared since it last answered, so a search run
+during a tagging pass stays current — two consecutive questions reported
+35,779 and then 35,819 vectors while the image pass was running. It is
+replaced if it dies, and nothing but the first question pays for the model.
 
 ## Tests
 

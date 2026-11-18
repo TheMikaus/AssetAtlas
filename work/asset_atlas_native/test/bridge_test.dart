@@ -134,6 +134,139 @@ void main() {
     });
   });
 
+  /// The exact lookup used to be a walk of the whole catalog, normalizing
+  /// every path on the way past, and it ran on every MCP call that names an
+  /// asset. These hold the index to the walk's answer rather than to its
+  /// implementation, which is why the walk is still there to compare against.
+  group('bridgeFindAsset answers the same way indexed as it did by scan', () {
+    List<AssetItem> catalogWith(List<AssetItem> extra) => [
+      _asset(r'C:\library\CityPack\SM_Door_01.fbx'),
+      _asset(r'C:\library\OfficePack\SM_Door_01.fbx'),
+      _asset(r'C:\library\CityPack\SM_Wall_01.fbx'),
+      ...extra,
+    ];
+
+    void bothAgree(String needle, List<AssetItem> assets) {
+      final scanned = bridgeFindAsset(needle, assets, byScan: true);
+      final indexed = bridgeFindAsset(needle, assets);
+      expect(
+        indexed.path,
+        scanned.path,
+        reason: 'the index answered $needle differently from the walk',
+      );
+      expect(indexed.id, scanned.id);
+    }
+
+    test('on a full path', () {
+      bothAgree(r'C:\library\CityPack\SM_Door_01.fbx', catalogWith(const []));
+    });
+
+    test('on a path spelled with the other separator', () {
+      bothAgree('C:/library/CityPack/SM_Door_01.fbx', catalogWith(const []));
+    });
+
+    test('on a path in the wrong case', () {
+      bothAgree(r'c:\LIBRARY\citypack\sm_door_01.FBX', catalogWith(const []));
+    });
+
+    test('on an asset id', () {
+      bothAgree(
+        r'test:C:\library\CityPack\SM_Wall_01.fbx',
+        catalogWith(const []),
+      );
+    });
+
+    test('on a path ending, which neither indexes', () {
+      bothAgree(r'OfficePack\SM_Door_01.fbx', catalogWith(const []));
+    });
+
+    test('on a bare name only one file has', () {
+      bothAgree('SM_Wall_01.fbx', catalogWith(const []));
+    });
+
+    test('when two assets share a path, the earlier one wins both ways', () {
+      // The catalog can hold the same path twice -- a rescan mid-flight, or
+      // nested source roots -- and the walk returned the first.
+      final twice = catalogWith([
+        _asset(r'C:\library\CityPack\SM_Door_01.fbx', pack: 'Duplicate'),
+      ]);
+      bothAgree(r'C:\library\CityPack\SM_Door_01.fbx', twice);
+      expect(
+        bridgeFindAsset(
+          r'C:\library\CityPack\SM_Door_01.fbx',
+          twice,
+        ).sourceName,
+        'CityPack',
+      );
+    });
+
+    test('an id that is also another asset\'s path takes the earlier', () {
+      // The case the position in the index exists for. The walk checked the
+      // path before the id *within* one asset, but returned the first asset
+      // matching either way -- so an id on an earlier asset beats a path on
+      // a later one, and two separate maps would have got this backwards.
+      final collides = [
+        _asset(r'C:\library\CityPack\SM_Odd_01.fbx', pack: 'First'),
+        _asset(r'C:\library\CityPack\SM_Other_01.fbx', pack: 'Second'),
+      ];
+      // The first asset's id is literally the second asset's path.
+      final shadowing = [
+        AssetItem(
+          id: r'C:\library\CityPack\SM_Other_01.fbx',
+          name: 'SM_Odd_01.fbx',
+          path: r'C:\library\CityPack\SM_Odd_01.fbx',
+          relativePath: 'SM_Odd_01.fbx',
+          sourceRoot: r'C:\library',
+          sourceName: 'First',
+          ext: 'fbx',
+          type: 'model',
+          size: 1,
+          modified: DateTime.fromMillisecondsSinceEpoch(0),
+          tags: const [],
+        ),
+        collides[1],
+      ];
+      bothAgree(r'C:\library\CityPack\SM_Other_01.fbx', shadowing);
+      expect(
+        bridgeFindAsset(
+          r'C:\library\CityPack\SM_Other_01.fbx',
+          shadowing,
+        ).sourceName,
+        'First',
+      );
+    });
+
+    test('both refuse to choose between two files of the same name', () {
+      for (final byScan in [true, false]) {
+        expect(
+          () => bridgeFindAsset(
+            'SM_Door_01.fbx',
+            catalogWith(const []),
+            byScan: byScan,
+          ),
+          throwsA(isA<BridgeRequestException>()),
+          reason: 'byScan: $byScan',
+        );
+      }
+    });
+
+    test('the index notices the catalog being replaced', () {
+      // It is cached on the identity of the list it was built from, so a
+      // rescan that hands over a new list must not be answered out of the
+      // old one.
+      final before = catalogWith(const []);
+      expect(bridgeFindAsset('SM_Wall_01.fbx', before).sourceName, 'CityPack');
+      final after = [
+        _asset(r'C:\library\NewPack\SM_Wall_01.fbx', pack: 'NewPack'),
+      ];
+      expect(bridgeFindAsset('SM_Wall_01.fbx', after).sourceName, 'NewPack');
+      expect(
+        () => bridgeFindAsset(r'C:\library\CityPack\SM_Door_01.fbx', after),
+        throwsA(isA<BridgeRequestException>()),
+      );
+    });
+  });
+
   group('the bridge server', () {
     late Directory temp;
     late int port;

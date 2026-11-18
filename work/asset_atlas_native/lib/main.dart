@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.38';
+const appVersion = '1.10.39';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -16235,7 +16235,37 @@ Object? _jsonNumber(double value) => value.isFinite ? value : null;
 /// Exact path first, then a path ending, then a unique name. A name that
 /// matches several files is an error rather than a guess -- picking the first
 /// of eleven `SM_Door_01.fbx` would answer confidently about the wrong file.
-AssetItem bridgeFindAsset(String? needle, List<AssetItem> assets) {
+int? _catalogByIdIdentity;
+Map<String, AssetItem>? _catalogByIdCache;
+
+/// The catalog keyed on asset id.
+///
+/// [bridgeFindAsset] accepts an id as well as a path, and the path half is
+/// already answered by [_catalogByNormalizedPath] -- which the render path
+/// builds anyway, so during a tagging pass this is the only new map. Keeping
+/// a second copy of the normalized paths here would have cost another 20 MB
+/// and another half-second to build, to answer a question already answered.
+///
+/// No normalizing: an id is compared verbatim, because that is what the walk
+/// this replaced did.
+Map<String, AssetItem> _catalogById(List<AssetItem> assets) {
+  final identity = identityHashCode(assets) ^ assets.length;
+  final cached = _catalogByIdCache;
+  if (cached != null && _catalogByIdIdentity == identity) return cached;
+  final byId = <String, AssetItem>{};
+  for (final asset in assets) {
+    byId.putIfAbsent(asset.id, () => asset);
+  }
+  _catalogByIdIdentity = identity;
+  _catalogByIdCache = byId;
+  return byId;
+}
+
+AssetItem bridgeFindAsset(
+  String? needle,
+  List<AssetItem> assets, {
+  bool byScan = false,
+}) {
   final wanted = (needle ?? '').trim();
   if (wanted.isEmpty) {
     throw const BridgeRequestException('No path given.');
@@ -16247,9 +16277,29 @@ AssetItem bridgeFindAsset(String? needle, List<AssetItem> assets) {
   }
 
   final key = normalizePathKey(wanted);
-  for (final asset in assets) {
-    if (normalizePathKey(asset.path) == key) return asset;
-    if (asset.id == wanted) return asset;
+  if (byScan) {
+    // The walk the index replaced, kept so the two can be compared: a test
+    // holds them to the same answer and a benchmark to the same question.
+    for (final asset in assets) {
+      if (normalizePathKey(asset.path) == key) return asset;
+      if (asset.id == wanted) return asset;
+    }
+  } else {
+    // Two lookups because the loop asked two different questions: the path
+    // compared normalized, the id verbatim.
+    final byPath = _catalogByNormalizedPath(assets)[key];
+    final byId = _catalogById(assets)[wanted];
+    if (byPath != null && byId != null && !identical(byPath, byId)) {
+      // A needle that is one asset's id and a *different* asset's path. The
+      // walk returned whichever of them came first in the catalog, and two
+      // maps cannot say which that is -- so this one case pays for a walk,
+      // which is right for something that takes an id shaped like a path.
+      for (final asset in assets) {
+        if (identical(asset, byPath) || identical(asset, byId)) return asset;
+      }
+    }
+    final either = byPath ?? byId;
+    if (either != null) return either;
   }
 
   final suffixed = <AssetItem>[];

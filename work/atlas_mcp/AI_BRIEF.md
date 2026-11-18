@@ -5,7 +5,7 @@ for whoever maintains Atlas — everything here is a fact about using the
 library, not about the code. `README.md` is the maintainer's document.
 
 If the model speaks MCP, it does not need most of this: it will read the
-server's own `instructions`, 14 tool descriptions and 6 prompts on connect,
+server's own `instructions`, 15 tool descriptions and 6 prompts on connect,
 which is about 3,250 tokens and always current. This file exists for a model
 that cannot speak MCP, and for briefing a person.
 
@@ -149,7 +149,7 @@ Atlas is open:
 | `find_animations` | clips, optionally matched to a character's rig. |
 | `find_attachments` | helmets, hair, capes and other kit for a character. |
 | `get_texture` | a texture image. |
-| `find_similar` | ranks assets by how they **look**. The only one that can. |
+| `find_similar` | ranks assets by how they **look**. The only one that can. `kind=image` for a material, `kind=model` for a shape. |
 | `find_duplicates` | redundant copies and the space they cost. |
 | `export_assets` | writes assets out of their archives into a folder. |
 
@@ -210,17 +210,23 @@ file over what a name suggests. The *nouns* are reliable — `Barrel`, `Helmet`,
 of 221,183 names; `gray` matches 0. So `search_assets` cannot answer "find me
 something grungy", and asking it to returns nothing or a handful of accidents.
 
-**Use `find_similar` for appearance.** It embeds a rendered picture of each
-model and ranks them against your words, so an adjective nobody indexed still
-works. Two things about it:
+**Use `find_similar` for appearance.** It ranks pictures against your words,
+so an adjective nobody indexed still works. Four things about it:
 
-- It only sees assets that have been **rendered and embedded**. That pass is
-  about 8.7 hours of background work for the whole library and is run a slice
-  at a time, so coverage is partial — the tool says how many vectors it
-  searched, and that number is the real limit on its answer.
+- **Ask for one kind.** `kind=model` ranks pictures *drawn from* models and
+  answers about shape. `kind=image` ranks the texture, atlas and sprite files
+  themselves and answers about material — "scuffed dark metal", "rough bare
+  brickwork". A shape question asked of both competes with whatever texture
+  suits the words, and the other way round. The default is both.
+- **Narrow it with `folder` or `pack`.** 28,490 of this library's 34,986
+  images are one icon pack, so an unnarrowed material question is mostly
+  answered with icons. Dressing a scene from one pack, pass that pack.
 - The scores are cosines from a sigmoid-trained model. Real matches sit around
-  **0.05 to 0.18**. Read the order; a score of 0.12 is not a bad match and
-  thresholding these numbers will throw away the right answer.
+  **0.05 to 0.18** against words, and around **0.9** against another picture.
+  Read the order; a score of 0.12 is not a bad match, and thresholding these
+  numbers will throw away the right answer.
+- It only sees what has been embedded, and says how many vectors it searched.
+  That number is the real limit on its answer.
 
 For *what a thing is*, keep using `search_assets` — the nouns in these names
 are reliable.
@@ -264,13 +270,16 @@ clip plays and the limbs sit wrong until something retargets it.
 
 Not bugs in the tools; they change what the answers are worth.
 
-- **`rig_family` and `model_kind` are filled in for 0 of 34,801 FBX files.**
-  Atlas fills both lazily, as filters ask, and the last rescan emptied them.
-  So `search_assets type="character"`, `type="mesh"` and `find_animations`'
-  rig matching come back **empty** — not thin, empty. Until
-  `backfill_rigs.py` has been run, inspect candidates individually:
-  `get_asset` reads the rig straight out of the file, which is the authority
-  anyway.
+- **`rig_family` and `model_kind` are filled in for all 34,801 FBX files**,
+  as of 2026-11-18. `search_assets type="character"` answers with 1,021
+  distinct characters and `find_animations` matches on rig over 787 clips.
+  Of the 34,801, 2,019 are on a recognised rig — 1,204 sidekick, 474
+  polygon, 341 unreal — and the other 32,782 are static meshes with no rig,
+  which is what most of a prop library is.
+
+  Atlas fills both lazily as filters ask, so a rescan empties them again and
+  `backfill_rigs.py` has to be re-run. `catalog_stats` says which state it
+  is in; believe it over this file.
 
 - **`type="animation"` is the exception, and does work.** Where `model_kind`
   is unset the folder decides: an FBX under a directory named `Animations`,
@@ -282,10 +291,14 @@ Not bugs in the tools; they change what the answers are worth.
   over it, and it says nothing about bones, so `rig_compatibility` still
   needs a real probe and will tell you when it has not got one.
 
-- **Visual coverage is partial and will be for a while.** `find_similar` can
-  only rank what has been rendered and embedded, and the full pass is about
-  8.7 hours of background work run a slice at a time. The tool reports how
-  many vectors it searched; treat that as the real scope of its answer.
+- **Visual coverage of models is complete.** All 31,491 distinct renderable
+  models are embedded. Four are not and never will be: three animation-only
+  FBX files the catalog classified as models, and one OBJ with no geometry.
+- **Some rows should not be in the store.** 2,091 images under a Unity
+  project's package cache were embedded before there was a rule against
+  them — documentation screenshots, not assets. The search drops them, so
+  they cannot answer, but the vector file is append-only and still holds
+  them.
 
 `catalog_stats` reports the current state of these.
 

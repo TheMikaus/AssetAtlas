@@ -10,6 +10,7 @@ and find out that the rest is sound.
 Run: python -m unittest test_tagging
 """
 
+import base64
 import io
 import json
 import os
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -26,6 +28,7 @@ if HERE not in sys.path:
 import atlas_embed
 import embedding_store
 import tag_assets
+import tag_images
 import tagging
 
 
@@ -1200,6 +1203,20 @@ class FindSimilarTest(unittest.TestCase):
         self.assertIn("+1 copy elsewhere", body)
 
     @needs_numpy
+    def test_an_answer_can_be_asked_the_next_question_with(self):
+        # It printed the relative path, which spells an archive entry
+        # `pack.zip!/entry` where every tool that takes a path wants
+        # `zip:Z:\...\pack.zip::entry`. So inspect_model answered "nothing in
+        # the catalog matches" to a result find_similar had just produced,
+        # and an agent chaining the two hit a dead end.
+        self.build_store()
+        body = self.body_of(self.atlas_mcp.tool_find_similar(
+            {"like_path": self.path_of("id:far", "SM_Cloud.fbx"),
+             "limit": 10}))
+        self.assertIn(
+            self.path_of("id:near", "SM_Barrel.fbx"), body,
+            "a result has to carry the path the other tools take")
+
     def test_it_says_how_much_was_searched_and_not_a_fixed_total(self):
         # A baked denominator went stale the moment the library was
         # rescanned, from 73,865 rows to 221,183.
@@ -1279,6 +1296,735 @@ class CommandLineTest(unittest.TestCase):
         with self.assertRaises(atlas_mcp.AtlasError) as caught:
             atlas_mcp.run_visual_search(phrase="grungy")
         self.assertIn("tag_assets.py", str(caught.exception))
+
+
+class StoreRefreshTest(unittest.TestCase):
+    """Seeing rows another process published after this store opened.
+
+    `open` reads the count once, which is right for a pass that owns the
+    file and wrong for a server that outlives one. Without this a search
+    process held for an hour during a tagging pass keeps answering out of
+    the library as it was when it started.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp(prefix="atlas-refresh-")
+        self.vectors = os.path.join(self.directory, "v.f32")
+        self.index = os.path.join(self.directory, "i.sqlite")
+        writer = embedding_store.EmbeddingStore.create(
+            self.vectors, self.index, dims=4, model_id="test-model")
+        writer.append([("first", [1.0, 0.0, 0.0, 0.0], "render", 1)])
+        writer.close()
+
+    def reader(self):
+        return embedding_store.EmbeddingStore.open(
+            self.vectors, self.index, expect_model_id="test-model")
+
+    def append(self, asset_id):
+        writer = embedding_store.EmbeddingStore.open(
+            self.vectors, self.index, expect_model_id="test-model")
+        writer.append([(asset_id, [0.0, 1.0, 0.0, 0.0], "image", 2)])
+        writer.close()
+
+    def test_a_reader_does_not_see_a_later_row_until_it_refreshes(self):
+        reader = self.reader()
+        try:
+            self.assertEqual(reader.count, 1)
+            self.append("second")
+            self.assertEqual(reader.count, 1)
+            self.assertEqual(reader.refresh(), 1)
+            self.assertEqual(reader.count, 2)
+        finally:
+            reader.close()
+
+    def test_refreshing_with_nothing_new_gains_nothing(self):
+        reader = self.reader()
+        try:
+            self.assertEqual(reader.refresh(), 0)
+            self.assertEqual(reader.count, 1)
+        finally:
+            reader.close()
+
+    def test_the_new_row_can_be_found_and_read(self):
+        # The count is not enough: the index has to be readable too, or the
+        # row is a vector nothing can name.
+        reader = self.reader()
+        try:
+            self.append("second")
+            reader.refresh()
+            row = reader.row_of("second")
+            self.assertIsNotNone(row)
+            self.assertEqual(list(reader.vector(row)), [0.0, 1.0, 0.0, 0.0])
+        finally:
+            reader.close()
+
+    def test_the_matrix_grows_with_it(self):
+        # The mapping covers the length the file had when it was made, so a
+        # refresh has to drop it or the new rows are not in what is searched.
+        reader = self.reader()
+        try:
+            first = len(bytes(reader.matrix()))
+            self.append("second")
+            reader.refresh()
+            self.assertGreater(len(bytes(reader.matrix())), first)
+        finally:
+            reader.close()
+
+    def test_a_store_in_another_model_space_stays_empty(self):
+        reader = embedding_store.EmbeddingStore.open(
+            self.vectors, self.index, expect_model_id="a-different-model")
+        try:
+            self.append("second")
+            self.assertEqual(reader.refresh(), 0)
+            self.assertEqual(reader.count, 0)
+        finally:
+            reader.close()
+
+    def test_unmapping_leaves_the_store_usable(self):
+        reader = self.reader()
+        try:
+            self.assertEqual(len(bytes(reader.matrix())), 16)
+            reader.unmap()
+            self.assertEqual(len(bytes(reader.matrix())), 16)
+        finally:
+            reader.close()
+
+
+class SourceFilterTest(unittest.TestCase):
+    """Ranking one kind of vector only.
+
+    Models are ranked from a picture drawn of them and images from the file
+    itself. Both in one store is what lets a search ask about a material and
+    a shape in the same breath; asked about one, the other is noise.
+    """
+
+    VECTORS = (
+        ("model:a", [1.0, 0.0, 0.0, 0.0], "render"),
+        ("image:a", [0.99, 0.01, 0.0, 0.0], "image"),
+        ("model:b", [0.0, 1.0, 0.0, 0.0], "render"),
+        ("image:b", [0.0, 0.99, 0.01, 0.0], "image"),
+    )
+
+    def setUp(self):
+        if _numpy is None:
+            self.skipTest("numpy is not installed")
+        self.directory = tempfile.mkdtemp(prefix="atlas-source-filter-")
+        self.store = embedding_store.EmbeddingStore.create(
+            os.path.join(self.directory, "v.f32"),
+            os.path.join(self.directory, "i.sqlite"),
+            dims=4, model_id=atlas_embed.MODEL_ID)
+        self.store.append([(asset_id, vector, source, 0)
+                           for asset_id, vector, source in self.VECTORS])
+
+    def tearDown(self):
+        self.store.close()
+
+    def search(self, source=None, top=10):
+        # like_asset_id, not a phrase: the text tower would have to load, and
+        # what is under test is the filter rather than the embedding.
+        return atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="model:a", top=top, source=source)
+
+    def test_without_a_filter_both_kinds_can_answer(self):
+        found = [item["asset_id"] for item in self.search()["results"]]
+        self.assertIn("image:a", found)
+        self.assertIn("model:b", found)
+
+    def test_asking_for_images_returns_no_models(self):
+        found = [item["asset_id"] for item in
+                 self.search(source="image")["results"]]
+        self.assertEqual(sorted(found), ["image:a", "image:b"])
+
+    def test_asking_for_renders_returns_no_images(self):
+        found = [item["asset_id"] for item in
+                 self.search(source="render")["results"]]
+        # model:a is the query, so it is not its own answer.
+        self.assertEqual(found, ["model:b"])
+
+    def test_the_count_reported_is_what_could_have_answered(self):
+        # Saying it searched the whole store when a filter excluded most of
+        # it overstates the search, and that number is how a consumer judges
+        # whether the answer is worth anything.
+        filtered = self.search(source="image")
+        self.assertEqual(filtered["searched"], 2)
+        self.assertEqual(filtered["held"], 4)
+        self.assertEqual(self.search()["searched"], 4)
+
+    def test_a_filter_that_excludes_everything_says_so_rather_than_guessing(
+            self):
+        store = embedding_store.EmbeddingStore.create(
+            os.path.join(self.directory, "only.f32"),
+            os.path.join(self.directory, "only.sqlite"),
+            dims=4, model_id=atlas_embed.MODEL_ID)
+        try:
+            store.append([("model:solo", [1.0, 0.0, 0.0, 0.0], "render", 0),
+                          ("model:other", [0.0, 1.0, 0.0, 0.0], "render", 0)])
+            reply = atlas_embed.search_store(
+                atlas_embed.Embedder(threads=1), store,
+                like_asset_id="model:solo", top=10, source="image")
+            self.assertEqual(reply["results"], [])
+            self.assertEqual(reply["searched"], 0)
+            self.assertEqual(reply["held"], 2)
+        finally:
+            store.close()
+
+    def test_a_narrowed_search_ranks_only_those_assets(self):
+        reply = atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="model:a", top=10, only_ids={"image:b"})
+        self.assertEqual([item["asset_id"] for item in reply["results"]],
+                         ["image:b"])
+        self.assertEqual(reply["searched"], 1)
+        self.assertEqual(reply["held"], 4)
+
+    def test_the_count_describes_the_corpus_not_the_answer(self):
+        # Whichever asset is named, the number of vectors that were looked
+        # through is the same; a count that moved with the query would be a
+        # worse answer to "how much was searched".
+        first = self.search(source="image")["searched"]
+        other = atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="image:a", top=10, source="image")["searched"]
+        self.assertEqual(first, other)
+
+    def test_narrowing_and_the_kind_filter_both_apply(self):
+        reply = atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="model:a", top=10, source="render",
+            only_ids={"image:b", "model:b"})
+        self.assertEqual([item["asset_id"] for item in reply["results"]],
+                         ["model:b"])
+
+    def test_a_row_that_should_not_be_in_the_store_cannot_answer(self):
+        # The vector file is append-only, so rows embedded before a rule
+        # existed to keep them out cannot be taken back; this is what stops
+        # them answering.
+        reply = atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="model:a", top=10, exclude_ids={"image:a"})
+        found = [item["asset_id"] for item in reply["results"]]
+        self.assertNotIn("image:a", found)
+        # Three left in scope, not two: the asset asked about is still part
+        # of what was looked through, it just cannot be its own answer.
+        self.assertEqual(reply["searched"], 3)
+        self.assertEqual(reply["held"], 4)
+
+    def test_an_exclusion_beats_an_explicit_narrowing(self):
+        reply = atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="model:a", top=10, only_ids={"image:a"},
+            exclude_ids={"image:a"})
+        self.assertEqual(reply["results"], [])
+
+    def test_narrowing_to_nothing_embedded_returns_nothing(self):
+        reply = atlas_embed.search_store(
+            atlas_embed.Embedder(threads=1), self.store,
+            like_asset_id="model:a", top=10, only_ids={"not:embedded"})
+        self.assertEqual(reply["results"], [])
+        self.assertEqual(reply["searched"], 0)
+
+    def test_the_filter_does_not_cost_the_results_it_should_have_found(self):
+        # Taking the top `top` first and filtering after is how a filtered
+        # search comes back short: here the two best rows are both renders,
+        # so a top-1 slice would leave an image search empty.
+        reply = self.search(source="image", top=1)
+        self.assertEqual(len(reply["results"]), 1)
+        self.assertEqual(reply["results"][0]["asset_id"], "image:a")
+
+
+class EmbedWorkerTest(unittest.TestCase):
+    """The child that stays alive, and what happens when it does not.
+
+    `ping` is used throughout because it is the one operation that touches
+    neither the model nor the store, so this tests the plumbing rather than
+    the 283 MB file behind it.
+    """
+
+    def setUp(self):
+        import atlas_mcp
+        self.atlas_mcp = atlas_mcp
+        self.directory = tempfile.mkdtemp(prefix="atlas-worker-")
+        self.worker = atlas_mcp.EmbedWorker(
+            os.path.join(self.directory, "v.f32"),
+            os.path.join(self.directory, "i.sqlite"))
+
+    def tearDown(self):
+        self.worker.close()
+
+    def test_it_answers_at_all(self):
+        reply = self.worker.ask(op="ping")
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["model_id"], atlas_embed.MODEL_ID)
+
+    def test_two_questions_are_one_child(self):
+        # The whole point: the text tower costs about 1.6 s to construct, and
+        # a process per question paid it every time.
+        self.worker.ask(op="ping")
+        self.worker.ask(op="ping")
+        self.assertEqual(self.worker.starts, 1)
+
+    def test_a_child_that_died_while_nobody_looked_is_replaced(self):
+        self.worker.ask(op="ping")
+        self.worker.process.kill()
+        self.worker.process.wait(timeout=10)
+        reply = self.worker.ask(op="ping")
+        self.assertTrue(reply["ok"])
+        self.assertEqual(self.worker.starts, 2)
+
+    def test_closing_twice_is_not_an_error(self):
+        self.worker.ask(op="ping")
+        self.worker.close()
+        self.worker.close()
+
+    def test_a_refusal_comes_back_as_an_error_not_a_reply(self):
+        with self.assertRaises(self.atlas_mcp.AtlasError):
+            self.worker.ask(op="no_such_operation")
+
+    def test_a_question_after_closing_starts_another_child(self):
+        self.worker.ask(op="ping")
+        self.worker.close()
+        self.assertTrue(self.worker.ask(op="ping")["ok"])
+        self.assertEqual(self.worker.starts, 2)
+
+    def test_an_unstartable_embedder_is_explained(self):
+        broken = self.atlas_mcp.EmbedWorker("nowhere.f32", "nowhere.sqlite")
+        previous = self.atlas_mcp.EMBED_SCRIPT
+        self.atlas_mcp.EMBED_SCRIPT = os.path.join(
+            self.directory, "not_a_script.py")
+        try:
+            with self.assertRaises(self.atlas_mcp.AtlasError) as caught:
+                broken.ask(op="ping")
+            # The child's own words, not a bare "it failed": a missing model
+            # file and a missing interpreter look identical otherwise.
+            self.assertIn("error output", str(caught.exception))
+        finally:
+            self.atlas_mcp.EMBED_SCRIPT = previous
+            broken.close()
+
+
+class FindSimilarKindTest(unittest.TestCase):
+    """The consumer-facing word for a kind, and what it refuses."""
+
+    def setUp(self):
+        import atlas_mcp
+        self.atlas_mcp = atlas_mcp
+
+    def test_the_three_kinds_map_onto_what_the_store_records(self):
+        self.assertEqual(self.atlas_mcp.SOURCE_BY_KIND["model"], "render")
+        self.assertEqual(self.atlas_mcp.SOURCE_BY_KIND["image"], "image")
+        self.assertIsNone(self.atlas_mcp.SOURCE_BY_KIND["any"])
+
+    def test_an_unknown_kind_is_refused_before_anything_is_loaded(self):
+        with self.assertRaises(self.atlas_mcp.AtlasError) as caught:
+            self.atlas_mcp.tool_find_similar(
+                {"text": "a barrel", "kind": "sounds"})
+        self.assertIn("kind is sounds", str(caught.exception))
+
+    def test_the_schema_offers_the_kinds_so_a_client_can_discover_them(self):
+        found = [tool for tool in self.atlas_mcp.TOOLS
+                 if tool["name"] == "find_similar"]
+        self.assertEqual(len(found), 1)
+        kind = found[0]["inputSchema"]["properties"]["kind"]
+        self.assertEqual(sorted(kind["enum"]), ["any", "image", "model"])
+
+
+class ImageCandidateTest(unittest.TestCase):
+    """The second queue: images, which are embedded as they stand.
+
+    The grouping and the ordering are deliberately the same code as the model
+    queue -- they are about duplicate files and archive locality, not about
+    geometry -- so what is tested here is only what differs.
+    """
+
+    SCHEMA = CandidateQueryTest.SCHEMA
+
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute(self.SCHEMA)
+
+    def tearDown(self):
+        self.connection.close()
+
+    def add(self, asset_id, name, path, ext, asset_type, size=100,
+            ignored=0, model_kind=None):
+        self.connection.execute(
+            "INSERT INTO catalog_assets (id, name, path, relative_path, ext,"
+            " type, size, ignored, model_kind, tags_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,'[]')",
+            (asset_id, name, path, path, ext, asset_type, size, ignored,
+             model_kind))
+
+    def ids(self, **kwargs):
+        return [row["id"] for row in
+                tagging.candidates(self.connection, **kwargs)]
+
+    def test_the_two_queues_do_not_see_each_other(self):
+        self.add("m", "Hut.fbx", "zip:p.zip::Hut.fbx", "fbx", "model")
+        self.add("t", "Hut_BC.png", "zip:p.zip::Hut_BC.png", "png", "image")
+        self.assertEqual(self.ids(kind="model"), ["m"])
+        self.assertEqual(self.ids(kind="image"), ["t"])
+
+    def test_model_is_what_a_caller_that_says_nothing_gets(self):
+        # Every existing caller -- Atlas's queue included -- passes no kind.
+        self.add("m", "Hut.fbx", "zip:p.zip::Hut.fbx", "fbx", "model")
+        self.add("t", "Hut_BC.png", "zip:p.zip::Hut_BC.png", "png", "image")
+        self.assertEqual(self.ids(), ["m"])
+
+    def test_an_unknown_kind_is_refused_rather_than_guessed(self):
+        with self.assertRaises(ValueError):
+            tagging.candidates(self.connection, kind="sounds")
+
+    def test_every_image_extension_in_the_library_is_selected(self):
+        for index, ext in enumerate(("png", "jpg", "gif", "bmp", "psd")):
+            self.add("i%d" % index, "T.%s" % ext, "zip:p.zip::T.%s" % ext,
+                     ext, "image")
+        self.assertEqual(len(self.ids(kind="image")), 5)
+
+    def test_a_model_is_not_dragged_in_by_its_extension(self):
+        # An FBX row mislabelled type=image must still not reach the image
+        # queue, because the extension is what decides whether PIL can read
+        # it and nothing else.
+        self.add("m", "Hut.fbx", "zip:p.zip::Hut.fbx", "fbx", "image")
+        self.assertEqual(self.ids(kind="image"), [])
+
+    def test_ignored_images_are_left_alone(self):
+        self.add("t", "T.png", "zip:p.zip::T.png", "png", "image",
+                 ignored=1)
+        self.assertEqual(self.ids(kind="image"), [])
+
+    def test_identical_copies_collapse_here_too(self):
+        self.add("a", "T_Wood.png", "zip:p1.zip::T_Wood.png", "png", "image")
+        self.add("b", "T_Wood.png", "zip:p2.zip::T_Wood.png", "png", "image")
+        self.assertEqual(self.ids(kind="image"), ["a"])
+
+    def test_a_package_cache_is_not_an_asset(self):
+        # These are in the catalog because a scan walked a whole Unity
+        # project. The first texture query answered with render-pipeline
+        # documentation figures, which beat a tiling texture at looking like
+        # the thing the texture is of.
+        self.add("t", "T_Wall.png", "zip:p.zip::T_Wall.png", "png", "image")
+        self.connection.execute(
+            "UPDATE catalog_assets SET relative_path = ?"
+            " WHERE id = 't'",
+            ("Future Slums/Library/PackageCache/com.unity.render-pipelines"
+             ".high-definition@10.7.0/Documentation~/Images/T_Wall.png",))
+        self.assertEqual(self.ids(kind="image"), [])
+
+    def test_a_pack_that_merely_says_documentation_is_kept(self):
+        # Narrow on purpose: "Documentation~" with the tilde is Unity's own
+        # convention for an excluded folder, where a pack with a plain
+        # Documentation folder is just a pack.
+        self.add("t", "T_Wall.png", "zip:p.zip::T_Wall.png", "png", "image")
+        self.connection.execute(
+            "UPDATE catalog_assets SET relative_path = ?"
+            " WHERE id = 't'", ("Synty/Documentation/T_Wall.png",))
+        self.assertEqual(self.ids(kind="image"), ["t"])
+
+    def test_a_model_in_a_package_cache_is_still_rendered(self):
+        # The exclusion is about images only: a package cache holds almost no
+        # models, and the few it holds are no worse to look at than any.
+        self.add("m", "Hut.fbx", "zip:p.zip::Hut.fbx", "fbx", "model")
+        self.connection.execute(
+            "UPDATE catalog_assets SET relative_path = ?"
+            " WHERE id = 'm'", ("Thing/Library/PackageCache/x/Hut.fbx",))
+        self.assertEqual(self.ids(kind="model"), ["m"])
+
+    def test_narrowing_a_search_matches_the_same_way_a_pass_does(self):
+        self.add("a", "T_One.png", "zip:POLY_Town.zip::T_One.png", "png",
+                 "image")
+        self.add("b", "T_Two.png", "zip:Other.zip::T_Two.png", "png", "image")
+        self.assertEqual(
+            tagging.asset_ids_matching(self.connection, pack="poly_town"),
+            {"a"})
+        self.assertIsNone(tagging.asset_ids_matching(self.connection))
+
+    def test_an_image_marked_animation_is_still_embedded(self):
+        # The animation rule exists because a clip has no geometry to draw.
+        # An image needs no geometry, so applying it here would drop textures
+        # on a classifier change that has nothing to do with them.
+        self.add("t", "T.png", "zip:p.zip::T.png", "png", "image",
+                 model_kind="animation")
+        self.assertEqual(self.ids(kind="image"), ["t"])
+
+    def test_the_size_comes_back_so_the_cap_can_be_checked_first(self):
+        self.add("t", "T.png", "zip:p.zip::T.png", "png", "image",
+                 size=4096)
+        rows = tagging.candidates(self.connection, kind="image")
+        self.assertEqual(rows[0]["size"], 4096)
+
+    def test_the_work_list_reports_the_size_as_well(self):
+        self.add("t", "T.png", "zip:p.zip::T.png", "png", "image", size=77)
+        directory = tempfile.mkdtemp(prefix="atlas-image-worklist-")
+        store = embedding_store.EmbeddingStore.create(
+            os.path.join(directory, "v.f32"),
+            os.path.join(directory, "i.sqlite"),
+            dims=4, model_id="test-model")
+        try:
+            work = tagging.work_list(store, self.connection, kind="image")
+            self.assertEqual(work.as_dict()["assets"][0]["size"], 77)
+        finally:
+            store.close()
+
+
+class ImageQueueIndependenceTest(unittest.TestCase):
+    """One store, two queues, and no crosstalk between them.
+
+    Models and images share embeddings.f32 and one failure table. A model
+    having a vector must not mark the texture beside it as done, or the pass
+    would quietly skip whatever sits next to finished work.
+    """
+
+    SCHEMA = CandidateQueryTest.SCHEMA
+
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute(self.SCHEMA)
+        self.connection.execute(
+            "INSERT INTO catalog_assets (id, name, path, relative_path, ext,"
+            " type, size, ignored, tags_json)"
+            " VALUES ('m','Hut.fbx','zip:p.zip::Hut.fbx','Hut.fbx','fbx',"
+            "'model',100,0,'[]')")
+        self.connection.execute(
+            "INSERT INTO catalog_assets (id, name, path, relative_path, ext,"
+            " type, size, ignored, tags_json)"
+            " VALUES ('t','Hut_BC.png','zip:p.zip::Hut_BC.png',"
+            "'Hut_BC.png','png','image',100,0,'[]')")
+        self.directory = tempfile.mkdtemp(prefix="atlas-image-queue-")
+        self.store = embedding_store.EmbeddingStore.create(
+            os.path.join(self.directory, "v.f32"),
+            os.path.join(self.directory, "i.sqlite"),
+            dims=4, model_id="test-model")
+
+    def tearDown(self):
+        self.store.close()
+
+    def remaining(self, kind):
+        return [asset["asset_id"] for asset in
+                tagging.work_list(self.store, self.connection,
+                                  kind=kind).as_dict()["assets"]]
+
+    def test_both_start_outstanding(self):
+        self.assertEqual(self.remaining("model"), ["m"])
+        self.assertEqual(self.remaining("image"), ["t"])
+
+    def test_embedding_the_model_leaves_the_texture_to_do(self):
+        self.store.append([("m", [1.0, 0.0, 0.0, 0.0], "render", 1)])
+        self.assertEqual(self.remaining("model"), [])
+        self.assertEqual(self.remaining("image"), ["t"])
+
+    def test_embedding_the_texture_leaves_the_model_to_do(self):
+        self.store.append([("t", [0.0, 1.0, 0.0, 0.0], "image", 1)])
+        self.assertEqual(self.remaining("image"), [])
+        self.assertEqual(self.remaining("model"), ["m"])
+
+    def test_the_source_of_each_vector_is_kept(self):
+        self.store.append([("m", [1.0, 0.0, 0.0, 0.0], "render", 1),
+                           ("t", [0.0, 1.0, 0.0, 0.0], "image", 2)])
+        names = self.store.asset_ids_by_row()
+        sources = self.store.sources_by_row()
+        self.assertEqual(len(names), len(sources))
+        by_asset = dict(zip(names, sources))
+        self.assertEqual(by_asset["m"], "render")
+        self.assertEqual(by_asset["t"], "image")
+
+
+class ImageReaderTest(unittest.TestCase):
+    """Reading the bytes: one archive handle, and the cap checked first."""
+
+    def setUp(self):
+        self.directory = tempfile.mkdtemp(prefix="atlas-image-reader-")
+        self.first = os.path.join(self.directory, "one.zip")
+        self.second = os.path.join(self.directory, "two.zip")
+        with zipfile.ZipFile(self.first, "w") as archive:
+            archive.writestr("a.png", b"first-a")
+            archive.writestr("b.png", b"first-b")
+        with zipfile.ZipFile(self.second, "w") as archive:
+            archive.writestr("c.png", b"second-c")
+        self.reader = tag_images.ArchiveReader()
+
+    def tearDown(self):
+        self.reader.close()
+
+    def entry(self, container, name):
+        return "zip:%s::%s" % (container, name)
+
+    def test_the_bytes_are_the_entry_asked_for(self):
+        self.assertEqual(self.reader.read(self.entry(self.first, "a.png")),
+                         b"first-a")
+        self.assertEqual(self.reader.read(self.entry(self.second, "c.png")),
+                         b"second-c")
+
+    def test_consecutive_entries_reuse_one_handle(self):
+        # Candidates come back in path order, so this is the common case; a
+        # handle per file would re-parse a central directory of tens of
+        # thousands of entries each time.
+        self.reader.read(self.entry(self.first, "a.png"))
+        self.reader.read(self.entry(self.first, "b.png"))
+        self.assertEqual(self.reader.opened, 1)
+
+    def test_a_different_archive_swaps_the_handle(self):
+        self.reader.read(self.entry(self.first, "a.png"))
+        self.reader.read(self.entry(self.second, "c.png"))
+        self.reader.read(self.entry(self.first, "b.png"))
+        self.assertEqual(self.reader.opened, 3)
+
+    def test_a_loose_file_needs_no_archive(self):
+        loose = os.path.join(self.directory, "loose.png")
+        with open(loose, "wb") as handle:
+            handle.write(b"on-disk")
+        self.assertEqual(self.reader.read(loose), b"on-disk")
+        self.assertEqual(self.reader.opened, 0)
+
+    def test_an_oversized_image_is_refused_without_being_read(self):
+        # The point of the cap is not to hold the file in memory, so it has
+        # to be checked from the catalog's size rather than after reading.
+        huge = {"path": self.entry(self.first, "a.png"), "size": 200 * 1024,
+                "asset_id": "x"}
+        with self.assertRaises(RuntimeError) as caught:
+            tag_images.load(self.reader, huge, 100 * 1024)
+        self.assertIn("over the", str(caught.exception))
+        self.assertEqual(self.reader.opened, 0)
+
+    def test_the_cap_can_be_turned_off(self):
+        huge = {"path": self.entry(self.first, "a.png"), "size": 200 * 1024,
+                "asset_id": "x"}
+        self.assertEqual(tag_images.load(self.reader, huge, 0), b"first-a")
+
+    def test_an_image_within_the_cap_is_read(self):
+        asset = {"path": self.entry(self.first, "b.png"), "size": 7,
+                 "asset_id": "b"}
+        self.assertEqual(tag_images.load(self.reader, asset, 100 * 1024),
+                         b"first-b")
+
+    def test_an_empty_file_is_a_failure_not_a_vector(self):
+        with zipfile.ZipFile(self.first, "a") as archive:
+            archive.writestr("empty.png", b"")
+        asset = {"path": self.entry(self.first, "empty.png"), "size": 0,
+                 "asset_id": "e"}
+        with self.assertRaises(RuntimeError):
+            tag_images.load(self.reader, asset, 100 * 1024)
+
+    def test_a_missing_entry_raises_rather_than_returning_nothing(self):
+        asset = {"path": self.entry(self.first, "absent.png"), "size": 10,
+                 "asset_id": "a"}
+        with self.assertRaises(KeyError):
+            tag_images.load(self.reader, asset, 100 * 1024)
+
+
+class PixelBatchTest(unittest.TestCase):
+    """Preparing a batch concurrently must not change a single pixel.
+
+    The store holds 31,491 vectors prepared one image at a time. A vector
+    prepared differently cannot be ranked against them, and the model id in
+    the header would not catch it, because the model would be the same. So
+    this is the test that lets the pool exist.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        if _numpy is None:
+            self.skipTest("numpy is not installed")
+        self.Image = Image
+
+    def pngs(self, count):
+        """Pictures with alpha, since the composite is what the pool runs."""
+        made = []
+        for index in range(count):
+            picture = self.Image.new("RGBA", (40 + index, 32), (0, 0, 0, 0))
+            for x in range(picture.width):
+                for y in range(picture.height):
+                    picture.putpixel(
+                        (x, y),
+                        ((x * 7 + index) % 256, (y * 11) % 256,
+                         (x + y) % 256, (x * 5) % 256))
+            buffer = io.BytesIO()
+            picture.save(buffer, format="PNG")
+            made.append(buffer.getvalue())
+        return made
+
+    def test_the_pool_and_the_loop_agree_exactly(self):
+        images = self.pngs(5)
+        pooled = atlas_embed.Embedder(threads=4)
+        serial = atlas_embed.Embedder(threads=1)
+        one_at_a_time = [serial._pixels(data) for data in images]
+        together = pooled._pixel_batch(images)
+        self.assertEqual(len(together), len(one_at_a_time))
+        for index, (left, right) in enumerate(zip(together, one_at_a_time)):
+            self.assertTrue(
+                _numpy.array_equal(left, right),
+                "image %d differs when prepared in a pool" % index)
+
+    def test_the_order_out_matches_the_order_in(self):
+        # The vectors are zipped back onto the entries by position, so a
+        # reordering here would store every vector under the wrong asset.
+        images = self.pngs(6)
+        embedder = atlas_embed.Embedder(threads=4)
+        together = embedder._pixel_batch(images)
+        for index, prepared in enumerate(together):
+            expected = embedder._pixels(images[index])
+            self.assertTrue(_numpy.array_equal(prepared, expected),
+                            "position %d is not the image sent there" % index)
+
+    def test_one_image_does_not_start_a_pool(self):
+        images = self.pngs(1)
+        embedder = atlas_embed.Embedder(threads=4)
+        self.assertEqual(len(embedder._pixel_batch(images)), 1)
+
+    def test_a_single_threaded_worker_still_works(self):
+        images = self.pngs(3)
+        embedder = atlas_embed.Embedder(threads=1)
+        self.assertEqual(len(embedder._pixel_batch(images)), 3)
+
+    def test_an_empty_batch_asks_the_model_nothing(self):
+        self.assertEqual(atlas_embed.Embedder(threads=4).embed_images([]), [])
+
+
+class ImageHandoverTest(unittest.TestCase):
+    """What the image driver sends the worker."""
+
+    class Recorder:
+        def __init__(self):
+            self.messages = []
+
+        def ask(self, **message):
+            self.messages.append(message)
+            return {"ok": True, "stored": len(message.get("entries") or [])}
+
+    def test_the_vectors_are_labelled_as_images_not_renders(self):
+        # The label is what lets a search ask for one kind only; mislabelled,
+        # a texture would be indistinguishable from a render of a model.
+        recorder = self.Recorder()
+        batch = [({"asset_id": "t", "relative_path": "T.png"}, b"bytes")]
+        tag_images.flush(recorder, batch, io.StringIO())
+        entry = recorder.messages[0]["entries"][0]
+        self.assertEqual(entry["source"], "image")
+        self.assertEqual(entry["asset_id"], "t")
+
+    def test_the_bytes_go_over_as_base64_under_the_image_key(self):
+        recorder = self.Recorder()
+        batch = [({"asset_id": "t", "relative_path": "T.png"}, b"bytes")]
+        tag_images.flush(recorder, batch, io.StringIO())
+        entry = recorder.messages[0]["entries"][0]
+        self.assertEqual(base64.b64decode(entry["image"]), b"bytes")
+
+    def test_a_short_count_is_reported_rather_than_assumed(self):
+        class Partial(self.Recorder):
+            def ask(self, **message):
+                self.messages.append(message)
+                return {"ok": True, "stored": 1}
+
+        recorder = Partial()
+        batch = [({"asset_id": "a", "relative_path": "a.png"}, b"1"),
+                 ({"asset_id": "b", "relative_path": "b.png"}, b"2")]
+        out = io.StringIO()
+        self.assertEqual(tag_images.flush(recorder, batch, out), 1)
+        self.assertIn("kept 1 of 2", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ import json
 import os
 import sys
 import time
+from concurrent import futures
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(HERE, "models", "siglip2-base-patch16-224")
@@ -206,12 +207,37 @@ class Embedder:
         data = (data * _RESCALE - _MEAN) / _STD
         return numpy.transpose(data, (2, 0, 1))
 
+    def _pixel_batch(self, png_list):
+        """`_pixels` for each image, concurrently, in the order given.
+
+        Worth having because of what the images are. A render is 224 px and
+        costs nothing to prepare, but a texture atlas is 2048x2048 or
+        4096x4096, and _pixels composites and converts it at full size
+        before the resize throws almost all of it away: 280 ms for a 2048,
+        of which the decode is only 95 ms. PIL drops the GIL for all of it,
+        so a batch of eight costs about one image's wait instead of eight.
+
+        What it deliberately does not do is change the arithmetic. The
+        31,491 vectors already in the store were prepared one at a time, and
+        a vector computed a different way cannot be ranked against them --
+        the model id in the header would not catch it, because the model is
+        the same. Same code per image, same order out; only the waiting
+        overlaps.
+        """
+        if len(png_list) < 2 or self.threads < 2:
+            return [self._pixels(png) for png in png_list]
+        # Bounded separately from the ONNX thread count: four concurrent
+        # 4096x4096 composites is already about half a gigabyte in flight.
+        workers = min(self.threads, len(png_list), 4)
+        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(self._pixels, png_list))
+
     def embed_images(self, png_list):
         """Vectors for a batch of PNGs, in the order given."""
         if not png_list:
             return []
         numpy = self.numpy
-        batch = numpy.stack([self._pixels(png) for png in png_list])
+        batch = numpy.stack(self._pixel_batch(png_list))
         pooled = self.vision.run(
             ["pooler_output"], {"pixel_values": batch})[0]
         if pooled.shape[-1] != DIMS:
@@ -319,72 +345,138 @@ def _open_store_for_reading(vectors_path, index_path):
         vectors_path, index_path, expect_model_id=MODEL_ID)
 
 
+def search_store(embedder, store, phrase=None, like_asset_id=None, top=20,
+                 source=None, only_ids=None, exclude_ids=None):
+    """Rank a store against a phrase or another asset. Returns the reply.
+
+    One copy, two callers: `--search` opens a store, asks this and prints;
+    `--serve` keeps a store open and asks this per request. They have to
+    agree, because the second exists only to save the first's startup.
+
+    `source` ranks one kind of vector only -- "render" for pictures drawn
+    from models, "image" for files that already were pictures. Without it a
+    question about a material competes with models whose silhouette happens
+    to suit the words, and a question about a shape competes with textures.
+
+    `only_ids` narrows to a set of asset ids, which is how a search is
+    confined to one pack or folder. It matters most for images: 28,490 of
+    this library's 34,986 are one icon pack, so "a wall texture" asked of
+    everything is mostly answered with icons.
+
+    Raises EmbedError for anything the caller got wrong; the message is the
+    one the user sees.
+    """
+    numpy = embedder.numpy
+    if store.count == 0:
+        raise EmbedError("the store holds no vectors yet; run "
+                         "tag_assets.py or tag_images.py first")
+
+    if like_asset_id is not None:
+        row = store.row_of(like_asset_id)
+        if row is None:
+            raise EmbedError("%s has no vector yet" % like_asset_id)
+        query_vector = numpy.asarray(store.vector(row), dtype=numpy.float32)
+        described = "like:" + like_asset_id
+    else:
+        query_vector = embedder.embed_text([phrase])[0]
+        described = phrase
+
+    if len(query_vector) != store.dims:
+        raise EmbedError(
+            "the query has %d dimensions and the store holds %d, so they "
+            "cannot be compared" % (len(query_vector), store.dims))
+
+    started = time.perf_counter()
+    # store.dims, not DIMS: the store header is the authority on its own
+    # width, and taking the model's constant instead reshaped a 4-wide
+    # test store as 768 and raised rather than saying anything useful.
+    matrix = numpy.frombuffer(
+        store.matrix(), dtype=numpy.float32).reshape(
+            store.count, store.dims)
+    scores = rank_against(numpy, matrix, query_vector)
+    # argsort then reverse: argpartition would be faster but the whole
+    # sort of 32,000 floats is under a millisecond and this is clearer.
+    #
+    # The whole order, not the top slice, because a source filter may reject
+    # most of what sorts highest -- taking `top` first and filtering after
+    # is how a filtered search comes back short of what it could answer.
+    order = numpy.argsort(scores)[::-1]
+    names = store.asset_ids_by_row()
+    sources = store.sources_by_row() if source else None
+
+    def in_scope(index):
+        """Whether this row could answer this question at all.
+
+        What `searched` counts, so it describes the corpus and not the
+        result list: the asset being asked about is left out of the answers
+        but is still part of what was looked through, and a count that moved
+        depending on which asset was named would be a worse number.
+        """
+        asset_id = names[index]
+        if asset_id is None:
+            return False
+        if sources is not None and sources[index] != source:
+            return False
+        if only_ids is not None and asset_id not in only_ids:
+            return False
+        # Last, because it overrides even an explicit narrowing: these are
+        # rows the store should not be holding at all.
+        if exclude_ids and asset_id in exclude_ids:
+            return False
+        return True
+
+    results = []
+    for index in order:
+        if len(results) >= max(1, top):
+            break
+        # Its own re-exports are dropped by the caller, which knows what
+        # shares a name; this drops only the row that was asked about.
+        if names[index] == like_asset_id or not in_scope(index):
+            continue
+        results.append({"asset_id": names[index],
+                        "score": float(scores[index])})
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+
+    # Named so the mapping is dropped before the caller can close the store:
+    # a live memoryview over it refuses the close, by design.
+    del matrix
+
+    # What was ranked, not what the file holds: with a filter on, the rest of
+    # the store could not have answered however well it matched, and saying
+    # otherwise overstates the search. Counted the same way the loop decides,
+    # so the two cannot disagree.
+    if sources is None and only_ids is None and not exclude_ids:
+        searched = store.count
+    else:
+        searched = sum(1 for index in range(store.count) if in_scope(index))
+    return {"ok": True, "query": described, "model_id": MODEL_ID,
+            "searched": searched, "held": store.count, "ms": elapsed_ms,
+            "source": source,
+            "note": "cosines from a sigmoid-trained model: rank them, "
+                    "do not threshold them",
+            "results": results}
+
+
 def run_search(embedder, out, vectors_path, index_path, phrase=None,
-               like_asset_id=None, top=20):
-    """Rank every stored asset against a phrase, or against another asset.
+               like_asset_id=None, top=20, source=None):
+    """One search from the command line: open, ask, print, close.
 
     Prints JSON: the query, how many vectors were searched, and the top
     matches as {asset_id, score}. Scores are cosines from a sigmoid-trained
     model, so they are small and only their order means anything -- the
     output says so, because a caller that thresholds them will be wrong.
     """
-    numpy = embedder.numpy
     store = _open_store_for_reading(vectors_path, index_path)
     try:
-        if store.count == 0:
-            json.dump({"ok": False,
-                       "error": "the store holds no vectors yet; run "
-                                "tag_assets.py first"}, out)
+        try:
+            reply = search_store(embedder, store, phrase=phrase,
+                                 like_asset_id=like_asset_id, top=top,
+                                 source=source)
+        except EmbedError as error:
+            json.dump({"ok": False, "error": str(error)}, out)
             out.write("\n")
             return 1
-
-        if like_asset_id is not None:
-            row = store.row_of(like_asset_id)
-            if row is None:
-                json.dump({"ok": False,
-                           "error": "%s has no vector yet" % like_asset_id},
-                          out)
-                out.write("\n")
-                return 1
-            query_vector = numpy.asarray(store.vector(row),
-                                         dtype=numpy.float32)
-            described = "like:" + like_asset_id
-        else:
-            query_vector = embedder.embed_text([phrase])[0]
-            described = phrase
-
-        if len(query_vector) != store.dims:
-            json.dump({"ok": False,
-                       "error": "the query has %d dimensions and the store "
-                                "holds %d, so they cannot be compared"
-                                % (len(query_vector), store.dims)}, out)
-            out.write("\n")
-            return 1
-
-        started = time.perf_counter()
-        # store.dims, not DIMS: the store header is the authority on its own
-        # width, and taking the model's constant instead reshaped a 4-wide
-        # test store as 768 and raised rather than saying anything useful.
-        matrix = numpy.frombuffer(
-            store.matrix(), dtype=numpy.float32).reshape(
-                store.count, store.dims)
-        scores = rank_against(numpy, matrix, query_vector)
-        # argsort then reverse: argpartition would be faster but the whole
-        # sort of 32,000 floats is under a millisecond and this is clearer.
-        order = numpy.argsort(scores)[::-1][:max(1, top)]
-        names = store.asset_ids_by_row()
-        results = [{"asset_id": names[index], "score": float(scores[index])}
-                   for index in order
-                   if names[index] is not None
-                   and names[index] != like_asset_id]
-        elapsed_ms = round((time.perf_counter() - started) * 1000)
-
-        del matrix
-        json.dump({"ok": True, "query": described, "model_id": MODEL_ID,
-                   "searched": store.count, "ms": elapsed_ms,
-                   "note": "cosines from a sigmoid-trained model: rank them, "
-                           "do not threshold them",
-                   "results": results}, out)
+        json.dump(reply, out)
         out.write("\n")
         return 0
     finally:
@@ -405,15 +497,29 @@ def run_text(embedder, phrase, out):
 #
 #   {"op": "ping"}
 #       -> {"ok": true, "model_id": "...", "dims": 768, "store": true}
-#   {"op": "next", "limit": 8, "pack": "POLYGON_Town"}
+#   {"op": "next", "limit": 8, "pack": "POLYGON_Town", "kind": "model"}
 #       -> {"ok": true, "selected": 31495, "done": 264, "given_up": 0,
 #           "remaining": 8, "assets": [{"asset_id": .., "path": ..}, ..]}
+#       kind is "model" (the default: things to render) or "image" (things
+#       that are already pictures). Two queues over one store.
 #   {"op": "images", "entries": [{"asset_id": "...", "png": "<base64>"}]}
 #       -> {"ok": true, "stored": 8, "count": 272, "ms": 612}
+#       "image" is accepted in place of "png", and "source" records what the
+#       vector was made from -- "render" by default, "image" for a file that
+#       was embedded as it stands.
 #   {"op": "failed", "entries": [{"asset_id": "...", "reason": "..."}]}
 #       -> {"ok": true, "recorded": 1}
 #   {"op": "text", "phrases": ["grungy"]}
 #       -> {"ok": true, "vectors": [[...]]}
+#   {"op": "search", "phrase": "a rusty barrel", "top": 20,
+#    "source": "image"}
+#       -> {"ok": true, "query": .., "searched": 34986, "held": 66477,
+#           "ms": 41, "gained": 0, "results": [{"asset_id": .., "score": ..}]}
+#       `like_asset_id` in place of `phrase` ranks against another asset.
+#       `source` is "render", "image", or absent for both. `searched` is what
+#       the filter left; `held` is the whole store; `gained` is how many rows
+#       appeared since the last question, which is how a search run during a
+#       tagging pass stays current.
 #
 # `images` appends rather than returning vectors. The store is only crash-safe
 # while one writer keeps an ordering that spans the vector file and its index,
@@ -438,6 +544,7 @@ class _Session:
         self.index_path = index_path
         self._store = None
         self._tagging = None
+        self._not_assets = None
 
     @property
     def tagging(self):
@@ -446,6 +553,32 @@ class _Session:
             import tagging
             self._tagging = tagging
         return self._tagging
+
+    @property
+    def not_assets(self):
+        """Asset ids that should never have been embedded, as a set.
+
+        The vector file is append-only, so rows that went in before a rule
+        existed to keep them out cannot be taken back: 2,898 images under a
+        Unity project's package cache and its documentation folders were
+        already embedded when the rule was written. The queue stops adding
+        them; this is what stops them answering.
+
+        Built once per process, because it is a LIKE over 221,183 rows and
+        this is a long-lived child. A catalog rescan that changed the answer
+        would need a new one -- a restart, which is what a rescan gets
+        anyway.
+        """
+        if self._not_assets is None:
+            with self.tagging.open_catalog_readonly() as connection:
+                self._not_assets = set()
+                for marker in self.tagging.NON_ASSET_PATH_MARKERS:
+                    self._not_assets.update(
+                        row[0] for row in connection.execute(
+                            "SELECT id FROM catalog_assets "
+                            "WHERE lower(relative_path) LIKE ?",
+                            ("%" + marker + "%",)))
+        return self._not_assets
 
     @property
     def store(self):
@@ -482,7 +615,8 @@ def _serve_next(session, message):
             ext=message.get("ext"),
             max_attempts=int(message.get("max_attempts")
                              or tagging.DEFAULT_MAX_ATTEMPTS),
-            limit=limit)
+            limit=limit,
+            kind=message.get("kind") or "model")
     reply = {"ok": True}
     reply.update(work.as_dict())
     return reply
@@ -496,9 +630,13 @@ def _serve_images(session, message):
                 "ms": 0}
     pngs = []
     for entry in entries:
-        encoded = entry.get("png")
+        # "png" is what a render is and what the key has always been called;
+        # "image" is the same field for a driver handing over a file that was
+        # already a picture, which may be a JPEG, a GIF or a PSD. Both are
+        # decoded by sniffing the bytes, so the name is a label, not a claim.
+        encoded = entry.get("png") or entry.get("image")
         if not encoded:
-            raise EmbedError("an entry has no png")
+            raise EmbedError("an entry has no png or image")
         if not entry.get("asset_id"):
             raise EmbedError("an entry has no asset_id to store it under")
         pngs.append(base64.b64decode(encoded))
@@ -556,6 +694,44 @@ def _serve_text(session, message):
                         for vector in vectors]}
 
 
+def _serve_search(session, message):
+    """A search, with the model and the store already loaded.
+
+    This is why serving is worth doing for searches and not only for
+    tagging. The text tower is a 283 MB int8 file and constructing a session
+    over it takes about 1.6 s; a process per query paid that every time, and
+    measured from the MCP a single `find_similar` cost 5 to 11 seconds.
+
+    The store is refreshed first and unmapped afterwards, because this
+    process is long-lived and the file is not finished: a tagging pass may
+    be appending to it while this answers.
+    """
+    store = session.store
+    gained = store.refresh()
+    only_ids = None
+    folder, pack = message.get("folder"), message.get("pack")
+    if folder or pack:
+        # Resolved here rather than sent in: a folder can name tens of
+        # thousands of assets, and a list of their ids on every query would
+        # be megabytes of JSON to say what two LIKE clauses say.
+        with session.tagging.open_catalog_readonly() as connection:
+            only_ids = session.tagging.asset_ids_matching(
+                connection, folder=folder, pack=pack)
+    try:
+        reply = search_store(
+            session.embedder, store,
+            phrase=message.get("phrase"),
+            like_asset_id=message.get("like_asset_id"),
+            top=int(message.get("top") or 20),
+            source=message.get("source"),
+            only_ids=only_ids,
+            exclude_ids=session.not_assets)
+    finally:
+        store.unmap()
+    reply["gained"] = gained
+    return reply
+
+
 _OPERATIONS = {
     "ping": _serve_ping,
     "next": _serve_next,
@@ -563,6 +739,7 @@ _OPERATIONS = {
     "failed": _serve_failed,
     "retry": _serve_retry,
     "text": _serve_text,
+    "search": _serve_search,
 }
 
 
@@ -621,6 +798,10 @@ def main(argv=None):
     parser.add_argument("--index", help="path to embeddings_index.sqlite")
     parser.add_argument("--top", type=int, default=20,
                         help="how many matches to print (default 20)")
+    parser.add_argument("--source", choices=("render", "image"),
+                        help="rank only vectors made this way: renders of "
+                             "models, or images embedded as they stand "
+                             "(default both)")
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS,
                         help="onnxruntime intra-op threads (default %d, kept "
                              "low so the machine stays usable)"
@@ -641,7 +822,8 @@ def main(argv=None):
             return run_search(
                 embedder, sys.stdout, arguments.vectors, arguments.index,
                 phrase=arguments.search,
-                like_asset_id=arguments.search_like, top=arguments.top)
+                like_asset_id=arguments.search_like, top=arguments.top,
+                source=arguments.source)
         return run_serve(embedder, sys.stdin, sys.stdout,
                          vectors_path=arguments.vectors,
                          index_path=arguments.index)

@@ -17,16 +17,19 @@ a question answered in the Atlas window should not come back different.
 See assetMatchesSearch and AssetItem.effectiveType in lib/main.dart.
 """
 
+import atexit
 import base64
 import io
 import json
 import os
+import queue
 import re
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 import zipfile
@@ -1900,6 +1903,12 @@ EMBED_TIMEOUT_SECONDS = 180
 VECTORS_NAME = "embeddings.f32"
 EMBED_INDEX_NAME = "embeddings_index.sqlite"
 
+# The consumer's word for a kind of vector, and the store's word for it.
+# None ranks both. Defined here rather than imported from tagging.py, which
+# imports this module and pulls numpy in behind it; this file deliberately
+# needs nothing but the standard library.
+SOURCE_BY_KIND = {"any": None, "model": "render", "image": "image"}
+
 NO_VECTORS = (
     "There are no visual embeddings yet, so nothing can be ranked by how it "
     "looks. Someone has to run the tagging pass first:\n"
@@ -1921,48 +1930,189 @@ def embeddings_present():
     return bool(vectors_path) and os.path.exists(vectors_path)
 
 
-def run_visual_search(phrase=None, like_asset_id=None, top=20):
-    """Ask atlas_embed.py to rank the store. Returns its parsed reply."""
+class EmbedWorker:
+    """`atlas_embed.py --serve`, kept alive between questions.
+
+    Why it exists: the text tower is a 283 MB int8 ONNX file, and building a
+    session over it costs about 1.6 s. A process per query paid that every
+    time, and measured from here a single find_similar took 5 to 11 seconds
+    -- for a consumer that asks several questions to narrow something down,
+    that is most of the conversation.
+
+    Why it is careful: this is a child process holding a model, inside a
+    server that may sit idle for hours between questions. It can die while
+    nothing is looking -- and the next question has to notice and start
+    another, rather than hand the caller a closed pipe. So every question
+    goes through one attempt, a restart, and one more attempt.
+
+    Why the threads: a long-lived child's stderr has to be drained or it
+    fills its pipe and the child blocks writing a warning nobody read. And a
+    blocking readline on a child that has hung would hang the server with
+    it, where the process-per-query version at least timed out. One reader
+    thread each, feeding queues that can be read with a timeout.
+    """
+
+    ASK_TIMEOUT_SECONDS = EMBED_TIMEOUT_SECONDS
+    STDERR_KEPT_LINES = 40
+
+    def __init__(self, vectors_path, index_path):
+        self.vectors_path = vectors_path
+        self.index_path = index_path
+        self.process = None
+        self.starts = 0
+        self._answers = None
+        self._errors = None
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------ plumbing
+
+    def _read_answers(self, stream, answers):
+        """Every line the child says, onto the queue it is waited on."""
+        try:
+            for line in stream:
+                answers.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            # None means "this child will not speak again", so a question
+            # waiting on it fails now instead of after the full timeout.
+            answers.put(None)
+
+    def _read_errors(self, stream, errors):
+        """The last few stderr lines, for when something has to be explained."""
+        try:
+            for line in stream:
+                errors.append(line)
+                if len(errors) > self.STDERR_KEPT_LINES:
+                    del errors[:-self.STDERR_KEPT_LINES]
+        except (OSError, ValueError):
+            pass
+
+    def _start(self):
+        answers = queue.Queue()
+        errors = []
+        self._answers = answers
+        self._errors = errors
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-P", EMBED_SCRIPT, "--serve",
+                 "--vectors", self.vectors_path, "--index", self.index_path],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1,
+                cwd=os.path.dirname(EMBED_SCRIPT))
+        except OSError as error:
+            raise AtlasError("Could not start the embedder: %s" % error)
+        self.starts += 1
+        # Bound to the queue and list this child was started with, not to the
+        # attributes: a restart replaces those, and a thread left over from
+        # the old child must not be able to answer for the new one.
+        for target, stream, sink in (
+                (self._read_answers, self.process.stdout, answers),
+                (self._read_errors, self.process.stderr, errors)):
+            threading.Thread(target=target, args=(stream, sink),
+                             daemon=True).start()
+
+    def _alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def _stop(self):
+        if self.process is None:
+            return
+        try:
+            self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        # The reader threads are still holding these; closing them is what
+        # releases the pipe handles, and the readers treat it as end of
+        # stream, which is what it is.
+        for stream in (self.process.stdout, self.process.stderr):
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        self.process = None
+
+    def _stderr_text(self):
+        return "".join(self._errors or []).strip() or "(nothing)"
+
+    # ------------------------------------------------------------ the ask
+
+    def _attempt(self, message):
+        if not self._alive():
+            self._stop()
+            self._start()
+        self.process.stdin.write(json.dumps(message) + "\n")
+        self.process.stdin.flush()
+        line = self._answers.get(timeout=self.ASK_TIMEOUT_SECONDS)
+        if line is None:
+            raise OSError("the embedder stopped answering")
+        return json.loads(line)
+
+    def ask(self, **message):
+        """One question. Restarts the child once if it has gone away."""
+        with self._lock:
+            try:
+                reply = self._attempt(message)
+            except (OSError, ValueError, queue.Empty) as first:
+                # A dead child is the expected failure here, not an exotic
+                # one: the server outlives it. Anything still broken after a
+                # fresh one is worth telling the caller about.
+                self._stop()
+                try:
+                    reply = self._attempt(message)
+                except (OSError, ValueError, queue.Empty) as second:
+                    raise AtlasError(
+                        "The embedder could not answer (%s, then %s after a "
+                        "restart). Its error output was:\n%s"
+                        % (first, second, self._stderr_text()))
+        if not reply.get("ok"):
+            raise AtlasError(reply.get("error") or "the embedder refused")
+        return reply
+
+    def close(self):
+        with self._lock:
+            self._stop()
+
+
+_embed_worker = None
+
+
+def embed_worker():
+    """The one worker, made on first use and kept.
+
+    A child is bound to the store it was started with -- that is what makes
+    keeping it worthwhile -- so one started for a different store is replaced
+    rather than asked about this one. DB_PATH does not move during a normal
+    server's life; it moves between tests, and the alternative is a worker
+    that quietly answers out of the wrong library.
+    """
+    global _embed_worker
     vectors_path, index_path = embedding_store_paths()
     if not os.path.exists(vectors_path):
         raise AtlasError(NO_VECTORS)
+    if _embed_worker is not None and (
+            _embed_worker.vectors_path != vectors_path
+            or _embed_worker.index_path != index_path):
+        _embed_worker.close()
+        _embed_worker = None
+    if _embed_worker is None:
+        _embed_worker = EmbedWorker(vectors_path, index_path)
+        # Without this the model outlives the server it was loaded for: a
+        # child whose stdin nobody closes keeps 283 MB resident.
+        atexit.register(_embed_worker.close)
+    return _embed_worker
 
-    command = [sys.executable, "-P", EMBED_SCRIPT,
-               "--vectors", vectors_path, "--index", index_path,
-               "--top", str(int(top))]
-    if like_asset_id:
-        command += ["--search-like", like_asset_id]
-    else:
-        command += ["--search", phrase or ""]
 
-    try:
-        finished = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=EMBED_TIMEOUT_SECONDS,
-            cwd=os.path.dirname(EMBED_SCRIPT))
-    except subprocess.TimeoutExpired:
-        raise AtlasError(
-            "The embedder did not answer within %d seconds. Loading the text "
-            "model takes about 1.6 s normally; this long usually means the "
-            "machine is under heavy load."
-            % EMBED_TIMEOUT_SECONDS)
-    except OSError as error:
-        raise AtlasError("Could not start the embedder: %s" % error)
-
-    output = finished.stdout.decode("utf-8", "replace").strip()
-    errors = finished.stderr.decode("utf-8", "replace").strip()
-    if not output:
-        raise AtlasError(
-            "The embedder said nothing. Its error output was:\n%s"
-            % (errors or "(none)"))
-    try:
-        reply = json.loads(output.splitlines()[-1])
-    except ValueError:
-        raise AtlasError(
-            "The embedder's reply was not JSON:\n%s" % output[:500])
-    if not reply.get("ok"):
-        raise AtlasError(reply.get("error") or "the embedder refused")
-    return reply
+def run_visual_search(phrase=None, like_asset_id=None, top=20, source=None,
+                      folder=None, pack=None):
+    """Ask the embedder to rank the store. Returns its parsed reply."""
+    return embed_worker().ask(
+        op="search", phrase=phrase or "", like_asset_id=like_asset_id,
+        top=int(top), source=source, folder=folder, pack=pack)
 
 
 def tool_find_similar(arguments):
@@ -1975,6 +2125,16 @@ def tool_find_similar(arguments):
     phrase = (arguments.get("text") or "").strip()
     like = (arguments.get("like_path") or "").strip()
     top = max(1, min(int(arguments.get("limit") or 20), 100))
+    # The store holds both pictures drawn from models and images embedded as
+    # they stand, and the two answer different questions: a material lives in
+    # a texture, a shape in a model. Ranked together, a question about one
+    # competes with whatever of the other happens to suit the words.
+    kind = (arguments.get("kind") or "any").strip().lower()
+    if kind not in SOURCE_BY_KIND:
+        raise AtlasError(
+            "kind is %s, not one of %s."
+            % (kind, ", ".join(sorted(SOURCE_BY_KIND))))
+    source = SOURCE_BY_KIND[kind]
     if not phrase and not like:
         raise AtlasError(
             "Give text to look for, or like_path to find more of the same.")
@@ -1995,10 +2155,20 @@ def tool_find_similar(arguments):
             # answers "more like this" with "this".
             like_name = (row["name"] or "").lower()
 
+    folder = (arguments.get("folder") or "").strip() or None
+    pack = (arguments.get("pack") or "").strip() or None
     reply = run_visual_search(phrase=phrase, like_asset_id=like_asset_id,
-                              top=top)
+                              top=top, source=source, folder=folder,
+                              pack=pack)
     results = reply.get("results") or []
     if not results:
+        if source is not None and reply.get("searched") == 0:
+            return text(
+                "Nothing of that kind has been embedded yet: the store holds "
+                "%d vectors, none of them %s. %s"
+                % (reply.get("held", 0), kind,
+                   "Run tag_images.py for the textures."
+                   if kind == "image" else "Run tag_assets.py for the models."))
         return text("Nothing to rank: the store holds %d vectors."
                     % reply.get("searched", 0))
 
@@ -2028,9 +2198,11 @@ def tool_find_similar(arguments):
             seen[key] = entry
         collapsed.append(entry)
 
+    kinds = {"model": "rendered models", "image": "images",
+             "any": "embedded assets"}
     lines = [
-        "%d of %d embedded assets, ranked by how they look%s"
-        % (len(collapsed), reply.get("searched", 0),
+        "%d of %d %s, ranked by how they look%s"
+        % (len(collapsed), reply.get("searched", 0), kinds[kind],
            " like that one" if like else ""),
         # Said every time, because the instinct on seeing 0.12 is to call it
         # a bad match. It is not a probability; the order is the answer.
@@ -2058,19 +2230,36 @@ def tool_find_similar(arguments):
         if entry["repeats"]:
             repeats = "  (+%d copy%s elsewhere)" % (
                 entry["repeats"], "" if entry["repeats"] == 1 else "ies")
-        lines.append("%2d. %.4f  %s%s"
-                     % (position, item["score"], row["name"], repeats))
-        lines.append("          %s  %s"
-                     % (container_of(row), row["relative_path"]))
+        lines.append("%2d. %.4f  %s  %s%s"
+                     % (position, item["score"], row["name"],
+                        container_of(row), repeats))
+        # The real path, not the relative one. A relative path spells an
+        # archive entry `pack.zip!/entry` where every tool that takes a path
+        # wants `zip:Z:\...\pack.zip::entry`, so printing it left a consumer
+        # holding an answer it could not ask the next question with --
+        # inspect_model replied "nothing in the catalog matches" to a result
+        # this tool had just produced.
+        lines.append("          %s" % row["path"])
 
     lines.append("")
     # No denominator: the only honest one is a count of what could be
     # embedded, and that needs a GROUP BY over the whole catalog on every
     # query. The number that matters is how much was searched.
-    lines.append("Ranked over the %d assets that have been rendered and "
-                 "embedded so far -- nothing else can appear here, however "
-                 "well it would have matched. Run tag_assets.py for more."
-                 % reply.get("searched", 0))
+    searched = reply.get("searched", 0)
+    held = reply.get("held", searched)
+    nouns = {"model": "models", "image": "images", "any": "assets"}
+    lines.append(
+        "Ranked over the %d %s embedded so far -- nothing else can appear "
+        "here, however well it would have matched.%s"
+        % (searched, nouns[kind],
+           "" if kind == "any" or held == searched
+           else " The store holds %d in all." % held))
+    if kind == "any":
+        lines.append(
+            "That is models and images together. kind=model ranks only "
+            "pictures drawn from models, kind=image only textures and "
+            "sprites -- a material is in the texture, a shape is in the "
+            "model, so asking for one keeps the other out of the way.")
     return text("\n".join(lines))
 
 
@@ -2257,13 +2446,16 @@ TOOLS = [
     {
         "name": "find_similar",
         "description":
-            "Rank assets by how they LOOK, from a rendered picture of each: "
-            "the only tool here that can answer a question about appearance. "
-            "Give text ('a grungy metal barrel', 'something gray and "
-            "industrial') or like_path to find more of the same shape. Every "
-            "other search matches names, and style words appear in none of "
-            "them. Needs the tagging pass to have been run; it says so when "
-            "it has not, and only embedded assets can be returned.",
+            "Rank assets by how they LOOK: the only tool here that can "
+            "answer a question about appearance. Give text ('a grungy metal "
+            "barrel', 'something gray and industrial') or like_path to find "
+            "more of the same. Every other search matches names, and style "
+            "words appear in none of them. Models are ranked from a rendered "
+            "picture and images from the file itself, so kind=image is how "
+            "to find a MATERIAL or a texture and kind=model how to find a "
+            "SHAPE -- ask for one and the other stays out of the way. Only "
+            "embedded assets can be returned, and it says how many it "
+            "searched.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2275,6 +2467,27 @@ TOOLS = [
                               "description":
                                   "An asset path; returns others that look "
                                   "like it. Use instead of text."},
+                "kind": {"type": "string",
+                         "enum": ["any", "model", "image"],
+                         "description":
+                             "Which to rank: model for pictures drawn from "
+                             "models, image for textures, atlases and "
+                             "sprites, any for both (the default). A "
+                             "material lives in the texture and a shape in "
+                             "the model, so a question about one is usually "
+                             "better asked of that kind alone."},
+                "folder": {"type": "string",
+                           "description":
+                               "Only assets whose path contains this. Worth "
+                               "using with kind=image: most of the library's "
+                               "images are one icon pack, so a texture "
+                               "question asked of everything is mostly "
+                               "answered with icons."},
+                "pack": {"type": "string",
+                         "description":
+                             "Only assets from archives matching this, e.g. "
+                             "POLYGON_SciFi_Horror. The usual way to dress a "
+                             "scene from one pack."},
                 "limit": {"type": "integer",
                           "description": "How many to rank (default 20, "
                                          "max 100)."},
