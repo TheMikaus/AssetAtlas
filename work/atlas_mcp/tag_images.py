@@ -104,15 +104,31 @@ def load(reader, asset, max_bytes):
     return data
 
 
-def flush(worker, batch, out):
-    """Hand a batch over. The worker embeds and keeps it; this counts."""
+def flush(worker, batch, out, failed=None):
+    """Hand a batch over. The worker embeds and keeps it; this counts.
+
+    An image the worker could not decode comes back named in `rejected` and
+    is already written down as a failure there -- the reason is only known
+    where the decode happens. Reporting it here is what keeps it out of the
+    final count without pretending it will be retried.
+    """
     reply = worker.ask(op="images", entries=[
         {"asset_id": asset["asset_id"],
          "image": base64.b64encode(data).decode("ascii"),
          "source": tagging.SOURCE_BY_KIND["image"]}
         for asset, data in batch])
     stored = reply.get("stored", 0)
-    if stored != len(batch):
+    rejected = reply.get("rejected") or []
+    if rejected:
+        by_id = {asset["asset_id"]: asset for asset, _data in batch}
+        for item in rejected:
+            asset = by_id.get(item["asset_id"])
+            where = (asset or {}).get("relative_path") or item["asset_id"]
+            out.write("  could not decode  %s -- %s\n"
+                      % (where, item["reason"][:100]))
+            if failed is not None:
+                failed.append((where, item["reason"][:120]))
+    elif stored != len(batch):
         out.write("  the worker kept %d of %d; the rest will be retried\n"
                   % (stored, len(batch)))
     return stored
@@ -195,7 +211,7 @@ def run(arguments, out):
                     time.sleep(arguments.pace_ms / 1000.0)
 
                 if len(batch) >= arguments.batch:
-                    done += flush(worker, batch, out)
+                    done += flush(worker, batch, out, failed)
                     batch = []
                     report_progress(out, done, total, started, failed)
 
@@ -215,7 +231,7 @@ def run(arguments, out):
         # append order makes a partial batch exactly as safe as a full one.
         if batch:
             try:
-                done += flush(worker, batch, out)
+                done += flush(worker, batch, out, failed)
             except (RuntimeError, OSError, ValueError) as error:
                 out.write("  the last %d could not be embedded: %s\n"
                           % (len(batch), error))

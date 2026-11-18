@@ -207,7 +207,7 @@ class Embedder:
         data = (data * _RESCALE - _MEAN) / _STD
         return numpy.transpose(data, (2, 0, 1))
 
-    def _pixel_batch(self, png_list):
+    def _pixel_batch(self, png_list, tolerant=False):
         """`_pixels` for each image, concurrently, in the order given.
 
         Worth having because of what the images are. A render is 224 px and
@@ -224,16 +224,72 @@ class Embedder:
         the same. Same code per image, same order out; only the waiting
         overlaps.
         """
+        # With `tolerant`, an image that will not decode comes back as the
+        # reason it would not, in its own position, rather than raising and
+        # taking the batch with it.
+        def one(png):
+            if not tolerant:
+                return self._pixels(png)
+            try:
+                return self._pixels(png)
+            except Exception as error:              # noqa: BLE001
+                return "%s: %s" % (type(error).__name__, error)
+
         if len(png_list) < 2 or self.threads < 2:
-            return [self._pixels(png) for png in png_list]
+            return [one(png) for png in png_list]
         # Bounded separately from the ONNX thread count: four concurrent
         # 4096x4096 composites is already about half a gigabyte in flight.
         workers = min(self.threads, len(png_list), 4)
         with futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(self._pixels, png_list))
+            return list(pool.map(one, png_list))
+
+    def prepare_images(self, png_list):
+        """Pixels for each image, and the ones that could not be decoded.
+
+        Returns `(prepared, failures)`: `prepared` is a list of
+        `(position, array)` and `failures` a list of `(position, reason)`,
+        both in the order given.
+
+        Tolerant because of where the decode happens. The driver reads bytes
+        and hands them over; whether PIL can make sense of them is only
+        discovered here, a batch later. One file it could not identify
+        therefore failed the whole batch it travelled in, and the batch
+        failing looked to the driver exactly like the worker dying -- which
+        stopped a pass 8,203 images short and took seven good ones with it.
+
+        A render cannot hit this, because Atlas either produced a PNG or
+        raised in the driver, which is why [embed_images] is still strict.
+        """
+        prepared = []
+        failures = []
+        for position, array in enumerate(self._pixel_batch(png_list,
+                                                           tolerant=True)):
+            if isinstance(array, str):
+                failures.append((position, array))
+            else:
+                prepared.append((position, array))
+        return prepared, failures
+
+    def embed_prepared(self, prepared):
+        """Vectors for already-prepared pixels, in the order given."""
+        if not prepared:
+            return []
+        numpy = self.numpy
+        batch = numpy.stack([array for _position, array in prepared])
+        pooled = self.vision.run(
+            ["pooler_output"], {"pixel_values": batch})[0]
+        if pooled.shape[-1] != DIMS:
+            raise EmbedError(
+                "the vision tower returned %d dimensions, not %d -- the "
+                "wrong output is being read" % (pooled.shape[-1], DIMS))
+        return [row.astype(numpy.float32) for row in pooled]
 
     def embed_images(self, png_list):
-        """Vectors for a batch of PNGs, in the order given."""
+        """Vectors for a batch of PNGs, in the order given.
+
+        Strict: anything that will not decode raises. Used where the bytes
+        were produced rather than read, so a failure is a bug and not a file.
+        """
         if not png_list:
             return []
         numpy = self.numpy
@@ -642,22 +698,38 @@ def _serve_images(session, message):
         pngs.append(base64.b64decode(encoded))
 
     started = time.perf_counter()
-    vectors = embedder_vectors(session.embedder, pngs, len(entries))
+    # Per entry, not per batch. One file PIL could not identify used to raise
+    # here, which failed all eight images it travelled with and read to the
+    # driver as the worker having died; a pass stopped 8,203 images short of
+    # the end on one such file.
+    prepared, undecodable = session.embedder.prepare_images(pngs)
+    vectors = embedder_vectors(
+        session.embedder, prepared, len(prepared))
     now_ms = int(time.time() * 1000)
+    kept = [entries[position] for position, _array in prepared]
     session.store.append(
         [(entry["asset_id"], vector, entry.get("source") or "render", now_ms)
-         for entry, vector in zip(entries, vectors)])
+         for entry, vector in zip(kept, vectors)])
     # A file that failed twice and then worked must not keep the attempts
     # against it, or a later run gives up on something that is fine.
-    for entry in entries:
+    for entry in kept:
         session.store.forget_failure(entry["asset_id"])
-    return {"ok": True, "stored": len(entries),
+    # Written down here rather than handed back for the driver to report:
+    # the reason is only known here, and a file that cannot be decoded is
+    # exactly what the failure table is for.
+    rejected = []
+    for position, reason in undecodable:
+        asset_id = entries[position]["asset_id"]
+        session.store.record_failure(asset_id, reason, now_ms)
+        rejected.append({"asset_id": asset_id, "reason": reason})
+    return {"ok": True, "stored": len(kept),
+            "rejected": rejected,
             "count": session.store.count,
             "ms": round((time.perf_counter() - started) * 1000)}
 
 
-def embedder_vectors(embedder, pngs, expected):
-    vectors = embedder.embed_images(pngs)
+def embedder_vectors(embedder, prepared, expected):
+    vectors = embedder.embed_prepared(prepared)
     if len(vectors) != expected:
         raise EmbedError(
             "the model returned %d vectors for %d images, so none of them "

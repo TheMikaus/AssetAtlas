@@ -314,13 +314,21 @@ def run(arguments, out):
 
 
 def flush(worker, batch, out):
-    """Hand a batch over. The worker embeds and keeps it; this counts."""
+    """Hand a batch over. The worker embeds and keeps it; this counts.
+
+    A render should never come back rejected -- Atlas either produced a PNG
+    or raised in the driver before it got here -- so if one does, it is worth
+    saying rather than counting as "will be retried".
+    """
     reply = worker.ask(op="images", entries=[
         {"asset_id": asset["asset_id"],
          "png": base64.b64encode(png).decode("ascii")}
         for asset, png in batch])
     stored = reply.get("stored", 0)
-    if stored != len(batch):
+    for item in reply.get("rejected") or []:
+        out.write("  the worker could not decode a render of %s -- %s\n"
+                  % (item["asset_id"], item["reason"][:100]))
+    if stored != len(batch) and not reply.get("rejected"):
         out.write("  the worker kept %d of %d; the rest will be retried\n"
                   % (stored, len(batch)))
     return stored

@@ -896,6 +896,14 @@ class ServeProtocolTest(unittest.TestCase):
     class FakeEmbedder:
         numpy = None
 
+        def prepare_images(self, pngs):
+            # Everything decodes, nothing is rejected: what this fake is for
+            # is the protocol, and the real decode has its own tests.
+            return [(position, None) for position in range(len(pngs))], []
+
+        def embed_prepared(self, prepared):
+            return [[0.0] * atlas_embed.DIMS for _ in prepared]
+
         def embed_images(self, pngs):
             return [[0.0] * atlas_embed.DIMS for _ in pngs]
 
@@ -1985,6 +1993,147 @@ class PixelBatchTest(unittest.TestCase):
         self.assertEqual(atlas_embed.Embedder(threads=4).embed_images([]), [])
 
 
+class UndecodableImageTest(unittest.TestCase):
+    """One file that will not decode must not take its batch with it.
+
+    This is the bug that stopped a real pass 8,203 images short. The driver
+    reads bytes and hands them over; whether PIL can make sense of them is
+    discovered a batch later, in the worker. Raising there failed all eight
+    images in the batch, and the batch failing looked to the driver exactly
+    like the worker having died, so it gave up on the whole run.
+    """
+
+    def setUp(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        if _numpy is None:
+            self.skipTest("numpy is not installed")
+        self.Image = Image
+
+    def png(self, shade=10):
+        picture = self.Image.new("RGB", (8, 8), (shade, shade, shade))
+        buffer = io.BytesIO()
+        picture.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_the_good_ones_are_prepared_and_the_bad_one_named(self):
+        embedder = atlas_embed.Embedder(threads=4)
+        batch = [self.png(10), b"this is not an image", self.png(20)]
+        prepared, failures = embedder.prepare_images(batch)
+        self.assertEqual([position for position, _ in prepared], [0, 2])
+        self.assertEqual([position for position, _ in failures], [1])
+        self.assertIn("Error", failures[0][1])
+
+    def test_a_whole_batch_of_rubbish_is_not_an_exception(self):
+        embedder = atlas_embed.Embedder(threads=4)
+        prepared, failures = embedder.prepare_images([b"no", b"nope"])
+        self.assertEqual(prepared, [])
+        self.assertEqual(len(failures), 2)
+
+    def test_an_empty_batch_prepares_nothing(self):
+        embedder = atlas_embed.Embedder(threads=4)
+        self.assertEqual(embedder.prepare_images([]), ([], []))
+
+    def test_preparing_tolerantly_gives_the_same_pixels_as_strictly(self):
+        # The tolerant path must not be a different preparation, or vectors
+        # from a pass that used it could not be ranked against the rest.
+        embedder = atlas_embed.Embedder(threads=4)
+        images = [self.png(10), self.png(20)]
+        prepared, failures = embedder.prepare_images(images)
+        self.assertEqual(failures, [])
+        for position, array in prepared:
+            self.assertTrue(
+                _numpy.array_equal(array, embedder._pixels(images[position])))
+
+    def test_the_single_threaded_path_is_tolerant_too(self):
+        embedder = atlas_embed.Embedder(threads=1)
+        prepared, failures = embedder.prepare_images([b"no", self.png()])
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(len(failures), 1)
+
+    def test_a_render_that_will_not_decode_still_raises(self):
+        # embed_images stays strict: its caller produced the bytes, so a
+        # failure there is a bug and not a file.
+        embedder = atlas_embed.Embedder(threads=2)
+        with self.assertRaises(Exception):
+            embedder.embed_images([self.png(), b"not an image"])
+
+
+class UndecodableOverTheWireTest(unittest.TestCase):
+    """The same thing through the worker, which is where it bit."""
+
+    def setUp(self):
+        if not models_present():
+            self.skipTest("the SigLIP files are not present")
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        self.directory = tempfile.mkdtemp(prefix="atlas-undecodable-")
+        self.vectors = os.path.join(self.directory, "v.f32")
+        self.index = os.path.join(self.directory, "i.sqlite")
+        embedding_store.EmbeddingStore.create(
+            self.vectors, self.index, dims=atlas_embed.DIMS,
+            model_id=atlas_embed.MODEL_ID).close()
+        self.worker = tag_assets.Worker(2, self.vectors, self.index)
+
+    def tearDown(self):
+        self.worker.close()
+
+    def good_png(self):
+        from PIL import Image
+        buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), (30, 60, 90)).save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def test_the_batch_survives_one_unreadable_file(self):
+        reply = self.worker.ask(op="images", entries=[
+            {"asset_id": "good:1", "image": self.good_png(),
+             "source": "image"},
+            {"asset_id": "bad:1",
+             "image": base64.b64encode(b"not an image").decode("ascii"),
+             "source": "image"},
+            {"asset_id": "good:2", "image": self.good_png(),
+             "source": "image"},
+        ])
+        self.assertEqual(reply["stored"], 2)
+        self.assertEqual([item["asset_id"] for item in reply["rejected"]],
+                         ["bad:1"])
+
+    def test_the_file_is_written_down_so_it_is_not_retried_for_ever(self):
+        self.worker.ask(op="images", entries=[
+            {"asset_id": "bad:2",
+             "image": base64.b64encode(b"rubbish").decode("ascii"),
+             "source": "image"},
+        ])
+        failures = self.worker.ask(op="failed", entries=[])
+        self.assertEqual(failures["recorded"], 0)
+        store = embedding_store.EmbeddingStore.open(
+            self.vectors, self.index, expect_model_id=atlas_embed.MODEL_ID)
+        try:
+            self.assertEqual(store.failure_counts().get("bad:2"), 1)
+        finally:
+            store.close()
+
+    def test_the_good_ones_are_findable_afterwards(self):
+        self.worker.ask(op="images", entries=[
+            {"asset_id": "keep:1", "image": self.good_png(),
+             "source": "image"},
+            {"asset_id": "drop:1",
+             "image": base64.b64encode(b"x").decode("ascii"),
+             "source": "image"},
+        ])
+        store = embedding_store.EmbeddingStore.open(
+            self.vectors, self.index, expect_model_id=atlas_embed.MODEL_ID)
+        try:
+            self.assertIsNotNone(store.row_of("keep:1"))
+            self.assertIsNone(store.row_of("drop:1"))
+        finally:
+            store.close()
+
+
 class ImageHandoverTest(unittest.TestCase):
     """What the image driver sends the worker."""
 
@@ -2012,6 +2161,26 @@ class ImageHandoverTest(unittest.TestCase):
         tag_images.flush(recorder, batch, io.StringIO())
         entry = recorder.messages[0]["entries"][0]
         self.assertEqual(base64.b64decode(entry["image"]), b"bytes")
+
+    def test_a_rejection_is_named_and_counted_as_a_failure(self):
+        class Rejecting(self.Recorder):
+            def ask(self, **message):
+                self.messages.append(message)
+                return {"ok": True, "stored": 1,
+                        "rejected": [{"asset_id": "b",
+                                      "reason": "UnidentifiedImageError: x"}]}
+
+        recorder = Rejecting()
+        batch = [({"asset_id": "a", "relative_path": "a.png"}, b"1"),
+                 ({"asset_id": "b", "relative_path": "bad/b.png"}, b"2")]
+        out = io.StringIO()
+        failed = []
+        self.assertEqual(tag_images.flush(recorder, batch, out, failed), 1)
+        self.assertIn("could not decode", out.getvalue())
+        self.assertIn("bad/b.png", out.getvalue())
+        # In the run's own tally, so the summary at the end is honest.
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0][0], "bad/b.png")
 
     def test_a_short_count_is_reported_rather_than_assumed(self):
         class Partial(self.Recorder):
