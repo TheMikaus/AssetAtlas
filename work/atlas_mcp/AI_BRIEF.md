@@ -294,11 +294,16 @@ Not bugs in the tools; they change what the answers are worth.
 - **Visual coverage of models is complete.** All 31,491 distinct renderable
   models are embedded. Four are not and never will be: three animation-only
   FBX files the catalog classified as models, and one OBJ with no geometry.
-- **Some rows should not be in the store.** 2,091 images under a Unity
-  project's package cache were embedded before there was a rule against
-  them — documentation screenshots, not assets. The search drops them, so
-  they cannot answer, but the vector file is append-only and still holds
-  them.
+- **Visual coverage of images is complete too**, as of 2026-11-18: 32,084
+  distinct textures, atlases and sprites. Four are not embedded and will not
+  be — two JPEGs inside archives that are not zip files, a 177.7 MB PSD over
+  the one-image cap, and a PSD with no readable composite.
+
+- **Some rows should not be in the store.** The store holds 34,343 image
+  vectors but ranks 32,084: the other 2,259 are images under a Unity
+  project's package cache, embedded before there was a rule against them —
+  documentation screenshots, not assets. The search drops them, so they
+  cannot answer, but the vector file is append-only and still holds them.
 
 `catalog_stats` reports the current state of these.
 
