@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.43';
+const appVersion = '1.10.44';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -5194,7 +5194,10 @@ class _RasterModelViewState extends State<RasterModelView> {
   }
 
   String _keyFor(Size size, double scale) => [
-    identityHashCode(widget.mesh),
+    // Named rather than hashed: `identityHashCode` can be handed out again
+    // for a different mesh once the first is collected, and this key decides
+    // whether the image on screen still matches the model.
+    sceneNameFor(widget.mesh, widget.uvSetOverride),
     widget.yaw.toStringAsFixed(4),
     widget.pitch.toStringAsFixed(4),
     widget.zoom.toStringAsFixed(4),
@@ -5233,10 +5236,9 @@ class _RasterModelViewState extends State<RasterModelView> {
       // mesh rather than per frame. Animation hands us a scene it already
       // holds, whose positions it swaps in place.
       final override = widget.sceneOverride;
+      String? sceneKey;
       if (override == null) {
-        final sceneKey =
-            '${identityHashCode(widget.mesh)}|'
-            '${widget.uvSetOverride ?? ''}';
+        sceneKey = sceneNameFor(widget.mesh, widget.uvSetOverride);
         if (_scene == null || _sceneKey != sceneKey) {
           _scene = RasterScene.fromMesh(
             widget.mesh,
@@ -5267,12 +5269,20 @@ class _RasterModelViewState extends State<RasterModelView> {
         useSpecular: widget.useSpecular,
       );
 
-      // Coarse frames are small and wanted immediately; spending an isolate
-      // hop on them would add more latency than it saves. The sharp frame is
-      // the one that would stall the window, so that one goes to a worker.
-      final raster = widget.interacting
+      // Every frame goes to the worker, coarse ones included. They used to be
+      // drawn here, on the grounds that spawning an isolate for one costs more
+      // than it saves -- true of [rasterizeSceneInIsolate], which spawns one
+      // per call, and the reason this is a worker that stays alive instead.
+      // Drawing them here meant each frame of a drag was time the window could
+      // not lay out, paint, or read the mouse, and it is 8 ms for an ordinary
+      // kit model and 36-47 ms for the large meshes in this library.
+      //
+      // An animated scene is the exception: its positions are replaced in
+      // place 30 times a second, so there is no stable scene for the worker to
+      // hold and it would have to be sent the geometry every frame.
+      final raster = sceneKey == null
           ? rasterizeScene(request)
-          : await rasterizeSceneInIsolate(request);
+          : await RenderWorker.shared.render(request, sceneKey: sceneKey);
       final image = await imageFromRaster(raster);
       if (!mounted) {
         image.dispose();
@@ -5407,6 +5417,24 @@ class RasterScene {
 
   final List<RasterMaterial> materials;
   final int totalTriangles;
+
+  /// Stands in for a scene the receiver already holds.
+  ///
+  /// [RenderWorker] puts this in the message instead of the real scene; see
+  /// [RasterRequest.withScene]. Rendering it draws nothing, which is the point
+  /// -- if a protocol mistake ever let it reach the rasteriser, the frame comes
+  /// back empty rather than wrong.
+  static final RasterScene placeholder = RasterScene(
+    positions: Float32List(0),
+    triangleIndices: Int32List(0),
+    triangleMaterial: Int32List(0),
+    triangleObject: Int32List(0),
+    triangleUvs: Float32List(0),
+    triangleHasUv: Uint8List(0),
+    triangleTint: Int32List(0),
+    materials: const [],
+    totalTriangles: 0,
+  );
 
   static RasterScene fromMesh(MeshModel mesh, {String? uvSetOverride}) {
     final triangles = <int>[];
@@ -5794,6 +5822,36 @@ class RasterRequest {
   /// view at any size.
   final double panX;
   final double panY;
+
+  /// The same frame, to be drawn from another copy of the same scene.
+  ///
+  /// [RenderWorker] sends the frame with [RasterScene.placeholder] in place of
+  /// the real scene and the worker puts its own held copy back, because an
+  /// isolate message is a deep copy: sending the scene with every frame would
+  /// copy the whole flattened model -- megabytes on a large one -- for each
+  /// frame of a drag.
+  RasterRequest withScene(RasterScene replacement) => RasterRequest(
+    scene: replacement,
+    yaw: yaw,
+    pitch: pitch,
+    zoom: zoom,
+    width: width,
+    height: height,
+    renderMode: renderMode,
+    lightingMode: lightingMode,
+    cullBackFaces: cullBackFaces,
+    useBaseTexture: useBaseTexture,
+    useNormalMaps: useNormalMaps,
+    useEmissiveMaps: useEmissiveMaps,
+    useSpecular: useSpecular,
+    backgroundArgb: backgroundArgb,
+    maxFaces: maxFaces,
+    visibleMaterial: visibleMaterial,
+    visibleObject: visibleObject,
+    hiddenObjects: hiddenObjects,
+    panX: panX,
+    panY: panY,
+  );
 }
 
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
@@ -5809,11 +5867,23 @@ RasterResult rasterizeScene(RasterRequest request) {
   final bgG = (request.backgroundArgb >> 8) & 0xff;
   final bgB = request.backgroundArgb & 0xff;
   final bgA = (request.backgroundArgb >> 24) & 0xff;
-  for (var i = 0; i < pixels.length; i += 4) {
-    pixels[i] = bgR;
-    pixels[i + 1] = bgG;
-    pixels[i + 2] = bgB;
-    pixels[i + 3] = bgA;
+  // A word at a time rather than a byte at a time. [pixels] is RGBA in memory
+  // order, so on a little-endian host the first byte is the low byte of the
+  // word; every platform this app builds for is little-endian, and the
+  // fallback below keeps the picture right if that ever stops being true.
+  if (Endian.host == Endian.little) {
+    Uint32List.view(pixels.buffer).fillRange(
+      0,
+      width * height,
+      (bgA << 24) | (bgB << 16) | (bgG << 8) | bgR,
+    );
+  } else {
+    for (var i = 0; i < pixels.length; i += 4) {
+      pixels[i] = bgR;
+      pixels[i + 1] = bgG;
+      pixels[i + 2] = bgB;
+      pixels[i + 3] = bgA;
+    }
   }
   // Larger is nearer, so the buffer starts at "infinitely far".
   depth.fillRange(0, depth.length, -double.infinity);
@@ -6156,8 +6226,311 @@ RasterResult rasterizeScene(RasterRequest request) {
 
 /// Renders a frame on a worker isolate, so a full-resolution frame does not
 /// stall the window.
+///
+/// Spawns an isolate per call, which is why the viewer does not use this for
+/// the frames of a drag -- see [RenderWorker].
 Future<RasterResult> rasterizeSceneInIsolate(RasterRequest request) {
   return Isolate.run(() => rasterizeScene(request));
+}
+
+/// A name for a mesh's flattened scene, unique for as long as the mesh lives.
+///
+/// [RenderWorker] holds its scenes under this name, so a name that can repeat
+/// would draw the wrong model: `identityHashCode` is not unique -- it may be
+/// handed out again for a different object once the first is collected. An
+/// [Expando] hangs the name on the mesh itself, so it is unique while the mesh
+/// exists and collected along with it.
+final Expando<String> _sceneNames = Expando<String>('raster scene name');
+var _sceneNameCount = 0;
+
+/// The name of the scene flattened from [mesh] under [uvSetOverride].
+///
+/// The UV set is part of the name because it changes the flattened scene --
+/// [RasterScene.fromMesh] bakes the chosen UVs in -- while leaving the mesh
+/// the same object.
+String sceneNameFor(MeshModel mesh, String? uvSetOverride) {
+  final name = _sceneNames[mesh] ??= 'mesh${_sceneNameCount += 1}';
+  return '$name|${uvSetOverride ?? ''}';
+}
+
+/// One frame asked of the render worker.
+///
+/// [scene] is null in the ordinary case: the worker holds the scene under
+/// [sceneKey] from an earlier frame, and [request] carries
+/// [RasterScene.placeholder] in its place. The worker asks for it when it does
+/// not have it.
+class RenderFrameMessage {
+  const RenderFrameMessage({
+    required this.id,
+    required this.sceneKey,
+    required this.request,
+    this.scene,
+  });
+
+  final int id;
+  final String sceneKey;
+  final RasterRequest request;
+  final RasterScene? scene;
+}
+
+/// A rendered frame, a request for the scene, or a failure.
+///
+/// The frame travels as a plain [RasterResult], which copies its pixel buffer
+/// across. [TransferableTypedData] would move it instead, and was tried: the
+/// round trip for a frame with nothing in it to draw measured 4.4 ms either
+/// way, against 0.2 ms for the same trip at 1x1, so the cost that scales with
+/// the buffer is allocating and reclaiming it, not copying it. Keeping the
+/// plain result avoids a class whose bytes may be read only once.
+class RenderFrameReply {
+  const RenderFrameReply.frame(this.id, RasterResult this.result)
+    : needsScene = false,
+      error = null;
+  const RenderFrameReply.needsScene(this.id)
+    : result = null,
+      needsScene = true,
+      error = null;
+  const RenderFrameReply.failed(this.id, String this.error)
+    : result = null,
+      needsScene = false;
+
+  final int id;
+  final RasterResult? result;
+
+  /// The worker does not hold the scene this frame named; send it and retry.
+  final bool needsScene;
+  final String? error;
+}
+
+/// How many flattened scenes the worker keeps.
+///
+/// One would be enough for the viewer alone, but a variant grid draws the same
+/// mesh in many cells and the animation preview sits beside the still view, so
+/// a single slot would have two views evicting each other's scene every frame
+/// and paying the transfer again each time. Three covers the cases that exist
+/// and bounds what the worker holds.
+const renderWorkerSceneSlots = 3;
+
+/// Worker entry point. Top-level by necessity: isolates are spawned by
+/// function reference, and a closure here would capture its surroundings.
+Future<void> renderWorkerEntry(SendPort host) async {
+  final port = ReceivePort();
+  host.send(port.sendPort);
+
+  // Insertion-ordered, so the oldest key is the first one -- this is the
+  // eviction order.
+  final held = <String, RasterScene>{};
+
+  await for (final message in port) {
+    if (message is! RenderFrameMessage) break;
+
+    final offered = message.scene;
+    if (offered != null) {
+      held.remove(message.sceneKey);
+      held[message.sceneKey] = offered;
+      while (held.length > renderWorkerSceneSlots) {
+        held.remove(held.keys.first);
+      }
+    }
+
+    final scene = held[message.sceneKey];
+    if (scene == null) {
+      host.send(RenderFrameReply.needsScene(message.id));
+      continue;
+    }
+
+    try {
+      host.send(
+        RenderFrameReply.frame(
+          message.id,
+          rasterizeScene(message.request.withScene(scene)),
+        ),
+      );
+    } catch (error) {
+      host.send(RenderFrameReply.failed(message.id, error.toString()));
+    }
+  }
+  port.close();
+}
+
+/// The rasteriser on an isolate that stays alive between frames.
+///
+/// The viewer used to draw moving frames by calling [rasterizeScene] straight
+/// on the UI isolate, because the alternative on offer was
+/// [rasterizeSceneInIsolate], which spawns an isolate per call. So every frame
+/// of a drag was time the window could not lay out, paint, or read the mouse.
+/// Measured at half resolution in a 900x700 panel, steady state: 8 ms a frame
+/// for an ordinary kit model, and 36-47 ms for the 33k- and 133k-face meshes
+/// in this library -- 21 frames a second before the rest of the frame is
+/// counted, which is what "not real time" was.
+///
+/// This keeps one isolate and one set of flattened scenes, so a frame costs a
+/// message with a camera in it. The UI isolate is then free while the frame is
+/// drawn, and the raster cost stops being added to the cost of the rebuild.
+class RenderWorker {
+  RenderWorker._();
+
+  static RenderWorker? _shared;
+
+  /// The process-wide worker. Views share it deliberately: frames then queue
+  /// behind each other instead of competing for cores with the UI isolate.
+  static RenderWorker get shared => _shared ??= RenderWorker._();
+
+  Isolate? _isolate;
+  SendPort? _send;
+  ReceivePort? _receive;
+  Future<void>? _starting;
+
+  var _nextId = 0;
+  final Map<int, _PendingFrame> _pending = {};
+
+  /// How many times a flattened scene has been sent across to the worker.
+  ///
+  /// The whole point of a worker that stays alive is that this counts scenes
+  /// and not frames, so a drag of a hundred frames sends one. Read by the
+  /// tests; nothing in the app depends on it.
+  var sceneTransfers = 0;
+
+  /// True once the worker is up. Tests use it to tell "fell back to this
+  /// isolate" from "rendered elsewhere".
+  bool get running => _send != null;
+
+  Future<void> _start() async {
+    final receive = ReceivePort();
+    _receive = receive;
+    final ready = Completer<SendPort>();
+
+    receive.listen((message) {
+      if (message is SendPort) {
+        if (!ready.isCompleted) ready.complete(message);
+        return;
+      }
+      if (message is RenderFrameReply) {
+        _settle(message);
+        return;
+      }
+      // A null is the exit notification: the worker died, so nothing in
+      // flight will ever be answered.
+      if (message == null) _failAll('the render worker stopped');
+    });
+
+    _isolate = await Isolate.spawn(
+      renderWorkerEntry,
+      receive.sendPort,
+      onExit: receive.sendPort,
+      errorsAreFatal: true,
+      debugName: 'raster',
+    );
+    _send = await ready.future;
+  }
+
+  void _settle(RenderFrameReply reply) {
+    final pending = _pending[reply.id];
+    if (pending == null) return;
+
+    if (reply.needsScene) {
+      // First frame for this scene, or the worker has since evicted it.
+      sceneTransfers += 1;
+      _send?.send(
+        RenderFrameMessage(
+          id: pending.id,
+          sceneKey: pending.sceneKey,
+          request: pending.request.withScene(RasterScene.placeholder),
+          scene: pending.scene,
+        ),
+      );
+      return;
+    }
+
+    _pending.remove(reply.id);
+    final result = reply.result;
+    if (result != null) {
+      pending.completer.complete(result);
+    } else {
+      pending.completer.completeError(
+        StateError(reply.error ?? 'the render worker failed'),
+      );
+    }
+  }
+
+  void _failAll(String reason) {
+    _send = null;
+    _isolate = null;
+    _starting = null;
+    _receive?.close();
+    _receive = null;
+    final waiting = _pending.values.toList();
+    _pending.clear();
+    for (final pending in waiting) {
+      pending.completer.completeError(StateError(reason));
+    }
+  }
+
+  /// Renders [request]'s frame, keeping its scene on the worker under
+  /// [sceneKey] so later frames for the same scene need not carry it.
+  ///
+  /// Falls back to drawing on this isolate if the worker cannot be started:
+  /// a viewer that draws while stalling the window is better than one that
+  /// shows nothing.
+  Future<RasterResult> render(
+    RasterRequest request, {
+    required String sceneKey,
+  }) async {
+    try {
+      await (_starting ??= _start());
+    } catch (error) {
+      _failAll('the render worker could not start: $error');
+      return rasterizeScene(request);
+    }
+
+    final send = _send;
+    if (send == null) return rasterizeScene(request);
+
+    final id = _nextId += 1;
+    final pending = _PendingFrame(
+      id: id,
+      sceneKey: sceneKey,
+      request: request,
+      scene: request.scene,
+    );
+    _pending[id] = pending;
+
+    // The scene is left out on purpose; the worker asks when it needs it.
+    send.send(
+      RenderFrameMessage(
+        id: id,
+        sceneKey: sceneKey,
+        request: request.withScene(RasterScene.placeholder),
+      ),
+    );
+    return pending.completer.future;
+  }
+
+  /// Stops the worker. The app never needs this -- the isolate costs nothing
+  /// idle and lives as long as the window -- but a test that leaves it running
+  /// never finishes.
+  void dispose() {
+    _isolate?.kill(priority: Isolate.immediate);
+    _failAll('the render worker was disposed');
+    if (identical(_shared, this)) _shared = null;
+  }
+}
+
+class _PendingFrame {
+  _PendingFrame({
+    required this.id,
+    required this.sceneKey,
+    required this.request,
+    required this.scene,
+  });
+
+  final int id;
+  final String sceneKey;
+
+  /// Kept whole, scene included, so the frame can be sent again with the
+  /// scene attached when the worker says it does not hold it.
+  final RasterRequest request;
+  final RasterScene scene;
+  final completer = Completer<RasterResult>();
 }
 
 /// Blinn-Phong highlight for a normal under a light.
