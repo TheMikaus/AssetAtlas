@@ -18,3 +18,11 @@ work/atlas_mcp/models/
 # Embedding vectors are a derived cache, rebuilt from the assets.
 *.f32
 embeddings_index.sqlite
+
+# Staged build artifacts. The directory is part of the documented layout
+# (see README.md), so it stays; what a build puts in it does not. These were
+# tracked from before `**/build/` existed above, and an ignore rule does not
+# untrack what is already tracked -- 29 MB of binaries, replaced wholesale on
+# every release, so each release added another copy to history.
+outputs/*
+!outputs/.gitkeep
