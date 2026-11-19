@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.42';
+const appVersion = '1.10.43';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -12281,7 +12281,63 @@ bool _stemsShareARoot(String stem, String candidate) {
   return candidate.startsWith('${stem}_') || stem.startsWith('${candidate}_');
 }
 
-List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
+int? _nearbyTexturesCatalogIdentity;
+final Map<String, List<AssetItem>> _nearbyTexturesCache = {};
+
+/// How many models' answers to keep. The viewer asks about one model, so a
+/// single entry would do for it -- but [_validateModelTextures] asks about
+/// every model it sweeps, and a one-entry cache would have each sweep evict
+/// the answer the viewer is repainting from. A few hundred lists of
+/// references cost almost nothing beside a catalog of this size.
+const _nearbyTexturesCacheLimit = 256;
+
+/// The textures that sit near a model, remembered between calls.
+///
+/// This is called from inside two `build` methods -- the viewer's texture
+/// picker and the discovery panel -- and the viewport calls `setState` on
+/// every pointer move while the camera is dragged. So the walk below ran once
+/// per frame, over the whole catalog, and each surviving asset paid two regex
+/// replaces in [parentPath].
+///
+/// It was tolerable at 221,183 assets and stopped being tolerable at 327,365,
+/// of which 109,177 carry a texture extension and so get past the cheap
+/// extension check. Nothing about the walk changed; the library grew 48%.
+///
+/// [byScan] forces the walk, so a test can hold the cache to the same answer.
+List<AssetItem> findNearbyTextures(
+  AssetItem model,
+  List<AssetItem> allAssets, {
+  bool byScan = false,
+}) {
+  if (byScan) return _nearbyTexturesByScan(model, allAssets);
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  if (_nearbyTexturesCatalogIdentity != identity) {
+    _nearbyTexturesCache.clear();
+    _nearbyTexturesCatalogIdentity = identity;
+  }
+  // Keyed on the id rather than the item: a rescan hands out new AssetItem
+  // objects for the same files, and that arrives here as a new catalog
+  // identity, which clears the map above.
+  final cached = _nearbyTexturesCache[model.id];
+  if (cached != null) return cached;
+  // Unmodifiable, because the list is now shared between every caller that
+  // asks about this model. A caller that sorted or added to it would have
+  // been editing the cache; this makes that a thrown error rather than a
+  // wrong picker two frames later.
+  final found = List<AssetItem>.unmodifiable(
+    _nearbyTexturesByScan(model, allAssets),
+  );
+  if (_nearbyTexturesCache.length >= _nearbyTexturesCacheLimit) {
+    _nearbyTexturesCache.clear();
+  }
+  _nearbyTexturesCache[model.id] = found;
+  return found;
+}
+
+List<AssetItem> _nearbyTexturesByScan(
+  AssetItem model,
+  List<AssetItem> allAssets,
+) {
   final modelDir = parentPath(model.path);
   final modelParent = parentPath(modelDir);
   final modelGrandParent = parentPath(modelParent);
@@ -12637,21 +12693,144 @@ Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
   ]);
 }
 
+/// The `.mtl` sidecar an OBJ names, read from wherever that OBJ lives.
+///
+/// The catalog is no help here: it holds 0 rows for `mtl`, because a sidecar
+/// is not an asset anyone browses for. So the file is read beside the OBJ --
+/// from the folder, or from the same archive entry's folder -- which is also
+/// the only place the format says to look.
+///
+/// A sidecar that is missing or unreadable is not an error. It leaves every
+/// material the flat grey it had before any of this existed, which is the
+/// right answer for the 559 OBJ files on disk and the 94% of archive entries
+/// that name no library at all.
+Future<Map<String, ObjMaterialDefinition>> loadObjMaterialLibrary(
+  AssetItem asset,
+  String objText,
+) async {
+  final names = objMaterialLibraryNames(objText);
+  if (names.isEmpty) return const {};
+
+  final definitions = <String, ObjMaterialDefinition>{};
+  for (final name in names) {
+    String? text;
+    try {
+      if (isZipVirtualPath(asset.path)) {
+        final zip = parseZipVirtualPath(asset.path);
+        if (zip == null) continue;
+        final bytes = await readZipVirtualAssetBytesByPath(
+          buildZipVirtualPath(
+            zip.zipPath,
+            resolveZipRelativeEntryPath(zip.entryPath, name),
+          ),
+        );
+        if (bytes != null && bytes.isNotEmpty) {
+          text = utf8.decode(bytes, allowMalformed: true);
+        }
+      } else {
+        final relative = name.replaceAll(
+          RegExp(r'[\\/]'),
+          Platform.pathSeparator,
+        );
+        final file = File(
+          '${parentPath(asset.path)}${Platform.pathSeparator}$relative',
+        );
+        if (file.existsSync()) {
+          // Bytes rather than readAsString: an exporter that wrote a material
+          // name in the Windows codepage would otherwise throw here, and lose
+          // the colours of every other material in the file with it.
+          text = utf8.decode(await file.readAsBytes(), allowMalformed: true);
+        }
+      }
+    } on Exception catch (_) {
+      // Unreadable sidecar: the materials stay grey. Deliberately not fatal,
+      // because the geometry is fine and a grey model beats no model.
+    }
+    if (text == null) continue;
+    // Later libraries win on a name collision, which is the order an OBJ
+    // declaring two of them implies.
+    definitions.addAll(parseObjMaterialLibrary(text));
+  }
+  return definitions;
+}
+
+/// Resolves and decodes the base textures an OBJ's sidecar asked for.
+///
+/// Separate from [parseObjMesh] because decoding is asynchronous and the
+/// parser is not, and separate from [loadObjMaterialLibrary] because
+/// resolving a reference to a real file is a question about the catalog
+/// rather than about the sidecar.
+///
+/// `allowFallbackLookup` is off: the sidecar named the file, so a near-miss
+/// guess would be substituting a texture the artist did not ask for. A
+/// reference that does not resolve leaves that material on its `Kd` colour,
+/// and the discovery panel reports the reference as missing.
+Future<MeshModel> withResolvedObjTextures(
+  MeshModel mesh,
+  String modelPath,
+  List<AssetItem> allAssets,
+) async {
+  if (mesh.materials.every((material) => material.textures.isEmpty)) {
+    return mesh;
+  }
+
+  final replacements = <MeshMaterial>[];
+  for (final material in mesh.materials) {
+    final reference = material.textures.isEmpty
+        ? null
+        : material.textures.first;
+    final resolved = reference == null
+        ? null
+        : resolveTextureReference(
+            modelPath,
+            reference,
+            allAssets: allAssets,
+            allowFallbackLookup: false,
+          );
+    if (resolved == null) {
+      replacements.add(material);
+      continue;
+    }
+    // Reads through the texture cache, so an atlas named by several materials
+    // -- which is the normal case in these kits -- is decoded once.
+    final bitmap = await firstTextureBitmap([resolved]);
+    if (bitmap == null) {
+      replacements.add(material);
+      continue;
+    }
+    replacements.add(
+      material.withBaseTexture(
+        path: resolved,
+        image: await imageFromRgba(bitmap.rgba, bitmap.width, bitmap.height),
+        pixels: bitmap.rgba,
+      ),
+    );
+  }
+  return mesh.withMaterials(replacements);
+}
+
 Future<MeshModel> loadMesh(
   AssetItem asset, {
   List<AssetItem> allAssets = const [],
   int fallbackCheckerSquareSize = 16,
 }) async {
   if (asset.ext == 'obj') {
+    String objText;
     if (isZipVirtualPath(asset.path)) {
       final bytes = await readZipVirtualAssetBytesByPath(asset.path);
       if (bytes == null || bytes.isEmpty) {
         throw const FormatException('Could not read OBJ bytes from ZIP entry.');
       }
-      final objText = utf8.decode(bytes, allowMalformed: true);
-      return parseObjMesh(objText, asset.name);
+      objText = utf8.decode(bytes, allowMalformed: true);
+    } else {
+      objText = await File(asset.path).readAsString();
     }
-    return parseObjMesh(await File(asset.path).readAsString(), asset.name);
+    final mesh = parseObjMesh(
+      objText,
+      asset.name,
+      materialLibrary: await loadObjMaterialLibrary(asset, objText),
+    );
+    return withResolvedObjTextures(mesh, asset.path, allAssets);
   }
   if (asset.ext == 'stl') {
     // Bytes, not text: a binary STL is the common case and decoding it as
@@ -13492,20 +13671,134 @@ String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
   return selected;
 }
 
+/// One material as an `.mtl` sidecar describes it.
+///
+/// Only the two fields that change a picture. `Ks`, `Ns`, `Ni` and `illum`
+/// describe a lighting model this renderer does not implement, so reading
+/// them would mean storing numbers nothing looks at.
+class ObjMaterialDefinition {
+  const ObjMaterialDefinition({this.color, this.diffuseTexture});
+
+  /// `Kd`, or null when the material did not state one.
+  final Color? color;
+
+  /// `map_Kd` verbatim, still relative to the sidecar's own folder.
+  final String? diffuseTexture;
+}
+
+/// The `mtllib` files an OBJ asks for, in the order it names them.
+///
+/// Separate from [parseObjMesh] because the sidecar has to be read before the
+/// mesh can be parsed with it, and the caller is the only one that knows
+/// whether "beside the OBJ" means a folder or an open archive.
+List<String> objMaterialLibraryNames(String objText) {
+  final names = <String>[];
+  for (final rawLine in objText.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (!line.toLowerCase().startsWith('mtllib ')) continue;
+    final name = line.substring(7).trim();
+    if (name.isNotEmpty && !names.contains(name)) names.add(name);
+  }
+  return names;
+}
+
+/// Reads an `.mtl` sidecar: the per-material colours and diffuse textures.
+///
+/// Nothing read a `.mtl` until now, so every OBJ in the library drew in one
+/// flat grey however many materials it declared. `ship_dark.obj` names five
+/// -- wood, woodDark, iron, window, textile -- and they were all the same
+/// colour on screen.
+///
+/// Measured over the 4,189 OBJ files on disk: 3,429 have a sidecar carrying
+/// `Kd` colours and no texture at all, 201 name a texture with `map_Kd`, and
+/// 559 have no sidecar. So for most of this library the sidecar holds colour
+/// rather than an image, and reading only `map_Kd` would have fixed the rarer
+/// half of the problem.
+///
+/// `Kd` is scaled straight from 0..1 to 0..255 with no gamma step. That is
+/// what the FBX path does with the same quantity, and matching it means an
+/// OBJ and its FBX twin draw the same colour -- which matters more here than
+/// colorimetric correctness, because the twins sit side by side in this
+/// library and a visible difference between them reads as a bug.
+Map<String, ObjMaterialDefinition> parseObjMaterialLibrary(String mtlText) {
+  final definitions = <String, ObjMaterialDefinition>{};
+  var currentName = '';
+  Color? currentColor;
+  String? currentTexture;
+
+  void commit() {
+    if (currentName.isEmpty) return;
+    definitions[currentName] = ObjMaterialDefinition(
+      color: currentColor,
+      diffuseTexture: currentTexture,
+    );
+  }
+
+  for (final rawLine in mtlText.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (line.isEmpty || line.startsWith('#')) continue;
+    final space = line.indexOf(RegExp(r'\s'));
+    if (space <= 0) continue;
+    final keyword = line.substring(0, space).toLowerCase();
+    final value = line.substring(space + 1).trim();
+
+    if (keyword == 'newmtl') {
+      commit();
+      currentName = value;
+      currentColor = null;
+      currentTexture = null;
+    } else if (keyword == 'kd') {
+      final parts = value.split(RegExp(r'\s+'));
+      if (parts.length < 3) continue;
+      final channels = [
+        for (final part in parts.take(3)) double.tryParse(part),
+      ];
+      if (channels.any((channel) => channel == null)) continue;
+      currentColor = Color.fromARGB(
+        255,
+        (channels[0]!.clamp(0.0, 1.0) * 255).round(),
+        (channels[1]!.clamp(0.0, 1.0) * 255).round(),
+        (channels[2]!.clamp(0.0, 1.0) * 255).round(),
+      );
+    } else if (keyword == 'map_kd') {
+      // The whole remainder, not the last token: a texture path may contain
+      // spaces. The format also allows option flags before the filename
+      // (`map_Kd -o 0 0 0 wood.png`); none of the 357 map_Kd lines in this
+      // library uses one, so rather than guess at where the options end,
+      // leave such a line unread and let the warning say the texture was not
+      // found. A wrong texture is worse than a missing one.
+      if (value.startsWith('-')) continue;
+      if (value.isNotEmpty) currentTexture = value;
+    }
+  }
+  commit();
+  return definitions;
+}
+
 /// Parses an OBJ, including the parts the first version threw away.
 ///
 /// `vt` lines and the `v/vt/vn` corner references were being dropped, so an
 /// OBJ could never be textured no matter what else resolved -- a Synty barn
 /// carries 12k texture coordinates and arrived with none. `usemtl` splits the
-/// mesh into materials and `mtllib` records the sidecar so the texture
-/// resolver can chase it; an OBJ that names neither still parses, it just gets
-/// one unnamed material.
-MeshModel parseObjMesh(String text, String name) {
+/// mesh into materials and the sidecar those names are looked up in gives
+/// each one its colour and texture; an OBJ that names neither still parses,
+/// it just gets one unnamed material.
+///
+/// [materialLibrary] is the sidecar already read, from
+/// [parseObjMaterialLibrary]. It is a parameter rather than a file this
+/// function opens so that the parser stays text-in, mesh-out: the sidecar may
+/// be on disk beside the OBJ or an entry in an archive this function has no
+/// handle on, and [loadMesh] is where that distinction already lives. Empty
+/// is the old behaviour -- every material flat grey.
+MeshModel parseObjMesh(
+  String text,
+  String name, {
+  Map<String, ObjMaterialDefinition> materialLibrary = const {},
+}) {
   final vertices = <Vec3>[];
   final texCoords = <Vec2>[];
   final faces = <MeshFace>[];
   final materialNames = <String>[];
-  final materialLibraries = <String>[];
   var currentMaterial = 0;
 
   int? resolveIndex(String token, int count) {
@@ -13540,11 +13833,6 @@ MeshModel parseObjMesh(String text, String name) {
           ),
         );
       }
-    } else if (line.startsWith('mtllib ')) {
-      final library = line.substring(7).trim();
-      if (library.isNotEmpty && !materialLibraries.contains(library)) {
-        materialLibraries.add(library);
-      }
     } else if (line.startsWith('usemtl ')) {
       final material = line.substring(7).trim();
       final existing = materialNames.indexOf(material);
@@ -13575,22 +13863,40 @@ MeshModel parseObjMesh(String text, String name) {
     throw const FormatException('No OBJ geometry found.');
   }
 
+  const flatGrey = Color(0xffb9c2cc);
   final materials = [
     for (final materialName in materialNames)
-      MeshMaterial(
-        name: materialName,
-        color: const Color(0xffb9c2cc),
-        textures: const [],
-      ),
+      () {
+        final defined = materialLibrary[materialName];
+        final reference = defined?.diffuseTexture;
+        return MeshMaterial(
+          name: materialName,
+          // Grey only when the sidecar is absent or said nothing. A material
+          // the sidecar does describe draws in its own colour, which is what
+          // makes ship_dark's wood, iron and window three colours instead of
+          // one.
+          color: defined?.color ?? flatGrey,
+          textures: reference == null ? const [] : [reference],
+        );
+      }(),
+  ];
+  // The texture references, not the sidecar names. `mtllib` used to go here,
+  // so the only "texture" an OBJ could offer the resolver was `ship_dark.mtl`
+  // -- which is not an image, so it resolved to nothing and was then reported
+  // as a missing texture. The sidecar is read now, so what goes here is what
+  // it asked for.
+  final references = <String>[
+    for (final material in materials)
+      if (material.textures.isNotEmpty) material.textures.first,
   ];
   return MeshModel.normalized(
     name: name,
     vertices: vertices,
     faces: faces,
     materials: materials.isEmpty
-        ? const [MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
+        ? const [MeshMaterial(name: '', color: flatGrey, textures: [])]
         : materials,
-    textureFiles: materialLibraries,
+    textureFiles: references.toSet().toList(),
   );
 }
 
