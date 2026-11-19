@@ -277,9 +277,11 @@ Not bugs in the tools; they change what the answers are worth.
   polygon, 341 unreal — and the other 32,782 are static meshes with no rig,
   which is what most of a prop library is.
 
-  Atlas fills both lazily as filters ask, so a rescan empties them again and
-  `backfill_rigs.py` has to be re-run. `catalog_stats` says which state it
-  is in; believe it over this file.
+  Atlas fills both lazily as filters ask, and an ordinary rescan keeps what
+  is already known for every file whose size has not changed. Files added by
+  a rescan have no rig recorded until something asks, and a *forced* rescan
+  clears the lot. Either way `backfill_rigs.py` fills the gaps in one pass.
+  `catalog_stats` says which state it is in; believe it over this file.
 
 - **`type="animation"` is the exception, and does work.** Where `model_kind`
   is unset the folder decides: an FBX under a directory named `Animations`,

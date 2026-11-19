@@ -163,7 +163,13 @@ does not have.
 Atlas fills `rig_family` in lazily — it reads a file when a filter needs the
 answer. That is right for an app, and it leaves the column nearly empty, which
 is what `search_assets type=character` and `find_animations rig=...` lean on.
-Every rescan empties it again, and `catalog_stats` says which state it is in.
+An ordinary rescan does **not** empty it: `carryClassification` keeps the rig
+and the model kind for every file whose size has not changed, which is what
+makes a rescan cheap. A file that did change loses its verdict, because the
+old one was about different bytes, and newly scanned files have none yet. The
+*forced* rescan throws all of them away on purpose, which is hours of importer
+runs to rebuild. `catalog_stats` says which state the column is in; believe it
+over this paragraph.
 
 `backfill_rigs.py` fills it in one pass, a few minutes over the whole library
 with twelve workers. Run over all 34,801 FBX files it read every one and found
