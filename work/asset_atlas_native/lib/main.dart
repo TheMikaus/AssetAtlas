@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.40';
+const appVersion = '1.10.41';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -15812,6 +15812,14 @@ class AssetAtlasDatabase {
     'tags_json': jsonEncode(asset.tags),
     'ignored': asset.ignored ? 1 : 0,
     'model_kind': asset.modelKind,
+    // Was missing, and saveCatalog deletes every row before reinserting --
+    // so each save wrote NULL over the whole column. The read at
+    // _assetFromRow and the per-row write at the lazy classifier both
+    // handled it, which is why it looked like it worked: a rig read for one
+    // filter survived until the next scan and then vanished, taking
+    // backfill_rigs.py's 34,801 answers with it. That is the "a rescan
+    // empties rig_family" everyone had learned to expect.
+    'rig_family': asset.rigFamily,
     'referenced_by_model': asset.referencedByModel ? 1 : 0,
   };
 
