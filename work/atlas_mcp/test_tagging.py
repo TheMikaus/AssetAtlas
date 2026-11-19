@@ -79,8 +79,18 @@ class EmbedderContractTest(unittest.TestCase):
 
     def test_only_formats_with_geometry_are_rendered(self):
         # Audio has nothing to see and .uasset is unreadable outside Unreal,
-        # so neither can produce a picture to embed.
-        self.assertEqual(set(tagging.RENDERABLE_EXTS), {"fbx", "obj"})
+        # so neither can produce a picture to embed. The list may only hold
+        # formats Atlas itself can turn into triangles -- it is the renderer,
+        # and a format it cannot read fails every asset of that kind on every
+        # run for ever.
+        self.assertEqual(set(tagging.RENDERABLE_EXTS),
+                         {"fbx", "obj", "stl"})
+
+    def test_the_formats_not_rendered_are_the_ones_atlas_cannot_read(self):
+        # DAE and GLB are in the catalog as models and are deliberately
+        # absent: 3,045 and 3,035 files that nothing here can draw yet.
+        for ext in ("dae", "glb", "blend", "uasset", "wav"):
+            self.assertNotIn(ext, tagging.RENDERABLE_EXTS)
 
     def test_the_default_thread_count_leaves_the_machine_usable(self):
         # The whole point of the queue is that it runs behind an interactive
@@ -1683,6 +1693,18 @@ class ImageCandidateTest(unittest.TestCase):
     def test_an_unknown_kind_is_refused_rather_than_guessed(self):
         with self.assertRaises(ValueError):
             tagging.candidates(self.connection, kind="sounds")
+
+    def test_stl_is_rendered_like_any_other_model(self):
+        # 2,843 of these were in the catalog and invisible to a search that
+        # ranks by shape, which is the one thing an STL does carry.
+        self.add("s", "blasterA.stl", "zip:p.zip::blasterA.stl", "stl",
+                 "model")
+        self.assertEqual(self.ids(kind="model"), ["s"])
+
+    def test_an_stl_is_not_mistaken_for_an_image(self):
+        self.add("s", "blasterA.stl", "zip:p.zip::blasterA.stl", "stl",
+                 "model")
+        self.assertEqual(self.ids(kind="image"), [])
 
     def test_every_image_extension_in_the_library_is_selected(self):
         for index, ext in enumerate(("png", "jpg", "gif", "bmp", "psd")):

@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.41';
+const appVersion = '1.10.42';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3499,6 +3499,7 @@ class _PreviewPanelState extends State<PreviewPanel> {
     if (item.type == 'model') {
       if (isZipVirtualPath(item.path) &&
           item.ext != 'obj' &&
+          item.ext != 'stl' &&
           item.ext != 'fbx') {
         return _unsupportedZipModelPreview(item);
       }
@@ -7219,7 +7220,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
   /// The mesh itself, so the panel can tell "this material is a flat colour"
   /// apart from "this model's textures are missing". Shares the cached import.
   Future<MeshModel>? _loadMesh() {
-    if (!_previewableModelExts.contains(widget.asset.ext)) return null;
+    if (!previewableModelExts.contains(widget.asset.ext)) return null;
     return MeshLoadCache.load(widget.asset, allAssets: widget.allAssets);
   }
 
@@ -7229,7 +7230,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
     final allAssets = widget.allAssets;
     final onActivateAsset = widget.onActivateAsset;
     final nearby = findNearbyTextures(asset, allAssets);
-    if (_previewableModelExts.contains(asset.ext)) {
+    if (previewableModelExts.contains(asset.ext)) {
       return FutureBuilder<MeshModel>(
         future: meshFuture,
         builder: (context, meshSnapshot) =>
@@ -7971,7 +7972,7 @@ bool looksLikeAnimation(String relativePath) {
 /// OBJ is here because the parser now keeps `vt` and `usemtl`; before that it
 /// produced geometry with no texture information, so there was nothing for the
 /// discovery panel to say about one.
-const _previewableModelExts = {'fbx', 'obj'};
+const previewableModelExts = {'fbx', 'obj', 'stl'};
 
 /// One material, with its resolved texture shown rather than described.
 ///
@@ -9384,7 +9385,7 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   AssetItem asset,
   List<AssetItem> allAssets,
 ) async {
-  if (!_previewableModelExts.contains(asset.ext)) return const [];
+  if (!previewableModelExts.contains(asset.ext)) return const [];
   textureReferenceScanCount += 1;
   // Shares the import with the 3D preview instead of spawning a second helper.
   final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
@@ -12652,6 +12653,17 @@ Future<MeshModel> loadMesh(
     }
     return parseObjMesh(await File(asset.path).readAsString(), asset.name);
   }
+  if (asset.ext == 'stl') {
+    // Bytes, not text: a binary STL is the common case and decoding it as
+    // text would corrupt the floats before the parser saw them.
+    final bytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : await File(asset.path).readAsBytes();
+    if (bytes == null || bytes.isEmpty) {
+      throw const FormatException('Could not read STL bytes.');
+    }
+    return parseStlMesh(bytes, asset.name);
+  }
   if (asset.ext == 'fbx') {
     fbxLog('Loading FBX mesh: ${asset.path}');
     final zipBytes = isZipVirtualPath(asset.path)
@@ -13346,6 +13358,7 @@ String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
     'sm',
     'fbx',
     'obj',
+    'stl',
     'mesh',
     'meshes',
     'model',
@@ -13578,6 +13591,117 @@ MeshModel parseObjMesh(String text, String name) {
         ? const [MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
         : materials,
     textureFiles: materialLibraries,
+  );
+}
+
+/// Whether these bytes are a binary STL rather than an ASCII one.
+///
+/// The triangle count in the header is the only reliable test. A binary STL
+/// may *begin* with the word "solid" -- several exporters write their product
+/// name into the 80-byte header and it often starts that way -- so sniffing
+/// for that word reads them as ASCII, finds no `vertex` lines, and reports a
+/// file with geometry as having none.
+///
+/// The arithmetic cannot mistake an ASCII file for a binary one. Bytes 80..84
+/// of an ASCII file are text, and the smallest byte text uses is 0x09, so the
+/// little-endian count read there is at least 0x09090909 -- 151 million
+/// triangles, which would need a 7.5 GB file to satisfy.
+bool looksLikeBinaryStl(Uint8List bytes) {
+  if (bytes.length < 84) return false;
+  final declared = ByteData.sublistView(
+    bytes,
+    80,
+    84,
+  ).getUint32(0, Endian.little);
+  if (declared == 0) return false;
+  // Not an exact length match: exporters pad the end, and a file with
+  // trailing bytes is still a file whose triangles are all present.
+  return bytes.length >= 84 + declared * 50;
+}
+
+/// A triangle soup from an STL file, binary or ASCII.
+///
+/// STL is the simplest format in the library and the poorest: triangles, and
+/// nothing else. No UVs, no materials, no units, no object names. So these
+/// draw in the same flat colour an OBJ with no `mtllib` does, which is all
+/// the format can carry -- a grey render of an STL is correct, not a failure
+/// to find its texture.
+///
+/// The per-facet normals are read past. They are routinely zero or wrong in
+/// files exported by CAD tools, and the renderer derives its own from the
+/// winding regardless (see renderer_geometry_test.dart), so storing them
+/// would be storing something nothing reads.
+///
+/// Vertices are not welded. A triangle soup repeats every shared corner, so
+/// this is three vertices per face where a welded mesh would be about one --
+/// but shading here is per face, so welding would change no pixel, and the
+/// largest STL in this library is 0.26 MB, about 5,500 triangles.
+MeshModel parseStlMesh(Uint8List bytes, String name) {
+  final vertices = <Vec3>[];
+  final faces = <MeshFace>[];
+
+  void addTriangle(Vec3 a, Vec3 b, Vec3 c) {
+    final first = vertices.length;
+    vertices
+      ..add(a)
+      ..add(b)
+      ..add(c);
+    faces.add(MeshFace([first, first + 1, first + 2]));
+  }
+
+  if (looksLikeBinaryStl(bytes)) {
+    final declared = ByteData.sublistView(
+      bytes,
+      80,
+      84,
+    ).getUint32(0, Endian.little);
+    final data = ByteData.sublistView(bytes);
+    for (var triangle = 0; triangle < declared; triangle += 1) {
+      // 84 past the header and the count, 50 per triangle, 12 past the
+      // facet normal to reach the first corner.
+      final corner = 84 + triangle * 50 + 12;
+      if (corner + 36 > bytes.length) break;
+      Vec3 at(int offset) => Vec3(
+        data.getFloat32(offset, Endian.little),
+        data.getFloat32(offset + 4, Endian.little),
+        data.getFloat32(offset + 8, Endian.little),
+      );
+      addTriangle(at(corner), at(corner + 12), at(corner + 24));
+    }
+  } else {
+    final text = utf8.decode(bytes, allowMalformed: true);
+    final pending = <Vec3>[];
+    for (final rawLine in text.split(RegExp(r'\r?\n'))) {
+      final line = rawLine.trim();
+      // Lowercased for the keyword only: the convention is lower case and
+      // most writers follow it, but not all of them do.
+      if (!line.toLowerCase().startsWith('vertex')) continue;
+      final parts = line.split(RegExp(r'\s+'));
+      if (parts.length < 4) continue;
+      final x = double.tryParse(parts[1]);
+      final y = double.tryParse(parts[2]);
+      final z = double.tryParse(parts[3]);
+      if (x == null || y == null || z == null) continue;
+      pending.add(Vec3(x, y, z));
+      if (pending.length == 3) {
+        addTriangle(pending[0], pending[1], pending[2]);
+        pending.clear();
+      }
+    }
+    // A facet cut short by a truncated file contributes nothing rather than a
+    // triangle with an invented corner.
+  }
+
+  if (faces.isEmpty) {
+    throw const FormatException('No STL geometry found.');
+  }
+  return MeshModel.normalized(
+    name: name,
+    vertices: vertices,
+    faces: faces,
+    materials: const [
+      MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: []),
+    ],
   );
 }
 
@@ -16529,6 +16653,13 @@ Future<Map<String, Object?>> bridgeInspect(
     warnings.add(
       'OBJ carries no units. These packs ship OBJ in centimetres beside an '
       'FBX in metres, so prefer the FBX twin if there is one.',
+    );
+  }
+  if (authoredSize == null && asset.ext == 'stl') {
+    warnings.add(
+      'STL carries no units, no UVs and no materials -- only triangles. It '
+      'is a 3D-printing format, and these kits ship an FBX or OBJ twin '
+      'beside it; prefer that for anything that needs texturing.',
     );
   }
 

@@ -54,7 +54,14 @@ INDEX_NAME = "embeddings_index.sqlite"
 
 # What is worth looking at. Audio has nothing to see; .uasset is unreadable
 # outside Unreal, so there is no geometry to draw.
-RENDERABLE_EXTS = ("fbx", "obj")
+#
+# STL joined these in Atlas 1.10.42. It carries triangles and nothing else --
+# no UVs, no materials -- so an STL renders flat grey, which is a true picture
+# of the file and a poor one of the object: the Kenney kits that ship them
+# ship an OBJ twin beside each, and the twin is what has the colour. Embedded
+# anyway, because shape is what a render carries and 2,843 of these were
+# invisible to a search that ranks by shape.
+RENDERABLE_EXTS = ("fbx", "obj", "stl")
 
 # Images are the other half of the library an eye is useful on: the atlases a
 # model is textured with, and the icon sprites. Nothing is drawn for these --
