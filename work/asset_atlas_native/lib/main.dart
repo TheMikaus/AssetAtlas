@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.39';
+const appVersion = '1.10.40';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -9553,6 +9553,18 @@ bool textureChannelsAgree(String requestedBase, String candidateBase) =>
 final _pathSeparatorPattern = RegExp(r'[\\/]');
 final _paletteTailPattern = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*');
 
+/// How many words a texture name puts in front of its palette tail.
+///
+/// `PolygonSciFiSpace_Texture_01_A` says one thing before `Texture_01_A`;
+/// `PolygonSciFiSpace_Signs_Texture_01_A` says two, and that second word is a
+/// different atlas rather than a spelling of the same one. Used to separate
+/// candidates whose tails match, which otherwise tie.
+int _qualifierCount(String base) {
+  final match = _paletteTailPattern.firstMatch(base);
+  final head = match == null ? base : base.substring(0, match.start);
+  return textureNameTokens(head).length;
+}
+
 int? _catalogByPathIdentity;
 Map<String, AssetItem>? _catalogByPathCache;
 
@@ -9990,6 +10002,21 @@ String? findDeterministicTextureRelink(
     if (requestedPaletteTail.isNotEmpty &&
         candidatePaletteTail == requestedPaletteTail) {
       value += 105;
+      // A matching tail is not enough on its own, because a pack holds
+      // several atlases that share one: PolygonSciFiSpace_Texture_01_A and
+      // PolygonSciFiSpace_Signs_Texture_01_A both end in Texture_01_A, both
+      // scored 105 + 25, and the tie was broken alphabetically -- which put
+      // the signs sheet ahead of the atlas every model in the pack wants.
+      // SM_Prop_Turret_Base_Double_01 drew in signage.
+      //
+      // What separates them is the qualifier in front of the tail. The
+      // request names one thing before its tail (PolygonSciFiCity) and so
+      // does the atlas (PolygonSciFiSpace); the signs sheet names two. A
+      // request that does carry a qualifier prefers a candidate that also
+      // does, by the same count.
+      if (_qualifierCount(base) == _qualifierCount(requestedBase)) {
+        value += 15;
+      }
     }
 
     // Common singular/plural drift eg. window -> windows.
@@ -12909,24 +12936,66 @@ Future<MeshModel> meshModelFromImporterJson(
     final uvSet = (material['uvSet'] as String?)?.trim() ?? '';
     final embeddedTextureBase64 =
         (material['embeddedTextureBase64'] as String?) ?? '';
-    final resolvedTextures = textureRefs
-        .map(
-          (texture) => resolveTextureReference(
-            modelPath,
-            texture,
-            allAssets: allAssets,
-            allowFallbackLookup: false,
-          ),
-        )
-        .whereType<String>()
-        .toList();
+    // The base colour may only come from a reference that is a base colour.
+    //
+    // `textures` holds every reference the material names, the normal and
+    // emissive maps included, and the base slot used to take the first of
+    // them that resolved. That is right only while the colour map resolves
+    // first: SM_Wep_Mining_Laser_01 names a colour map and an emissive map,
+    // the colour map resolved to nothing, and the emissive became the base
+    // colour -- so the model drew as a black silhouette with a few bright
+    // spots, while the material still reported a texture as found.
+    //
+    // Two filters, because either can be the one that knows. The importer
+    // declares `normalTexture` and `emissiveTexture` outright, and a name
+    // that says what channel it is says so whether or not it was declared.
+    final declaredChannelRefs = {
+      ((material['normalTexture'] as String?) ?? '').trim(),
+      ((material['emissiveTexture'] as String?) ?? '').trim(),
+    }..removeWhere((reference) => reference.isEmpty);
+    bool isBaseColourRef(String reference) {
+      if (declaredChannelRefs.contains(reference.trim())) return false;
+      final base = reference
+          .split(_pathSeparatorPattern)
+          .last
+          .toLowerCase()
+          .replaceAll(_extensionPattern, '');
+      return textureChannelWord(base).isEmpty;
+    }
+
+    String? resolve(String reference) => resolveTextureReference(
+      modelPath,
+      reference,
+      allAssets: allAssets,
+      allowFallbackLookup: false,
+    );
+
+    // Resolved once each, then split. Resolving twice would pay the relink
+    // twice, and the relink is the expensive half of building a material.
+    final resolutions = [
+      for (final reference in textureRefs)
+        (reference: reference, resolved: resolve(reference)),
+    ];
+    // Every channel, which is what the material genuinely resolved and what
+    // the diagnostics, the palette matching and inspect_model all report. An
+    // emissive map that resolved did resolve; it is simply not a base colour.
+    final resolvedTextures = [
+      for (final each in resolutions)
+        if (each.resolved != null) each.resolved!,
+    ];
+    // Only what may colour a face.
+    final resolvedBaseColours = [
+      for (final each in resolutions)
+        if (each.resolved != null && isBaseColourRef(each.reference))
+          each.resolved!,
+    ];
     fbxLog(
       'Material ${(material['name'] as String?) ?? 'Material'} refs=${textureRefs.length} resolved=${resolvedTextures.length}',
     );
     // Both of these read through the texture cache, so the atlas this
     // material names is read off disk and decoded once however many
     // materials and however many assets in the pack point at it.
-    final textureColor = await firstTextureAverageColor(resolvedTextures);
+    final textureColor = await firstTextureAverageColor(resolvedBaseColours);
     ui.Image? textureImage;
     Uint8List? texturePixels;
     if (embeddedTextureBase64.isNotEmpty) {
@@ -12949,7 +13018,7 @@ Future<MeshModel> meshModelFromImporterJson(
     if (textureImage == null) {
       // The pixels come from the cache, so single-texel faces can be filled
       // directly without reading the image back per asset.
-      final bitmap = await firstTextureBitmap(resolvedTextures);
+      final bitmap = await firstTextureBitmap(resolvedBaseColours);
       if (bitmap != null) {
         textureImage = await imageFromRgba(
           bitmap.rgba,
