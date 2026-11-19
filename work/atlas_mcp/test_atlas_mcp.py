@@ -1827,5 +1827,143 @@ class PromptTest(unittest.TestCase):
         self.assertIn("prompts", atlas_mcp.INSTRUCTIONS)
 
 
+class ArgumentTypeTest(unittest.TestCase):
+    """What happens when a client sends the type the *name* suggests.
+
+    Arguments arrive as JSON from a model writing JSON, and it reaches for
+    the type the name implies rather than the type the schema states. Both
+    directions went wrong: `inspect=true` raised `'bool' object has no
+    attribute 'lower'`, and `overwrite="false"` was read as true.
+    """
+
+    def test_text_takes_a_number_because_a_number_is_unambiguous(self):
+        # A pack called 2024 is a pack.
+        self.assertEqual(
+            atlas_mcp.text_argument({"pack": 2024}, "pack"), "2024")
+
+    def test_text_refuses_a_boolean_in_words_a_caller_can_act_on(self):
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.text_argument({"pack": True}, "pack")
+        message = str(caught.exception)
+        self.assertIn("pack", message)
+        self.assertNotIn("object has no attribute", message)
+
+    def test_text_refuses_a_list_by_saying_it_takes_one(self):
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.text_argument({"pack": ["a", "b"]}, "pack")
+        self.assertIn("single piece of text", str(caught.exception))
+
+    def test_an_absent_or_empty_argument_is_the_default(self):
+        self.assertEqual(atlas_mcp.text_argument({}, "pack", "all"), "all")
+        self.assertEqual(
+            atlas_mcp.text_argument({"pack": ""}, "pack", "all"), "all")
+
+    def test_a_number_may_arrive_as_text(self):
+        self.assertEqual(atlas_mcp.int_argument({"limit": "20"}, "limit", 5),
+                         20)
+
+    def test_a_number_refuses_a_boolean_rather_than_counting_it_as_one(self):
+        # bool is a subclass of int, so int(True) is 1: a limit of one
+        # result, silently, where the caller asked for something else.
+        with self.assertRaises(atlas_mcp.AtlasError):
+            atlas_mcp.int_argument({"limit": True}, "limit", 5)
+
+    def test_a_number_refuses_words(self):
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.int_argument({"limit": "twenty"}, "limit", 5)
+        self.assertIn("whole number", str(caught.exception))
+
+    def test_a_float_may_arrive_as_text(self):
+        self.assertEqual(atlas_mcp.float_argument({"yaw": "0.6"}, "yaw"), 0.6)
+        self.assertIsNone(atlas_mcp.float_argument({}, "yaw"))
+
+    def test_the_word_false_means_false(self):
+        # bool("false") is True. This is the one that overwrote files the
+        # caller had asked to leave alone.
+        for word in ("false", "FALSE", " no ", "off", "0"):
+            self.assertIs(
+                atlas_mcp.bool_argument({"overwrite": word}, "overwrite"),
+                False, "%r should be false" % word)
+
+    def test_the_word_true_means_true(self):
+        for word in ("true", "TRUE", "yes", "on", "1"):
+            self.assertIs(
+                atlas_mcp.bool_argument({"overwrite": word}, "overwrite"),
+                True, "%r should be true" % word)
+
+    def test_a_real_boolean_is_taken_as_it_is(self):
+        self.assertIs(
+            atlas_mcp.bool_argument({"overwrite": True}, "overwrite"), True)
+        self.assertIs(
+            atlas_mcp.bool_argument({"overwrite": False}, "overwrite"), False)
+
+    def test_a_default_of_true_survives_an_absent_argument(self):
+        # distinct defaults to collapsing copies.
+        self.assertIs(atlas_mcp.bool_argument({}, "distinct", True), True)
+        self.assertIs(
+            atlas_mcp.bool_argument({"distinct": False}, "distinct", True),
+            False)
+
+    def test_a_word_that_is_neither_is_refused_not_guessed(self):
+        with self.assertRaises(atlas_mcp.AtlasError) as caught:
+            atlas_mcp.bool_argument({"overwrite": "maybe"}, "overwrite")
+        self.assertIn("true or false", str(caught.exception))
+
+
+class GetAssetInspectTest(CatalogTest):
+    """get_asset's `inspect`, which reads boolean and is a string enum.
+
+    Each of these asserts the asset's own details came back, not merely that
+    an error did not. Asserting the absence of a message is how a test ends
+    up passing on "nothing in the catalog matches" instead of on the fix --
+    the first draft of these named an asset the fixture does not have.
+    """
+
+    ASSET = "SM_Prop_Anvil_01.fbx"
+
+    def answered_about_the_asset(self, result):
+        self.assertFalse(result.get("isError"),
+                         result["content"][0].get("text"))
+        body = result["content"][0]["text"]
+        self.assertNotIn("has no attribute", body)
+        # The handler reached its report, which the AttributeError prevented.
+        self.assertIn(self.ASSET, body)
+        self.assertIn("path", body)
+        return body
+
+    def test_inspect_true_is_honoured_rather_than_crashing(self):
+        # The reported failure: 'bool' object has no attribute 'lower'.
+        self.answered_about_the_asset(
+            self.call_raw("get_asset", path=self.ASSET, inspect=True))
+
+    def test_inspect_false_is_honoured_too(self):
+        self.answered_about_the_asset(
+            self.call_raw("get_asset", path=self.ASSET, inspect=False))
+
+    def test_the_documented_words_still_work(self):
+        for word in ("none", "summary", "full"):
+            self.answered_about_the_asset(
+                self.call_raw("get_asset", path=self.ASSET, inspect=word))
+
+    def test_the_text_true_still_works_as_it_did(self):
+        # What the user fell back to when the boolean failed.
+        self.answered_about_the_asset(
+            self.call_raw("get_asset", path=self.ASSET, inspect="true"))
+
+    def test_absent_means_summary_as_before(self):
+        self.answered_about_the_asset(
+            self.call_raw("get_asset", path=self.ASSET))
+
+    def test_a_value_that_means_nothing_is_explained(self):
+        result = self.call_raw("get_asset", path=self.ASSET,
+                               inspect="sideways")
+        self.assertTrue(result.get("isError"))
+        body = result["content"][0]["text"]
+        self.assertIn("none", body)
+        self.assertIn("summary", body)
+        self.assertIn("full", body)
+        self.assertNotIn("has no attribute", body)
+
+
 if __name__ == "__main__":
     unittest.main()

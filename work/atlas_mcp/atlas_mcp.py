@@ -713,7 +713,7 @@ def build_query(arguments):
     clauses = ["ignored = 0"]
     params = []
 
-    kind = (arguments.get("type") or "all").lower()
+    kind = text_argument(arguments, "type", "all").lower()
     if kind not in TYPE_FILTERS:
         raise AtlasError(
             "Unknown type %r. Use one of: %s."
@@ -721,19 +721,19 @@ def build_query(arguments):
     if TYPE_FILTERS[kind]:
         clauses.append("(%s)" % TYPE_FILTERS[kind])
 
-    parsed = parse_asset_query(arguments.get("query"))
+    parsed = parse_asset_query(text_argument(arguments, "query"))
     if parsed:
         query_where, query_params = query_sql(parsed)
         clauses.append(query_where)
         params.extend(query_params)
 
     for field, column in (("pack", "relative_path"), ("folder", "relative_path")):
-        value = (arguments.get(field) or "").strip().lower()
+        value = text_argument(arguments, field).strip().lower()
         if value:
             clauses.append("lower(%s) LIKE ?" % column)
             params.append("%" + value.replace("\\", "/") + "%")
 
-    ext = (arguments.get("ext") or "").strip().lower().lstrip(".")
+    ext = text_argument(arguments, "ext").strip().lower().lstrip(".")
     if ext:
         clauses.append("ext = ?")
         params.append(ext)
@@ -817,8 +817,8 @@ def archive_clause(connection, arguments):
     over the path would have to guess at Unreal_5_4 against Unreal_Project_4_22
     against a bare 4_22, and would quietly miss builds.
     """
-    engine = (arguments.get("engine") or "").strip().lower()
-    build = (arguments.get("build") or "").strip().lower()
+    engine = text_argument(arguments, "engine").strip().lower()
+    build = text_argument(arguments, "build").strip().lower()
     if not engine and not build:
         return None, []
     if build and build not in BUILD_KINDS:
@@ -1122,14 +1122,121 @@ def text(body):
     return {"content": [{"type": "text", "text": body}]}
 
 
+# ------------------------------------------------------------- arguments
+#
+# Arguments arrive as JSON from a model writing JSON, and a model reaches for
+# the type the *name* suggests rather than the type the schema states. Both
+# directions of that went wrong here:
+#
+#   get_asset inspect=true   ->  'bool' object has no attribute 'lower',
+#                                because `inspect` reads boolean and is a
+#                                string enum. The caller was told the name of
+#                                a Python method, which it can do nothing
+#                                with.
+#   export_assets overwrite="false"
+#                            ->  bool("false") is True, so files the caller
+#                                asked to leave alone were overwritten. No
+#                                error at all, which is worse.
+#
+# So every argument is read through one of these. They are lenient where the
+# intent is unambiguous -- "20" is twenty, 2024 is text, "false" is false --
+# and refuse with a sentence naming what they wanted where it is not.
+
+
+def text_argument(arguments, name, default=""):
+    """One argument as text.
+
+    A number is accepted because a number is unambiguous as text: a pack
+    called 2024 is a pack. A boolean is not -- `true` has no textual meaning
+    -- and neither is a list or an object, which say the caller wanted
+    several of something that takes one.
+    """
+    value = arguments.get(name)
+    # Falsy means absent, which is what `(x or default)` did before: an empty
+    # string is how a client says "no opinion".
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise AtlasError(
+            "%s takes text, not true/false. If you meant to turn something "
+            "on, the tool's schema says which values it accepts." % name)
+    if isinstance(value, (int, float)):
+        return str(value)
+    if not isinstance(value, str):
+        raise AtlasError(
+            "%s takes a single piece of text, not a %s."
+            % (name, type(value).__name__))
+    return value
+
+
+def int_argument(arguments, name, default):
+    """One argument as a whole number, accepting "20" for 20."""
+    value = arguments.get(name)
+    if value is None or value == "":
+        return default
+    # Before int(): bool is a subclass of int in Python, so True would
+    # quietly become a limit of 1 rather than being refused.
+    if isinstance(value, bool):
+        raise AtlasError("%s takes a number, not true/false." % name)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise AtlasError(
+            "%s takes a whole number; %r is not one." % (name, value))
+
+
+def float_argument(arguments, name, default=None):
+    """One argument as a number, accepting "0.6" for 0.6."""
+    value = arguments.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise AtlasError("%s takes a number, not true/false." % name)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise AtlasError("%s takes a number; %r is not one." % (name, value))
+
+
+_TRUE_WORDS = ("true", "yes", "y", "on", "1")
+_FALSE_WORDS = ("false", "no", "n", "off", "0")
+
+
+def bool_argument(arguments, name, default=False):
+    """One argument as true or false.
+
+    The words matter as much as the type. `bool("false")` is True, so a
+    client that sent the string "false" -- which is what writing JSON by hand
+    produces often enough -- got the opposite of what it asked for, silently,
+    including on export_assets' overwrite.
+    """
+    value = arguments.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+        raise AtlasError(
+            "%s takes true or false; %r is neither." % (name, value))
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raise AtlasError(
+        "%s takes true or false, not a %s." % (name, type(value).__name__))
+
+
 # ----------------------------------------------------------------- tools
 
 
 def tool_search_assets(arguments):
-    limit = min(int(arguments.get("limit") or DEFAULT_LIMIT), MAX_LIMIT)
-    offset = max(int(arguments.get("offset") or 0), 0)
-    distinct = arguments.get("distinct")
-    distinct = True if distinct is None else bool(distinct)
+    limit = min(int_argument(arguments, "limit", DEFAULT_LIMIT), MAX_LIMIT)
+    offset = max(int_argument(arguments, "offset", 0), 0)
+    # Defaults to collapsing copies, so absent means true here.
+    distinct = bool_argument(arguments, "distinct", True)
 
     with open_catalog() as connection:
         if distinct:
@@ -1213,7 +1320,28 @@ def _find_row(connection, needle):
 
 
 def tool_get_asset(arguments):
-    inspect = (arguments.get("inspect") or "summary").lower()
+    # `inspect` reads boolean and is a string enum, so true/false is what a
+    # client sends first -- it is what the name asks for. Both have an
+    # obvious meaning here, so they are honoured rather than refused: yes,
+    # read the file; no, stay in the catalog.
+    requested = arguments.get("inspect")
+    if isinstance(requested, bool):
+        inspect = "summary" if requested else "none"
+    else:
+        inspect = text_argument(arguments, "inspect", "summary").lower()
+        # The *words* too, not only the type. "true" is what a caller falls
+        # back to when the boolean fails, and it has worked all along by
+        # accident -- it is not one of the three, but nor is it "none", so
+        # the old code read the file. Rejecting it now would break the one
+        # spelling people had found that worked.
+        if inspect in _TRUE_WORDS:
+            inspect = "summary"
+        elif inspect in _FALSE_WORDS:
+            inspect = "none"
+    if inspect not in ("none", "summary", "full"):
+        raise AtlasError(
+            "inspect takes 'none', 'summary' or 'full' (or true/false for "
+            "'summary'/'none'); %r is none of those." % (requested,))
     with open_catalog() as connection:
         row = _find_row(connection, arguments.get("path"))
         neighbours = connection.execute(
@@ -1293,7 +1421,7 @@ def tool_get_asset(arguments):
 
 
 def tool_list_packs(arguments):
-    query = (arguments.get("query") or "").strip().lower()
+    query = text_argument(arguments, "query").strip().lower()
     with open_catalog() as connection:
         rows = connection.execute(
             "SELECT path, relative_path, source_name, type, model_kind, "
@@ -1329,7 +1457,7 @@ def tool_list_packs(arguments):
 
 
 def tool_browse(arguments):
-    prefix = (arguments.get("folder") or "").strip().replace("\\", "/").strip("/")
+    prefix = text_argument(arguments, "folder").strip().replace("\\", "/").strip("/")
     with open_catalog() as connection:
         if prefix:
             rows = connection.execute(
@@ -1424,9 +1552,9 @@ def tool_catalog_stats(arguments):
 
 
 def tool_find_animations(arguments):
-    limit = min(int(arguments.get("limit") or DEFAULT_LIMIT), MAX_LIMIT)
-    wanted = (arguments.get("rig") or "").strip().lower()
-    character = (arguments.get("character") or "").strip()
+    limit = min(int_argument(arguments, "limit", DEFAULT_LIMIT), MAX_LIMIT)
+    wanted = text_argument(arguments, "rig").strip().lower()
+    character = text_argument(arguments, "character").strip()
 
     with open_catalog() as connection:
         if character:
@@ -1476,7 +1604,8 @@ def tool_find_animations(arguments):
 
 def tool_find_attachments(arguments):
     with open_catalog() as connection:
-        character = _find_row(connection, arguments.get("character"))
+        character = _find_row(
+            connection, text_argument(arguments, "character"))
         pack = container_of(character)
         rows = connection.execute(
             "SELECT * FROM catalog_assets WHERE ignored = 0 AND type = 'model' "
@@ -1541,9 +1670,9 @@ def tool_get_texture(arguments):
 
 def tool_find_packs(arguments):
     """Packs rather than archives, with the builds each one ships."""
-    query = (arguments.get("query") or "").strip().lower()
-    engine = (arguments.get("engine") or "").strip().lower()
-    build = (arguments.get("build") or "").strip().lower()
+    query = text_argument(arguments, "query").strip().lower()
+    engine = text_argument(arguments, "engine").strip().lower()
+    build = text_argument(arguments, "build").strip().lower()
     if build and build not in BUILD_KINDS:
         raise AtlasError(
             "Unknown build %r. Use one of: %s." % (build, ", ".join(BUILD_KINDS)))
@@ -1613,8 +1742,8 @@ def tool_find_packs(arguments):
 
 def tool_find_duplicates(arguments):
     """Files the catalog holds more than one copy of."""
-    limit = min(int(arguments.get("limit") or 30), MAX_LIMIT)
-    ext = (arguments.get("ext") or "").strip().lower().lstrip(".")
+    limit = min(int_argument(arguments, "limit", 30), MAX_LIMIT)
+    ext = text_argument(arguments, "ext").strip().lower().lstrip(".")
     clauses = ["ignored = 0"]
     params = []
     if ext:
@@ -1681,15 +1810,20 @@ def _safe_relative(entry_path):
 
 def tool_export_assets(arguments):
     """Write assets out of their archives into a folder."""
-    dest = (arguments.get("dest") or "").strip()
+    dest = text_argument(arguments, "dest").strip()
     if not dest:
         raise AtlasError("Give dest: the folder to write into.")
     dest = os.path.abspath(dest)
     paths = arguments.get("paths") or []
     if isinstance(paths, str):
         paths = [paths]
-    overwrite = bool(arguments.get("overwrite"))
-    limit = min(int(arguments.get("limit") or DEFAULT_EXPORT_FILES),
+    if not isinstance(paths, list):
+        raise AtlasError(
+            "paths takes a list of paths, or one path as text, not a "
+            "%s." % type(paths).__name__)
+    paths = [text_argument({"path": each}, "path") for each in paths]
+    overwrite = bool_argument(arguments, "overwrite")
+    limit = min(int_argument(arguments, "limit", DEFAULT_EXPORT_FILES),
                 MAX_EXPORT_FILES)
 
     with open_catalog() as connection:
@@ -1869,8 +2003,10 @@ def tool_inspect_model(arguments):
 
 def tool_rig_compatibility(arguments):
     report = bridge_call("/rig_compat", {
-        "character": arguments.get("character"),
-        "clip": arguments.get("clip"),
+        # Dart casts both as String on the far side, so a bool would
+        # throw over there rather than being explained over here.
+        "character": text_argument(arguments, "character"),
+        "clip": text_argument(arguments, "clip"),
     })
     character = report.get("character") or {}
     clip = report.get("clip") or {}
@@ -2122,14 +2258,14 @@ def tool_find_similar(arguments):
     appearance. Everything else matches text, and the style words people
     reach for -- grungy, gray, ornate -- appear in none of the 221,183 names.
     """
-    phrase = (arguments.get("text") or "").strip()
-    like = (arguments.get("like_path") or "").strip()
-    top = max(1, min(int(arguments.get("limit") or 20), 100))
+    phrase = text_argument(arguments, "text").strip()
+    like = text_argument(arguments, "like_path").strip()
+    top = max(1, min(int_argument(arguments, "limit", 20), 100))
     # The store holds both pictures drawn from models and images embedded as
     # they stand, and the two answer different questions: a material lives in
     # a texture, a shape in a model. Ranked together, a question about one
     # competes with whatever of the other happens to suit the words.
-    kind = (arguments.get("kind") or "any").strip().lower()
+    kind = text_argument(arguments, "kind", "any").strip().lower()
     if kind not in SOURCE_BY_KIND:
         raise AtlasError(
             "kind is %s, not one of %s."
@@ -2155,8 +2291,8 @@ def tool_find_similar(arguments):
             # answers "more like this" with "this".
             like_name = (row["name"] or "").lower()
 
-    folder = (arguments.get("folder") or "").strip() or None
-    pack = (arguments.get("pack") or "").strip() or None
+    folder = text_argument(arguments, "folder").strip() or None
+    pack = text_argument(arguments, "pack").strip() or None
     reply = run_visual_search(phrase=phrase, like_asset_id=like_asset_id,
                               top=top, source=source, folder=folder,
                               pack=pack)
@@ -2264,12 +2400,12 @@ def tool_find_similar(arguments):
 
 
 def tool_render_asset(arguments):
-    size = int(arguments.get("size") or 512)
+    size = int_argument(arguments, "size", 512)
     report = bridge_call("/render", {
         "path": arguments.get("path"),
         "size": size,
-        "yaw": arguments.get("yaw"),
-        "pitch": arguments.get("pitch"),
+        "yaw": float_argument(arguments, "yaw"),
+        "pitch": float_argument(arguments, "pitch"),
     })
     data = base64.b64decode(report["png"])
     caption = "%s  %dx%d  %s of %s faces drawn" % (
@@ -2364,7 +2500,9 @@ TOOLS = [
                             "description":
                                 "'summary' reads the file (default). 'full' also "
                                 "lists every node and bone. 'none' stays in the "
-                                "catalog."},
+                                "catalog. true and false are accepted too, "
+                                "meaning 'summary' and 'none', because the name "
+                                "reads like a flag."},
             },
             "required": ["path"],
         },
