@@ -154,6 +154,40 @@ void main() {
     );
   });
 
+  test('what the importer read about a model survives a save', () async {
+    // saveCatalog deletes every row and reinserts from _rowFor, so a column
+    // _rowFor forgets is written as NULL over the whole catalog. rig_family
+    // was forgotten: it was read back correctly and written correctly one
+    // row at a time by the lazy classifier, so a rig looked up for a filter
+    // survived until the next scan and then vanished -- taking
+    // backfill_rigs.py's sweep of 34,801 files with it, which is why "a
+    // rescan empties rig_family" had become folklore.
+    final db = await _openAt(await _freshDbPath('asset_atlas_db_rig_'));
+    final classified = _asset('m1', name: 'SM_Chr_Hero.fbx', type: 'model')
+      ..modelKind = 'mesh'
+      ..rigFamily = 'polygon'
+      ..referencedByModel = true;
+
+    await db.saveCatalog(assets: [classified], sourceRoots: [r'C:\Packs\A']);
+    final restored = (await db.loadCatalog()).assets.single;
+
+    expect(restored.modelKind, 'mesh');
+    expect(restored.rigFamily, 'polygon',
+        reason: 'the rig the importer read must survive being saved');
+    expect(restored.referencedByModel, isTrue);
+  });
+
+  test('a save does not invent a rig for a model nobody has read', () async {
+    final db = await _openAt(await _freshDbPath('asset_atlas_db_norig_'));
+    await db.saveCatalog(
+      assets: [_asset('m2', name: 'SM_Prop.fbx', type: 'model')],
+      sourceRoots: [r'C:\Packs\A'],
+    );
+    final restored = (await db.loadCatalog()).assets.single;
+    expect(restored.rigFamily, isNull);
+    expect(restored.modelKind, isNull);
+  });
+
   test('updateAssetIgnored touches one row and leaves the rest alone', () async {
     final path = await _freshDbPath('asset_atlas_db_ignore_');
     final db = await _openAt(path);

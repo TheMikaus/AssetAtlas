@@ -30,6 +30,11 @@ struct Face {
   int b;
   int c;
   int material;
+  // Which node in the file this face came from. A character sheet is a dozen
+  // characters as a dozen nodes, and the material split does not follow the
+  // node split -- one pack puts all of them in a single material -- so this is
+  // the only way to take such a file apart again.
+  int object;
   double u1;
   double v1;
   double u2;
@@ -247,6 +252,8 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
 // and the Sidekick rig is the Unreal mannequin with extra bones. The bones
 // themselves are unambiguous, so the probe reports which of these it saw and
 // the caller decides what that means.
+static std::string texture_path(ufbx_texture* texture);
+
 static const char* const kRigMarkerBones[] = {
   // Polygon: Synty's own rig, capitalised.
   "Hips", "UpperLeg_R", "Clavicle_L", "Spine_01",
@@ -276,6 +283,128 @@ static void print_rig_markers(ufbx_scene* scene) {
   printf("]");
 }
 
+// Everything about a file that can be said without sending its geometry.
+//
+// The full import of a large model is a hundred megabytes of JSON -- the
+// Polygon mech is 106MB -- which is the right shape for the renderer and the
+// wrong shape for anything that only wants to know what the file holds. This
+// prints the counts and the names: what a tool asking "what is in this file?"
+// needs, in a few kilobytes.
+static void print_summary(ufbx_scene* scene, const std::string& label) {
+  size_t total_faces = 0;
+  size_t total_vertices = 0;
+  bool have_bounds = false;
+  double min_x = 0, min_y = 0, min_z = 0, max_x = 0, max_y = 0, max_z = 0;
+
+  // Through the nodes, the same way the full import walks the scene, so an
+  // instanced mesh is counted once per instance and carries its transform.
+  std::vector<std::string> object_names;
+  for (size_t node_index = 0; node_index < scene->nodes.count; ++node_index) {
+    const ufbx_node* node = scene->nodes.data[node_index];
+    if (!node || !node->mesh) continue;
+    const ufbx_mesh* mesh = node->mesh;
+    object_names.push_back(string_from_ufbx(node->name));
+    total_faces += mesh->num_faces;
+    total_vertices += mesh->num_indices;
+    for (size_t i = 0; i < mesh->vertex_position.values.count; ++i) {
+      ufbx_vec3 local = mesh->vertex_position.values.data[i];
+      ufbx_vec3 world = ufbx_transform_position(&node->geometry_to_world, local);
+      if (!have_bounds) {
+        min_x = max_x = world.x;
+        min_y = max_y = world.y;
+        min_z = max_z = world.z;
+        have_bounds = true;
+        continue;
+      }
+      if (world.x < min_x) min_x = world.x;
+      if (world.x > max_x) max_x = world.x;
+      if (world.y < min_y) min_y = world.y;
+      if (world.y > max_y) max_y = world.y;
+      if (world.z < min_z) min_z = world.z;
+      if (world.z > max_z) max_z = world.z;
+    }
+  }
+  for (size_t mesh_index = 0; mesh_index < scene->meshes.count; ++mesh_index) {
+    const ufbx_mesh* mesh = scene->meshes.data[mesh_index];
+    if (!mesh || mesh->instances.count != 0) continue;
+    object_names.push_back(string_from_ufbx(mesh->name));
+    total_faces += mesh->num_faces;
+    total_vertices += mesh->num_indices;
+  }
+
+  double duration = 0.0;
+  for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+    const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+    if (!stack) continue;
+    const double length = stack->time_end - stack->time_begin;
+    if (length > duration) duration = length;
+  }
+
+  printf("{\"kind\":");
+  print_json_string(total_faces > 0 ? "mesh" : "animation");
+  printf(",\"name\":");
+  print_json_string(label.c_str());
+  printf(",\"faces\":%zu", total_faces);
+  printf(",\"vertices\":%zu", total_vertices);
+  printf(",\"objects\":%zu", object_names.size());
+  printf(",\"materials\":%zu", scene->materials.count);
+  printf(",\"bones\":%zu", scene->bones.count);
+  printf(",\"animationStacks\":%zu", scene->anim_stacks.count);
+  printf(",\"durationSeconds\":%.6g", duration);
+  printf(",\"unitMeters\":%.6g", scene->settings.unit_meters);
+
+  if (have_bounds) {
+    printf(",\"bounds\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]",
+           min_x, min_y, min_z, max_x, max_y, max_z);
+  }
+
+  printf(",\"objectNames\":[");
+  for (size_t i = 0; i < object_names.size(); ++i) {
+    if (i > 0) putchar(0x2C);
+    print_json_string(object_names[i].c_str());
+  }
+  printf("]");
+
+  printf(",\"materialNames\":[");
+  for (size_t i = 0; i < scene->materials.count; ++i) {
+    const ufbx_material* material = scene->materials.data[i];
+    if (i > 0) putchar(0x2C);
+    print_json_string(material ? string_from_ufbx(material->name).c_str() : "");
+  }
+  printf("]");
+
+  printf(",\"textureFiles\":[");
+  for (size_t i = 0; i < scene->textures.count; ++i) {
+    ufbx_texture* texture = scene->textures.data[i];
+    if (i > 0) putchar(0x2C);
+    print_json_string(texture_path(texture).c_str());
+  }
+  printf("]");
+
+  printf(",\"boneNames\":[");
+  bool first_bone = true;
+  for (size_t i = 0; i < scene->nodes.count; ++i) {
+    const ufbx_node* node = scene->nodes.data[i];
+    if (!node || node->is_root) continue;
+    if (!node->bone && node->attrib_type != UFBX_ELEMENT_BONE) continue;
+    if (!first_bone) putchar(0x2C);
+    first_bone = false;
+    print_json_string(string_from_ufbx(node->name).c_str());
+  }
+  printf("]");
+
+  printf(",\"animationNames\":[");
+  for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
+    const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
+    if (i > 0) putchar(0x2C);
+    print_json_string(stack ? string_from_ufbx(stack->name).c_str() : "");
+  }
+  printf("]");
+
+  print_rig_markers(scene);
+  printf("}");
+}
+
 static bool debug_spaces_enabled() {
   size_t len = 0;
   char* value = nullptr;
@@ -285,7 +414,7 @@ static bool debug_spaces_enabled() {
   return on;
 }
 
-static std::string texture_path(ufbx_texture* texture) {
+std::string texture_path(ufbx_texture* texture) {
   if (!texture) return std::string();
   std::string path = string_from_ufbx(texture->filename);
   if (path.empty()) path = string_from_ufbx(texture->relative_filename);
@@ -342,18 +471,21 @@ static double normalize_unit_value(double value) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    fprintf(stderr, "Usage: asset_atlas_mesh_importer <model.fbx> | --stdin <label>\n");
+    fprintf(stderr, "Usage: asset_atlas_mesh_importer [--probe|--summary] <model.fbx> | --stdin <label>\n");
     return 2;
   }
 
   bool read_from_stdin = false;
   bool probe_only = false;
+  bool summary_only = false;
   std::string input_label;
   const char* file_argument = nullptr;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--stdin") {
       read_from_stdin = true;
+    } else if (arg == "--summary") {
+      summary_only = true;
     } else if (arg == "--probe") {
       // Classification only: skip geometry extraction and the JSON
       // payload, which dominate cost when sweeping a whole catalog.
@@ -364,7 +496,7 @@ int main(int argc, char** argv) {
   }
   input_label = file_argument ? file_argument : "<stdin>";
   if (!read_from_stdin && !file_argument) {
-    fprintf(stderr, "Usage: asset_atlas_mesh_importer [--probe] <model.fbx> | --stdin [--probe] <label>\n");
+    fprintf(stderr, "Usage: asset_atlas_mesh_importer [--probe|--summary] <model.fbx> | --stdin [--probe|--summary] <label>\n");
     return 2;
   }
 
@@ -411,6 +543,12 @@ int main(int argc, char** argv) {
   if (!scene) {
     fprintf(stderr, "ufbx failed: %s\n", error.description.data ? error.description.data : "unknown error");
     return 1;
+  }
+
+  if (summary_only) {
+    print_summary(scene, input_label);
+    ufbx_free_scene(scene);
+    return 0;
   }
 
   if (probe_only) {
@@ -625,8 +763,11 @@ int main(int argc, char** argv) {
     return (int)skin_bone_names.size() - 1;
   };
 
-  auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world) {
+  std::vector<std::string> object_names;
+  auto append_mesh = [&](ufbx_mesh* mesh, const ufbx_matrix* geometry_to_world, const char* object_name) {
     if (!mesh || mesh->num_faces == 0) return;
+    const int object_index = static_cast<int>(object_names.size());
+    object_names.push_back(object_name ? object_name : "");
     if (debug_spaces_enabled()) {
       if (geometry_to_world) {
         const ufbx_matrix& g = *geometry_to_world;
@@ -672,6 +813,23 @@ int main(int argc, char** argv) {
       }
     }
 
+    // A node scaled negatively on an odd number of axes is a mirror, and a
+    // mirror reverses which way a triangle faces. ufbx transforms the points
+    // and leaves the winding alone, so the two mirrored parts of the Polygon
+    // mech came out inside out: culled away when backface culling was on, lit
+    // from within when it was off. Emitting the corners in reverse order puts
+    // the normal back outside -- reversing the whole corner rather than just
+    // the indices, so UVs, colours and skin weights stay with their vertex.
+    bool mirrored = false;
+    if (geometry_to_world) {
+      const ufbx_matrix& g = *geometry_to_world;
+      const double determinant =
+        g.cols[0].x * (g.cols[1].y * g.cols[2].z - g.cols[1].z * g.cols[2].y) -
+        g.cols[1].x * (g.cols[0].y * g.cols[2].z - g.cols[0].z * g.cols[2].y) +
+        g.cols[2].x * (g.cols[0].y * g.cols[1].z - g.cols[0].z * g.cols[1].y);
+      mirrored = determinant < 0.0;
+    }
+
     std::vector<unsigned int> tri_indices(mesh->max_face_triangles * 3);
     for (size_t face_index = 0; face_index < mesh->num_faces; ++face_index) {
       ufbx_face face = mesh->faces.data[face_index];
@@ -691,7 +849,9 @@ int main(int argc, char** argv) {
         double tri_uvs[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
         std::vector<std::array<double, 6>> tri_uv_sets(uv_set_names.size());
         for (size_t corner = 0; corner < 3; ++corner) {
-          unsigned int vertex_index = tri_indices[tri * 3 + corner];
+          // 0,1,2 normally; 0,2,1 when mirrored.
+          const size_t source = (mirrored && corner != 0) ? 3 - corner : corner;
+          unsigned int vertex_index = tri_indices[tri * 3 + source];
           ufbx_vec3 p = ufbx_get_vertex_vec3(&mesh->vertex_position, vertex_index);
           if (geometry_to_world) {
             p = ufbx_transform_position(geometry_to_world, p);
@@ -732,6 +892,7 @@ int main(int argc, char** argv) {
           base + 1,
           base + 2,
           material_index,
+          object_index,
           tri_uvs[0],
           tri_uvs[1],
           tri_uvs[2],
@@ -750,14 +911,14 @@ int main(int argc, char** argv) {
   for (size_t node_index = 0; node_index < scene->nodes.count; ++node_index) {
     ufbx_node* node = scene->nodes.data[node_index];
     if (!node || !node->mesh) continue;
-    append_mesh(node->mesh, &node->geometry_to_world);
+    append_mesh(node->mesh, &node->geometry_to_world, string_from_ufbx(node->name).c_str());
   }
 
   // Defensive fallback for unusual scenes that contain an unattached mesh.
   for (size_t mesh_index = 0; mesh_index < scene->meshes.count; ++mesh_index) {
     ufbx_mesh* mesh = scene->meshes.data[mesh_index];
     if (!mesh || mesh->instances.count != 0) continue;
-    append_mesh(mesh, nullptr);
+    append_mesh(mesh, nullptr, string_from_ufbx(mesh->name).c_str());
   }
 
   if (vertices.empty() || faces.empty()) {
@@ -838,6 +999,15 @@ int main(int argc, char** argv) {
 
   printf("{\"kind\":\"mesh\",\"name\":");
   print_json_string(input_label.c_str());
+  // Where this mesh was before it was fitted into the viewer's unit box.
+  //
+  // Emitted for every mesh, not just skinned ones. An attachment -- a helmet,
+  // a beard -- is authored at the origin of the joint it belongs to, at the
+  // character's scale, and both facts are destroyed by the normalisation
+  // above. Undo it with these and the piece can be put back where the artist
+  // built it, which is the whole basis of placing one on a character.
+  printf(",\"framingCenter\":[%.9g,%.9g,%.9g],\"framingScale\":%.9g",
+    center.x, center.y, center.z, scale);
   printf(",\"vertices\":[");
   for (size_t i = 0; i < vertices.size(); ++i) {
     const Vec3& v = vertices[i];
@@ -849,6 +1019,16 @@ int main(int argc, char** argv) {
     const Vec4& c = vertex_colors[i];
     if (i) putchar(',');
     printf("[%.9g,%.9g,%.9g,%.9g]", c.x, c.y, c.z, c.w);
+  }
+  printf("],\"objects\":[");
+  for (size_t i = 0; i < object_names.size(); ++i) {
+    if (i) putchar(',');
+    print_json_string(object_names[i].c_str());
+  }
+  printf("],\"faceObjects\":[");
+  for (size_t i = 0; i < faces.size(); ++i) {
+    if (i) putchar(',');
+    printf("%d", faces[i].object);
   }
   printf("],\"faces\":[");
   for (size_t i = 0; i < faces.size(); ++i) {

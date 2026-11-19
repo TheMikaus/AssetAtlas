@@ -56,7 +56,8 @@ database you care about.
 4. Split `lib/main.dart` (now ~5.3k lines) into data/services/render/ui slices,
    keeping the suite green at each step.
 5. Repo hygiene: history still carries ~182 MB from a committed `node_modules`
-   (a 172 MB `electron.exe`), and `outputs/` is tracked and grows per release.
+   (a 172 MB `electron.exe`), which only a history rewrite would remove.
+   `outputs/` was untracked on 2026-11-18, so it no longer grows per release.
 
 ## Handoff Update Checklist
 
