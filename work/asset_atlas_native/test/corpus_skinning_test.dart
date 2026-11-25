@@ -30,6 +30,8 @@ const _sidekickClipEntry =
     'A_MOD_BL_Idle_Standing_Femn.fbx';
 const _sidekickReference = 'SourceFiles/Character/SidekickSyntyCharacter.fbx';
 const _royalePack = 'POLYGON_BattleRoyale_Source_Files_v4 (1).zip';
+const _spacePack = 'POLYGON_SciFiSpace_SourceFiles.zip';
+const _spaceRobot = '_SourceFiles/Characters/SK_Chr_BR_War_Robot_01.fbx';
 const _royaleCharacter = 'Source Files/Characters/SK_Chr_MilitaryMale_01.fbx';
 
 String? get _packPath {
@@ -200,9 +202,38 @@ void main() {
       );
     });
 
-    test('and none at all with the other', () {
-      expect(rigBoneOverlap(sidekickReference.skeleton!, polygonClip), 0);
-      expect(rigBoneOverlap(polygonReference.skeleton!, sidekickClip), 0);
+    test('and no name at all in common with the other', () {
+      // Exactly, these two rigs share nothing: Polygon capitalises every
+      // joint and the mannequin does not. That is still the claim here --
+      // but rigBoneOverlap folds case now, and folded they share Spine_01
+      // against spine_01, Head against head, and so on. So the count is
+      // asked for exactly, and the decision is asked for separately.
+      expect(
+        rigBoneMatches(sidekickReference.skeleton!, polygonClip).exact,
+        0,
+      );
+      expect(
+        rigBoneMatches(polygonReference.skeleton!, sidekickClip).exact,
+        0,
+      );
+    });
+
+    test('and folded case does not let them drive each other', () {
+      // The measured risk of folding: a character shares a median 27% of its
+      // bones with the wrong family's rig, which is well over the four-bone
+      // count that used to be the whole guard.
+      for (final pair in [
+        (sidekickReference.skeleton!, polygonClip),
+        (polygonReference.skeleton!, sidekickClip),
+      ]) {
+        final matches = rigBoneMatches(pair.$1, pair.$2);
+        expect(matches.folded, greaterThan(0), reason: 'folding does match');
+        expect(
+          matches.folded / pair.$1.bones.length,
+          lessThan(minimumRigMatchFraction),
+        );
+        expect(rigMatch(pair.$1, pair.$2), isFalse);
+      }
     });
 
     test('an unrelated rig is infinitely far, not perfectly aligned', () {
@@ -216,6 +247,78 @@ void main() {
         rigAxisDifference(polygonReference.skeleton!, polygonClip),
         lessThan(90),
       );
+    });
+  }, skip: skipReason);
+
+  group('the War Robot, the file Mike reported', () {
+    late MeshModel robot;
+    late SkeletonAnimation sidekick;
+
+    setUpAll(() async {
+      if (pack == null) return;
+      final space =
+          '${File(pack).parent.path}${Platform.pathSeparator}$_spacePack';
+      robot = await meshModelFromImporterJson(
+        await _import(space, _spaceRobot),
+        modelPath: buildZipVirtualPath(space, _spaceRobot),
+        name: 'SK_Chr_BR_War_Robot_01.fbx',
+      );
+      sidekick = SkeletonAnimation.fromJson(
+        (await _import(pack, _sidekickClipEntry))['skeleton']
+            as Map<String, dynamic>?,
+      )!;
+    });
+
+    test('nine of its joints differ from the clip by case alone', () {
+      // The reported bug, on the real files. Pelvis, Thigh_L/R, Foot_L/R,
+      // UpperArm_L/R and Hand_L/R are the character's spellings; the clip
+      // writes all nine lower-case, so they resolved to nothing and the legs
+      // stayed in the bind pose while the spine moved.
+      final matches = rigBoneMatches(robot.skeleton!, sidekick);
+      expect(robot.skeleton!.bones, hasLength(48));
+      expect(matches.exact, 19, reason: 'what matched before folding');
+      expect(matches.folded, 28, reason: '19 plus the nine case-only joints');
+      for (final bone in [
+        'Pelvis',
+        'Thigh_L',
+        'Thigh_R',
+        'Foot_L',
+        'Foot_R',
+        'UpperArm_L',
+        'UpperArm_R',
+        'Hand_L',
+        'Hand_R',
+      ]) {
+        expect(
+          sidekick.indexOfBone(bone),
+          greaterThanOrEqualTo(0),
+          reason: '$bone must resolve in the clip',
+        );
+      }
+      expect(rigMatch(robot.skeleton!, sidekick), isTrue);
+    });
+
+    test('its joint axes still differ, so the preview retargets it', () {
+      // Measured at 75 degrees, well past the 40 that makes direct posing
+      // invalid. So the fold does not switch this character to direct
+      // posing: it goes on being corrected through a reference, which is the
+      // path the clip preview already takes for the newer Synty packs.
+      final difference = rigAxisDifference(robot.skeleton!, sidekick);
+      expect(difference, greaterThan(maxDirectPoseAngle));
+      expect(difference, lessThan(90));
+    });
+
+    test('and posing it directly does not collapse it', () {
+      // Not a claim that it looks right -- that needs the built app, and the
+      // plan's WP3 acceptance check is still open. It is a floor: whatever
+      // the pose does to this character now, it does not fold it in half the
+      // way the mismatched BattleRoyale character below folds.
+      final bind = _extent(robot.vertices);
+      final posed = _extent(
+        poseSkinnedVertices(character: robot, clip: sidekick, frame: 10),
+      );
+      expect(posed.height, greaterThan(bind.height * 0.9));
+      expect(posed.height, lessThan(bind.height * 1.1));
     });
   }, skip: skipReason);
 
