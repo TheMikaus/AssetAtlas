@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.46';
+const appVersion = '1.10.47';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -4865,7 +4865,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     if (rest == null) return;
     // A character with no bones in common with the clip cannot be driven by it
     // at all; say so rather than showing a bind pose with no explanation.
-    if (rigBoneOverlap(rest, widget.skeleton) < minimumRigOverlap) {
+    if (!rigMatch(rest, widget.skeleton)) {
       _plan = null;
       _boneWorld = null;
       _retargetNote =
@@ -15389,13 +15389,28 @@ double rigAxisDifference(
   // Returning zero here made a rig with nothing in common look like the best
   // possible reference, which is how a Sidekick character got chosen to
   // correct a Polygon clip.
-  if (angles.length < minimumRigOverlap) return double.infinity;
+  if (angles.isEmpty || !rigMatch(characterRest, clip)) {
+    return double.infinity;
+  }
   angles.sort();
   return angles[angles.length ~/ 2];
 }
 
 /// How many bones two rigs must share before they can be compared at all.
 const minimumRigOverlap = 4;
+
+/// How much of a character's rig a clip must name once case is folded.
+///
+/// A count is no longer enough on its own. Exactly, a Polygon rig and a
+/// Sidekick rig share zero bone names; folded, a character shares a median
+/// 27% of its bones with the *wrong* family's rig -- `Spine_01` against
+/// `spine_01`, `Head` against `head` -- which is more than four bones. So the
+/// folded test is a share of the character's own rig, not a tally.
+///
+/// Measured over 800 rigged characters against the 12 distinct clip rigs in
+/// the library: at 0.5, 786 characters match their right rig and 6 match a
+/// wrong one; at 0.4 it is 786 and 8. Hence 0.5.
+const minimumRigMatchFraction = 0.5;
 
 /// How many bones a character's rig shares with a clip.
 ///
@@ -15408,6 +15423,42 @@ int rigBoneOverlap(SkeletonAnimation rig, SkeletonAnimation clip) {
     if (clip.indexOfBone(bone.name, path: bone.path) >= 0) shared += 1;
   }
   return shared;
+}
+
+/// How many of a rig's bones the clip names exactly, and how many once case
+/// is folded. The folded figure includes the exact one.
+({int exact, int folded}) rigBoneMatches(
+  SkeletonAnimation rig,
+  SkeletonAnimation clip,
+) {
+  var exact = 0;
+  var folded = 0;
+  for (final bone in rig.bones) {
+    if (clip.indexOfBone(bone.name, path: bone.path, foldCase: false) >= 0) {
+      exact += 1;
+      folded += 1;
+      continue;
+    }
+    if (clip.indexOfBone(bone.name, path: bone.path) >= 0) folded += 1;
+  }
+  return (exact: exact, folded: folded);
+}
+
+/// Whether [clip] may drive [character] at all.
+///
+/// The one place this is decided. Two rules, either of which is enough:
+///
+///  * [minimumRigOverlap] bones matched **exactly** -- this is the rule as it
+///    was before case was folded, kept verbatim so that nothing which pairs
+///    today stops pairing;
+///  * or [minimumRigMatchFraction] of the character's bones matched once case
+///    is folded, which is what lets the War Robot's `Pelvis` be driven by a
+///    clip's `pelvis` while keeping a Polygon rig away from Sidekick clips.
+bool rigMatch(SkeletonAnimation character, SkeletonAnimation clip) {
+  if (character.bones.isEmpty) return false;
+  final matches = rigBoneMatches(character, clip);
+  if (matches.exact >= minimumRigOverlap) return true;
+  return matches.folded / character.bones.length >= minimumRigMatchFraction;
 }
 
 /// Poses a character's vertices into a packed buffer.
@@ -15610,6 +15661,71 @@ String normalizeBonePath(String path) {
       .join('/');
 }
 
+/// The answer for a folded key that two differently-spelled bones share.
+///
+/// Matches nothing. Guessing which of the two was meant would drive a limb
+/// from the wrong joint, and a wrong pose is worse than a bind pose. Not seen
+/// in this library -- folding case merged no two distinct names in 1,024
+/// skeletons -- and handled anyway.
+const int _ambiguousBone = -2;
+
+/// Folded-case lookup tables, built once per skeleton on first use.
+///
+/// `indexOfBone` is called per bone inside loops: `rigAxisDifference` calls it
+/// for every bone of a character every time a plan is built, and
+/// `rigBoneOverlap` once per bone of a rig. A folded step that scanned the
+/// bone list or lower-cased in the loop would be paid thousands of times per
+/// clip. [SkeletonAnimation] has a `const` constructor and so cannot hold a
+/// lazily built field; these hang off the object instead, the same pattern as
+/// `_sceneNames`.
+final Expando<Map<String, int>> _foldedBoneNames = Expando<Map<String, int>>(
+  'folded bone names',
+);
+final Expando<Map<String, int>> _foldedBonePaths = Expando<Map<String, int>>(
+  'folded bone paths',
+);
+
+Map<String, int> _foldedBoneNamesOf(SkeletonAnimation skeleton) {
+  final known = _foldedBoneNames[skeleton];
+  if (known != null) return known;
+  final table = _foldTable(skeleton.bones.map((bone) => bone.name));
+  _foldedBoneNames[skeleton] = table;
+  return table;
+}
+
+Map<String, int> _foldedBonePathsOf(SkeletonAnimation skeleton) {
+  final known = _foldedBonePaths[skeleton];
+  if (known != null) return known;
+  final table = _foldTable(
+    skeleton.bones.map((bone) => normalizeBonePath(bone.path)),
+  );
+  _foldedBonePaths[skeleton] = table;
+  return table;
+}
+
+/// Lower-cased key to index, or [_ambiguousBone] where two *different*
+/// spellings collide.
+///
+/// The same spelling appearing twice is not ambiguity: the exact pass above
+/// already answers it, and folding never gets asked.
+Map<String, int> _foldTable(Iterable<String> values) {
+  final table = <String, int>{};
+  final firstSpelling = <String, String>{};
+  var index = 0;
+  for (final value in values) {
+    final key = value.toLowerCase();
+    final seen = firstSpelling[key];
+    if (seen == null) {
+      firstSpelling[key] = value;
+      table[key] = index;
+    } else if (seen != value) {
+      table[key] = _ambiguousBone;
+    }
+    index += 1;
+  }
+  return table;
+}
+
 /// A rig and the motion sampled onto it.
 ///
 /// Positions only, in world space, one sample per frame. That is everything a
@@ -15696,9 +15812,21 @@ class SkeletonAnimation {
 
   /// The bone of this rig with the given name, or -1.
   ///
-  /// Names are how a clip and a character are joined: Synty rigs share them
-  /// exactly, so no mapping table is needed.
-  int indexOfBone(String name, {String? path}) {
+  /// Names are how a clip and a character are joined. Synty rigs share them,
+  /// but not always their case: `SK_Chr_BR_War_Robot_01.fbx` carries `Pelvis`,
+  /// `Thigh_L` and `Hand_L` beside `spine_01` and `calf_l`, while the
+  /// Sidekick clips in the same library write every one of them lower-case.
+  /// Nine joints of that character differ from its clips by case alone --
+  /// hips, legs, feet, arms and hands -- so a walk clip moved its spine and
+  /// left its legs in the bind pose.
+  ///
+  /// Order is the whole safety argument: the three exact forms are tried
+  /// first and unchanged, so every lookup that resolves today resolves to the
+  /// same index. Folding runs only after all three have failed.
+  ///
+  /// [foldCase] false stops after the exact forms, which is how `rigMatch`
+  /// counts what matched exactly and what only matched folded.
+  int indexOfBone(String name, {String? path, bool foldCase = true}) {
     if (path != null && path.isNotEmpty) {
       for (var i = 0; i < bones.length; i += 1) {
         if (bones[i].path == path) return i;
@@ -15716,6 +15844,17 @@ class SkeletonAnimation {
     for (var i = 0; i < bones.length; i += 1) {
       if (bones[i].name == name) return i;
     }
+    if (!foldCase) return -1;
+    if (path != null && path.isNotEmpty) {
+      final folded =
+          _foldedBonePathsOf(this)[normalizeBonePath(path).toLowerCase()];
+      // An ambiguous key stops the search rather than falling through to the
+      // name: if the path cannot say which bone was meant, the name -- which
+      // is weaker -- certainly cannot.
+      if (folded != null) return folded >= 0 ? folded : -1;
+    }
+    final byName = _foldedBoneNamesOf(this)[name.toLowerCase()];
+    if (byName != null && byName >= 0) return byName;
     return -1;
   }
 
@@ -17592,10 +17731,10 @@ Future<Map<String, Object?>> bridgeRigCompat(
     verdict =
         'No. ${characterFamily.label} and ${clipFamily.label} are different '
         'rigs; they share $shared bones.';
-  } else if (shared < minimumRigOverlap) {
+  } else if (!rigMatch(characterRig, clipRig)) {
     verdict =
-        'No. Only $shared bones in common, below the $minimumRigOverlap '
-        'needed to compare them at all.';
+        'No. Only $shared of ${characterRig.bones.length} bones in common, '
+        'too few to drive this character.';
   } else if (!difference.isFinite) {
     verdict = 'Probably not: the rigs cannot be compared in their rest poses.';
   } else if (difference < 5) {
@@ -17629,7 +17768,7 @@ Future<Map<String, Object?>> bridgeRigCompat(
     'sharedBones': shared,
     'familiesCompatible': compatible,
     'restPoseDifferenceDegrees': _jsonNumber(difference),
-    'willPlay': compatible && shared >= minimumRigOverlap,
+    'willPlay': compatible && rigMatch(characterRig, clipRig),
     'verdict': verdict,
   };
 }
