@@ -77,7 +77,11 @@ Playdate framework: N/A
 - Proposed, unapproved: EMB-004, persist the average texture colour that
   `averageImageColor` already computes, which answers colour queries with no
   model at all.
-- Open from earlier: PR #3 awaiting merge. Both backfills are done -- see
+- 2026-11-25: **PR #3 is merged** -- `c9035b9` on `main`, 21 commits from
+  `fix/stage-1-correctness`, after CI failed once on an analyze info in a new
+  test file and passed on the fix. Everything in this file down to v1.10.51
+  is now on `main`. New work branches from `main`.
+- Open from earlier: both backfills are done -- see
   Progress. The library rescan is **done**, verified 2026-11-25: the two
   INTERFACE HUD sprite packs that the rules-v2 catalog was missing hold
   2,127 and 1,183 rows, which is exactly the 3,310 PNG recorded as absent,
@@ -142,8 +146,6 @@ Playdate framework: N/A
   behind: 145,442 rows in the file against 138,746 in the index, about 20 MB
   of 447 MB now dead. Harmless but it will only grow with each forced pass;
   there is no compaction.
-- PR #3 now carries `a1b37b8`, which is workflow configuration unrelated to
-  that PR's subject. Not moved to its own branch — awaiting the user's call.
 - Standing Flutter gate (`flutter analyze` + `flutter test`) conflicts with
   the new contract: `CLAUDE.old.md` makes it mandatory before every commit,
   the contract requires approval before commands that write output. Unresolved.
