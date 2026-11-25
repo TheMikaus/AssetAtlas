@@ -77,8 +77,11 @@ Playdate framework: N/A
 - Proposed, unapproved: EMB-004, persist the average texture colour that
   `averageImageColor` already computes, which answers colour queries with no
   model at all.
-- Open from earlier: library rescan (catalog on rules v2, app on v3);
-  PR #3 awaiting merge. Both backfills are done -- see Progress.
+- Open from earlier: PR #3 awaiting merge. Both backfills are done -- see
+  Progress. The library rescan is **done**, verified 2026-11-25: the two
+  INTERFACE HUD sprite packs that the rules-v2 catalog was missing hold
+  2,127 and 1,183 rows, which is exactly the 3,310 PNG recorded as absent,
+  and 484 archives are indexed.
 - The plan's nine work packages are all implemented. WP9 step 1 and the
   re-embedding are now done too (2026-11-25, below). What it still leaves
   open, by its own text: grid collapsing of twins, and reading inside a

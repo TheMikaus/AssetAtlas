@@ -110,6 +110,8 @@ Kept separate from the above on purpose. Nothing below exists in source.
   (`Tooltip` inside `ToggleButtons` crashing `flutter_windows.dll`,
   `bump_version.ps1` owning both version literals, `closeCachedArchives()` in
   teardown) do not reach a session by default.
-- The catalog was scanned under rules v2 while the app is at v3; 49 archives
-  holding 66,441 entries are absent, including the two INTERFACE HUD sprite
-  packs (3,310 PNG). Unverified whether a rescan has been run since.
+- Closed 2026-11-25: the catalog had been scanned under rules v2 while the app
+  was at v3, leaving 49 archives and 66,441 entries absent. The rescan has
+  since been run -- the two INTERFACE HUD sprite packs named as missing hold
+  2,127 and 1,183 rows (the 3,310 PNG recorded), and 484 archives are
+  indexed in a 480,826-row catalog.
