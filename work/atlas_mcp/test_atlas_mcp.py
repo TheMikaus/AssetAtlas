@@ -291,21 +291,86 @@ class AttachPointTest(unittest.TestCase):
         self.assertEqual(names, [name for name, _ in atlas_mcp.ATTACH_POINTS])
 
 
+def _rig_fixture():
+    """fixtures/rig_families.json, the rig rule written down once."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", "rig_families.json")
+    with io.open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 class RigTest(unittest.TestCase):
+    """The rig rule, against the fixture lib/main.dart is also tested on.
+
+    Two implementations of one rule in two languages is the arrangement that
+    always drifts, and this one had: graded against which clip rig actually
+    names each character's bones, over 800 rigged characters, this rule was
+    right 786 times and the Dart one 480. So neither side owns it:
+    fixtures/rig_families.json does, and both suites read that same file. A
+    case added there fails on whichever side has not caught up.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture = _rig_fixture()
+
+    def test_the_fixture_is_not_empty(self):
+        # A fixture that silently stopped loading would pass every loop below.
+        self.assertGreater(len(self.fixture["families"]), 12)
+        self.assertGreater(len(self.fixture["compatible"]), 8)
+
+    def test_every_family_case(self):
+        for row in self.fixture["families"]:
+            with self.subTest(markers=row["markers"], bones=row["bones"]):
+                self.assertEqual(
+                    atlas_mcp.rig_family_from_markers(row["markers"],
+                                                      row["bones"]),
+                    row["family"], row["why"])
+
+    def test_every_compatibility_case(self):
+        for row in self.fixture["compatible"]:
+            with self.subTest(character=row["character"], clip=row["clip"],
+                              same=row["sameContainer"]):
+                self.assertEqual(
+                    atlas_mcp.families_compatible(
+                        row["character"], row["clip"], "pack-a.zip",
+                        "pack-a.zip" if row["sameContainer"]
+                        else "pack-b.zip"),
+                    row["expected"], row["why"])
+
+    def test_an_unnamed_rig_with_no_container_drives_nothing(self):
+        # The caller that cannot say where the files came from gets the
+        # conservative answer rather than a guess.
+        self.assertFalse(atlas_mcp.families_compatible("other", "other"))
+
     def test_sidekick_wins_over_the_mannequin_it_extends(self):
         # A Sidekick rig is the Unreal mannequin plus attachment bones, so it
         # carries the mannequin's markers as well as its own.
         markers = ["pelvis", "spine_01", "hipAttachFront", "ik_hand_root"]
-        self.assertEqual(atlas_mcp.rig_family_from_markers(markers), "sidekick")
+        self.assertEqual(
+            atlas_mcp.rig_family_from_markers(markers, 121), "sidekick")
 
     def test_polygon_and_unreal_are_told_apart_by_case(self):
-        self.assertEqual(atlas_mcp.rig_family_from_markers(["Hips", "Spine_01"]),
-                         "polygon")
-        self.assertEqual(atlas_mcp.rig_family_from_markers(["pelvis", "spine_01"]),
-                         "unreal")
+        self.assertEqual(
+            atlas_mcp.rig_family_from_markers(["Hips", "Spine_01"], 52),
+            "polygon")
+        self.assertEqual(
+            atlas_mcp.rig_family_from_markers(["pelvis", "spine_01"], 56),
+            "unreal")
 
-    def test_no_markers_is_no_rig(self):
-        self.assertEqual(atlas_mcp.rig_family_from_markers([]), "none")
+    def test_no_bones_is_no_rig(self):
+        self.assertEqual(atlas_mcp.rig_family_from_markers([], 0), "none")
+
+    def test_bones_with_no_known_marker_is_a_rig_not_a_prop(self):
+        # Changed on 2026-11-24 with Mike's approval: "none" used to mean both
+        # "no skeleton" and "a skeleton we cannot name", and the second kind
+        # could never be animated. The Dogs pack is 82 bones of it.
+        self.assertEqual(atlas_mcp.rig_family_from_markers([], 82), "other")
+
+    def test_one_generic_marker_does_not_name_a_family(self):
+        # Kenney's 58-bone Blender rig shares exactly "Hips" with Polygon.
+        self.assertEqual(
+            atlas_mcp.rig_family_from_markers(["Hips"], 58), "other")
 
 
 class ProtocolTest(unittest.TestCase):

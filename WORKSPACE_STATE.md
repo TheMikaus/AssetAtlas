@@ -1,12 +1,29 @@
 # Workspace State
 
-Last updated: 2026-11-14
+Last updated: 2026-11-24
 Project / engine: Not applicable — Flutter Windows desktop app (AssetAtlas).
   User directive 2026-11-14: no engine rule applies here; generic contract only.
 Engine version: N/A
 Playdate framework: N/A
 
 ## Progress
+- 2026-11-24, rig correctness, on `fix/stage-1-correctness`. One plan document
+  covering ten requested items (`docs/tasks/PLAN-2026-11-24-rigs-twins-formats-tagging.md`,
+  committed `d7de2a6`), then four of its work packages:
+  `82a175c` v1.10.45 `.uasset` no longer reaches the audio player;
+  `0f1d356` v1.10.46 the search text survives a type change;
+  `6097144` v1.10.47 bone lookup folds case after every exact form fails,
+  plus `rigMatch` as the single match rule;
+  v1.10.48 one rig classifier owned by `work/atlas_mcp/fixtures/rig_families.json`,
+  a new `other` family, and unreal/sidekick compatibility. See DECISIONS.md
+  RIG-001. 736 Dart tests, 407 Python tests, analyze clean.
+- 2026-11-24 the `rig_family` column was re-filled under the new rule
+  (`backfill_rigs.py --all`, authorised by the user that day, Atlas closed,
+  catalog backed up to `asset_atlas_native.db.before-rig-rules-2`). 44,458 of
+  44,463 FBX read in about 7 minutes; the 5 skipped are the rows already
+  marked unreadable. Families now: none 42,103, sidekick 1,257, polygon 509,
+  unreal 345, other 244. No clip is `none` any more -- the 91 that were, and
+  13 mislabelled `polygon`, are the 104 `other` clips.
 - `460af7a` Six MCP prompts for the common Unreal sequences (survey_the_library,
   set_up_a_level, import_a_model, animate_a_character, dress_a_character,
   choose_a_build). 13 tests. Verified over stdio.
@@ -34,7 +51,12 @@ Playdate framework: N/A
   `averageImageColor` already computes, which answers colour queries with no
   model at all.
 - Open from earlier: library rescan (catalog on rules v2, app on v3);
-  `backfill_rigs.py` (rig_family is 7 of 27,652); PR #3 awaiting merge.
+  PR #3 awaiting merge. The `rig_family` backfill is done -- see Progress.
+- Next in the 2026-11-24 plan, in order: WP5 rig signatures and the
+  model/animation lists; WP7 twins; WP6 the authored texture (phase A on the
+  7 `.zip` Unity builds, phase B reading `.unitypackage`); WP8 GLB and glTF
+  via `cgltf`; WP9 tagging speed. WP3's acceptance check is still open: the
+  War Robot has not been watched playing a clip in the built app.
 
 ## Problems
 - PR #3 now carries `a1b37b8`, which is workflow configuration unrelated to
@@ -48,6 +70,16 @@ Playdate framework: N/A
   100–400 MB, unmeasured.
 
 ## User Directives
+- 2026-11-24: no full tagging or embedding run while the user is working on
+  this machine. Small scoped tests are fine; ask before anything long.
+- 2026-11-24: the catalog rig backfill may be run once the code is right,
+  with Atlas closed and the user told afterwards.
+- 2026-11-24: read `.unitypackage` for the authored texture chain (approved);
+  vendor `cgltf` for GLB and glTF (approved); do not write a DAE reader
+  (declined -- every DAE has a twin that already draws).
+- 2026-11-24: `none` and `other` are different rig answers, and a clip may
+  drive a character across the unreal/sidekick pair. Existing tests that
+  encoded the old meaning were changed with explicit approval.
 - Approve a bounded design before anything new is built.
 - Confirm architecture or data changes before anything is checked in.
 - No engine rule for this repository; generic rules apply.

@@ -129,7 +129,8 @@ def main():
         if result is None:
             return asset_id, None, None
         kind = "animation" if result.get("kind") == "animation" else "mesh"
-        rig = atlas_mcp.rig_family_from_markers(result.get("rigMarkers"))
+        rig = atlas_mcp.rig_family_from_markers(result.get("rigMarkers"),
+                                                result.get("bones") or 0)
         return asset_id, kind, rig
 
     rows = []

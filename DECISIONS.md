@@ -266,3 +266,97 @@ Record significant **approved** decisions; do not confuse proposals with impleme
 - **Affected components:** `lib/main.dart`, and a column or sidecar for the
   value. Data change — needs approval.
 
+
+## RIG-001 — One rig rule, owned by a fixture, with a family for rigs we cannot name
+
+- **ID / date:** RIG-001 / 2026-11-24
+- **Status:** Accepted (user approval, 2026-11-24, after a read-only
+  investigation he asked for and a plan he approved:
+  `docs/tasks/PLAN-2026-11-24-rigs-twins-formats-tagging.md`, WP3 and WP4)
+- **Context and verified evidence:** Animation mapping did not work. Four
+  measured causes, over the real library:
+  - **Case.** `SkeletonAnimation.indexOfBone` compared bone names with `==`,
+    and Synty writes mixed case inside one skeleton:
+    `SK_Chr_BR_War_Robot_01.fbx` has `Pelvis`, `Thigh_L`, `Foot_L`,
+    `UpperArm_L`, `Hand_L` beside `spine_01` and `calf_l`, while the Sidekick
+    clips write all of them lower-case. Nine joints differed by case alone --
+    hips, legs, feet, arms, hands. Over 800 rigged characters, the share of a
+    character's bones its best clip rig names: median 0.91 either way, but
+    p10 0.36 exact against 0.56 folded, and 486 of 800 characters above half
+    exact against 786 folded.
+  - **Two classifiers, one column.** Dart's `rigFamilyFromMarkers` tested a
+    marker the importer never reports and ignored six it does; Python's
+    tested all twelve. `backfill_rigs.py` wrote the column with one rule and
+    Atlas's lazy pass with the other. Graded against which clip rig actually
+    names each character's bones: Python right 786 of 800, Dart 480 -- it
+    called 303 rigged characters rigless. On 180 probed files they disagreed
+    about 49, every one a character mesh.
+  - **No `unreal` clips exist.** The library's 796 clips are 359 polygon, 346
+    sidekick, 91 unnamed. `rigFamiliesCompatible` required equal family
+    names, so "only animations for my character" passed **0 of 796** clips
+    for the 348 characters stored `unreal`.
+  - **`none` meant two things.** "No skeleton" and "a skeleton we have no
+    name for". 91 clips were `none` with real skeletons; the Dogs pack's mesh
+    and its 88 clips share one 82-bone rig exactly and were refused each
+    other. Of 400 meshes stored `none`, 399 genuinely have zero bones.
+- **Options considered:**
+  - A. Fold case inside `normalizeBonePath`, so every comparison folds.
+    Rejected: it would change the answer of lookups that already succeed, and
+    the "do not lose what works" condition was explicit.
+  - B. Fold case as a fallback after every exact form has failed. **Chosen.**
+  - C. Keep the count guard (`minimumRigOverlap = 4`) as the only match rule.
+    Rejected on measurement: folded, a character shares a median 27% of its
+    bones with the *wrong* family's rig, which is well over four bones.
+  - D. Make Dart's classifier the shared one. Rejected: it is the less correct
+    of the two by 306 characters.
+  - E. A bone-name signature per rig instead of family names. Deferred to WP5;
+    it is the real answer and needs a schema change.
+- **Decision and rationale:**
+  1. `indexOfBone` keeps its three exact steps unchanged and first, then folds
+     case for paths and names. A folded key two differently-spelled bones
+     share matches nothing.
+  2. `rigMatch` is the only place "may this clip drive this character" is
+     decided: the old exact count **or** `minimumRigMatchFraction` (0.5) of
+     the character's bones matched folded. At 0.5, 786 of 800 characters match
+     their right rig and 6 a wrong one; at 0.4, 786 and 8.
+  3. One classifier rule, written down in
+     `work/atlas_mcp/fixtures/rig_families.json` and read by both suites --
+     the arrangement already used for the search grammar. No bones is `none`;
+     a Sidekick attachment or IK bone is `sidekick`, tested first; two or more
+     Polygon markers is `polygon`; two or more mannequin markers is `unreal`;
+     anything else with bones is `other`. Two markers rather than one because
+     Kenney's 58-bone rig shares exactly `Hips` with Polygon and 13 clips were
+     labelled from that one name.
+  4. `other` is a new `RigFamily`. Two `other` rigs are compatible only when
+     they came out of the same container.
+  5. `unreal` and `sidekick` drive each other, because the Sidekick rig is the
+     Unreal mannequin with bones added.
+- **Tradeoffs / risks:**
+  - Names matching is necessary, not sufficient. With the legs matched,
+    `rigAxisDifference` sees more bones and its median angle can cross
+    `maxDirectPoseAngle = 40.0`, which switches a character between posing
+    directly and retargeting. **Not yet checked by eye in the built app** --
+    the plan's WP3 acceptance check is still open.
+  - The container test for `other` is a stopgap standing in for evidence about
+    bones. WP5 replaces it.
+  - The stored `rig_family` column had to be rewritten for the new rule
+    (`backfill_rigs.py --all`), and the chosen character's cached family had
+    to be refreshed from the catalog on load.
+- **Affected components and source references:** `lib/main.dart`
+  (`indexOfBone`, `rigMatch`, `rigBoneMatches`, `rigFamilyFromMarkers`,
+  `rigFamiliesCompatible`, `assetPassesRigFilter`,
+  `findClipReferenceCharacters`, `AnimationCharacter.refreshRigFrom`),
+  `work/atlas_mcp/atlas_mcp.py` (`rig_family_from_markers`,
+  `families_compatible`, `tool_find_animations`),
+  `work/atlas_mcp/backfill_rigs.py`,
+  `work/atlas_mcp/fixtures/rig_families.json`,
+  `test/fixtures/rig_bone_names.json`. The importer did not change: it already
+  reports all twelve markers and the bone count.
+- **Validation and revisit trigger:** both suites read the shared fixture, so a
+  case added there fails on whichever language has not caught up; the nine-joint
+  War Robot regression is built from bone lists read out of the real files. The
+  five skinning and reference suites the plan names pass with one assertion
+  changed, which is the one that encoded the old meaning of `none`. Revisit when
+  WP5 stores a bone signature per rig: `other`'s container test and the
+  `unreal`/`sidekick` special case both become consequences of the bones
+  instead of rules of their own.

@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.47';
+const appVersion = '1.10.48';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -617,6 +617,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
       typeFilter,
       rigFilter,
       AnimationCharacter.instance.rigFamily ?? '',
+      // The character's own path, because an unnamed rig is matched by the
+      // container it shipped in rather than by its family name.
+      AnimationCharacter.instance.path.value ?? '',
       modelTextureFilter,
       hideIgnored,
       hideZipAssets,
@@ -626,6 +629,25 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _listEpoch,
     ].join('|');
     if (cache != null && cachedKey == cacheKey) return cache;
+
+    // Only an unnamed rig needs this, and finding it is a scan of the
+    // catalog, so it is done once per filter pass and only when it can
+    // matter -- never per asset, and never for the three named families.
+    String? characterContainer;
+    if (rigFilter == 'compatible' &&
+        rigFamilyByName(AnimationCharacter.instance.rigFamily) ==
+            RigFamily.other) {
+      final chosen = AnimationCharacter.instance.path.value;
+      if (chosen != null) {
+        final key = normalizePathKey(chosen);
+        for (final asset in sortedAssets) {
+          if (normalizePathKey(asset.path) == key) {
+            characterContainer = assetContainerKey(asset);
+            break;
+          }
+        }
+      }
+    }
 
     final matches = sortedAssets.where((asset) {
       // A query that cannot be read matches nothing, rather than matching
@@ -666,6 +688,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         asset: asset,
         rigFilter: rigFilter,
         characterRig: AnimationCharacter.instance.rigFamily,
+        characterContainer: characterContainer,
       )) {
         return false;
       }
@@ -896,6 +919,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
   Future<void> _restorePersistedCatalog() async {
     try {
       final snapshot = await db.loadCatalog();
+      if (!mounted) return;
+      // Before the list is built from it: the chosen character's stored rig
+      // family may predate a change to the rig rules, and the filter reads
+      // that copy rather than the column.
+      await AnimationCharacter.instance.refreshRigFrom(snapshot.assets);
       if (!mounted) return;
       // A catalog saved before a rule change is missing whatever the change
       // added -- Unreal files, most recently -- and would otherwise report
@@ -8028,14 +8056,24 @@ bool assetPassesRigFilter({
   required AssetItem asset,
   required String rigFilter,
   required String? characterRig,
+  String? characterContainer,
 }) {
   if (rigFilter == 'all') return true;
   if (asset.rigFamily == null) return true;
   if (rigFilter == 'compatible') {
     if (characterRig == null) return true;
+    final assetFamily = rigFamilyByName(asset.rigFamily);
+    final characterFamily = rigFamilyByName(characterRig);
+    // The container is only consulted for an unnamed rig, and reading it per
+    // asset is not free -- this runs once per asset in the list on every
+    // keystroke.
+    final unnamed =
+        assetFamily == RigFamily.other || characterFamily == RigFamily.other;
     return rigFamiliesCompatible(
-      rigFamilyByName(asset.rigFamily),
-      rigFamilyByName(characterRig),
+      assetFamily,
+      characterFamily,
+      containerA: unnamed ? assetContainerKey(asset) : null,
+      containerB: unnamed ? characterContainer : null,
     );
   }
   return asset.rigFamily == rigFilter;
@@ -8094,7 +8132,18 @@ enum RigFamily {
   /// The plain Unreal mannequin: `root/pelvis/spine_01/thigh_l`.
   unreal,
 
-  /// A prop, or a mesh with no skeleton at all.
+  /// A real skeleton Atlas has no name for.
+  ///
+  /// Not a failure to read the file: the bones are there and the file can be
+  /// animated, they are simply not one of the three rigs above. The Dogs
+  /// pack's 82-bone rig and Kenney's 58-bone Blender rigs are the examples
+  /// here. 91 of the library's 796 clips land here, every one of them with a
+  /// real skeleton, and before this they were stored as [none] and could
+  /// never be paired with anything -- including the mesh shipped beside them
+  /// on the very same rig.
+  other,
+
+  /// No bones at all. A prop. Nothing can animate it.
   none,
 }
 
@@ -8103,28 +8152,70 @@ extension RigFamilyLabel on RigFamily {
     RigFamily.polygon => 'Polygon',
     RigFamily.sidekick => 'Sidekick',
     RigFamily.unreal => 'Unreal',
+    RigFamily.other => 'Other rig',
     RigFamily.none => 'No rig',
   };
 }
 
-/// Classifies a rig from the marker bones the importer's probe reported.
+/// Classifies a rig from the marker bones the importer's probe reported, and
+/// the number of bones it found.
 ///
-/// Order matters: Sidekick carries every mannequin bone as well as its own, so
-/// it has to be checked first or it reads as plain Unreal.
-RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
+/// One rule, mirrored exactly by `rig_family_from_markers` in
+/// `work/atlas_mcp/atlas_mcp.py`; both are tested against
+/// `work/atlas_mcp/fixtures/rig_families.json`, which owns it. Two
+/// implementations of the same rule in two languages is the arrangement that
+/// always drifts, and this one had: graded against which clip rig actually
+/// names each character's bones, over 800 rigged characters, the Python rule
+/// was right 786 times and this one 480 -- it called 303 rigged characters
+/// rigless. The rule below is the Python one, plus the bone count and the
+/// "two markers" test.
+///
+/// In order:
+///
+///  1. no bones at all is [RigFamily.none] -- a prop, whatever its names;
+///  2. any Sidekick attachment or IK bone is [RigFamily.sidekick], first,
+///     because a Sidekick rig carries every mannequin bone as well and would
+///     otherwise read as plain Unreal;
+///  3. **two or more** Polygon markers is [RigFamily.polygon];
+///  4. **two or more** mannequin markers is [RigFamily.unreal];
+///  5. anything else with bones is [RigFamily.other].
+///
+/// Two markers rather than one, because one generic name decided a family:
+/// Kenney's 58-bone Blender rig shares exactly `Hips` with the Polygon rig and
+/// nothing else, and 13 clips were stored as `polygon` on that basis.
+RigFamily rigFamilyFromMarkers(
+  Iterable<String> markers, {
+  required int bones,
+}) {
+  if (bones <= 0) return RigFamily.none;
   final present = markers.toSet();
   if (present.any(
-    (m) => m == 'hipAttachFront' || m == 'hipAttach_l' || m == 'hipAttach_r',
+    (m) =>
+        m == 'hipAttachFront' ||
+        m == 'hipAttach_l' ||
+        m == 'ik_hand_gun' ||
+        m == 'ik_hand_root',
   )) {
     return RigFamily.sidekick;
   }
-  if (present.contains('pelvis') || present.contains('thigh_l')) {
-    return RigFamily.unreal;
+  var polygon = 0;
+  var unreal = 0;
+  for (final marker in present) {
+    if (marker == 'Hips' ||
+        marker == 'UpperLeg_R' ||
+        marker == 'Clavicle_L' ||
+        marker == 'Spine_01') {
+      polygon += 1;
+    } else if (marker == 'pelvis' ||
+        marker == 'thigh_l' ||
+        marker == 'clavicle_l' ||
+        marker == 'spine_01') {
+      unreal += 1;
+    }
   }
-  if (present.contains('Hips') || present.contains('UpperLeg_R')) {
-    return RigFamily.polygon;
-  }
-  return RigFamily.none;
+  if (polygon >= 2) return RigFamily.polygon;
+  if (unreal >= 2) return RigFamily.unreal;
+  return RigFamily.other;
 }
 
 /// The family a loaded skeleton belongs to, read from its own bone names.
@@ -8133,14 +8224,41 @@ RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
 /// clip loaded for playback already carries its bones in memory, so its family
 /// can be named without going back to the file.
 RigFamily rigFamilyOfSkeleton(SkeletonAnimation skeleton) =>
-    rigFamilyFromMarkers(skeleton.bones.map((bone) => bone.name));
+    rigFamilyFromMarkers(
+      skeleton.bones.map((bone) => bone.name),
+      bones: skeleton.bones.length,
+    );
 
 /// Whether a clip can drive a model without retargeting between skeletons.
 ///
 /// Two files of the same family share bone names, which is what posing needs.
-/// Across families they share none, so no amount of correction helps.
-bool rigFamiliesCompatible(RigFamily a, RigFamily b) {
+/// Across families they share none, so no amount of correction helps -- with
+/// one exception and one special case.
+///
+/// The exception is Unreal and Sidekick. The Sidekick rig *is* the Unreal
+/// mannequin with attachment and IK bones added, so a Sidekick clip names
+/// every bone an Unreal character has. Requiring equal names meant that for
+/// the 348 characters stored as `unreal` -- the War Robot among them -- "only
+/// animations for my character" passed 0 of 796 clips, because the library
+/// holds no `unreal` clips at all: 359 are polygon, 346 sidekick, 91 other.
+///
+/// The special case is [RigFamily.other]: two rigs nobody has named are the
+/// same rig only if they shipped together, so this asks for the container as
+/// well. That is a stopgap -- the Dogs pack's mesh and its 88 clips are in one
+/// zip, which is the shape of the evidence available before WP5 stores a real
+/// bone signature. Without containers to compare, `other` drives nothing.
+bool rigFamiliesCompatible(
+  RigFamily a,
+  RigFamily b, {
+  String? containerA,
+  String? containerB,
+}) {
   if (a == RigFamily.none || b == RigFamily.none) return false;
+  if (a == RigFamily.other || b == RigFamily.other) {
+    return a == b && containerA != null && containerA == containerB;
+  }
+  if (a == RigFamily.unreal && b == RigFamily.sidekick) return true;
+  if (a == RigFamily.sidekick && b == RigFamily.unreal) return true;
   return a == b;
 }
 
@@ -12139,6 +12257,9 @@ class AttachPoint {
     RigFamily.polygon => polygon,
     RigFamily.sidekick => sidekick,
     RigFamily.unreal => unreal,
+    // A rig with no name has no table of attachment bones either. Naming one
+    // would be guessing at a hierarchy nobody has read.
+    RigFamily.other => const [],
     RigFamily.none => const [],
   };
 }
@@ -12984,7 +13105,12 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
       );
       kinds[assetId] = FbxClassification(
         kind: json['kind'] == 'animation' ? 'animation' : 'mesh',
-        rig: rigFamilyFromMarkers(markers).name,
+        rig: rigFamilyFromMarkers(
+          markers,
+          // The probe prints this in both of its branches; a file it could
+          // read but found no skeleton in reports zero, which is `none`.
+          bones: (json['bones'] as num?)?.toInt() ?? 0,
+        ).name,
       ).encode();
     } catch (error) {
       // Nothing was ever heard back, so nothing is known about this file.
@@ -14684,6 +14810,35 @@ class AnimationCharacter {
     }
   }
 
+  /// Re-reads the chosen character's rig family from the catalog.
+  ///
+  /// The family is kept here beside the path so the "works with my character"
+  /// filter can answer without the catalog being consulted. That copy is
+  /// written once, when the character is chosen, so a change to the rig rules
+  /// -- and the backfill that follows one -- leaves it stale: a character
+  /// stored `unreal` went on being filtered as `unreal` after the column
+  /// said otherwise.
+  Future<void> refreshRigFrom(Iterable<AssetItem> assets) async {
+    final chosen = path.value;
+    if (chosen == null) return;
+    final key = normalizePathKey(chosen);
+    for (final asset in assets) {
+      if (normalizePathKey(asset.path) != key) continue;
+      final fresh = asset.rigFamily;
+      if (fresh == null || fresh == rigFamily) return;
+      rigFamily = fresh;
+      try {
+        await AssetAtlasDatabase.instance.writeSetting(
+          animationCharacterRigKey,
+          fresh,
+        );
+      } catch (error) {
+        fbxLog('Could not save the refreshed character rig: $error');
+      }
+      return;
+    }
+  }
+
   /// Changes what the chosen character wears without changing the character.
   Future<void> setWorn(Iterable<String> wearing) async {
     worn = List.unmodifiable(wearing);
@@ -14925,10 +15080,18 @@ List<AssetItem> findClipReferenceCharacters(
     if (assetContainerKey(asset) != clipContainer) continue;
     // A clip has no mesh and no bind pose, so it cannot stand in for one.
     if (asset.modelKind == 'animation') continue;
+    // Can this character be driven by the clip, not is it spelt the same.
+    // Everything here is already in the clip's own container, which is what
+    // an unnamed rig is matched by, so both containers are that one.
     if (clipRig != null &&
         clipRig != RigFamily.none &&
         asset.rigFamily != null &&
-        rigFamilyByName(asset.rigFamily) != clipRig) {
+        !rigFamiliesCompatible(
+          rigFamilyByName(asset.rigFamily),
+          clipRig,
+          containerA: clipContainer,
+          containerB: clipContainer,
+        )) {
       continue;
     }
     candidates.add(asset);

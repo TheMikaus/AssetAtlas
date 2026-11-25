@@ -1029,18 +1029,60 @@ def summarise(path, mode="summary"):
     return result
 
 
-# The rig families Atlas recognises, by the marker bones the reader reports.
-# Mirrors rigFamilyFromMarkers in lib/main.dart: the bones are unambiguous
-# where the file names are not.
-def rig_family_from_markers(markers):
+# The rig families Atlas recognises, by the marker bones the reader reports
+# and the number of bones it found.
+#
+# Mirrors rigFamilyFromMarkers in lib/main.dart, and neither side owns the
+# rule: fixtures/rig_families.json does, and both suites read it. The bones
+# are unambiguous where the file names are not.
+#
+#   1. no bones at all is "none" -- a prop, whatever its names;
+#   2. any Sidekick attachment or IK bone is "sidekick", checked first
+#      because a Sidekick rig carries every mannequin bone as well;
+#   3. two or more Polygon markers is "polygon";
+#   4. two or more mannequin markers is "unreal";
+#   5. anything else with bones is "other" -- a real skeleton with a name
+#      Atlas does not know, which is not the same thing as no skeleton.
+#
+# Two markers rather than one: Kenney's 58-bone Blender rig shares exactly
+# "Hips" with the Polygon rig and nothing else, and 13 clips were stored as
+# polygon on that basis.
+POLYGON_MARKERS = frozenset({"Hips", "UpperLeg_R", "Clavicle_L", "Spine_01"})
+UNREAL_MARKERS = frozenset({"pelvis", "thigh_l", "clavicle_l", "spine_01"})
+SIDEKICK_MARKERS = frozenset({"hipAttachFront", "hipAttach_l",
+                              "ik_hand_gun", "ik_hand_root"})
+
+
+def rig_family_from_markers(markers, bones):
+    if not bones:
+        return "none"
     markers = set(markers or ())
-    if markers & {"hipAttachFront", "hipAttach_l", "ik_hand_gun", "ik_hand_root"}:
+    if markers & SIDEKICK_MARKERS:
         return "sidekick"
-    if markers & {"Hips", "UpperLeg_R", "Clavicle_L", "Spine_01"}:
+    if len(markers & POLYGON_MARKERS) >= 2:
         return "polygon"
-    if markers & {"pelvis", "thigh_l", "clavicle_l", "spine_01"}:
+    if len(markers & UNREAL_MARKERS) >= 2:
         return "unreal"
-    return "none"
+    return "other"
+
+
+def families_compatible(a, b, container_a=None, container_b=None):
+    """Whether a clip on rig `b` can drive a character on rig `a`.
+
+    Mirrors rigFamiliesCompatible in lib/main.dart. Unreal and Sidekick pair
+    because the Sidekick rig is the Unreal mannequin with bones added, and the
+    library holds no `unreal` clips at all -- so equality alone matched
+    nothing for 348 characters. Two `other` rigs pair only when they shipped
+    in the same container, which is the evidence available until a bone
+    signature is stored.
+    """
+    if a == "none" or b == "none":
+        return False
+    if a == "other" or b == "other":
+        return a == b and container_a is not None and container_a == container_b
+    if {a, b} == {"unreal", "sidekick"}:
+        return True
+    return a == b
 
 
 # ------------------------------------------------------------ attachments
@@ -1386,7 +1428,7 @@ def tool_get_asset(arguments):
             if unit:
                 lines.append("file units    %g m per unit" % unit)
             markers = data.get("rigMarkers") or []
-            family = rig_family_from_markers(markers)
+            family = rig_family_from_markers(markers, data.get("bones") or 0)
             if data.get("bones"):
                 lines.append("rig           %s, %d bones" % (family, data["bones"]))
             if data.get("animationStacks"):
@@ -1555,14 +1597,22 @@ def tool_find_animations(arguments):
     limit = min(int_argument(arguments, "limit", DEFAULT_LIMIT), MAX_LIMIT)
     wanted = text_argument(arguments, "rig").strip().lower()
     character = text_argument(arguments, "character").strip()
+    # A rig asked for by name means that rig. A rig read off a character means
+    # whatever can drive that character, which is a wider question: a Sidekick
+    # clip drives an Unreal mannequin.
+    for_character = False
+    character_container = None
 
     with open_catalog() as connection:
         if character:
             row = _find_row(connection, character)
             data = summarise(row["path"], "probe")
-            wanted = rig_family_from_markers(data.get("rigMarkers"))
+            wanted = rig_family_from_markers(data.get("rigMarkers"),
+                                             data.get("bones") or 0)
+            for_character = True
+            character_container = container_of(row)
             if wanted == "none":
-                return text("%s is not on a rig this can match against."
+                return text("%s has no skeleton, so nothing can animate it."
                             % row["name"])
         search = dict(arguments)
         search["type"] = "animation"
@@ -1587,7 +1637,12 @@ def tool_find_animations(arguments):
         except AtlasError:
             unreadable += 1
             continue
-        if rig_family_from_markers(data.get("rigMarkers")) == wanted:
+        family = rig_family_from_markers(data.get("rigMarkers"),
+                                         data.get("bones") or 0)
+        if family == wanted and not for_character:
+            kept.append(row)
+        elif for_character and families_compatible(
+                wanted, family, character_container, container_of(row)):
             kept.append(row)
 
     if not kept:

@@ -75,12 +75,17 @@ void main() {
       );
     });
 
-    test('a rig of unrecognised bones is no family, not a wrong guess', () {
+    test('a rig of unrecognised bones is a rig, not a prop', () {
+      // Changed on 2026-11-24, with Mike's approval. `none` used to mean both
+      // "no skeleton" and "a skeleton Atlas cannot name", and the second kind
+      // could never be paired with anything -- not even the clips shipped in
+      // the same zip on the same rig.
       expect(
         rigFamilyOfSkeleton(_rig(['Bone', 'Bone_A', 'Bone_B'])),
-        RigFamily.none,
+        RigFamily.other,
       );
     });
+
 
     test('case decides between two families that both have a spine_01', () {
       expect(
@@ -144,6 +149,40 @@ void main() {
         clipRig: RigFamily.polygon,
       );
       expect(found.map((a) => a.name), ['Polygon.fbx']);
+    });
+
+    test('a rig Atlas has no name for is still a reference', () {
+      // The Dogs pack: one mesh and 88 clips on one 82-bone rig that is
+      // neither Polygon, Sidekick nor Unreal. Stored as `none`, it ranked
+      // below props and could never be paired with its own clips.
+      final found = findClipReferenceCharacters(clip, [
+        _asset(clip, modelKind: 'animation', rigFamily: 'other'),
+        _asset(
+          r'C:\Packs\Anim\A\Dog.fbx',
+          modelKind: 'mesh',
+          rigFamily: 'other',
+        ),
+      ]);
+      expect(found.map((a) => a.name), ['Dog.fbx']);
+    });
+
+    test('a mannequin character can stand in for a Sidekick clip', () {
+      // Not the same family name, but the Sidekick rig is this character's
+      // rig with attachment and IK bones added, so it holds every bone the
+      // clip needs corrected.
+      final found = findClipReferenceCharacters(
+        clip,
+        [
+          _asset(clip, modelKind: 'animation', rigFamily: 'sidekick'),
+          _asset(
+            r'C:\Packs\Anim\A\Mannequin.fbx',
+            modelKind: 'mesh',
+            rigFamily: 'unreal',
+          ),
+        ],
+        clipRig: RigFamily.sidekick,
+      );
+      expect(found.map((a) => a.name), ['Mannequin.fbx']);
     });
 
     test('a file nothing has probed yet is still offered', () {

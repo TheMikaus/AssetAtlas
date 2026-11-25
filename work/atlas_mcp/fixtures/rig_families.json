@@ -1,0 +1,217 @@
+{
+  "note": [
+    "The rig rule, written down once. lib/main.dart's rigFamilyFromMarkers",
+    "and atlas_mcp.py's rig_family_from_markers are separate implementations",
+    "of it in two languages -- the arrangement that always drifts, and this",
+    "one had: graded against which clip rig actually names each character's",
+    "bones, over 800 rigged characters, the Python rule was right 786 times",
+    "and the Dart rule 480. Neither side owns the rule now. Both suites read",
+    "this file, and a case added here fails on whichever side has not caught",
+    "up.",
+    "",
+    "`markers` is what the importer's --probe reports for a file, which is",
+    "the subset of kRigMarkerBones (mesh_importer.cpp) the file carries, and",
+    "`bones` is the skeleton's bone count from the same probe."
+  ],
+  "families": [
+    {
+      "why": "Synty's own rig, capitalised. 39 of 300 probed files.",
+      "markers": ["Hips", "UpperLeg_R", "Clavicle_L", "Spine_01"],
+      "bones": 52,
+      "family": "polygon"
+    },
+    {
+      "why": "A Sidekick character: the mannequin plus attachment and IK bones.",
+      "markers": [
+        "pelvis",
+        "thigh_l",
+        "clavicle_l",
+        "spine_01",
+        "ik_hand_gun",
+        "ik_hand_root"
+      ],
+      "bones": 121,
+      "family": "sidekick"
+    },
+    {
+      "why": "A Sidekick clip. 81 of 300. No hips marker, but the IK bones are there.",
+      "markers": ["clavicle_l", "spine_01", "ik_hand_gun", "ik_hand_root"],
+      "bones": 121,
+      "family": "sidekick"
+    },
+    {
+      "why": "One attachment bone is enough; nothing else carries them.",
+      "markers": ["hipAttachFront"],
+      "bones": 121,
+      "family": "sidekick"
+    },
+    {
+      "why": "An IK bone alone is also enough.",
+      "markers": ["ik_hand_root"],
+      "bones": 100,
+      "family": "sidekick"
+    },
+    {
+      "why": "The plain mannequin. 30 of 300.",
+      "markers": ["pelvis", "thigh_l", "clavicle_l", "spine_01"],
+      "bones": 68,
+      "family": "unreal"
+    },
+    {
+      "why": "The mannequin with only its upper markers probed. 40 of 300.",
+      "markers": ["clavicle_l", "spine_01"],
+      "bones": 60,
+      "family": "unreal"
+    },
+    {
+      "why": "Exactly two Polygon markers is the floor for polygon.",
+      "markers": ["Hips", "Spine_01"],
+      "bones": 52,
+      "family": "polygon"
+    },
+    {
+      "why": "Exactly two mannequin markers is the floor for unreal.",
+      "markers": ["pelvis", "spine_01"],
+      "bones": 56,
+      "family": "unreal"
+    },
+    {
+      "why": "Kenney's 58-bone Blender rig shares exactly one name with Polygon. One marker must not name a family -- 13 clips were stored as polygon on this.",
+      "markers": ["Hips"],
+      "bones": 58,
+      "family": "other"
+    },
+    {
+      "why": "One Polygon marker, the other spelling. Still not a family.",
+      "markers": ["UpperLeg_R"],
+      "bones": 50,
+      "family": "other"
+    },
+    {
+      "why": "One marker from each family is not evidence for either.",
+      "markers": ["Spine_01", "spine_01"],
+      "bones": 64,
+      "family": "other"
+    },
+    {
+      "why": "The Dogs pack: a real 82-bone rig with no marker bone at all. Its mesh and its 88 clips are on it, and calling this 'none' is what stopped them pairing.",
+      "markers": [],
+      "bones": 82,
+      "family": "other"
+    },
+    {
+      "why": "A prop. No bones, so no rig, whatever else is true of it.",
+      "markers": [],
+      "bones": 0,
+      "family": "none"
+    },
+    {
+      "why": "Bone count decides first: marker names with no skeleton is a file the probe read as geometry only.",
+      "markers": ["Hips", "UpperLeg_R", "Clavicle_L", "Spine_01"],
+      "bones": 0,
+      "family": "none"
+    },
+    {
+      "why": "Sidekick is tested before the mannequin it extends, or every Sidekick file reads as unreal.",
+      "markers": [
+        "pelvis",
+        "thigh_l",
+        "clavicle_l",
+        "spine_01",
+        "hipAttach_l"
+      ],
+      "bones": 121,
+      "family": "sidekick"
+    },
+    {
+      "why": "Both capitalisations present and both over the threshold: Polygon is tested first, so it wins. Not seen in the library; pinned so the two languages cannot disagree about it.",
+      "markers": ["Hips", "UpperLeg_R", "pelvis", "thigh_l"],
+      "bones": 70,
+      "family": "polygon"
+    }
+  ],
+  "compatibleNote": [
+    "Whether a clip on `clip` can drive a character on `character`.",
+    "`sameContainer` says whether the two files came out of the same pack,",
+    "which only matters for a rig neither side can name."
+  ],
+  "compatible": [
+    {
+      "why": "A family drives itself.",
+      "character": "polygon",
+      "clip": "polygon",
+      "sameContainer": false,
+      "expected": true
+    },
+    {
+      "why": "The Sidekick rig is the Unreal mannequin with bones added, so a Sidekick clip names every bone an Unreal character has. The library holds no unreal clips at all, so equality alone matched 0 of 796 for 348 characters.",
+      "character": "unreal",
+      "clip": "sidekick",
+      "sameContainer": false,
+      "expected": true
+    },
+    {
+      "why": "And the other way round.",
+      "character": "sidekick",
+      "clip": "unreal",
+      "sameContainer": false,
+      "expected": true
+    },
+    {
+      "why": "Polygon shares not one bone name with either mannequin rig.",
+      "character": "polygon",
+      "clip": "sidekick",
+      "sameContainer": true,
+      "expected": false
+    },
+    {
+      "why": "Nor with the plain mannequin.",
+      "character": "unreal",
+      "clip": "polygon",
+      "sameContainer": false,
+      "expected": false
+    },
+    {
+      "why": "Two rigs nobody has named are the same rig only if they shipped together. The Dogs pack's mesh and clips are in one zip.",
+      "character": "other",
+      "clip": "other",
+      "sameContainer": true,
+      "expected": true
+    },
+    {
+      "why": "Two unnamed rigs from different packs are two different rigs until something reads their bones.",
+      "character": "other",
+      "clip": "other",
+      "sameContainer": false,
+      "expected": false
+    },
+    {
+      "why": "An unnamed rig is not a mannequin, even in the same pack.",
+      "character": "other",
+      "clip": "sidekick",
+      "sameContainer": true,
+      "expected": false
+    },
+    {
+      "why": "A prop has no bones for a clip to move.",
+      "character": "none",
+      "clip": "polygon",
+      "sameContainer": true,
+      "expected": false
+    },
+    {
+      "why": "And a clip with no skeleton moves nothing.",
+      "character": "polygon",
+      "clip": "none",
+      "sameContainer": true,
+      "expected": false
+    },
+    {
+      "why": "Not even itself.",
+      "character": "none",
+      "clip": "none",
+      "sameContainer": true,
+      "expected": false
+    }
+  ]
+}
