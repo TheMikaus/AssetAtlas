@@ -27,13 +27,13 @@ AssetItem _asset(String path, {String type = 'model', bool ignored = false}) {
   );
 }
 
-AssetItem _unrealBuild(String version) => _asset(
-  r'zip:Z:\Assets\Synty\POLYGON_SciFi_Space_Unreal_$version.zip'
-          .replaceAll(r'$version', version) +
-      '::Content/PolygonSciFiSpace/Meshes/Characters/'
-          'SK_Chr_BR_War_Robot_01.uasset',
-  type: 'unreal',
-);
+/// One engine build's copy, as the catalog holds it: `4_19`, `5_0`, `5_4`.
+AssetItem _unrealBuild(String version) {
+  const container = r'zip:Z:\Assets\Synty\POLYGON_SciFi_Space_Unreal_';
+  const entry = '::Content/PolygonSciFiSpace/Meshes/Characters/'
+      'SK_Chr_BR_War_Robot_01.uasset';
+  return _asset('$container$version.zip$entry', type: 'unreal');
+}
 
 final _sourceFbx = _asset(
   r'zip:Z:\Assets\Synty\POLYGON_SciFiSpace_SourceFiles.zip'
