@@ -1031,6 +1031,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
           ..clear()
           ..addAll(snapshot.rigBones);
         resetRigIndex();
+        resetTwinIndex();
         modelHasValidTextures.clear();
         MeshLoadCache.clear();
         ModelThumbnailCache.clear();
@@ -9381,7 +9382,7 @@ List<AssetItem> unityBuildsFor(AssetItem asset, List<AssetItem> allAssets) {
   return found;
 }
 
-/// The image in [allAssets] whose path ends with this Unity project path.
+/// The image in [allAssets] whose name matches this Unity project path.
 ///
 /// The chain gives `PolygonSciFiSpace/Textures/X.png` inside the Unity zip;
 /// what Atlas can draw is the copy in the source zip, or that same entry.
@@ -9392,14 +9393,16 @@ AssetItem? _textureAssetFor(
 ) {
   final wanted = unityPath.split('/').last.toLowerCase();
   final container = assetContainerKey(model);
-  AssetItem? elsewhere;
-  for (final asset in allAssets) {
-    if (!imageExts.contains(asset.ext)) continue;
-    if (asset.name.toLowerCase() != wanted) continue;
+  // The index relinking already builds, bucketed by base name and by
+  // container and rebuilt once per catalog revision. Walking the catalog
+  // here instead took a tagging pass from about 150 models a minute to 9.9,
+  // with the machine 89% idle -- not busy, waiting.
+  final named = _textureIndexOf(allAssets).byBaseName[twinStem(wanted)];
+  if (named == null || named.isEmpty) return null;
+  for (final asset in named) {
     if (assetContainerKey(asset) == container) return asset;
-    elsewhere ??= asset;
   }
-  return elsewhere;
+  return named.first;
 }
 
 /// The texture to draw a model with when the file itself names none.
@@ -9519,13 +9522,16 @@ const _nonBaseTextureWords = [
 /// `texture` is not required (PolygonNature's atlas is `PolygonNature_01.png`)
 /// and a pack with no single base atlas gets no answer at all.
 AssetItem? guessTextureByName(AssetItem model, List<AssetItem> allAssets) {
-  final container = assetContainerKey(model);
   final productTokens = _packNameWords(containerDisplayName(model));
   final candidates = <AssetItem>[];
   final depths = <String, int>{};
-  for (final asset in allAssets) {
-    if (!imageExts.contains(asset.ext)) continue;
-    if (assetContainerKey(asset) != container) continue;
+  // This model's own container only, through the helper that knows how the
+  // texture index keys one -- `zip:<path>` or `root:<root>`, not the
+  // catalog's container key. It also caches per container, which is the
+  // shape of a tagging pass: hundreds of models from one pack in a row.
+  // Walking the whole catalog here instead took a pass from about 150
+  // models a minute to 9.9, with the machine 89% idle.
+  for (final asset in _sameContainerTextures(model.path, allAssets)) {
     final parts = asset.path.replaceAll('\\', '/').toLowerCase().split('/');
     var anchor = -1;
     for (var i = 0; i < parts.length - 1; i += 1) {
