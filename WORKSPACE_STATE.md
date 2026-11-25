@@ -17,6 +17,22 @@ Playdate framework: N/A
   v1.10.48 one rig classifier owned by `work/atlas_mcp/fixtures/rig_families.json`,
   a new `other` family, and unreal/sidekick compatibility. See DECISIONS.md
   RIG-001. 736 Dart tests, 407 Python tests, analyze clean.
+- 2026-11-24, the rest of the plan, on `fix/stage-1-correctness`:
+  `6f796f9` v1.10.49 WP5 rig signatures (schema v8: `rig_signature` and a
+  `rig_bones` table), the model/animation lists and audition, and WP7 twins --
+  a `.uasset` now draws its FBX twin;
+  `f8051b7` v1.10.50 WP6 the authored texture (both Unity container formats),
+  WP8 GLB and glTF through cgltf with DAE declined, and WP9 tagging modes plus
+  the instrumentation that says whether a run is render-bound or embed-bound.
+  852 Dart tests, 422 Python tests, analyze clean. DECISIONS.md RIG-001,
+  FMT-001, TEX-001.
+- 2026-11-24 the catalog was backfilled a second time for the signatures
+  (backup `asset_atlas_native.db.before-rig-signatures`): 44,458 FBX read,
+  2,355 of them rigged, **129 distinct rigs**, 12 of which cover all 796 clips.
+- Verified in the running app at 1.10.50, through the bridge: the War Robot
+  reports "1 of 1 materials textured, SciFiSpaceBase4 textured 2048x2048" and
+  draws as a dark robot with blue panels. It read `flat colour, no texture`
+  before.
 - 2026-11-24 `6c4a940` find_animations answers from the `rig_family` column
   instead of re-reading files. It was returning nothing for every question --
   "None of the 9 clips looked at are on the sidekick rig" with 346 in the
@@ -62,12 +78,16 @@ Playdate framework: N/A
   `averageImageColor` already computes, which answers colour queries with no
   model at all.
 - Open from earlier: library rescan (catalog on rules v2, app on v3);
-  PR #3 awaiting merge. The `rig_family` backfill is done -- see Progress.
-- Next in the 2026-11-24 plan, in order: WP5 rig signatures and the
-  model/animation lists; WP7 twins; WP6 the authored texture (phase A on the
-  7 `.zip` Unity builds, phase B reading `.unitypackage`); WP8 GLB and glTF
-  via `cgltf`; WP9 tagging speed. WP3's acceptance check is still open: the
-  War Robot has not been watched playing a clip in the built app.
+  PR #3 awaiting merge. Both backfills are done -- see Progress.
+- The plan's nine work packages are all implemented. What it leaves open, by
+  its own text: the four timed tagging runs in WP9 step 1 (held by 0.6), the
+  re-embedding of models that now draw textured (needs a `--force` flag that
+  does not exist, and a run), grid collapsing of twins, and reading inside a
+  `.uasset` for its class.
+- WP3's by-eye acceptance was done offline rather than in the app: the robot
+  posed by a Sidekick idle and a forward walk, rendered through Atlas's own
+  pose-and-rasterise path, with the controls unchanged. Watching it in the
+  window itself is the one check nobody has run.
 
 ## Problems
 - PR #3 now carries `a1b37b8`, which is workflow configuration unrelated to
