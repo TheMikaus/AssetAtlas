@@ -575,6 +575,7 @@ class InterruptedRunTest(unittest.TestCase):
         max_attempts = 3
         retry_failed = False
         force = False
+        ids_file = None
 
     class FakeWorker:
         """Stands in for the child process, not for the queue.
@@ -603,7 +604,8 @@ class InterruptedRunTest(unittest.TestCase):
                         max_attempts=int(
                             message.get("max_attempts")
                             or tagging.DEFAULT_MAX_ATTEMPTS),
-                        limit=None if limit is None else int(limit))
+                        limit=None if limit is None else int(limit),
+                        force=bool(message.get("force")))
                 reply = {"ok": True}
                 reply.update(work.as_dict())
                 return reply
@@ -934,6 +936,75 @@ class InterruptedRunTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("not running", body)
         self.assertEqual(self.stored()[0], 0)
+
+
+class IdsFileTest(InterruptedRunTest):
+    """Re-embedding exactly the assets on a list.
+
+    A forced pass over this library is tens of hours and most of it would
+    be work for nothing: the pictures that changed are the models whose
+    file named no texture. Those can be listed in a few minutes from the
+    importer's own probe, and the pass takes the list.
+
+    Inherits the driver harness above: the same fake worker, the same real
+    store and real work_list.
+    """
+
+    def ids_file(self, ids):
+        path = os.path.join(self.directory, "ids.txt")
+        with io.open(path, "w", encoding="utf-8", newline="\n") as handle:
+            for asset_id in ids:
+                handle.write(asset_id + "\n")
+        return path
+
+    def run_with(self, **overrides):
+        arguments = self.Arguments()
+        for name, value in overrides.items():
+            setattr(arguments, name, value)
+        out = io.StringIO()
+        code = tag_assets.run(arguments, out)
+        return code, out.getvalue()
+
+    def test_only_the_listed_assets_are_embedded(self):
+        self.set_render(lambda row: b"png")
+        wanted = ["id:03", "id:07"]
+        code, body = self.run_with(ids_file=self.ids_file(wanted))
+        self.assertEqual(code, 0)
+        count, _failures = self.stored()
+        self.assertEqual(count, 2, body)
+
+    def test_it_says_how_many_of_the_ids_it_found(self):
+        self.set_render(lambda row: b"png")
+        _code, body = self.run_with(
+            ids_file=self.ids_file(["id:01", "id:02", "not-in-this-catalog"]))
+        self.assertIn("ids file", body)
+        self.assertIn("3 ids", body)
+        self.assertIn("2 of them", body)
+
+    def test_an_empty_list_does_nothing_rather_than_everything(self):
+        self.set_render(lambda row: b"png")
+        _code, body = self.run_with(ids_file=self.ids_file([]))
+        count, _failures = self.stored()
+        self.assertEqual(count, 0, body)
+
+    def test_the_limit_still_applies_on_top(self):
+        self.set_render(lambda row: b"png")
+        self.run_with(ids_file=self.ids_file(["id:01", "id:02", "id:03"]),
+                      limit=2)
+        count, _failures = self.stored()
+        self.assertEqual(count, 2)
+
+    def test_it_redoes_what_is_already_embedded_when_forced(self):
+        self.set_render(lambda row: b"png")
+        path = self.ids_file(["id:05"])
+        self.run_with(ids_file=path)
+        before, _ = self.stored()
+        # Without force the asset is done and the list selects nothing.
+        self.run_with(ids_file=path)
+        self.assertEqual(self.stored()[0], before)
+        # With it, the picture is taken again.
+        self.run_with(ids_file=path, force=True)
+        self.assertEqual(self.stored()[0], before + 1)
 
 
 class DurationTest(unittest.TestCase):

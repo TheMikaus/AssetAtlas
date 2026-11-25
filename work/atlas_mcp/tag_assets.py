@@ -41,6 +41,7 @@ Run it with -P, for the reason in atlas_embed.py's docstring.
 
 import argparse
 import base64
+import io
 import json
 import os
 import subprocess
@@ -194,7 +195,25 @@ def run(arguments, out):
                      "ext": arguments.ext,
                      "max_attempts": arguments.max_attempts,
                      "force": arguments.force}
-        work = worker.ask(op="next", limit=arguments.limit, **selection)
+        work = worker.ask(op="next", limit=None, **selection)
+        wanted_ids = None
+        if arguments.ids_file:
+            # Keep the queue's own order -- archive by archive -- and simply
+            # drop what is not on the list. The order is worth 600 ms an
+            # asset, so taking the file's order instead would cost more than
+            # the filtering saves.
+            with io.open(arguments.ids_file, encoding="utf-8") as handle:
+                wanted_ids = {line.strip() for line in handle if line.strip()}
+            work = dict(work)
+            work["assets"] = [asset for asset in work["assets"]
+                              if asset["asset_id"] in wanted_ids]
+            work["remaining"] = len(work["assets"])
+            out.write("ids file      %d ids, %d of them still in the queue\n"
+                      % (len(wanted_ids), work["remaining"]))
+        if arguments.limit:
+            work = dict(work)
+            work["assets"] = work["assets"][:arguments.limit]
+            work["remaining"] = len(work["assets"])
 
         out.write("%d distinct models selected, %d already embedded, "
                   "%d to do%s\n"
@@ -279,7 +298,9 @@ def run(arguments, out):
                     more = worker.ask(op="next", limit=arguments.batch * 8,
                                       **selection)
                     pending = [item for item in more["assets"]
-                               if item["asset_id"] not in taken]
+                               if item["asset_id"] not in taken
+                               and (wanted_ids is None
+                                    or item["asset_id"] in wanted_ids)]
                     taken.update(item["asset_id"] for item in pending)
                     total = done + len(batch) + len(pending)
         except KeyboardInterrupt:
@@ -360,6 +381,10 @@ def main(argv=None):
                         help="give up on an asset after this many failed "
                              "renders (default %d; 0 means never give up)"
                              % tagging.DEFAULT_MAX_ATTEMPTS)
+    parser.add_argument("--ids-file",
+                        help="a file of asset ids, one per line: embed "
+                             "exactly these, in the order the queue would "
+                             "have taken them")
     parser.add_argument("--force", action="store_true",
                         help="embed again even where a vector exists, for "
                              "when the way Atlas draws a model has changed")

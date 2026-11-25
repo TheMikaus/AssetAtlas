@@ -9364,22 +9364,43 @@ List<String> unityPackageSidecarsFor(AssetItem asset) {
   ];
 }
 
+/// One asset from each Unity build in the catalog, by product key.
+///
+/// Built once per catalog revision. Walking the catalog here instead cost
+/// every model that names no texture a pass over 480,826 rows, which is
+/// most of why a forced re-embed measured 5,249 ms a model.
+final Map<String, List<AssetItem>> _unityBuildsByProduct = {};
+int? _unityBuildsIdentity;
+
+Map<String, List<AssetItem>> _unityBuildIndex(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  if (_unityBuildsIdentity == identity) return _unityBuildsByProduct;
+  _unityBuildsByProduct.clear();
+  final seen = <String>{};
+  for (final asset in allAssets) {
+    final zip = parseZipVirtualPath(asset.path);
+    if (zip == null) continue;
+    final container = containerDisplayName(asset);
+    if (!container.toLowerCase().contains('unity')) continue;
+    if (!seen.add(normalizePathKey(zip.zipPath))) continue;
+    final product = twinProductKey(container);
+    if (product.isEmpty) continue;
+    _unityBuildsByProduct.putIfAbsent(product, () => []).add(asset);
+  }
+  _unityBuildsIdentity = identity;
+  return _unityBuildsByProduct;
+}
+
+void resetUnityBuildIndex() {
+  _unityBuildsByProduct.clear();
+  _unityBuildsIdentity = null;
+}
+
 /// The Unity builds of the same product as [asset], nearest first.
 List<AssetItem> unityBuildsFor(AssetItem asset, List<AssetItem> allAssets) {
   final product = twinProductKey(containerDisplayName(asset));
   if (product.isEmpty) return const [];
-  final seen = <String>{};
-  final found = <AssetItem>[];
-  for (final other in allAssets) {
-    final zip = parseZipVirtualPath(other.path);
-    if (zip == null) continue;
-    final container = containerDisplayName(other);
-    if (!container.toLowerCase().contains('unity')) continue;
-    if (twinProductKey(container) != product) continue;
-    if (!seen.add(normalizePathKey(zip.zipPath))) continue;
-    found.add(other);
-  }
-  return found;
+  return _unityBuildIndex(allAssets)[product] ?? const [];
 }
 
 /// The image in [allAssets] whose name matches this Unity project path.
@@ -15193,16 +15214,14 @@ class MeshLoadCache {
 /// The UVs are the model's own, so a correct atlas lands correctly; a wrong
 /// one is obvious at a glance, which is the point of choosing by hand.
 Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
-  final bytes = await readAssetBytes(texturePath);
-  if (bytes == null || bytes.isEmpty) return mesh;
-  final image = await decodeImage(bytes);
-  Uint8List? pixels;
-  try {
-    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    pixels = data?.buffer.asUint8List();
-  } catch (error) {
-    fbxLog('Chosen texture readback failed: $error');
-  }
+  // Through the cache, not past it. Every model in a pack is assigned the
+  // same atlas, and reading and decoding a 2048x2048 PNG per model is what
+  // a tagging pass does hundreds of times in a row; textureBitmap already
+  // holds the decoded pixels with an LRU budget.
+  final bitmap = await textureBitmap(texturePath);
+  if (bitmap == null) return mesh;
+  final pixels = bitmap.rgba;
+  final image = await imageFromRgba(pixels, bitmap.width, bitmap.height);
 
   final materials = mesh.materials.isEmpty
       ? [const MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
