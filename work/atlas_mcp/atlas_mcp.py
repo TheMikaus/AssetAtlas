@@ -1066,6 +1066,80 @@ def rig_family_from_markers(markers, bones):
     return "other"
 
 
+# The rig signature: a rig's identity, which is the set of bone names it
+# holds. Mirrors rigSignatureOf in lib/main.dart, and neither side owns it:
+# fixtures/rig_signatures.json does, and both suites read it.
+#
+# Lower-cased, so two exports of one rig that differ only in case are one rig;
+# sorted, so the order the exporter wrote them in cannot matter; then hashed,
+# because the names themselves are stored once per signature in the catalog's
+# rig_bones table and an asset row only needs the key.
+#
+# FNV-1a rather than a cryptographic hash: an identity key over about fifty
+# distinct rigs, not something anyone could want to forge, and arithmetic both
+# languages do without a dependency.
+RIG_FNV_OFFSET = 0xCBF29CE484222325
+RIG_FNV_PRIME = 0x100000001B3
+RIG_FNV_MASK = 0xFFFFFFFFFFFFFFFF
+
+# How many bones two rigs must share exactly before one may drive the other,
+# and how much of the character's rig must match once case is folded. Mirrors
+# minimumRigOverlap and minimumRigMatchFraction in lib/main.dart.
+MINIMUM_RIG_OVERLAP = 4
+MINIMUM_RIG_MATCH_FRACTION = 0.5
+
+
+def rig_signature_of(bone_names):
+    names = sorted(name.lower() for name in (bone_names or []) if name)
+    if not names:
+        return ""
+    value = RIG_FNV_OFFSET
+    for index, name in enumerate(names):
+        if index:
+            value = ((value ^ 0x0A) * RIG_FNV_PRIME) & RIG_FNV_MASK
+        for character in name:
+            code = ord(character)
+            value = ((value ^ (code & 0xFF)) * RIG_FNV_PRIME) & RIG_FNV_MASK
+            if code > 0xFF:
+                value = (((value ^ ((code >> 8) & 0xFF)) * RIG_FNV_PRIME)
+                         & RIG_FNV_MASK)
+    return ("%016x" % value)[:12]
+
+
+def rig_name_matches(character_bones, clip_bones):
+    """How many of a character's bones the clip names, exactly and folded."""
+    clip_exact = set(clip_bones or ())
+    clip_folded = {name.lower() for name in (clip_bones or ())}
+    exact = 0
+    folded = 0
+    for bone in character_bones or ():
+        if bone in clip_exact:
+            exact += 1
+            folded += 1
+        elif bone.lower() in clip_folded:
+            folded += 1
+    return exact, folded
+
+
+def rig_match_from_counts(character_bones, exact, folded):
+    if character_bones <= 0:
+        return False
+    if exact >= MINIMUM_RIG_OVERLAP:
+        return True
+    return folded / float(character_bones) >= MINIMUM_RIG_MATCH_FRACTION
+
+
+def rig_match_names(character_bones, clip_bones):
+    """Whether a clip on `clip_bones` may drive a character on the others.
+
+    The bone-level rule, which supersedes the family names for any pair where
+    both rigs are known: two rigs are compatible when the clip names enough of
+    the character's own bones, whatever either rig is called.
+    """
+    exact, folded = rig_name_matches(character_bones, clip_bones)
+    return rig_match_from_counts(len(character_bones or ()), exact, folded)
+
+
 def families_compatible(a, b, container_a=None, container_b=None):
     """Whether a clip on rig `b` can drive a character on rig `a`.
 
@@ -1598,6 +1672,71 @@ def tool_catalog_stats(arguments):
 RIG_FAMILIES = ("polygon", "sidekick", "unreal", "other")
 
 
+def _column(row, name):
+    """row[name], or None where the catalog is older than that column.
+
+    sqlite3.Row raises IndexError for a column that is not in the query, and
+    a catalog written before the rig signatures existed has none.
+    """
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _rig_bones(connection):
+    """The bone names behind each signature, or {} on a catalog without them.
+
+    A few dozen rows. Atlas writes this table; a catalog that predates it
+    answers nothing here and the family names are used instead.
+    """
+    table = connection.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'rig_bones'").fetchone()[0]
+    if not table:
+        return {}
+    return {row[0]: json.loads(row[1]) for row in
+            connection.execute("SELECT signature, bones_json FROM rig_bones")}
+
+
+def _signatures_driving(connection, character_bones):
+    """Clip signatures whose rig can drive a character on these bones.
+
+    Asked of the distinct signatures rather than of the clips: this library
+    holds 796 clips on 12 rigs, so this is a dozen comparisons however many
+    clips there are.
+    """
+    bones = _rig_bones(connection)
+    if not bones or not character_bones:
+        return None
+    found = []
+    for row in connection.execute(
+            "SELECT DISTINCT rig_signature FROM catalog_assets "
+            "WHERE model_kind = 'animation' AND rig_signature IS NOT NULL"):
+        clip_bones = bones.get(row[0])
+        if clip_bones and rig_match_names(character_bones, clip_bones):
+            found.append(row[0])
+    return found
+
+
+def _clips_on_signatures(connection, search, signatures, fetch):
+    where, params, _kind, _sieve = build_query(search)
+    sql = ("SELECT * FROM catalog_assets WHERE (%s) "
+           "AND model_kind = 'animation' AND rig_signature IN (%s) "
+           "ORDER BY name" % (where, ",".join("?" * len(signatures))))
+    if fetch:
+        sql += " LIMIT %d" % fetch
+    return connection.execute(sql, params + list(signatures)).fetchall()
+
+
+def _count_clips_on_signatures(connection, search, signatures):
+    where, params, _kind, _sieve = build_query(search)
+    sql = ("SELECT count(*) FROM catalog_assets WHERE (%s) "
+           "AND model_kind = 'animation' AND rig_signature IN (%s)"
+           % (where, ",".join("?" * len(signatures))))
+    return connection.execute(sql, params + list(signatures)).fetchone()[0]
+
+
 def _clips_on_rigs(connection, search, families, fetch):
     """Clip rows whose recorded rig is one of [families].
 
@@ -1667,6 +1806,32 @@ def tool_find_animations(arguments):
 
         search = {key: value for key, value in arguments.items()
                   if key not in ("rig", "character", "type", "limit", "offset")}
+
+        # Bones before family names, for a character whose rig the catalog
+        # has recorded. A family is a label with four values; the bones are
+        # the rig itself, which is what decides whether a clip can drive it.
+        # This is what pairs the Dogs pack with its own clips -- both are
+        # `other`, and the family rule could only say "same container".
+        if for_character:
+            character_bones = _rig_bones(connection).get(
+                _column(row, "rig_signature") or "")
+            signatures = (_signatures_driving(connection, character_bones)
+                          if character_bones else None)
+            if signatures:
+                found = _clips_on_signatures(
+                    connection, search, signatures, limit * 4)
+                if found:
+                    total = _count_clips_on_signatures(
+                        connection, search, signatures)
+                    kept = found[:limit]
+                    shown = "\n".join(describe_row(r, i + 1)
+                                      for i, r in enumerate(kept))
+                    more = ("" if total <= len(kept)
+                            else " (%d shown)" % len(kept))
+                    return text(
+                        "%d clips on a rig that can drive %s%s, matched on "
+                        "bone names rather than rig family.\n\n%s"
+                        % (total, row["name"], more, shown))
 
         if not wanted:
             listing = dict(search)

@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.48';
+const appVersion = '1.10.49';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -272,6 +272,10 @@ class CatalogScreen extends StatefulWidget {
 class _CatalogScreenState extends State<CatalogScreen> {
   final db = AssetAtlasDatabase.instance;
   final assets = <AssetItem>[];
+
+  /// The bone names behind each rig signature in the catalog, read once when
+  /// it opens. A few dozen entries: rigs repeat across thousands of files.
+  final rigBonesBySignature = <String, List<String>>{};
   final selectedIds = <String>{};
   final sourceRoots = <String>{};
 
@@ -617,6 +621,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       typeFilter,
       rigFilter,
       AnimationCharacter.instance.rigFamily ?? '',
+      AnimationCharacter.instance.rigSignature ?? '',
       // The character's own path, because an unnamed rig is matched by the
       // container it shipped in rather than by its family name.
       AnimationCharacter.instance.path.value ?? '',
@@ -629,6 +634,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _listEpoch,
     ].join('|');
     if (cache != null && cachedKey == cacheKey) return cache;
+
+    // Bones beat family names wherever both rigs are known. The index is
+    // built once per catalog, not once per pass.
+    final rigIndex = rigFilter == 'compatible'
+        ? rigIndexFor(assets, rigBonesBySignature)
+        : null;
+    final characterSignature = AnimationCharacter.instance.rigSignature;
 
     // Only an unnamed rig needs this, and finding it is a scan of the
     // catalog, so it is done once per filter pass and only when it can
@@ -689,6 +701,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
         rigFilter: rigFilter,
         characterRig: AnimationCharacter.instance.rigFamily,
         characterContainer: characterContainer,
+        characterSignature: characterSignature,
+        rigIndex: rigIndex,
       )) {
         return false;
       }
@@ -846,9 +860,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
       if (asset != null) {
         asset.modelKind = decoded.kind;
         asset.rigFamily = decoded.rig;
+        asset.rigSignature = decoded.signature;
+      }
+      final signature = decoded.signature;
+      if (signature != null && decoded.bones.isNotEmpty) {
+        rigBonesBySignature.putIfAbsent(signature, () => decoded.bones);
       }
       _modelKindInFlight.remove(entry.key);
     }
+    // The catalog list is the same object with changed items in it, so the
+    // index's generation key has not moved. Drop it by hand or a newly
+    // classified rig would not appear in anyone's list until a rescan.
+    resetRigIndex();
     _modelKindClassified += kinds.length;
 
     setState(() {
@@ -942,6 +965,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
         assets
           ..clear()
           ..addAll(snapshot.assets);
+        rigBonesBySignature
+          ..clear()
+          ..addAll(snapshot.rigBones);
+        resetRigIndex();
         modelHasValidTextures.clear();
         MeshLoadCache.clear();
         ModelThumbnailCache.clear();
@@ -1802,6 +1829,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         asset: active,
                         allAssets: assets,
                         catalogRevision: catalogRevision,
+                        rigBones: rigBonesBySignature,
                         onActivateAsset: _activateAsset,
                       ),
                     ),
@@ -3459,6 +3487,7 @@ class PreviewPanel extends StatefulWidget {
     required this.allAssets,
     required this.catalogRevision,
     required this.onActivateAsset,
+    this.rigBones = const {},
     super.key,
   });
 
@@ -3467,12 +3496,36 @@ class PreviewPanel extends StatefulWidget {
   final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
+  /// The bone names behind each rig signature, for the pairing lists.
+  final Map<String, List<String>> rigBones;
+
   @override
   State<PreviewPanel> createState() => _PreviewPanelState();
 }
 
 class _PreviewPanelState extends State<PreviewPanel> {
   double detailsWidth = 360;
+
+  /// The other half of a pairing being tried out: a clip when a model is
+  /// selected, a model when a clip is selected.
+  ///
+  /// Deliberately not [AnimationCharacter]: that is the character Mike chose
+  /// and it drives every clip preview in the app. Auditioning is "show me
+  /// this pair now", and it must not quietly replace a choice he made.
+  AssetItem? audition;
+
+  void _setAudition(AssetItem? asset) => setState(() => audition = asset);
+
+  @override
+  void didUpdateWidget(covariant PreviewPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Selecting something else ends the audition: it was a pairing with the
+    // old selection, and keeping it would play a clip against a model the
+    // user is no longer looking at.
+    if (oldWidget.asset?.path != widget.asset?.path && audition != null) {
+      audition = null;
+    }
+  }
 
   // Same reason as the diagnostics panel: a future built inline in build()
   // re-read and re-inflated the archive entry on every rebuild.
@@ -3529,6 +3582,9 @@ class _PreviewPanelState extends State<PreviewPanel> {
                   allAssets: widget.allAssets,
                   catalogRevision: widget.catalogRevision,
                   onActivateAsset: widget.onActivateAsset,
+                  rigBones: widget.rigBones,
+                  audition: audition,
+                  onAudition: _setAudition,
                 ),
               ),
             ],
@@ -3538,8 +3594,129 @@ class _PreviewPanelState extends State<PreviewPanel> {
     );
   }
 
+  /// The pairing being auditioned, drawn in place of the still model.
+  Widget _auditionPreview(AssetItem item, AssetItem other) {
+    final model = item.effectiveType == 'animation' ? other : item;
+    final clip = item.effectiveType == 'animation' ? item : other;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.play_circle_outline, size: 18),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'Auditioning ${clip.name} on ${model.name}',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: () => _setAudition(null),
+                icon: const Icon(Icons.stop, size: 16),
+                label: const Text('Stop'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: FutureBuilder<MeshModel>(
+            // The clip is read the same way the still preview reads a model,
+            // so an audition costs the same one import and hits the same
+            // cache the next time.
+            future: MeshLoadCache.load(clip, allAssets: widget.allAssets),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final loaded = snapshot.data;
+              if (loaded == null || loaded.skeleton == null) {
+                return Center(
+                  child: Text('${clip.name} carries no motion to play.'),
+                );
+              }
+              return AnimationClipPreview(
+                mesh: loaded,
+                allAssets: widget.allAssets,
+                clipPath: clip.path,
+                auditionCharacterPath: model.path,
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The twin's picture, with a line saying whose it is.
+  ///
+  /// The details panel goes on describing the selected file -- its path, its
+  /// size, its type. Only the picture is borrowed, and the banner says so,
+  /// because a .uasset that silently showed a model would be claiming Atlas
+  /// can read Unreal's format.
+  Widget _twinPreview(AssetItem item, AssetItem twin) {
+    return Column(
+      children: [
+        DecoratedBox(
+          decoration: BoxDecoration(
+            color: const Color(0xfff2f5f9),
+            border: Border.all(color: Colors.black12),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: [
+                const Icon(Icons.link, size: 16, color: Colors.black54),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    item.type == 'unreal'
+                        ? 'Showing the ${twin.ext.toUpperCase()} twin: '
+                              '${twin.name}. .${item.ext} files can only be '
+                              'opened in Unreal Engine.'
+                        : 'Showing the ${twin.ext.toUpperCase()} twin: '
+                              '${twin.name}. Atlas cannot read .${item.ext} '
+                              'yet.',
+                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => widget.onActivateAsset(twin),
+                  child: const Text('Open it'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: ModelPreview(
+            asset: twin,
+            allAssets: widget.allAssets,
+            catalogRevision: widget.catalogRevision,
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _previewFor(AssetItem item) {
+    final other = audition;
+    if (other != null) return _auditionPreview(item, other);
     final kind = previewKindFor(item);
+
+    // A file Atlas cannot draw, with a file beside it that it can: 56% of
+    // the .uasset files in this library have an FBX or OBJ twin, and every
+    // DAE and glTF does.
+    if (kind == PreviewKind.unreal ||
+        kind == PreviewKind.none ||
+        kind == PreviewKind.zipModelUnsupported) {
+      final twin = previewableTwinOf(item, widget.allAssets);
+      if (twin != null) return _twinPreview(item, twin);
+    }
 
     if (kind == PreviewKind.image) {
       if (isZipVirtualPath(item.path)) {
@@ -4313,6 +4490,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     ? null
                                     : widget.asset.path,
                                 rig: widget.asset.rigFamily,
+                                signature: widget.asset.rigSignature,
                                 wearing: wornPaths,
                               ),
                             ),
@@ -5150,6 +5328,7 @@ class AnimationClipPreview extends StatelessWidget {
     required this.mesh,
     this.allAssets = const [],
     this.clipPath = '',
+    this.auditionCharacterPath,
     super.key,
   });
 
@@ -5160,6 +5339,14 @@ class AnimationClipPreview extends StatelessWidget {
 
   /// Where this clip came from, so its reference rig can be found beside it.
   final String clipPath;
+
+  /// Play on this character instead of the chosen one, for one audition.
+  ///
+  /// Set from a pairing list. It deliberately does not touch
+  /// [AnimationCharacter]: trying a clip on a model is a look, not a
+  /// decision, and silently replacing the character the user chose would be
+  /// a change they never asked for and would have to undo.
+  final String? auditionCharacterPath;
 
   String get _duration {
     if (mesh.durationSeconds <= 0) return 'unknown';
@@ -5173,15 +5360,22 @@ class AnimationClipPreview extends StatelessWidget {
       return Column(
         children: [
           Expanded(
-            child: ValueListenableBuilder<String?>(
-              valueListenable: AnimationCharacter.instance.path,
-              builder: (context, characterPath, _) => SkeletonPlayer(
-                skeleton: skeleton,
-                characterPath: characterPath,
-                allAssets: allAssets,
-                clipPath: clipPath,
-              ),
-            ),
+            child: auditionCharacterPath != null
+                ? SkeletonPlayer(
+                    skeleton: skeleton,
+                    characterPath: auditionCharacterPath,
+                    allAssets: allAssets,
+                    clipPath: clipPath,
+                  )
+                : ValueListenableBuilder<String?>(
+                    valueListenable: AnimationCharacter.instance.path,
+                    builder: (context, characterPath, _) => SkeletonPlayer(
+                      skeleton: skeleton,
+                      characterPath: characterPath,
+                      allAssets: allAssets,
+                      clipPath: clipPath,
+                    ),
+                  ),
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -7483,6 +7677,9 @@ class AssetDetailsPanel extends StatelessWidget {
     required this.allAssets,
     required this.catalogRevision,
     required this.onActivateAsset,
+    this.rigBones = const {},
+    this.audition,
+    this.onAudition,
     super.key,
   });
 
@@ -7490,6 +7687,16 @@ class AssetDetailsPanel extends StatelessWidget {
   final List<AssetItem> allAssets;
   final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
+
+  /// The bone names behind each rig signature, for the pairing lists.
+  final Map<String, List<String>> rigBones;
+
+  /// The pairing currently being tried out, if any.
+  final AssetItem? audition;
+
+  /// Start or stop an audition. Null when the panel is shown somewhere that
+  /// has no preview to play it in.
+  final ValueChanged<AssetItem?>? onAudition;
 
   @override
   Widget build(BuildContext context) {
@@ -7542,6 +7749,19 @@ class AssetDetailsPanel extends StatelessWidget {
               runSpacing: 8,
               children: item.tags.map((tag) => Chip(label: Text(tag))).toList(),
             ),
+            TwinFormatsList(
+              item: item,
+              allAssets: allAssets,
+              onActivateAsset: onActivateAsset,
+            ),
+            RigPairingList(
+              item: item,
+              allAssets: allAssets,
+              rigBones: rigBones,
+              audition: audition,
+              onAudition: onAudition,
+              onActivateAsset: onActivateAsset,
+            ),
             if (item.type == 'model') ...[
               const SizedBox(height: 14),
               ModelTextureDiagnostics(
@@ -7553,6 +7773,306 @@ class AssetDetailsPanel extends StatelessWidget {
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// The same model in other formats, and the ones that might be it.
+///
+/// Shown only when there is something to show. A pack ships one FBX zip and
+/// up to seven Unreal zips of the same models, so the Unreal line is usually
+/// a count with the containers under it rather than seven separate lines.
+class TwinFormatsList extends StatelessWidget {
+  const TwinFormatsList({
+    required this.item,
+    required this.allAssets,
+    required this.onActivateAsset,
+    super.key,
+  });
+
+  final AssetItem item;
+  final List<AssetItem> allAssets;
+  final ValueChanged<AssetItem> onActivateAsset;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!twinEligible(item)) return const SizedBox.shrink();
+    final twins = twinIndexFor(allAssets).twinsOf(item);
+    if (twins.isEmpty) return const SizedBox.shrink();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (twins.same.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          const Text(
+            'Same model, other formats',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 4),
+          ..._formatLines(twins.same, false),
+        ],
+        if (twins.possible.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          const Text(
+            'Possibly the same model',
+            style: TextStyle(fontWeight: FontWeight.w700, color: Colors.black54),
+          ),
+          const Text(
+            'Same file name, a pack name that does not quite match.',
+            style: TextStyle(fontSize: 11, color: Colors.black54),
+          ),
+          const SizedBox(height: 4),
+          ..._formatLines(twins.possible, true),
+        ],
+      ],
+    );
+  }
+
+  List<Widget> _formatLines(List<AssetItem> twins, bool uncertain) {
+    final byExt = <String, List<AssetItem>>{};
+    for (final twin in twins) {
+      byExt.putIfAbsent(twin.ext.toUpperCase(), () => []).add(twin);
+    }
+    final extensions = byExt.keys.toList()..sort();
+    return [
+      for (final ext in extensions)
+        _TwinFormatLine(
+          label: byExt[ext]!.length == 1
+              ? ext
+              : '$ext x${byExt[ext]!.length}',
+          twins: byExt[ext]!,
+          uncertain: uncertain,
+          onActivateAsset: onActivateAsset,
+        ),
+    ];
+  }
+}
+
+class _TwinFormatLine extends StatelessWidget {
+  const _TwinFormatLine({
+    required this.label,
+    required this.twins,
+    required this.uncertain,
+    required this.onActivateAsset,
+  });
+
+  final String label;
+  final List<AssetItem> twins;
+  final bool uncertain;
+  final ValueChanged<AssetItem> onActivateAsset;
+
+  @override
+  Widget build(BuildContext context) {
+    final colour = uncertain ? Colors.black54 : null;
+    if (twins.length == 1) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 72,
+              child: Text(
+                label,
+                style: TextStyle(fontSize: 12, color: colour),
+              ),
+            ),
+            Expanded(
+              child: InkWell(
+                onTap: () => onActivateAsset(twins.single),
+                child: Text(
+                  containerDisplayName(twins.single),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: uncertain ? Colors.black54 : Colors.blue.shade800,
+                    decoration: TextDecoration.underline,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(left: 16, bottom: 4),
+        dense: true,
+        visualDensity: VisualDensity.compact,
+        title: Text(label, style: TextStyle(fontSize: 12, color: colour)),
+        children: [
+          for (final twin in twins)
+            InkWell(
+              onTap: () => onActivateAsset(twin),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    containerDisplayName(twin),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: uncertain ? Colors.black54 : Colors.blue.shade800,
+                      decoration: TextDecoration.underline,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The other half of a pairing: the clips that drive this model, or the
+/// models this clip drives.
+///
+/// Built from rig signatures, so the question answered is "do these two rigs
+/// hold the same bones" rather than "do these two files carry the same
+/// family label". Nothing is shown for a file with no rig -- an empty
+/// heading on every prop in the library would be noise.
+class RigPairingList extends StatelessWidget {
+  const RigPairingList({
+    required this.item,
+    required this.allAssets,
+    required this.rigBones,
+    required this.onActivateAsset,
+    this.audition,
+    this.onAudition,
+    super.key,
+  });
+
+  final AssetItem item;
+  final List<AssetItem> allAssets;
+  final Map<String, List<String>> rigBones;
+  final AssetItem? audition;
+  final ValueChanged<AssetItem?>? onAudition;
+  final ValueChanged<AssetItem> onActivateAsset;
+
+  @override
+  Widget build(BuildContext context) {
+    final signature = item.rigSignature;
+    if (signature == null || signature.isEmpty || rigBones.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final isClip = item.effectiveType == 'animation';
+    if (!isClip && item.modelKind != 'mesh') return const SizedBox.shrink();
+
+    final index = rigIndexFor(allAssets, rigBones);
+    final found = isClip ? index.modelsFor(item) : index.clipsFor(item);
+    if (found.isEmpty) return const SizedBox.shrink();
+
+    final heading = isClip
+        ? 'Models this clip drives (${found.length})'
+        : 'Animations for this model (${found.length})';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 14),
+        Text(heading, style: const TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 6),
+        SizedBox(
+          // A fixed height inside the panel's own ListView: an unbounded
+          // list inside a scrolling list has no height to lay out in, and
+          // the Sidekick rig has 346 clips, so this is a builder.
+          height: 240,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              border: Border.all(color: Colors.black12),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: ListView.builder(
+              itemCount: found.length,
+              itemBuilder: (context, position) {
+                final other = found[position];
+                final playing = audition?.path == other.path;
+                return _RigPairingRow(
+                  other: other,
+                  playing: playing,
+                  onPlay: onAudition == null
+                      ? null
+                      : () => onAudition!(playing ? null : other),
+                  onOpen: () => onActivateAsset(other),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _RigPairingRow extends StatelessWidget {
+  const _RigPairingRow({
+    required this.other,
+    required this.playing,
+    required this.onPlay,
+    required this.onOpen,
+  });
+
+  final AssetItem other;
+  final bool playing;
+  final VoidCallback? onPlay;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      child: Row(
+        children: [
+          if (onPlay != null)
+            IconButton(
+              tooltip: playing ? 'Stop' : 'Audition this pairing',
+              visualDensity: VisualDensity.compact,
+              icon: Icon(
+                playing ? Icons.stop_circle_outlined : Icons.play_circle_outline,
+                size: 18,
+              ),
+              onPressed: onPlay,
+            ),
+          Expanded(
+            child: InkWell(
+              onTap: onOpen,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      other.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontWeight: playing ? FontWeight.w700 : FontWeight.w400,
+                      ),
+                    ),
+                    Text(
+                      containerDisplayName(other),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -8057,11 +8577,19 @@ bool assetPassesRigFilter({
   required String rigFilter,
   required String? characterRig,
   String? characterContainer,
+  String? characterSignature,
+  RigIndex? rigIndex,
 }) {
   if (rigFilter == 'all') return true;
   if (asset.rigFamily == null) return true;
   if (rigFilter == 'compatible') {
     if (characterRig == null) return true;
+    // Bones first, where both rigs are known: the family is a label with
+    // four values and the signature is the thing itself. This is what lets
+    // the Dogs pack pair with its own clips without the container stopgap,
+    // and what keeps two unrelated `other` rigs apart even inside one zip.
+    final byBones = rigIndex?.compatible(characterSignature, asset.rigSignature);
+    if (byBones != null) return byBones;
     final assetFamily = rigFamilyByName(asset.rigFamily);
     final characterFamily = rigFamilyByName(characterRig);
     // The container is only consulted for an unnamed rig, and reading it per
@@ -8093,16 +8621,27 @@ RigFamily rigFamilyByName(String? name) {
 /// in one map, so the two facts share a string rather than needing a second
 /// map threaded through every layer.
 class FbxClassification {
-  const FbxClassification({required this.kind, required this.rig});
+  const FbxClassification({
+    required this.kind,
+    required this.rig,
+    this.signature,
+    this.bones = const [],
+  });
 
-  /// Reads the encoded form. An older value with no rig reads as unknown,
-  /// which is what a catalog written before this existed will hold.
+  /// Reads the encoded form, in any of the three it has had: `kind`,
+  /// `kind#rig`, and `kind#rig#signature#bone\u0001bone`. A catalog written
+  /// before a field existed reads as null for it rather than failing.
   factory FbxClassification.decode(String value) {
-    final split = value.indexOf('#');
-    if (split < 0) return FbxClassification(kind: value, rig: null);
+    final parts = value.split('#');
+    if (parts.length == 1) return FbxClassification(kind: value, rig: null);
+    final bones = parts.length > 3 && parts[3].isNotEmpty
+        ? parts[3].split('\u0001')
+        : const <String>[];
     return FbxClassification(
-      kind: value.substring(0, split),
-      rig: value.substring(split + 1),
+      kind: parts[0],
+      rig: parts[1],
+      signature: parts.length > 2 && parts[2].isNotEmpty ? parts[2] : null,
+      bones: bones,
     );
   }
 
@@ -8112,7 +8651,21 @@ class FbxClassification {
   /// The [RigFamily] name, or null when the file was never probed for one.
   final String? rig;
 
-  String encode() => rig == null ? kind : '$kind#$rig';
+  /// The rig's identity, from [rigSignatureOf]. Null for a file with no bones
+  /// or one probed before signatures existed.
+  final String? signature;
+
+  /// The bone names behind [signature], so the names can be stored once per
+  /// signature rather than once per file.
+  final List<String> bones;
+
+  String encode() {
+    if (rig == null) return kind;
+    if (signature == null) return '$kind#$rig';
+    // The separator is a control character no bone name holds; `#` is already
+    // taken by the field separator and `_` and `/` are common in rig names.
+    return '$kind#$rig#$signature#${bones.join('\u0001')}';
+  }
 }
 
 /// The skeleton a model or clip is built on.
@@ -8218,6 +8771,54 @@ RigFamily rigFamilyFromMarkers(
   return RigFamily.other;
 }
 
+/// A rig's identity: the set of bone names it holds.
+///
+/// Lower-cased, so two exports of one rig that differ only in case are one
+/// rig -- which is the whole finding behind the case-folded lookup. Sorted,
+/// so the order the exporter happened to write them in cannot matter. Then
+/// hashed, because the names themselves are stored once per signature in
+/// `rig_bones` and every asset row only needs the key.
+///
+/// FNV-1a rather than a cryptographic hash: this is an identity key over
+/// about fifty distinct rigs, not something anyone could want to forge, and
+/// it is a dozen lines of arithmetic that Python computes identically with no
+/// dependency added on either side. `work/atlas_mcp/fixtures/rig_signatures.json`
+/// owns the definition and both languages are tested against it.
+///
+/// Empty for a file with no bones: a prop has no rig to identify.
+String rigSignatureOf(Iterable<String> boneNames) {
+  final names = <String>[];
+  for (final name in boneNames) {
+    if (name.isEmpty) continue;
+    names.add(name.toLowerCase());
+  }
+  if (names.isEmpty) return '';
+  names.sort();
+  // FNV-1a, 64-bit. Dart's int is a signed 64-bit two's-complement value and
+  // both operations wrap, which is the arithmetic FNV wants; Python masks to
+  // the same 64 bits.
+  var hash = -3750763034362895579; // 0xcbf29ce484222325 as a signed int64
+  for (var index = 0; index < names.length; index += 1) {
+    if (index > 0) hash = _fnvByte(hash, 0x0A);
+    for (final unit in names[index].codeUnits) {
+      hash = _fnvByte(hash, unit & 0xFF);
+      if (unit > 0xFF) hash = _fnvByte(hash, (unit >> 8) & 0xFF);
+    }
+  }
+  // Printed as unsigned, in two halves. `toUnsigned(64)` cannot help here:
+  // there is no non-negative int64 for a value with the top bit set, so it
+  // returns the negative number unchanged and `toRadixString` writes a minus
+  // sign -- which is a signature Python would never produce, for the half of
+  // all rigs whose hash happens to land above 2^63.
+  final high = (hash >> 32) & 0xFFFFFFFF;
+  final low = hash & 0xFFFFFFFF;
+  final hex = high.toRadixString(16).padLeft(8, '0') +
+      low.toRadixString(16).padLeft(8, '0');
+  return hex.substring(0, 12);
+}
+
+int _fnvByte(int hash, int byte) => (hash ^ byte) * 0x100000001b3;
+
 /// The family a loaded skeleton belongs to, read from its own bone names.
 ///
 /// The catalog's `rig_family` column comes from the importer's `--probe`, but a
@@ -8228,6 +8829,356 @@ RigFamily rigFamilyOfSkeleton(SkeletonAnimation skeleton) =>
       skeleton.bones.map((bone) => bone.name),
       bones: skeleton.bones.length,
     );
+
+// --- Twins: the same model in another format or another build ------------
+//
+// Half this library is the same models twice. 120,481 .uasset files carry
+// 48,282 distinct names; 15,928 of those names also exist as an FBX or an
+// OBJ, which covers 67,999 of the uassets -- 56%. Every DAE and every glTF
+// has a same-name FBX or OBJ in its own pack, and so do 2,843 of the 3,035
+// GLB. A Synty pack ships as one FBX zip beside up to seven Unreal zips of
+// the same models.
+//
+// So the question "what is this file" often has a better answer in another
+// file, and the one that matters most: a .uasset cannot be drawn, but its
+// FBX twin can.
+
+/// Words in a container name that say which build it is, not which pack.
+const _twinBuildWords = {
+  'sourcefiles',
+  'source',
+  'files',
+  'unreal',
+  'unity',
+  'ue4',
+  'ue5',
+  'project',
+  'projects',
+};
+
+/// The container's own name, for reading rather than for comparing.
+///
+/// [assetContainerKey] is a whole path, because two packs can be named the
+/// same under different roots; the last segment is what a person calls it.
+String containerDisplayName(AssetItem asset) {
+  // From the asset's own path, not from the key: the key is lower-cased for
+  // comparing, and a pack name shown in lower case reads as a different file
+  // from the one on disk.
+  final zip = parseZipVirtualPath(asset.path);
+  final source = zip?.zipPath ?? assetContainerKey(asset);
+  final cut = source.lastIndexOf(RegExp(r'[\\/]'));
+  final name = cut < 0 ? source : source.substring(cut + 1);
+  return name.isEmpty ? source : name;
+}
+
+/// The product a container belongs to, as a word with no punctuation.
+///
+/// `POLYGON_SciFiSpace_SourceFiles.zip`, `POLYGON_SciFiSpace_Unreal_4_19.zip`
+/// and `POLYGON_SciFi_Space_Unreal_5_4_v1_14_0.zip` are three builds of one
+/// pack, and nothing but the name says so. Dropping the build words, the
+/// version runs and every separator leaves `polygonscifispace` for all three.
+String twinProductKey(String containerName) {
+  var name = containerName.toLowerCase();
+  // A container is a zip, a .unitypackage, or a folder. Drop a trailing
+  // extension of any kind: the format a pack arrived in is not part of which
+  // pack it is, and the Unity builds sit beside the zips under one name.
+  final dot = name.lastIndexOf('.');
+  if (dot > 0 && name.length - dot <= 15) name = name.substring(0, dot);
+  final words = name.split(RegExp(r'[^a-z0-9]+'));
+  final buffer = StringBuffer();
+  for (final word in words) {
+    if (word.isEmpty) continue;
+    if (_twinBuildWords.contains(word)) continue;
+    // A version run: `v4`, `4`, `19`, `2019`, `v1`. Numbers never identify a
+    // pack here, and every one of them differs between builds of one pack.
+    if (RegExp(r'^v?[0-9]+$').hasMatch(word)) continue;
+    for (final unit in word.codeUnits) {
+      if (unit >= 0x61 && unit <= 0x7A) buffer.writeCharCode(unit);
+    }
+  }
+  return buffer.toString();
+}
+
+/// A file name with no extension, lower-cased.
+String twinStem(String fileName) {
+  final dot = fileName.lastIndexOf('.');
+  final stem = dot <= 0 ? fileName : fileName.substring(0, dot);
+  return stem.toLowerCase();
+}
+
+/// Unreal names that are not models and never pair with one.
+///
+/// Of the 120,481 uassets here, the ones left over after the models are
+/// textures (`T_`, 13,965), materials, blueprints, physics assets and
+/// skeletons. Pairing `T_Crate_01.uasset` with `Crate_01.fbx` would be a
+/// different feature -- a texture is not another format of the model.
+bool twinEligible(AssetItem asset) {
+  if (asset.type != 'model' && asset.type != 'unreal') return false;
+  if (asset.type != 'unreal') return true;
+  final stem = twinStem(asset.name);
+  if (stem.endsWith('_physicsasset') || stem.endsWith('_skeleton')) {
+    return false;
+  }
+  for (final prefix in const ['t_', 'm_', 'mi_', 'mat_', 'mf_', 'bp_']) {
+    if (stem.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
+/// The key two files share when they are the same model: the product they
+/// came from, and the name they were given. Empty when the asset cannot
+/// take part.
+String twinKeyFor(AssetItem asset) {
+  if (!twinEligible(asset)) return '';
+  final stem = twinStem(asset.name);
+  if (stem.isEmpty) return '';
+  return '${twinProductKey(containerDisplayName(asset))}|$stem';
+}
+
+/// One model's other copies, in both strengths.
+class TwinGroup {
+  const TwinGroup({required this.same, required this.possible});
+
+  /// Same product, same name. The same model, as far as a name can say.
+  final List<AssetItem> same;
+
+  /// Same name, a product key that does not match, and a name distinctive
+  /// enough that the coincidence is unlikely. Shown separately and never
+  /// used for a preview.
+  final List<AssetItem> possible;
+
+  bool get isEmpty => same.isEmpty && possible.isEmpty;
+}
+
+/// Every twin relationship in a catalog, built once per revision.
+class TwinIndex {
+  TwinIndex._(this._byKey, this._byStem, this._productsByStem);
+
+  factory TwinIndex.of(List<AssetItem> allAssets) {
+    final byKey = <String, List<AssetItem>>{};
+    final byStem = <String, List<AssetItem>>{};
+    final productsByStem = <String, Set<String>>{};
+    for (final asset in allAssets) {
+      if (!twinEligible(asset)) continue;
+      final stem = twinStem(asset.name);
+      if (stem.isEmpty) continue;
+      final product = twinProductKey(containerDisplayName(asset));
+      byKey.putIfAbsent('$product|$stem', () => []).add(asset);
+      byStem.putIfAbsent(stem, () => []).add(asset);
+      // Only the model side counts towards "one product": the whole point of
+      // the weaker tier is a model in one product and its Unreal build in a
+      // container named differently, and seven Unreal zips must not look
+      // like seven products.
+      if (asset.type == 'model') {
+        productsByStem.putIfAbsent(stem, () => <String>{}).add(product);
+      }
+    }
+    return TwinIndex._(byKey, byStem, productsByStem);
+  }
+
+  final Map<String, List<AssetItem>> _byKey;
+  final Map<String, List<AssetItem>> _byStem;
+  final Map<String, Set<String>> _productsByStem;
+
+  /// How distinctive a name has to be before a cross-product match is worth
+  /// showing. `pipe_end` in a Kenney kit and an unrelated `pipe_end.uasset`
+  /// are not the same model.
+  static const _minimumPossibleStem = 8;
+
+  TwinGroup twinsOf(AssetItem asset) {
+    if (!twinEligible(asset)) {
+      return const TwinGroup(same: [], possible: []);
+    }
+    final stem = twinStem(asset.name);
+    final product = twinProductKey(containerDisplayName(asset));
+    final same = <AssetItem>[];
+    for (final other in _byKey['$product|$stem'] ?? const <AssetItem>[]) {
+      if (other.id != asset.id) same.add(other);
+    }
+
+    final possible = <AssetItem>[];
+    final products = _productsByStem[stem] ?? const <String>{};
+    final distinctive =
+        stem.length >= _minimumPossibleStem && stem.contains('_');
+    if (distinctive && products.length <= 1) {
+      for (final other in _byStem[stem] ?? const <AssetItem>[]) {
+        if (other.id == asset.id) continue;
+        if (twinProductKey(containerDisplayName(other)) == product) continue;
+        possible.add(other);
+      }
+    }
+    return TwinGroup(
+      same: _ordered(same),
+      possible: _ordered(possible),
+    );
+  }
+
+  List<AssetItem> _ordered(List<AssetItem> found) {
+    if (found.isEmpty) return const [];
+    final sorted = [...found]
+      ..sort((a, b) {
+        final byExt = a.ext.compareTo(b.ext);
+        if (byExt != 0) return byExt;
+        return normalizePathKey(a.path).compareTo(normalizePathKey(b.path));
+      });
+    return List<AssetItem>.unmodifiable(sorted);
+  }
+}
+
+TwinIndex? _twinIndex;
+int? _twinIndexIdentity;
+
+/// The twin index for this catalog, built on first use. Same generation key
+/// as the other catalog-wide indexes.
+TwinIndex twinIndexFor(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final known = _twinIndex;
+  if (known != null && _twinIndexIdentity == identity) return known;
+  final index = TwinIndex.of(allAssets);
+  _twinIndex = index;
+  _twinIndexIdentity = identity;
+  return index;
+}
+
+void resetTwinIndex() {
+  _twinIndex = null;
+  _twinIndexIdentity = null;
+}
+
+/// The twin to draw when the selected file cannot be drawn itself.
+///
+/// FBX before OBJ on purpose: these packs ship the OBJ in centimetres with
+/// nothing in the file to say so, which is the note at the units check in
+/// [loadMesh]. Only a "same model" twin -- a guess is not worth a picture.
+AssetItem? previewableTwinOf(AssetItem asset, List<AssetItem> allAssets) {
+  final twins = twinIndexFor(allAssets).twinsOf(asset);
+  for (final ext in const ['fbx', 'obj', 'stl']) {
+    for (final other in twins.same) {
+      if (other.ext != ext) continue;
+      if (previewKindFor(other) != PreviewKind.model) continue;
+      return other;
+    }
+  }
+  return null;
+}
+
+/// Which clips drive which models, over a whole catalog.
+///
+/// Built from rig signatures rather than from pairs. Storing the verdict for
+/// every pair would be 2,147 characters x 796 clips, about 1.7 million rows,
+/// all of which would have to be rewritten the day the rule changed. The
+/// facts are the bone names, and rigs repeat hard: 224 clips sampled here
+/// hold 12 distinct rigs and 800 characters hold 42. So the answer is
+/// computed between *signatures* -- a few hundred pairs for the library --
+/// and remembered.
+///
+/// Built once per catalog revision, never in `build()`.
+class RigIndex {
+  RigIndex({required this.bonesBySignature});
+
+  /// The bone names behind each signature, from the catalog's `rig_bones`.
+  final Map<String, List<String>> bonesBySignature;
+
+  final Map<String, List<AssetItem>> clipsBySignature = {};
+  final Map<String, List<AssetItem>> charactersBySignature = {};
+  final Map<String, bool> _verdicts = {};
+
+  void add(AssetItem asset) {
+    final signature = asset.rigSignature;
+    if (signature == null || signature.isEmpty) return;
+    if (asset.effectiveType == 'animation') {
+      clipsBySignature.putIfAbsent(signature, () => []).add(asset);
+    } else if (asset.modelKind == 'mesh') {
+      charactersBySignature.putIfAbsent(signature, () => []).add(asset);
+    }
+  }
+
+  /// Whether a clip on [clipSignature] may drive a character on
+  /// [characterSignature]. Unknown bones mean no answer rather than a guess.
+  bool? compatible(String? characterSignature, String? clipSignature) {
+    if (characterSignature == null ||
+        clipSignature == null ||
+        characterSignature.isEmpty ||
+        clipSignature.isEmpty) {
+      return null;
+    }
+    final key = '$characterSignature|$clipSignature';
+    final known = _verdicts[key];
+    if (known != null) return known;
+    final characterBones = bonesBySignature[characterSignature];
+    final clipBones = bonesBySignature[clipSignature];
+    if (characterBones == null || clipBones == null) return null;
+    final answer = rigMatchNames(characterBones, clipBones);
+    _verdicts[key] = answer;
+    return answer;
+  }
+
+  /// Every clip that can drive [model], nearest first: the model's own
+  /// container, then by path so the order cannot depend on the scan.
+  List<AssetItem> clipsFor(AssetItem model) =>
+      _sorted(model, _matching(model.rigSignature, clipsBySignature, true));
+
+  /// Every rigged mesh [clip] can drive.
+  List<AssetItem> modelsFor(AssetItem clip) =>
+      _sorted(clip, _matching(clip.rigSignature, charactersBySignature, false));
+
+  List<AssetItem> _matching(
+    String? signature,
+    Map<String, List<AssetItem>> candidates,
+    bool signatureIsCharacter,
+  ) {
+    if (signature == null || signature.isEmpty) return const [];
+    final found = <AssetItem>[];
+    for (final entry in candidates.entries) {
+      final answer = signatureIsCharacter
+          ? compatible(signature, entry.key)
+          : compatible(entry.key, signature);
+      if (answer == true) found.addAll(entry.value);
+    }
+    return found;
+  }
+
+  List<AssetItem> _sorted(AssetItem anchor, List<AssetItem> found) {
+    if (found.isEmpty) return const [];
+    final container = assetContainerKey(anchor);
+    final sorted = [...found]..sort((a, b) {
+      final aHere = assetContainerKey(a) == container ? 0 : 1;
+      final bHere = assetContainerKey(b) == container ? 0 : 1;
+      if (aHere != bHere) return aHere - bHere;
+      return normalizePathKey(a.path).compareTo(normalizePathKey(b.path));
+    });
+    return List<AssetItem>.unmodifiable(sorted);
+  }
+}
+
+RigIndex? _rigIndex;
+int? _rigIndexIdentity;
+
+/// The index for this catalog, built on first use and kept until the catalog
+/// changes. Same generation key as [findNearbyTextures]: a rescan hands out
+/// new AssetItem objects, which arrives here as a new identity.
+RigIndex rigIndexFor(
+  List<AssetItem> allAssets,
+  Map<String, List<String>> bonesBySignature,
+) {
+  final identity =
+      identityHashCode(allAssets) ^ allAssets.length ^ bonesBySignature.length;
+  final known = _rigIndex;
+  if (known != null && _rigIndexIdentity == identity) return known;
+  final index = RigIndex(bonesBySignature: bonesBySignature);
+  for (final asset in allAssets) {
+    index.add(asset);
+  }
+  _rigIndex = index;
+  _rigIndexIdentity = identity;
+  return index;
+}
+
+/// Forgets the index. For tests, and for a catalog replaced in place.
+void resetRigIndex() {
+  _rigIndex = null;
+  _rigIndexIdentity = null;
+}
 
 /// Whether a clip can drive a model without retargeting between skeletons.
 ///
@@ -13103,6 +14054,10 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
       final markers = ((json['rigMarkers'] as List<dynamic>?) ?? const []).map(
         (value) => value.toString(),
       );
+      final boneNames = ((json['boneNames'] as List<dynamic>?) ?? const [])
+          .map((value) => value.toString())
+          .toList();
+      final signature = rigSignatureOf(boneNames);
       kinds[assetId] = FbxClassification(
         kind: json['kind'] == 'animation' ? 'animation' : 'mesh',
         rig: rigFamilyFromMarkers(
@@ -13111,6 +14066,8 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
           // read but found no skeleton in reports zero, which is `none`.
           bones: (json['bones'] as num?)?.toInt() ?? 0,
         ).name,
+        signature: signature.isEmpty ? null : signature,
+        bones: boneNames,
       ).encode();
     } catch (error) {
       // Nothing was ever heard back, so nothing is known about this file.
@@ -14753,6 +15710,12 @@ class AnimationCharacter {
   /// filter. Null until a character with a known rig is chosen.
   String? rigFamily;
 
+  /// The chosen character's rig signature, which is what the filter really
+  /// compares. Not persisted: it is read back from the catalog as the
+  /// catalog loads, so it cannot survive a change to how signatures are
+  /// computed, which is exactly what a stale copy would do.
+  String? rigSignature;
+
   /// What the chosen character is wearing, as attachment asset paths.
   ///
   /// Kept with the character rather than with the preview so the clip
@@ -14786,9 +15749,11 @@ class AnimationCharacter {
   Future<void> set(
     String? assetPath, {
     String? rig,
+    String? signature,
     Iterable<String> wearing = const [],
   }) async {
     rigFamily = assetPath == null ? null : rig;
+    rigSignature = assetPath == null ? null : signature;
     worn = assetPath == null ? const [] : List.unmodifiable(wearing);
     path.value = assetPath;
     outfitRevision.value += 1;
@@ -14824,6 +15789,7 @@ class AnimationCharacter {
     final key = normalizePathKey(chosen);
     for (final asset in assets) {
       if (normalizePathKey(asset.path) != key) continue;
+      rigSignature = asset.rigSignature;
       final fresh = asset.rigFamily;
       if (fresh == null || fresh == rigFamily) return;
       rigFamily = fresh;
@@ -15607,9 +16573,13 @@ int rigBoneOverlap(SkeletonAnimation rig, SkeletonAnimation clip) {
   return (exact: exact, folded: folded);
 }
 
-/// Whether [clip] may drive [character] at all.
+/// Whether a clip may drive a character at all, given how much of the
+/// character's rig the clip names.
 ///
-/// The one place this is decided. Two rules, either of which is enough:
+/// The one place this is decided, in the one form both callers can reach:
+/// [rigMatch] counts with the bones in memory and their paths, and
+/// [rigMatchNames] counts from two lists of names out of the catalog. Two
+/// rules, either of which is enough:
 ///
 ///  * [minimumRigOverlap] bones matched **exactly** -- this is the rule as it
 ///    was before case was folded, kept verbatim so that nothing which pairs
@@ -15617,11 +16587,59 @@ int rigBoneOverlap(SkeletonAnimation rig, SkeletonAnimation clip) {
 ///  * or [minimumRigMatchFraction] of the character's bones matched once case
 ///    is folded, which is what lets the War Robot's `Pelvis` be driven by a
 ///    clip's `pelvis` while keeping a Polygon rig away from Sidekick clips.
+bool rigMatchFromCounts({
+  required int characterBones,
+  required int exact,
+  required int folded,
+}) {
+  if (characterBones <= 0) return false;
+  if (exact >= minimumRigOverlap) return true;
+  return folded / characterBones >= minimumRigMatchFraction;
+}
+
+/// [rigMatchFromCounts] for two loaded skeletons.
 bool rigMatch(SkeletonAnimation character, SkeletonAnimation clip) {
-  if (character.bones.isEmpty) return false;
   final matches = rigBoneMatches(character, clip);
-  if (matches.exact >= minimumRigOverlap) return true;
-  return matches.folded / character.bones.length >= minimumRigMatchFraction;
+  return rigMatchFromCounts(
+    characterBones: character.bones.length,
+    exact: matches.exact,
+    folded: matches.folded,
+  );
+}
+
+/// How many of a character's bone names a clip names, exactly and folded.
+///
+/// The catalog's form of [rigBoneMatches]: two lists of names, no paths, no
+/// geometry. Paths can only rescue a bone that names alone would miss, so
+/// this is the conservative count of the two.
+({int exact, int folded}) rigNameMatches(
+  List<String> characterBones,
+  List<String> clipBones,
+) {
+  final clipExact = clipBones.toSet();
+  final clipFolded = {for (final name in clipBones) name.toLowerCase()};
+  var exact = 0;
+  var folded = 0;
+  for (final bone in characterBones) {
+    if (clipExact.contains(bone)) {
+      exact += 1;
+      folded += 1;
+      continue;
+    }
+    if (clipFolded.contains(bone.toLowerCase())) folded += 1;
+  }
+  return (exact: exact, folded: folded);
+}
+
+/// [rigMatchFromCounts] for two rigs known only by their bone names, which is
+/// what a rig signature carries.
+bool rigMatchNames(List<String> characterBones, List<String> clipBones) {
+  final matches = rigNameMatches(characterBones, clipBones);
+  return rigMatchFromCounts(
+    characterBones: characterBones.length,
+    exact: matches.exact,
+    folded: matches.folded,
+  );
 }
 
 /// Poses a character's vertices into a packed buffer.
@@ -16626,6 +17644,7 @@ class AssetItem {
     this.ignored = false,
     this.modelKind,
     this.rigFamily,
+    this.rigSignature,
     this.referencedByModel = false,
   });
 
@@ -16652,6 +17671,16 @@ class AssetItem {
   /// Learned from the same probe that fills [modelKind] and persisted with it.
   /// Null means not yet classified; `none` means classified and rigless.
   String? rigFamily;
+
+  /// Which rig this file is on, as [rigSignatureOf] of its bone names.
+  ///
+  /// The family is a label with four possible values; this is the identity.
+  /// Two files with the same signature hold the same bone names, which is
+  /// what decides whether a clip can drive a character -- the names
+  /// themselves live once per signature in the catalog's `rig_bones` table
+  /// rather than once per file. Null for a file with no bones, and for one
+  /// probed before signatures existed.
+  String? rigSignature;
 
   /// Set once some model has been read and found to use this image. Persisted,
   /// because it is only learned by importing a model.
@@ -16725,10 +17754,17 @@ class ScanStatus {
 }
 
 class PersistedCatalog {
-  const PersistedCatalog({required this.assets, required this.sourceRoots});
+  const PersistedCatalog({
+    required this.assets,
+    required this.sourceRoots,
+    this.rigBones = const {},
+  });
 
   final List<AssetItem> assets;
   final Set<String> sourceRoots;
+
+  /// The bone names behind each rig signature the assets refer to.
+  final Map<String, List<String>> rigBones;
 }
 
 class AssetAtlasDatabase {
@@ -16744,7 +17780,20 @@ class AssetAtlasDatabase {
   ///        file no longer orphans it from projects and ignore flags
   ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
   ///   v5 - referenced_by_model, images a model was found to use
-  static const schemaVersion = 7;
+  ///   v6 - settings
+  ///   v7 - rig_family, the skeleton an FBX is built on
+  ///   v8 - rig_signature per asset, and rig_bones: the bone names behind
+  ///        each signature, stored once per rig rather than once per file
+  static const schemaVersion = 8;
+
+  /// Created identically by the v8 upgrade and by a fresh install.
+  static const _rigBonesTable = '''
+    CREATE TABLE IF NOT EXISTS rig_bones (
+      signature TEXT PRIMARY KEY,
+      bone_count INTEGER NOT NULL,
+      bones_json TEXT NOT NULL
+    )
+  ''';
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -16824,6 +17873,12 @@ class AssetAtlasDatabase {
             )
             ''');
           }
+          if (oldVersion < 8) {
+            await db.execute(
+              'ALTER TABLE catalog_assets ADD COLUMN rig_signature TEXT',
+            );
+            await db.execute(_rigBonesTable);
+          }
         },
         onCreate: (db, _) async {
           await db.execute('''
@@ -16842,9 +17897,11 @@ class AssetAtlasDatabase {
               ignored INTEGER NOT NULL DEFAULT 0,
               model_kind TEXT,
               rig_family TEXT,
+              rig_signature TEXT,
               referenced_by_model INTEGER NOT NULL DEFAULT 0
             )
           ''');
+          await db.execute(_rigBonesTable);
           await db.execute('''
             CREATE TABLE catalog_sources (
               root_path TEXT PRIMARY KEY
@@ -16929,6 +17986,7 @@ class AssetAtlasDatabase {
         ignored: (row['ignored'] as int) == 1,
         modelKind: row['model_kind'] as String?,
         rigFamily: row['rig_family'] as String?,
+        rigSignature: row['rig_signature'] as String?,
         referencedByModel: (row['referenced_by_model'] as int? ?? 0) == 1,
       );
     }).toList();
@@ -16958,7 +18016,11 @@ class AssetAtlasDatabase {
       fbxLog('Dropped ${stale.length} AppleDouble entries from the catalog.');
     }
 
-    return PersistedCatalog(assets: assets, sourceRoots: sourceRoots);
+    return PersistedCatalog(
+      assets: assets,
+      sourceRoots: sourceRoots,
+      rigBones: await loadRigBones(),
+    );
   }
 
   /// Rebuilds every asset id in the content-independent v2 format and
@@ -17062,6 +18124,9 @@ class AssetAtlasDatabase {
     // backfill_rigs.py's 34,801 answers with it. That is the "a rescan
     // empties rig_family" everyone had learned to expect.
     'rig_family': asset.rigFamily,
+    // Saved for the same reason rig_family is: saveCatalog replaces every
+    // row, so a column it forgets is a column the next scan empties.
+    'rig_signature': asset.rigSignature,
     'referenced_by_model': asset.referencedByModel ? 1 : 0,
   };
 
@@ -17136,13 +18201,43 @@ class AssetAtlasDatabase {
         final decoded = FbxClassification.decode(entry.value);
         batch.update(
           'catalog_assets',
-          {'model_kind': decoded.kind, 'rig_family': decoded.rig},
+          {
+            'model_kind': decoded.kind,
+            'rig_family': decoded.rig,
+            'rig_signature': decoded.signature,
+          },
           where: 'id = ?',
           whereArgs: [entry.key],
         );
+        // The names go in once per rig. `IGNORE` rather than `REPLACE`: a
+        // signature is the hash of exactly these names, so a row that is
+        // already there says the same thing, and rewriting it would be
+        // thousands of pointless writes on a backfill.
+        if (decoded.signature != null && decoded.bones.isNotEmpty) {
+          batch.insert('rig_bones', {
+            'signature': decoded.signature,
+            'bone_count': decoded.bones.length,
+            'bones_json': jsonEncode(decoded.bones),
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
+        }
       }
       await batch.commit(noResult: true);
     });
+  }
+
+  /// The bone names behind every signature the catalog knows.
+  ///
+  /// A few dozen rows: 224 clips sampled across this library hold 12 distinct
+  /// rigs, 800 characters hold 42. Read once when the catalog opens.
+  Future<Map<String, List<String>>> loadRigBones() async {
+    await initialize();
+    final rows = await _db!.query('rig_bones');
+    return {
+      for (final row in rows)
+        row['signature'] as String:
+            (jsonDecode(row['bones_json'] as String) as List<dynamic>)
+                .cast<String>(),
+    };
   }
 
   /// Records that a model uses these images, so they read as textures rather

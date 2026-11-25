@@ -127,39 +127,71 @@ def main():
             if done[0] % 500 == 0:
                 print("  %d / %d" % (done[0], len(todo)), flush=True)
         if result is None:
-            return asset_id, None, None
+            return asset_id, None, None, None, None
         kind = "animation" if result.get("kind") == "animation" else "mesh"
         rig = atlas_mcp.rig_family_from_markers(result.get("rigMarkers"),
                                                 result.get("bones") or 0)
-        return asset_id, kind, rig
+        bones = result.get("boneNames") or []
+        return asset_id, kind, rig, atlas_mcp.rig_signature_of(bones) or None, bones
 
     rows = []
+    rig_bones = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for asset_id, kind, rig in pool.map(classify, todo):
+        for asset_id, kind, rig, signature, bones in pool.map(classify, todo):
             if rig is None:
                 continue
-            rows.append((kind, rig, asset_id))
+            rows.append((kind, rig, signature, asset_id))
+            if signature and bones:
+                # The names go in once per rig, not once per file: 224 clips
+                # sampled from this library are on 12 distinct rigs.
+                rig_bones.setdefault(signature, bones)
     archives.close()
 
     counts = {}
-    for _, rig, _ in rows:
+    for _, rig, _, _ in rows:
         counts[rig] = counts.get(rig, 0) + 1
     print("read %d of %d: %s"
           % (len(rows), len(todo),
              ", ".join("%s %d" % pair for pair in sorted(counts.items()))))
+    print("%d distinct rigs among them." % len(rig_bones))
 
     if options.dry_run:
         print("--dry-run: nothing written.")
         connection.close()
         return 0
 
+    has_signatures = connection.execute(
+        "SELECT count(*) FROM pragma_table_info('catalog_assets') "
+        "WHERE name = 'rig_signature'").fetchone()[0] > 0
+    if not has_signatures:
+        print("This catalog has no rig_signature column, so only the family "
+              "is written. Open Atlas once to migrate it, then run this "
+              "again.")
+        for start in range(0, len(rows), BATCH):
+            connection.executemany(
+                "UPDATE catalog_assets SET model_kind = ?, rig_family = ? "
+                "WHERE id = ?",
+                [(kind, rig, asset_id)
+                 for kind, rig, _, asset_id in rows[start:start + BATCH]])
+            connection.commit()
+        connection.close()
+        print("written.")
+        return 0
+
     for start in range(0, len(rows), BATCH):
         connection.executemany(
-            "UPDATE catalog_assets SET model_kind = ?, rig_family = ? WHERE id = ?",
+            "UPDATE catalog_assets SET model_kind = ?, rig_family = ?, "
+            "rig_signature = ? WHERE id = ?",
             rows[start:start + BATCH])
         connection.commit()
+    connection.executemany(
+        "INSERT OR IGNORE INTO rig_bones (signature, bone_count, bones_json) "
+        "VALUES (?, ?, ?)",
+        [(signature, len(bones), json.dumps(bones))
+         for signature, bones in rig_bones.items()])
+    connection.commit()
     connection.close()
-    print("written.")
+    print("written: %d rows, %d rigs." % (len(rows), len(rig_bones)))
     return 0
 
 

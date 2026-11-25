@@ -263,6 +263,25 @@ static const char* const kRigMarkerBones[] = {
   "hipAttachFront", "hipAttach_l", "ik_hand_gun", "ik_hand_root",
 };
 
+// Every bone the file carries, in the scene's own order and spelling.
+//
+// Printed by --summary and by --probe. The probe needs them because a rig is
+// identified by the set of names it holds: two files are on the same rig when
+// the sets match, which no count of marker bones can tell you.
+static void print_bone_names(const ufbx_scene* scene) {
+  printf(",\"boneNames\":[");
+  bool first_bone = true;
+  for (size_t i = 0; i < scene->nodes.count; ++i) {
+    const ufbx_node* node = scene->nodes.data[i];
+    if (!node || node->is_root) continue;
+    if (!node->bone && node->attrib_type != UFBX_ELEMENT_BONE) continue;
+    if (!first_bone) putchar(0x2C);
+    first_bone = false;
+    print_json_string(string_from_ufbx(node->name).c_str());
+  }
+  printf("]");
+}
+
 static void print_rig_markers(ufbx_scene* scene) {
   printf(",\"rigMarkers\":[");
   bool first = true;
@@ -381,17 +400,7 @@ static void print_summary(ufbx_scene* scene, const std::string& label) {
   }
   printf("]");
 
-  printf(",\"boneNames\":[");
-  bool first_bone = true;
-  for (size_t i = 0; i < scene->nodes.count; ++i) {
-    const ufbx_node* node = scene->nodes.data[i];
-    if (!node || node->is_root) continue;
-    if (!node->bone && node->attrib_type != UFBX_ELEMENT_BONE) continue;
-    if (!first_bone) putchar(0x2C);
-    first_bone = false;
-    print_json_string(string_from_ufbx(node->name).c_str());
-  }
-  printf("]");
+  print_bone_names(scene);
 
   printf(",\"animationNames\":[");
   for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
@@ -570,6 +579,7 @@ int main(int argc, char** argv) {
       printf(",\"bones\":%zu", scene->bones.count);
       printf(",\"durationSeconds\":%.6g", duration);
       print_rig_markers(scene);
+      print_bone_names(scene);
       printf("}");
       ufbx_free_scene(scene);
       return 0;
@@ -582,6 +592,7 @@ int main(int argc, char** argv) {
     printf("{\"kind\":\"mesh\",\"faces\":%zu", total_faces);
     printf(",\"bones\":%zu", scene->bones.count);
     print_rig_markers(scene);
+    print_bone_names(scene);
     printf("}");
     ufbx_free_scene(scene);
     return 0;

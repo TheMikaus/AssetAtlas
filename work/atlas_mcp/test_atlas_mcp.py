@@ -31,7 +31,10 @@ CREATE TABLE catalog_assets (
   source_name TEXT NOT NULL, ext TEXT NOT NULL, type TEXT NOT NULL,
   size INTEGER NOT NULL, modified_ms INTEGER NOT NULL, tags_json TEXT NOT NULL,
   ignored INTEGER NOT NULL DEFAULT 0, model_kind TEXT, rig_family TEXT,
+  rig_signature TEXT,
   referenced_by_model INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE rig_bones (signature TEXT PRIMARY KEY, bone_count INTEGER NOT NULL,
+  bones_json TEXT NOT NULL);
 CREATE TABLE catalog_sources (root_path TEXT PRIMARY KEY);
 CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL,
   root_path TEXT, created_ms INTEGER NOT NULL);
@@ -371,6 +374,148 @@ class RigTest(unittest.TestCase):
         # Kenney's 58-bone Blender rig shares exactly "Hips" with Polygon.
         self.assertEqual(
             atlas_mcp.rig_family_from_markers(["Hips"], 58), "other")
+
+
+def _match_fixture():
+    """fixtures/rig_match.json, the bone-level rule written down once."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", "rig_match.json")
+    with io.open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _signature_fixture():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "fixtures", "rig_signatures.json")
+    with io.open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+class RigSignatureTest(unittest.TestCase):
+    """The rig signature and the bone-level rule, against the shared fixtures.
+
+    Atlas computes these in Dart and this server in Python. A hash that
+    disagreed would not raise anything: it would quietly make half the
+    catalog carry keys the other half cannot match. So the definition lives
+    in fixtures/ and both suites read it.
+    """
+
+    def test_every_signature_case(self):
+        for row in _signature_fixture()["cases"]:
+            with self.subTest(bones=len(row["bones"])):
+                self.assertEqual(atlas_mcp.rig_signature_of(row["bones"]),
+                                 row["signature"], row["why"])
+
+    def test_case_and_order_do_not_make_a_new_rig(self):
+        one = atlas_mcp.rig_signature_of(["Hips", "Spine_01", "Head"])
+        self.assertEqual(atlas_mcp.rig_signature_of(["head", "HIPS", "spine_01"]),
+                         one)
+        self.assertEqual(atlas_mcp.rig_signature_of(["Spine_01", "Head", "Hips"]),
+                         one)
+
+    def test_a_different_set_is_a_different_rig(self):
+        self.assertNotEqual(atlas_mcp.rig_signature_of(["Hips", "Spine_01"]),
+                            atlas_mcp.rig_signature_of(["Hips"]))
+
+    def test_every_match_case(self):
+        for row in _match_fixture()["cases"]:
+            with self.subTest(character=len(row["character"]),
+                              clip=len(row["clip"])):
+                self.assertEqual(
+                    atlas_mcp.rig_match_names(row["character"], row["clip"]),
+                    row["compatible"], row["why"])
+
+
+class FindAnimationsBySignatureTest(unittest.TestCase):
+    """A character pairs with the clips whose bones fit it.
+
+    The case the family names could not express: two rigs Atlas has no name
+    for, in different packs. The family rule had to answer "only in the same
+    container", because a name cannot tell one unnamed rig from another. The
+    bones can.
+    """
+
+    ROOT = r"K:\Assets"
+    DOG = ["dog_%d_joint" % index for index in range(40)]
+    CAT = ["cat_%d_joint" % index for index in range(40)]
+
+    @classmethod
+    def row(cls, name, pack, kind, bones):
+        entry = "Files/" + name
+        signature = atlas_mcp.rig_signature_of(bones) or None
+        return {
+            "id": "asset:v2:" + (pack + entry).lower(),
+            "name": name,
+            "path": "zip:%s\\%s::%s" % (cls.ROOT, pack, entry),
+            "relative_path": "Assets/%s!/%s" % (pack, entry),
+            "source_root": cls.ROOT,
+            "source_name": "Assets",
+            "ext": "fbx",
+            "type": "model",
+            "size": 2048,
+            "modified_ms": 0,
+            "tags_json": json.dumps(name.lower().split("_")),
+            "ignored": 0,
+            "model_kind": kind,
+            "rig_family": "other" if bones else "none",
+            "rig_signature": signature,
+            "referenced_by_model": 0,
+        }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.mkdtemp(prefix="atlas-mcp-sig-")
+        cls.db = os.path.join(cls.directory, "catalog.db")
+        rows = [
+            cls.row("SK_Dog.fbx", "Dogs.zip", "mesh", cls.DOG),
+            cls.row("A_Dog_Bark.fbx", "Dogs.zip", "animation", cls.DOG),
+            # The same rig, shipped in a different pack. The family rule
+            # refused this pairing; the bones allow it.
+            cls.row("A_Dog_Extra.fbx", "DogsDLC.zip", "animation", cls.DOG),
+            cls.row("A_Cat_Prowl.fbx", "Cats.zip", "animation", cls.CAT),
+        ]
+        connection = sqlite3.connect(cls.db)
+        connection.executescript(SCHEMA)
+        columns = list(rows[0])
+        connection.executemany(
+            "INSERT INTO catalog_assets (%s) VALUES (%s)"
+            % (",".join(columns), ",".join("?" * len(columns))),
+            [[row[c] for c in columns] for row in rows])
+        for bones in (cls.DOG, cls.CAT):
+            connection.execute(
+                "INSERT INTO rig_bones (signature, bone_count, bones_json) "
+                "VALUES (?, ?, ?)",
+                (atlas_mcp.rig_signature_of(bones), len(bones),
+                 json.dumps(bones)))
+        connection.execute("INSERT INTO catalog_sources VALUES (?)",
+                           (cls.ROOT,))
+        connection.commit()
+        connection.close()
+        cls.previous = atlas_mcp.DB_PATH
+        atlas_mcp.DB_PATH = cls.db
+
+    @classmethod
+    def tearDownClass(cls):
+        atlas_mcp.DB_PATH = cls.previous
+        shutil.rmtree(cls.directory, ignore_errors=True)
+
+    def call(self, **arguments):
+        result = atlas_mcp.handle_tools_call(
+            {"name": "find_animations", "arguments": arguments})
+        self.assertFalse(result.get("isError"),
+                         result["content"][0].get("text"))
+        return result["content"][0]["text"]
+
+    def test_the_same_rig_in_another_pack_now_pairs(self):
+        answer = self.call(character="SK_Dog.fbx")
+        self.assertIn("A_Dog_Bark.fbx", answer)
+        self.assertIn("A_Dog_Extra.fbx", answer)
+
+    def test_a_different_rig_does_not(self):
+        self.assertNotIn("A_Cat_Prowl.fbx", self.call(character="SK_Dog.fbx"))
+
+    def test_the_answer_says_it_matched_on_bones(self):
+        self.assertIn("bone names", self.call(character="SK_Dog.fbx"))
 
 
 class FindAnimationsTest(unittest.TestCase):
