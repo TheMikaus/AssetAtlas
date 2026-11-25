@@ -373,6 +373,137 @@ class RigTest(unittest.TestCase):
             atlas_mcp.rig_family_from_markers(["Hips"], 58), "other")
 
 
+class FindAnimationsTest(unittest.TestCase):
+    """find_animations reads the catalog's own answer.
+
+    It used to over-fetch rows and read each file, from a time when
+    rig_family held 7 rows of 27,652. The column is filled now -- 44,458 of
+    44,463 FBX -- and the reading made the tool answer "none of the 9 clips
+    looked at are on the sidekick rig" for a library holding 346 of them,
+    because the rows it fetched were unread models rather than clips.
+    """
+
+    ROOT = r"K:\Assets"
+
+    @classmethod
+    def row(cls, name, pack, kind, rig):
+        entry = "Files/" + name
+        return {
+            "id": "asset:v2:" + (pack + entry).lower(),
+            "name": name,
+            "path": "zip:%s\\%s::%s" % (cls.ROOT, pack, entry),
+            "relative_path": "Assets/%s!/%s" % (pack, entry),
+            "source_root": cls.ROOT,
+            "source_name": "Assets",
+            "ext": "fbx",
+            "type": "model",
+            "size": 2048,
+            "modified_ms": 0,
+            "tags_json": json.dumps(name.lower().split("_")),
+            "ignored": 0,
+            "model_kind": kind,
+            "rig_family": rig,
+            "referenced_by_model": 0,
+        }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.mkdtemp(prefix="atlas-mcp-anim-")
+        cls.db = os.path.join(cls.directory, "catalog.db")
+        rows = [
+            cls.row("SK_Chr_Robot.fbx", "Space.zip", "mesh", "unreal"),
+            cls.row("SK_Dog.fbx", "Dogs.zip", "mesh", "other"),
+            cls.row("A_Walk_Sidekick.fbx", "Locomotion.zip", "animation",
+                    "sidekick"),
+            cls.row("A_Idle_Polygon.fbx", "Locomotion.zip", "animation",
+                    "polygon"),
+            cls.row("A_Dog_Bark.fbx", "Dogs.zip", "animation", "other"),
+            cls.row("A_Crane_Swing.fbx", "Airport.zip", "animation", "other"),
+            # Never read: no model_kind, no rig. It must not be mistaken for a
+            # clip, and it must not be silently dropped from the "not read
+            # yet" accounting either.
+            cls.row("SM_Unread.fbx", "Space.zip", None, None),
+        ]
+        connection = sqlite3.connect(cls.db)
+        connection.executescript(SCHEMA)
+        columns = list(rows[0])
+        connection.executemany(
+            "INSERT INTO catalog_assets (%s) VALUES (%s)"
+            % (",".join(columns), ",".join("?" * len(columns))),
+            [[row[c] for c in columns] for row in rows])
+        connection.execute("INSERT INTO catalog_sources VALUES (?)",
+                           (cls.ROOT,))
+        connection.commit()
+        connection.close()
+        cls.previous = atlas_mcp.DB_PATH
+        atlas_mcp.DB_PATH = cls.db
+
+    @classmethod
+    def tearDownClass(cls):
+        atlas_mcp.DB_PATH = cls.previous
+        shutil.rmtree(cls.directory, ignore_errors=True)
+
+    def call(self, **arguments):
+        result = atlas_mcp.handle_tools_call(
+            {"name": "find_animations", "arguments": arguments})
+        self.assertFalse(result.get("isError"),
+                         result["content"][0].get("text"))
+        return result["content"][0]["text"]
+
+    def test_a_named_rig_lists_the_clips_on_it(self):
+        answer = self.call(rig="sidekick")
+        self.assertIn("A_Walk_Sidekick.fbx", answer)
+        self.assertNotIn("A_Idle_Polygon.fbx", answer)
+
+    def test_a_named_rig_means_that_rig_exactly(self):
+        # Not "whatever could drive it": the caller named a rig.
+        answer = self.call(rig="unreal")
+        self.assertNotIn("A_Walk_Sidekick.fbx", answer)
+
+    def test_other_is_a_rig_that_can_be_asked_for(self):
+        answer = self.call(rig="other")
+        self.assertIn("A_Dog_Bark.fbx", answer)
+        self.assertIn("A_Crane_Swing.fbx", answer)
+
+    def test_a_character_gets_what_can_drive_it(self):
+        # The mannequin character and a Sidekick clip: different family
+        # names, same bones, and the library has no unreal clips at all.
+        answer = self.call(character="SK_Chr_Robot.fbx")
+        self.assertIn("A_Walk_Sidekick.fbx", answer)
+        self.assertNotIn("A_Idle_Polygon.fbx", answer)
+
+    def test_an_unnamed_rig_pairs_only_inside_its_own_pack(self):
+        answer = self.call(character="SK_Dog.fbx")
+        self.assertIn("A_Dog_Bark.fbx", answer)
+        self.assertNotIn("A_Crane_Swing.fbx", answer,
+                         "another pack's unnamed rig is another rig")
+
+    def test_no_rig_asked_for_lists_every_clip(self):
+        answer = self.call()
+        for name in ("A_Walk_Sidekick.fbx", "A_Idle_Polygon.fbx",
+                     "A_Dog_Bark.fbx", "A_Crane_Swing.fbx"):
+            self.assertIn(name, answer)
+
+    def test_an_unread_model_is_never_offered_as_a_clip(self):
+        for arguments in ({"rig": "sidekick"}, {"character": "SK_Chr_Robot.fbx"}):
+            self.assertNotIn("SM_Unread.fbx", self.call(**arguments))
+
+    def test_a_prop_cannot_be_animated(self):
+        atlas_mcp_row = self.row("SM_Crate.fbx", "Space.zip", "mesh", "none")
+        connection = sqlite3.connect(self.db)
+        columns = list(atlas_mcp_row)
+        connection.execute(
+            "INSERT INTO catalog_assets (%s) VALUES (%s)"
+            % (",".join(columns), ",".join("?" * len(columns))),
+            [atlas_mcp_row[c] for c in columns])
+        connection.commit()
+        connection.close()
+        result = atlas_mcp.handle_tools_call(
+            {"name": "find_animations",
+             "arguments": {"character": "SM_Crate.fbx"}})
+        self.assertIn("no skeleton", result["content"][0]["text"])
+
+
 class ProtocolTest(unittest.TestCase):
     def drive(self, *messages):
         stdin = io.StringIO("".join(json.dumps(m) + "\n" for m in messages))

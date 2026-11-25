@@ -1593,6 +1593,51 @@ def tool_catalog_stats(arguments):
     return text("\n".join(lines))
 
 
+# Every family the rig rule can produce, "none" aside -- which is the answer
+# for a file with no bones and can never be animated.
+RIG_FAMILIES = ("polygon", "sidekick", "unreal", "other")
+
+
+def _clips_on_rigs(connection, search, families, fetch):
+    """Clip rows whose recorded rig is one of [families].
+
+    model_kind = 'animation' strictly, not the loose prefilter the type=
+    argument uses: that one includes every never-read model so a cold catalog
+    still finds something, and here it would flood the answer with files that
+    are not clips at all.
+    """
+    where, params, _kind, _sieve = build_query(search)
+    sql = ("SELECT * FROM catalog_assets WHERE (%s) "
+           "AND model_kind = 'animation' "
+           "AND lower(coalesce(rig_family, '')) IN (%s) "
+           "ORDER BY name" % (where, ",".join("?" * len(families))))
+    if fetch:
+        sql += " LIMIT %d" % fetch
+    return connection.execute(sql, params + list(families)).fetchall()
+
+
+def _count_clips_on_rigs(connection, search, families):
+    where, params, _kind, _sieve = build_query(search)
+    sql = ("SELECT count(*) FROM catalog_assets WHERE (%s) "
+           "AND model_kind = 'animation' "
+           "AND lower(coalesce(rig_family, '')) IN (%s)"
+           % (where, ",".join("?" * len(families))))
+    return connection.execute(sql, params + list(families)).fetchone()[0]
+
+
+def _unread_clip_candidates(connection, search, limit):
+    """Rows that might be clips but have never been read.
+
+    The fallback for a catalog the backfill has not been run on: before it,
+    rig_family held 7 rows of 27,652 and reading the files was the only way
+    to answer at all.
+    """
+    where, params, _kind, _sieve = build_query(search)
+    sql = ("SELECT * FROM catalog_assets WHERE (%s) AND ext = 'fbx' "
+           "AND rig_family IS NULL ORDER BY name LIMIT ?" % where)
+    return connection.execute(sql, params + [limit]).fetchall()
+
+
 def tool_find_animations(arguments):
     limit = min(int_argument(arguments, "limit", DEFAULT_LIMIT), MAX_LIMIT)
     wanted = text_argument(arguments, "rig").strip().lower()
@@ -1606,27 +1651,96 @@ def tool_find_animations(arguments):
     with open_catalog() as connection:
         if character:
             row = _find_row(connection, character)
-            data = summarise(row["path"], "probe")
-            wanted = rig_family_from_markers(data.get("rigMarkers"),
-                                             data.get("bones") or 0)
+            # The column first. The backfill fills it for every FBX the
+            # reader can open, and reading the file again to learn what the
+            # catalog already knows costs an archive read per call.
+            wanted = (row["rig_family"] or "").strip().lower()
+            if not wanted:
+                data = summarise(row["path"], "probe")
+                wanted = rig_family_from_markers(data.get("rigMarkers"),
+                                                 data.get("bones") or 0)
             for_character = True
             character_container = container_of(row)
             if wanted == "none":
                 return text("%s has no skeleton, so nothing can animate it."
                             % row["name"])
-        search = dict(arguments)
-        search["type"] = "animation"
-        # Over-fetch when a rig was asked for, since matching means reading.
-        rows, total, _ = rows_for(
-            connection, search, limit if not wanted else limit * 3, 0)
 
-    if not rows:
-        return text("No animation clips matched.")
+        search = {key: value for key, value in arguments.items()
+                  if key not in ("rig", "character", "type", "limit", "offset")}
 
-    if not wanted:
-        shown = "\n".join(describe_row(r, i + 1) for i, r in enumerate(rows[:limit]))
-        return text("%d clips.\n\n%s" % (total, shown))
+        if not wanted:
+            listing = dict(search)
+            listing["type"] = "animation"
+            rows, total, _ = rows_for(connection, listing, limit, 0)
+            if not rows:
+                return text("No animation clips matched.")
+            shown = "\n".join(
+                describe_row(r, i + 1) for i, r in enumerate(rows[:limit]))
+            return text("%d clips.\n\n%s" % (total, shown))
 
+        if for_character:
+            families = [family for family in RIG_FAMILIES
+                        if families_compatible(wanted, family, "pack", "pack")]
+        else:
+            families = [family for family in RIG_FAMILIES if family == wanted]
+        if not families:
+            return text("%r is not a rig this knows. Ask for one of: %s."
+                        % (wanted, ", ".join(RIG_FAMILIES)))
+
+        # An unnamed rig pairs only inside its own container, which is a
+        # question about paths rather than about SQL, so those rows are
+        # fetched whole and filtered here. There are 244 such files in this
+        # library, so "whole" is cheap.
+        by_container = for_character and "other" in families
+        rows = _clips_on_rigs(connection, search, families,
+                              0 if by_container else limit * 4)
+        if by_container:
+            rows = [row for row in rows
+                    if (row["rig_family"] or "").lower() != "other"
+                    or container_of(row) == character_container]
+            total = len(rows)
+        else:
+            total = _count_clips_on_rigs(connection, search, families)
+        kept = rows[:limit]
+
+        if not kept:
+            unread = _unread_clip_candidates(connection, search, limit * 3)
+            if unread:
+                return _find_animations_by_reading(
+                    unread, wanted, for_character, character_container, limit)
+            return text(
+                "No clips on the %s rig%s. %d clips are recorded in the "
+                "catalog overall."
+                % (wanted,
+                   " or a rig compatible with it" if for_character else "",
+                   connection.execute(
+                       "SELECT count(*) FROM catalog_assets "
+                       "WHERE model_kind = 'animation'").fetchone()[0]))
+
+        unread = connection.execute(
+            "SELECT count(*) FROM catalog_assets WHERE ext = 'fbx' "
+            "AND rig_family IS NULL").fetchone()[0]
+
+    shown = "\n".join(describe_row(r, i + 1) for i, r in enumerate(kept))
+    headline = ("%d clips that can drive a character on the %s rig"
+                if for_character else "%d clips on the %s rig")
+    more = "" if total <= len(kept) else " (%d shown)" % len(kept)
+    note = ""
+    if unread:
+        note = ("\n\n%d FBX have no rig recorded -- never read, or the "
+                "reader could not open them -- so they are not counted here. "
+                "backfill_rigs.py reads the ones it can, with Atlas closed."
+                % unread)
+    return text("%s%s.\n\n%s%s"
+                % (headline % (total, wanted), more, shown, note))
+
+
+def _find_animations_by_reading(rows, wanted, for_character, container, limit):
+    """The pre-backfill path: read each candidate and classify it.
+
+    Only reached when the column has no answer for anything that matched,
+    which means the catalog has not been backfilled.
+    """
     kept = []
     unreadable = 0
     for row in rows:
@@ -1642,19 +1756,18 @@ def tool_find_animations(arguments):
         if family == wanted and not for_character:
             kept.append(row)
         elif for_character and families_compatible(
-                wanted, family, character_container, container_of(row)):
+                wanted, family, container, container_of(row)):
             kept.append(row)
 
     if not kept:
-        return text("None of the %d clips looked at are on the %s rig."
+        return text("None of the %d unread files looked at are on the %s rig."
                     % (len(rows), wanted))
     shown = "\n".join(describe_row(r, i + 1) for i, r in enumerate(kept))
-    note = ""
-    if unreadable:
-        note = "\n\n%d clips could not be read." % unreadable
-    return text("%d clips on the %s rig, out of %d looked at (%d in the "
-                "catalog overall).\n\n%s%s"
-                % (len(kept), wanted, len(rows), total, shown, note))
+    note = "" if not unreadable else (
+        "\n\n%d files could not be read." % unreadable)
+    return text("%d clips on the %s rig, read from the files because the "
+                "catalog has no rig recorded for them.\n\n%s%s"
+                % (len(kept), wanted, shown, note))
 
 
 def tool_find_attachments(arguments):
@@ -2611,7 +2724,10 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "rig": {"type": "string", "enum": ["polygon", "sidekick", "unreal"]},
+                "rig": {"type": "string", "enum": list(RIG_FAMILIES),
+                        "description":
+                            "'other' is a real skeleton Atlas has no "
+                            "name for, such as the Dogs pack's rig."},
                 "character": {"type": "string",
                               "description": "Path of a character whose rig to match."},
                 "pack": {"type": "string"},
