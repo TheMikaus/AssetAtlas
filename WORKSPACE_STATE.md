@@ -17,6 +17,17 @@ Playdate framework: N/A
   v1.10.48 one rig classifier owned by `work/atlas_mcp/fixtures/rig_families.json`,
   a new `other` family, and unreal/sidekick compatibility. See DECISIONS.md
   RIG-001. 736 Dart tests, 407 Python tests, analyze clean.
+- 2026-11-24 `6c4a940` find_animations answers from the `rig_family` column
+  instead of re-reading files. It was returning nothing for every question --
+  "None of the 9 clips looked at are on the sidekick rig" with 346 in the
+  library -- because its prefilter pulls in never-read model rows. Measured
+  after: 346 clips for the War Robot, 88 for the dog (all in its own pack),
+  no file reads. WP5's MCP step brought forward; signatures still to come.
+- 2026-11-24 Atlas rebuilt at 1.10.48 and left running. Before that the built
+  exe was 1.10.44, which predates `other` and would have read those 244 files
+  as "No rig". Verified through the bridge: inspect_model reports the robot as
+  Unreal/48 bones, and rig_compatibility calls a Sidekick walk playable over
+  28 shared bones while refusing a Polygon clip at 14.
 - 2026-11-24 the `rig_family` column was re-filled under the new rule
   (`backfill_rigs.py --all`, authorised by the user that day, Atlas closed,
   catalog backed up to `asset_atlas_native.db.before-rig-rules-2`). 44,458 of
