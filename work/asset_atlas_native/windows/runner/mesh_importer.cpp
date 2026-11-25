@@ -13,6 +13,7 @@
 #include "third_party/ufbx/ufbx.h"
 
 #include "gltf_reader.h"
+#include "json_number.h"
 
 struct Vec3 {
   double x;
@@ -189,9 +190,10 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
     time_begin = scene->anim_stacks.data[0]->time_begin;
   }
 
-  printf(",\"frameRate\":%.6g", frame_count > 1 && duration > 0.0
-    ? (double)(frame_count - 1) / duration
-    : kSkeletonSampleRate);
+  printf(",\"frameRate\":%.6g", json_double(
+    frame_count > 1 && duration > 0.0
+      ? (double)(frame_count - 1) / duration
+      : kSkeletonSampleRate));
   printf(",\"stride\":12");
 
   // The rig's own rest pose, unevaluated.
@@ -206,9 +208,12 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
     const ufbx_matrix m = bones[i]->node_to_world;
     if (i) putchar(0x2C);
     printf("%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
-      m.cols[0].x, m.cols[0].y, m.cols[0].z,
-      m.cols[1].x, m.cols[1].y, m.cols[1].z,
-      m.cols[2].x, m.cols[2].y, m.cols[2].z,
+      json_double(m.cols[0].x), json_double(m.cols[0].y),
+      json_double(m.cols[0].z),
+      json_double(m.cols[1].x), json_double(m.cols[1].y),
+      json_double(m.cols[1].z),
+      json_double(m.cols[2].x), json_double(m.cols[2].y),
+      json_double(m.cols[2].z),
       m.cols[3].x, m.cols[3].y, m.cols[3].z);
   }
   printf("]");
@@ -236,10 +241,14 @@ static void print_skeleton(ufbx_scene* scene, double duration) {
       const ufbx_matrix m = node->node_to_world;
       if (i) putchar(0x2C);
       printf("%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
-        m.cols[0].x, m.cols[0].y, m.cols[0].z,
-        m.cols[1].x, m.cols[1].y, m.cols[1].z,
-        m.cols[2].x, m.cols[2].y, m.cols[2].z,
-        m.cols[3].x, m.cols[3].y, m.cols[3].z);
+        json_double(m.cols[0].x), json_double(m.cols[0].y),
+        json_double(m.cols[0].z),
+        json_double(m.cols[1].x), json_double(m.cols[1].y),
+        json_double(m.cols[1].z),
+        json_double(m.cols[2].x), json_double(m.cols[2].y),
+        json_double(m.cols[2].z),
+        json_double(m.cols[3].x), json_double(m.cols[3].y),
+        json_double(m.cols[3].z));
     }
     if (posed) ufbx_free_scene(posed);
     putchar(0x5D);
@@ -371,12 +380,14 @@ static void print_summary(ufbx_scene* scene, const std::string& label) {
   printf(",\"materials\":%zu", scene->materials.count);
   printf(",\"bones\":%zu", scene->bones.count);
   printf(",\"animationStacks\":%zu", scene->anim_stacks.count);
-  printf(",\"durationSeconds\":%.6g", duration);
-  printf(",\"unitMeters\":%.6g", scene->settings.unit_meters);
+  printf(",\"durationSeconds\":%.6g", json_double(duration));
+  printf(",\"unitMeters\":%.6g",
+         json_double(scene->settings.unit_meters));
 
   if (have_bounds) {
     printf(",\"bounds\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]",
-           min_x, min_y, min_z, max_x, max_y, max_z);
+           json_double(min_x), json_double(min_y), json_double(min_z),
+           json_double(max_x), json_double(max_y), json_double(max_z));
   }
 
   printf(",\"objectNames\":[");
@@ -590,7 +601,7 @@ int main(int argc, char** argv) {
       }
       printf("{\"kind\":\"animation\",\"animationStacks\":%zu", scene->anim_stacks.count);
       printf(",\"bones\":%zu", scene->bones.count);
-      printf(",\"durationSeconds\":%.6g", duration);
+      printf(",\"durationSeconds\":%.6g", json_double(duration));
       print_rig_markers(scene);
       print_bone_names(scene);
       printf("}");
@@ -961,7 +972,7 @@ int main(int argc, char** argv) {
       print_json_string(input_label.c_str());
       printf(",\"animationStacks\":%zu", scene->anim_stacks.count);
       printf(",\"bones\":%zu", scene->bones.count);
-      printf(",\"durationSeconds\":%.6g", duration);
+      printf(",\"durationSeconds\":%.6g", json_double(duration));
       printf(",\"animationNames\":[");
       for (size_t i = 0; i < scene->anim_stacks.count; ++i) {
         const ufbx_anim_stack* stack = scene->anim_stacks.data[i];
@@ -1031,18 +1042,21 @@ int main(int argc, char** argv) {
   // above. Undo it with these and the piece can be put back where the artist
   // built it, which is the whole basis of placing one on a character.
   printf(",\"framingCenter\":[%.9g,%.9g,%.9g],\"framingScale\":%.9g",
-    center.x, center.y, center.z, scale);
+    json_double(center.x), json_double(center.y), json_double(center.z),
+    json_double(scale));
   printf(",\"vertices\":[");
   for (size_t i = 0; i < vertices.size(); ++i) {
     const Vec3& v = vertices[i];
     if (i) putchar(',');
-    printf("[%.9g,%.9g,%.9g]", v.x, v.y, v.z);
+    printf("[%.9g,%.9g,%.9g]",
+           json_double(v.x), json_double(v.y), json_double(v.z));
   }
   printf("],\"vertexColors\":[");
   for (size_t i = 0; i < vertex_colors.size(); ++i) {
     const Vec4& c = vertex_colors[i];
     if (i) putchar(',');
-    printf("[%.9g,%.9g,%.9g,%.9g]", c.x, c.y, c.z, c.w);
+    printf("[%.9g,%.9g,%.9g,%.9g]", json_double(c.x), json_double(c.y),
+           json_double(c.z), json_double(c.w));
   }
   printf("],\"objects\":[");
   for (size_t i = 0; i < object_names.size(); ++i) {
@@ -1058,7 +1072,10 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < faces.size(); ++i) {
     const Face& f = faces[i];
     if (i) putchar(',');
-    printf("[%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]", f.a, f.b, f.c, f.material, f.u1, f.v1, f.u2, f.v2, f.u3, f.v3);
+    printf("[%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]",
+           f.a, f.b, f.c, f.material,
+           json_double(f.u1), json_double(f.v1), json_double(f.u2),
+           json_double(f.v2), json_double(f.u3), json_double(f.v3));
   }
   printf("],\"materials\":[");
   for (size_t i = 0; i < materials.size(); ++i) {
@@ -1066,13 +1083,19 @@ int main(int argc, char** argv) {
     if (i) putchar(',');
     printf("{\"name\":");
     print_json_string(material.name.c_str());
-    printf(",\"color\":[%.6g,%.6g,%.6g]", material.r, material.g, material.b);
-    printf(",\"opacity\":%.6g", material.opacity);
-    printf(",\"roughness\":%.6g", material.roughness);
-    printf(",\"metalness\":%.6g", material.metalness);
-    printf(",\"specularFactor\":%.6g", material.specular_factor);
-    printf(",\"emissiveFactor\":%.6g", material.emissive_factor);
-    printf(",\"emissiveColor\":[%.6g,%.6g,%.6g]", material.emissive_r, material.emissive_g, material.emissive_b);
+    printf(",\"color\":[%.6g,%.6g,%.6g]", json_double(material.r),
+           json_double(material.g), json_double(material.b));
+    printf(",\"opacity\":%.6g", json_double(material.opacity));
+    printf(",\"roughness\":%.6g", json_double(material.roughness));
+    printf(",\"metalness\":%.6g", json_double(material.metalness));
+    printf(",\"specularFactor\":%.6g",
+           json_double(material.specular_factor));
+    printf(",\"emissiveFactor\":%.6g",
+           json_double(material.emissive_factor));
+    printf(",\"emissiveColor\":[%.6g,%.6g,%.6g]",
+           json_double(material.emissive_r),
+           json_double(material.emissive_g),
+           json_double(material.emissive_b));
     printf(",\"shaderType\":%d", material.shader_type);
     printf(",\"shadingModel\":");
     print_json_string(material.shading_model.c_str());
@@ -1101,21 +1124,26 @@ int main(int argc, char** argv) {
       print_json_string(skin_bone_paths[i].c_str());
       const ufbx_matrix m = skin_bind_inverse[i];
       printf(",\"bindInverse\":[%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g]}",
-        m.cols[0].x, m.cols[0].y, m.cols[0].z,
-        m.cols[1].x, m.cols[1].y, m.cols[1].z,
-        m.cols[2].x, m.cols[2].y, m.cols[2].z,
-        m.cols[3].x, m.cols[3].y, m.cols[3].z);
+        json_double(m.cols[0].x), json_double(m.cols[0].y),
+        json_double(m.cols[0].z),
+        json_double(m.cols[1].x), json_double(m.cols[1].y),
+        json_double(m.cols[1].z),
+        json_double(m.cols[2].x), json_double(m.cols[2].y),
+        json_double(m.cols[2].z),
+        json_double(m.cols[3].x), json_double(m.cols[3].y),
+        json_double(m.cols[3].z));
     }
     printf("],\"vertices\":[");
     for (size_t i = 0; i < skin_vertices.size(); ++i) {
       if (i) putchar(0x2C);
       const std::array<double, 8>& w = skin_vertices[i];
       printf("%d,%.5g,%d,%.5g,%d,%.5g,%d,%.5g",
-        (int)w[0], w[1], (int)w[2], w[3],
-        (int)w[4], w[5], (int)w[6], w[7]);
+        (int)w[0], json_double(w[1]), (int)w[2], json_double(w[3]),
+        (int)w[4], json_double(w[5]), (int)w[6], json_double(w[7]));
     }
     printf("],\"normalizeCenter\":[%.9g,%.9g,%.9g],\"normalizeScale\":%.9g",
-      center.x, center.y, center.z, scale);
+      json_double(center.x), json_double(center.y), json_double(center.z),
+      json_double(scale));
     printf(",\"vertexSkin\":[");
     for (size_t i = 0; i < vertex_skin.size(); ++i) {
       if (i) putchar(0x2C);
@@ -1138,7 +1166,9 @@ int main(int argc, char** argv) {
     for (size_t face_index = 0; face_index < faces.size(); ++face_index) {
       if (face_index) putchar(',');
       const auto& uv = faces[face_index].uv_sets[uv_set_index];
-      printf("[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]", uv[0], uv[1], uv[2], uv[3], uv[4], uv[5]);
+      printf("[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]",
+             json_double(uv[0]), json_double(uv[1]), json_double(uv[2]),
+             json_double(uv[3]), json_double(uv[4]), json_double(uv[5]));
     }
     printf("]}");
   }

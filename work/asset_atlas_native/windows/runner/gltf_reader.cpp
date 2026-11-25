@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "gltf_reader.h"
+#include "json_number.h"
 
 namespace {
 
@@ -367,7 +368,8 @@ int gltf_print_model(const std::string& label,
   printf("],\"vertices\":[");
   for (size_t i = 0; i < positions.size(); i += 3) {
     if (i) putchar(',');
-    printf("[%.9g,%.9g,%.9g]", positions[i], positions[i + 1], positions[i + 2]);
+    printf("[%.9g,%.9g,%.9g]", json_double(positions[i]),
+           json_double(positions[i + 1]), json_double(positions[i + 2]));
   }
   printf("],\"faceObjects\":[");
   for (size_t i = 0; i < faces.size(); ++i) {
@@ -379,7 +381,10 @@ int gltf_print_model(const std::string& label,
     const GltfFace& f = faces[i];
     if (i) putchar(',');
     printf("[%d,%d,%d,%d,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g]", f.a, f.b, f.c,
-           f.material, f.uv[0], f.uv[1], f.uv[2], f.uv[3], f.uv[4], f.uv[5]);
+           f.material,
+           json_double(f.uv[0]), json_double(f.uv[1]),
+           json_double(f.uv[2]), json_double(f.uv[3]),
+           json_double(f.uv[4]), json_double(f.uv[5]));
   }
   printf("],\"materials\":[");
   for (size_t i = 0; i < materials.size(); ++i) {
@@ -387,10 +392,11 @@ int gltf_print_model(const std::string& label,
     if (i) putchar(',');
     printf("{\"name\":");
     print_json_string_local(material.name.c_str());
-    printf(",\"color\":[%.6g,%.6g,%.6g]", material.r, material.g, material.b);
-    printf(",\"opacity\":%.6g", material.opacity);
-    printf(",\"roughness\":%.6g", material.roughness);
-    printf(",\"metalness\":%.6g", material.metalness);
+    printf(",\"color\":[%.6g,%.6g,%.6g]", json_double(material.r),
+           json_double(material.g), json_double(material.b));
+    printf(",\"opacity\":%.6g", json_double(material.opacity));
+    printf(",\"roughness\":%.6g", json_double(material.roughness));
+    printf(",\"metalness\":%.6g", json_double(material.metalness));
     printf(",\"specularFactor\":0.2");
     printf(",\"emissiveFactor\":0");
     printf(",\"emissiveColor\":[0,0,0]");
