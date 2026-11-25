@@ -154,8 +154,10 @@ other paths are accidentally O(n²): `assets.removeWhere((a) => !assets.any(...)
   single biggest lever on large-model load time — a senior-scoped change.
 - **Git history carries 182 MB.** `work/asset-atlas-desktop/node_modules` was committed in the
   initial import, including a 172 MB `electron.exe`. The files were deleted in `0b46d35`, but a fresh
-  clone still pays for them. `outputs/` (29 MB of built binaries) is also tracked and grows per
-  release.
+  clone still pays for them, and only rewriting history would change that. `outputs/` (29 MB of
+  built binaries, which a release replaced wholesale) **is no longer tracked** as of 2026-11-18: it
+  is ignored but for a `.gitkeep`, so the documented directory survives a clone and its contents do
+  not. That stops history growing per release; it does not shrink what is already there.
 - **No CI**, despite a GitHub remote and a roadmap item asking for it. Nothing enforces
   analyze/test on a push. → **TASK-09**
 - **Docs have drifted from the code.** The README and `AI_HANDOFF_LATEST.md` state that copy skips

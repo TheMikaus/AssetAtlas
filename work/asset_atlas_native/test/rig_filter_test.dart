@@ -58,6 +58,32 @@ void main() {
       );
     });
 
+    test('a Sidekick clip drives an Unreal character', () {
+      // The library holds no `unreal` clips at all -- 359 polygon, 346
+      // sidekick, 91 none -- so demanding equal names passed 0 of 796 clips
+      // for the 348 characters stored as unreal. The Sidekick rig is the
+      // Unreal mannequin with extra bones, which is why these pair.
+      expect(
+        passes(rig: 'sidekick', filter: 'compatible', character: 'unreal'),
+        isTrue,
+      );
+      expect(
+        passes(rig: 'unreal', filter: 'compatible', character: 'sidekick'),
+        isTrue,
+      );
+    });
+
+    test('Polygon is still a different rig', () {
+      expect(
+        passes(rig: 'polygon', filter: 'compatible', character: 'unreal'),
+        isFalse,
+      );
+      expect(
+        passes(rig: 'sidekick', filter: 'compatible', character: 'polygon'),
+        isFalse,
+      );
+    });
+
     test('compatible with no character chosen hides nothing', () {
       expect(passes(rig: 'sidekick', filter: 'compatible'), isTrue);
     });

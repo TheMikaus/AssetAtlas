@@ -88,8 +88,9 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: MaterialVariantGrid(
+            body: CellVariantGrid(
               mesh: _stacked(),
+              cells: CellVariantGrid.byMaterial(_stacked()),
               yaw: 0,
               pitch: 0,
               zoom: 1,
@@ -117,8 +118,9 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: Scaffold(
-            body: MaterialVariantGrid(
+            body: CellVariantGrid(
               mesh: single,
+              cells: CellVariantGrid.byMaterial(single),
               yaw: 0,
               pitch: 0,
               zoom: 1,
@@ -130,7 +132,7 @@ void main() {
           ),
         ),
       );
-      expect(find.textContaining('one material'), findsOneWidget);
+      expect(find.textContaining('nothing to compare'), findsOneWidget);
     });
   });
 }

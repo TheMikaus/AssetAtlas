@@ -139,6 +139,124 @@ void main() {
     });
   });
 
+  group('SearchAndSummary', () {
+    Widget host(TextEditingController controller, int visibleCount) {
+      return MaterialApp(
+        home: Scaffold(
+          body: SearchAndSummary(
+            controller: controller,
+            visibleCount: visibleCount,
+            totalCount: 40,
+            selectedCount: 0,
+            sortMode: AssetSortMode.path,
+            gridMode: false,
+            onChanged: (_) {},
+            onSortChanged: (_) {},
+            onGridModeChanged: (_) {},
+            onSelectAllVisible: () {},
+            onClearSelection: () {},
+          ),
+        ),
+      );
+    }
+
+    testWidgets('an empty list under an active query says so', (tester) async {
+      final controller = TextEditingController(text: 'door');
+      addTearDown(controller.dispose);
+
+      await tester.pumpWidget(host(controller, 0));
+      await tester.pump();
+
+      expect(
+        find.textContaining('Still searching for "door"'),
+        findsOneWidget,
+      );
+      expect(find.text('Clear search'), findsOneWidget);
+    });
+
+    testWidgets('Clear search empties the box and reports it', (tester) async {
+      final controller = TextEditingController(text: 'door');
+      addTearDown(controller.dispose);
+      var reported = 'not called';
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SearchAndSummary(
+              controller: controller,
+              visibleCount: 0,
+              totalCount: 40,
+              selectedCount: 0,
+              sortMode: AssetSortMode.path,
+              gridMode: false,
+              onChanged: (value) => reported = value,
+              onSortChanged: (_) {},
+              onGridModeChanged: (_) {},
+              onSelectAllVisible: () {},
+              onClearSelection: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      await tester.tap(find.text('Clear search'));
+      expect(controller.text, isEmpty);
+      expect(reported, '');
+    });
+
+    testWidgets('an empty list with no query stays quiet', (tester) async {
+      final controller = TextEditingController();
+      addTearDown(controller.dispose);
+
+      await tester.pumpWidget(host(controller, 0));
+      await tester.pump();
+
+      expect(find.textContaining('Still searching'), findsNothing);
+      expect(find.text('Clear search'), findsNothing);
+    });
+
+    testWidgets('a list with results stays quiet too', (tester) async {
+      final controller = TextEditingController(text: 'door');
+      addTearDown(controller.dispose);
+
+      await tester.pumpWidget(host(controller, 7));
+      await tester.pump();
+
+      expect(find.textContaining('Still searching'), findsNothing);
+    });
+  });
+
+  group('the type filter and the search box are independent', () {
+    Finder searchField() {
+      return find.byWidgetPredicate(
+        (widget) =>
+            widget is TextField &&
+            (widget.decoration?.hintText ?? '').startsWith('Search'),
+      );
+    }
+
+    testWidgets('changing the type keeps what was typed', (tester) async {
+      await tester.pumpWidget(const AssetAtlasApp(enablePersistence: false));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(searchField(), 'door');
+      // The query is debounced by 120ms.
+      await tester.pump(const Duration(milliseconds: 200));
+      expect(tester.widget<TextField>(searchField()).controller?.text, 'door');
+
+      await tester.scrollUntilVisible(
+        find.textContaining('MODEL ('),
+        180,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.textContaining('MODEL ('));
+      await tester.pump(const Duration(milliseconds: 200));
+
+      expect(tester.widget<TextField>(searchField()).controller?.text, 'door');
+    });
+  });
+
   group('AssetGrid', () {
     testWidgets('renders a tile per asset with a type icon fallback', (
       tester,
@@ -158,6 +276,7 @@ void main() {
           home: Scaffold(
             body: AssetGrid(
               assets: assets,
+              versionMembers: const {},
               active: assets.first,
               selectedIds: const {},
               onActivate: (_) {},
@@ -187,6 +306,7 @@ void main() {
           home: Scaffold(
             body: AssetGrid(
               assets: assets,
+              versionMembers: const {},
               active: null,
               selectedIds: const {},
               onActivate: (asset) => activated = asset,
@@ -217,6 +337,7 @@ void main() {
           home: Scaffold(
             body: AssetList(
               assets: assets,
+              versionMembers: const {},
               active: null,
               selectedIds: const {},
               onActivate: (_) {},
@@ -241,6 +362,7 @@ void main() {
           home: Scaffold(
             body: AssetList(
               assets: assets,
+              versionMembers: const {},
               active: null,
               selectedIds: const {},
               onActivate: (_) {},

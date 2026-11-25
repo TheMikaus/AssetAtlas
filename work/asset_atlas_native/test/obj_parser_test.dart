@@ -34,9 +34,29 @@ void main() {
       expect(mesh.faces.first.uvs.first.y, 1);
     });
 
-    test('records the material library so the resolver can chase it', () {
+    test('the material library is asked for, not offered as a texture', () {
+      // This used to assert `mesh.textureFiles == ['barn.mtl']`, on the idea
+      // that recording the sidecar let the resolver chase it. Nothing ever
+      // chased it: `barn.mtl` went where texture references go, and the
+      // resolver dutifully reported a missing texture for a file that is not
+      // an image. The sidecar is read now, so the name belongs to whoever
+      // reads it and `textureFiles` holds what the sidecar asked for.
+      expect(objMaterialLibraryNames(_texturedQuad), ['barn.mtl']);
       final mesh = parseObjMesh(_texturedQuad, 'quad');
-      expect(mesh.textureFiles, ['barn.mtl']);
+      expect(mesh.textureFiles, isEmpty);
+    });
+
+    test('a sidecar that was read colours and textures the material', () {
+      final mesh = parseObjMesh(
+        _texturedQuad,
+        'quad',
+        materialLibrary: parseObjMaterialLibrary(
+          'newmtl Barn_Walls\nKd 0.5 0.25 0.125\nmap_Kd Textures/barn.png\n',
+        ),
+      );
+      expect(mesh.materials.single.color.r * 255, closeTo(128, 1));
+      expect(mesh.materials.single.textures, ['Textures/barn.png']);
+      expect(mesh.textureFiles, ['Textures/barn.png']);
     });
 
     test('usemtl names the material', () {

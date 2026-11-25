@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:archive/archive.dart';
 import 'package:asset_atlas_native/main.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// The exact shape of the file that crashed the app: macOS writes a small
@@ -70,6 +71,124 @@ void main() {
         ),
         isTrue,
       );
+    });
+  });
+
+  group('previewKindFor', () {
+    AssetItem asset(String relativePath, String type, {String? path}) {
+      final name = relativePath.split('/').last;
+      return AssetItem(
+        id: relativePath,
+        name: name,
+        path: path ?? (r'C:\Packs\' + relativePath.replaceAll('/', r'\')),
+        relativePath: relativePath,
+        sourceRoot: r'C:\Packs',
+        sourceName: 'Packs',
+        ext: name.contains('.') ? name.split('.').last : '',
+        type: type,
+        size: 100,
+        modified: DateTime.fromMillisecondsSinceEpoch(1000),
+        tags: const [],
+      );
+    }
+
+    test('an Unreal asset is never the audio player', () {
+      for (final ext in unrealExts) {
+        expect(
+          previewKindFor(asset('Pack/thing.$ext', 'unreal')),
+          PreviewKind.unreal,
+          reason: '.$ext fell through to a native audio plugin before this',
+        );
+      }
+    });
+
+    test('audio is still the audio player', () {
+      expect(previewKindFor(asset('Pack/a.wav', 'audio')), PreviewKind.audio);
+    });
+
+    test('images and models are unchanged', () {
+      expect(previewKindFor(asset('Pack/a.png', 'image')), PreviewKind.image);
+      expect(previewKindFor(asset('Pack/a.fbx', 'model')), PreviewKind.model);
+      expect(previewKindFor(asset('Pack/a.obj', 'model')), PreviewKind.model);
+      expect(previewKindFor(asset('Pack/a.stl', 'model')), PreviewKind.model);
+    });
+
+    test('a model inside a zip is read in memory only for obj, stl and fbx', () {
+      String inZip(String entry) =>
+          buildZipVirtualPath(r'C:\Packs\pack.zip', entry);
+      for (final entry in ['Models/a.obj', 'Models/a.stl', 'Models/a.fbx']) {
+        expect(
+          previewKindFor(asset(entry, 'model', path: inZip(entry))),
+          PreviewKind.model,
+        );
+      }
+      expect(
+        previewKindFor(
+          asset(
+            'Models/a.gltf',
+            'model',
+            path: inZip('Models/a.gltf'),
+          ),
+        ),
+        PreviewKind.zipModelUnsupported,
+      );
+    });
+
+    test('anything else draws nothing rather than guessing', () {
+      expect(previewKindFor(asset('Pack/notes.txt', 'other')), PreviewKind.none);
+      expect(previewKindFor(asset('Pack/LICENSE', 'other')), PreviewKind.none);
+    });
+  });
+
+  group('PlainPreview', () {
+    testWidgets('says what the file is and why it cannot be shown', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: PlainPreview(
+              icon: Icons.videogame_asset_outlined,
+              name: 'SM_Chr_Robot.uasset',
+              message: 'Unreal asset. It can only be opened in Unreal Engine.',
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('SM_Chr_Robot.uasset'), findsOneWidget);
+      expect(
+        find.text('Unreal asset. It can only be opened in Unreal Engine.'),
+        findsOneWidget,
+      );
+      expect(find.byIcon(Icons.videogame_asset_outlined), findsOneWidget);
+      // The whole point: no transport controls.
+      expect(find.byType(AudioPreview), findsNothing);
+      expect(find.byIcon(Icons.play_arrow), findsNothing);
+    });
+  });
+
+  group('an extension the guard does not know', () {
+    test('is not treated as audio', () {
+      // What the preview panel used to hand to audioplayers_windows for any
+      // type that was neither image nor model.
+      final uasset = <int>[
+        0xC1, 0x83, 0x2A, 0x9E, // Unreal's package magic
+        ...List<int>.filled(60, 0),
+      ];
+      expect(looksLikePlayableAudio(uasset, 'uasset'), isFalse);
+      expect(looksLikePlayableAudio(uasset, 'umap'), isFalse);
+      expect(looksLikePlayableAudio(uasset, ''), isFalse);
+    });
+
+    test('a known extension is still judged on its bytes alone', () {
+      final wave = [
+        0x52, 0x49, 0x46, 0x46,
+        0, 0, 0, 0,
+        0x57, 0x41, 0x56, 0x45,
+      ];
+      expect(looksLikePlayableAudio(wave, 'wav'), isTrue);
     });
   });
 

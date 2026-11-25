@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "atlas": {
+      "command": "python",
+      "args": [
+        "-I",
+        "C:/Users/white/Documents/Codex/2026-07-08/woul/work/atlas_mcp/atlas_mcp.py"
+      ]
+    }
+  }
+}

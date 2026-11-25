@@ -5,6 +5,47 @@ import 'package:asset_atlas_native/main.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('--probe reports the bone names, not only how many there are', () async {
+    // The rig signature is the set of names, so the probe has to say them.
+    // --summary already did; --probe is the one the catalog pass runs, and
+    // it printed a count alone, which cannot tell two 48-bone rigs apart.
+    final helper = File(
+      'build/windows/x64/runner/Release/asset_atlas_mesh_importer.exe',
+    );
+    if (!helper.existsSync()) {
+      markTestSkipped('Build the Windows app before running native FBX tests.');
+      return;
+    }
+    final fixture = File(
+      'test/fixtures/fbx/transformed_uv_embedded.fbx',
+    ).absolute;
+    expect(fixture.existsSync(), isTrue);
+
+    final probed = await Process.run(helper.absolute.path, [
+      '--probe',
+      fixture.path,
+    ]);
+    expect(probed.exitCode, 0, reason: probed.stderr as String? ?? '');
+    final json = jsonDecode(probed.stdout as String) as Map<String, dynamic>;
+    expect(json.containsKey('boneNames'), isTrue);
+    expect(json['boneNames'], isA<List<dynamic>>());
+    expect(
+      (json['boneNames'] as List<dynamic>).length,
+      json['bones'] as int,
+      reason: 'one name per bone the probe counted',
+    );
+
+    // --summary and --probe must agree about them: the signature is computed
+    // from whichever ran, and two spellings of one rig would split it.
+    final summarised = await Process.run(helper.absolute.path, [
+      '--summary',
+      fixture.path,
+    ]);
+    final summaryJson =
+        jsonDecode(summarised.stdout as String) as Map<String, dynamic>;
+    expect(json['boneNames'], summaryJson['boneNames']);
+  });
+
   test(
     'native importer preserves instances, embedded texture, and UV sets',
     () async {

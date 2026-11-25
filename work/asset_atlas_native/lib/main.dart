@@ -19,7 +19,83 @@ import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
-Future<void> main() async {
+import 'visual_tag_queue.dart';
+import 'visual_tagging.dart';
+
+/// What the command line asked for.
+///
+/// The strip's button needs somebody to press it, which is fine for a pass
+/// over one newly scanned folder and no use for the whole library: that is
+/// an 18-hour job that wants to run with nobody watching.
+class StartupOptions {
+  const StartupOptions({
+    this.tagAll = false,
+    this.renderLanes,
+    this.tagMode,
+    this.tagForce = false,
+  });
+
+  /// Start tagging the whole library as soon as the catalog is restored.
+  final bool tagAll;
+
+  /// Renders in flight at once, or null to leave the queue's own default.
+  final int? renderLanes;
+
+  /// How hard a tagging run may push the machine, or null for the saved
+  /// setting. An explicit `--tag-lanes` still wins over the mode's lanes.
+  final TaggingMode? tagMode;
+
+  /// Embed again even where a vector exists -- `--tag-force`.
+  final bool tagForce;
+}
+
+/// Reads `--tag-all` and `--tag-lanes=N`.
+///
+/// A bad value is ignored rather than fatal. The alternative is an app that
+/// refuses to open because of a typo in a flag, and the flag is a
+/// convenience: anything it cannot understand leaves the default in place.
+StartupOptions parseStartupOptions(List<String> arguments) {
+  const lanesFlag = '--tag-lanes=';
+  const modeFlag = '--tag-mode=';
+  var tagAll = false;
+  var force = false;
+  int? lanes;
+  TaggingMode? mode;
+  for (final argument in arguments) {
+    if (argument == '--tag-all') {
+      tagAll = true;
+      continue;
+    }
+    if (argument == '--tag-force') {
+      force = true;
+      continue;
+    }
+    if (argument.startsWith(lanesFlag)) {
+      final value = int.tryParse(argument.substring(lanesFlag.length).trim());
+      // Capped rather than trusted. Each lane is a subprocess and an
+      // isolate, and a mistyped 400 would ask the machine for 400 of each.
+      if (value != null && value >= 1 && value <= 32) lanes = value;
+      continue;
+    }
+    if (argument.startsWith(modeFlag)) {
+      final name = argument.substring(modeFlag.length).trim().toLowerCase();
+      // Only a name this knows. An unknown one leaves the saved setting
+      // alone rather than silently choosing for the user.
+      for (final candidate in TaggingMode.values) {
+        if (candidate.name == name) mode = candidate;
+      }
+    }
+  }
+  return StartupOptions(
+    tagAll: tagAll,
+    renderLanes: lanes,
+    tagMode: mode,
+    tagForce: force,
+  );
+}
+
+Future<void> main(List<String> arguments) async {
+  final options = parseStartupOptions(arguments);
   WidgetsFlutterBinding.ensureInitialized();
   initializeFbxLogPath();
   if (enableFbxLogs) {
@@ -33,7 +109,7 @@ Future<void> main() async {
   // Restoring this before the first frame keeps a clip from briefly showing
   // the stick figure when a character was already chosen.
   await AnimationCharacter.instance.load();
-  runApp(const AssetAtlasApp());
+  runApp(AssetAtlasApp(options: options));
 }
 
 const imageExts = {'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'psd'};
@@ -51,11 +127,63 @@ const textureExts = {
 };
 const audioExts = {'wav', 'mp3', 'flac', 'ogg', 'midi', 'mid'};
 const modelExts = {'obj', 'fbx', 'gltf', 'glb', 'blend', 'dae', 'stl'};
+
+/// Unreal's own asset files: cooked or imported, and unreadable outside the
+/// engine.
+///
+/// Indexed but never previewed. The Unreal build of a Synty pack contains
+/// nothing else -- `Unreal_PolygonPirates` is 636 `.uasset` and 2 `.umap` with
+/// not one FBX among them -- so leaving them out made those archives look
+/// empty, which reads as a broken scanner rather than as the truth about what
+/// is in the file.
+const unrealExts = {'uasset', 'umap', 'uexp', 'ubulk'};
 const archiveExts = {'zip'};
-const maxZipIntrospectionBytes = 128 * 1024 * 1024;
-const maxZipEntriesToInspect = 25000;
+
+/// A ceiling on entries read out of one archive's directory.
+///
+/// A safety valve against something pathological, not a quality setting: the
+/// largest archive in this library holds a few thousand entries, and reading
+/// the directory costs no more than that whatever the archive weighs.
+///
+/// There used to be a companion byte cap as well, and it was quietly the
+/// biggest hole in the catalog. Archives were read by slurping the whole file
+/// into memory, so anything over 128MB had to be skipped -- which silently
+/// dropped 49 Synty archives holding 66,441 indexable entries, 3,284 of them
+/// FBX, against the 73,865 the catalog did have. Reads come off the central
+/// directory now (`InputFileStream`), so a 2GB archive opens as cheaply as a
+/// 2MB one and there is nothing left for a byte cap to protect.
+const maxZipEntriesToInspect = 200000;
+
+/// How many archives keep an open file handle for reading entries.
 const maxZipArchiveCacheEntries = 8;
-const appVersion = '1.10.18';
+
+/// How long an archive stays open after the last entry read.
+///
+/// An open handle is what makes browsing cheap -- reopening costs 20-40ms of
+/// directory parsing, and scrolling a grid reads hundreds of entries -- but on
+/// Windows it also blocks renaming or deleting that archive. Nobody expects a
+/// browser to lock the file they are trying to reorganise, so the handles are
+/// dropped shortly after the reading stops.
+const zipArchiveIdleTimeout = Duration(seconds: 5);
+
+/// How many bytes of decoded texture to keep.
+///
+/// Decoded means raw RGBA, so the size on disk is no guide: this library's
+/// packs use 2048x2048 atlases (16MB each) and 4096x4096 ones (64MB each),
+/// and ten models out of POLYGON_SciFi_Horror between them wanted 128MB in
+/// two textures. 256MB would hold that pack and little more, so the budget
+/// is 512MB: the failure mode of a cache too small is evicting a texture
+/// just before the next asset asks for it, which costs the read it was meant
+/// to save. Atlas sits around 500MB with the catalog loaded, so this is a
+/// real increase and a deliberate one.
+///
+/// It is a cache of bytes, not of images: nothing here holds a file handle or
+/// a GPU resource, so the only cost is the memory.
+///
+/// Not const only so tests can shrink it and watch eviction happen without
+/// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
+var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
+const appVersion = '1.10.51';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -131,9 +259,14 @@ void initializeFbxLogPath() {
 }
 
 class AssetAtlasApp extends StatelessWidget {
-  const AssetAtlasApp({this.enablePersistence = true, super.key});
+  const AssetAtlasApp({
+    this.enablePersistence = true,
+    this.options = const StartupOptions(),
+    super.key,
+  });
 
   final bool enablePersistence;
+  final StartupOptions options;
 
   @override
   Widget build(BuildContext context) {
@@ -147,15 +280,23 @@ class AssetAtlasApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: CatalogScreen(enablePersistence: enablePersistence),
+      home: CatalogScreen(
+        enablePersistence: enablePersistence,
+        options: options,
+      ),
     );
   }
 }
 
 class CatalogScreen extends StatefulWidget {
-  const CatalogScreen({this.enablePersistence = true, super.key});
+  const CatalogScreen({
+    this.enablePersistence = true,
+    this.options = const StartupOptions(),
+    super.key,
+  });
 
   final bool enablePersistence;
+  final StartupOptions options;
 
   @override
   State<CatalogScreen> createState() => _CatalogScreenState();
@@ -164,8 +305,156 @@ class CatalogScreen extends StatefulWidget {
 class _CatalogScreenState extends State<CatalogScreen> {
   final db = AssetAtlasDatabase.instance;
   final assets = <AssetItem>[];
+
+  /// The bone names behind each rig signature in the catalog, read once when
+  /// it opens. A few dozen entries: rigs repeat across thousands of files.
+  final rigBonesBySignature = <String, List<String>>{};
+
+  /// How hard a tagging run may push this machine. Saved between runs.
+  TaggingMode _taggingMode = TaggingMode.balanced;
+
+  /// One row per model instead of one row per file. Saved between runs.
+  ///
+  /// On by default: `war_robot_01` is seven files in this library -- the
+  /// source FBX and six Unreal builds of it -- and seven rows of the same
+  /// robot is not what anyone is looking for.
+  bool collapseVersions = true;
+
+  Future<void> _loadCollapseVersions() async {
+    try {
+      final saved = await db.readSetting(collapseVersionsKey);
+      if (!mounted || saved == null) return;
+      setState(() => collapseVersions = saved == 'true');
+    } catch (error) {
+      fbxLog('Could not read the collapse setting: $error');
+    }
+  }
+
+  Future<void> _setCollapseVersions(bool value) async {
+    setState(() => collapseVersions = value);
+    try {
+      await db.writeSetting(collapseVersionsKey, '$value');
+    } catch (error) {
+      fbxLog('Could not save the collapse setting: $error');
+    }
+  }
+
+  Future<void> _loadTaggingMode() async {
+    try {
+      final saved = await db.readSetting(taggingModeKey);
+      if (!mounted) return;
+      setState(() {
+        _taggingMode = widget.options.tagMode ?? taggingModeByName(saved);
+      });
+    } catch (error) {
+      fbxLog('Could not read the tagging mode: $error');
+    }
+  }
+
+  Future<void> _setTaggingMode(TaggingMode mode) async {
+    setState(() => _taggingMode = mode);
+    try {
+      await db.writeSetting(taggingModeKey, mode.name);
+    } catch (error) {
+      fbxLog('Could not save the tagging mode: $error');
+    }
+  }
   final selectedIds = <String>{};
   final sourceRoots = <String>{};
+
+  /// True when the persisted catalog was scanned under older rules than the
+  /// scanner now applies, so the counts understate what the folders hold.
+  bool catalogRulesStale = false;
+
+  /// Narrows the folder tree to names containing this. Distinct from
+  /// [folderFilter], which is the folder the asset list is narrowed to.
+  String folderTreeFilter = '';
+  final TextEditingController folderFilterController = TextEditingController();
+
+  /// Scans every source again, in order. What a catalog saved under older
+  /// rules needs, and otherwise a long way round to the Scan button.
+  /// Walk every source again, keeping what is still true.
+  ///
+  /// `force` discards every probed classification and starts over, which is
+  /// hours of importer runs for this library -- so it is a separate button,
+  /// not the default.
+  /// Start tagging [scope], or report why it cannot be.
+  Future<void> _startVisualTagging(TagScope scope) async {
+    if (_tagQueue?.isRunning ?? false) return;
+    final script = embedderScriptPath();
+    if (script == null) {
+      setState(() => _tagUnavailable =
+          'atlas_embed.py was not found beside the app. Visual tagging needs '
+          'work/atlas_mcp next to the executable.');
+      return;
+    }
+    setState(() {
+      _tagUnavailable = null;
+      _tagProgress = const TagProgress(state: TagState.starting);
+    });
+    final python = await findEmbedderPython(script: script);
+    if (!mounted) return;
+    if (python == null) {
+      setState(() {
+        _tagUnavailable =
+            'No Python on PATH could run the embedder. It needs onnxruntime, '
+            'Pillow, numpy and sentencepiece -- see '
+            'work/atlas_mcp/README.md.';
+        _tagProgress = const TagProgress(state: TagState.idle);
+      });
+      return;
+    }
+
+    final folder = db.catalogDirectory;
+    if (folder == null) {
+      setState(() => _tagUnavailable =
+          'The catalog is not open yet, and the embedding store lives beside '
+          'it.');
+      return;
+    }
+    final separator = Platform.pathSeparator;
+    final queue = VisualTagQueue(
+      python: python,
+      script: script,
+      vectorsPath: '$folder${separator}embeddings.f32',
+      indexPath: '$folder${separator}embeddings_index.sqlite',
+      // The app's own renderer, which is the point: what gets embedded is
+      // what the app shows.
+      renderAsset: (path, size) async {
+        final asset = assets.firstWhere(
+          (candidate) => candidate.path == path,
+          orElse: () => throw StateError('$path is no longer catalogued'),
+        );
+        final drawn = await renderAsset(
+          asset,
+          allAssets: assets,
+          size: size,
+        );
+        return drawn.png;
+      },
+      // There is no bridge in the way here -- the renderer is in this
+      // process -- so the only way it "stops" is the app shutting down.
+      isRendererAlive: () async => mounted,
+      // The mode sets all three; an explicit --tag-lanes still wins, which
+      // is what that flag was for before modes existed.
+      renderConcurrency: widget.options.renderLanes ?? _taggingMode.lanes,
+      threads: _taggingMode.threadsOn(Platform.numberOfProcessors),
+      paceMs: _taggingMode.paceMs,
+      force: widget.options.tagForce,
+      onProgress: (progress) {
+        if (!mounted) return;
+        setState(() => _tagProgress = progress);
+      },
+    );
+    _tagQueue = queue;
+    await queue.start(scope);
+  }
+
+  Future<void> _rescanAllSources({bool force = false}) async {
+    for (final root in sourceRoots.toList()) {
+      await scanFolder(root, force: force);
+    }
+  }
   final searchController = TextEditingController();
 
   AssetItem? active;
@@ -191,13 +480,21 @@ class _CatalogScreenState extends State<CatalogScreen> {
   Timer? _searchDebounce;
   ScanHandle? _activeScan;
 
+  /// Visual tagging, running behind everything else.
+  ///
+  /// Created on demand, because it starts a Python child process holding
+  /// 325 MB of model and most sessions never ask for one.
+  VisualTagQueue? _tagQueue;
+  TagProgress _tagProgress = const TagProgress(state: TagState.idle);
+  String? _tagUnavailable;
+
   /// Bumped whenever something that affects filtering changes without the
   /// catalog itself changing: an ignore toggle, a texture validation result, an
   /// FBX classification.
   int _listEpoch = 0;
   List<AssetItem>? _sortedCache;
   String? _sortedCacheKey;
-  List<AssetItem>? _filteredCache;
+  CollapsedAssets? _filteredCache;
   String? _filteredCacheKey;
   List<FolderNode>? _folderRootsCache;
   int _folderRootsRevision = -1;
@@ -232,6 +529,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
         'Restoring catalog in the background...',
       );
       _restorePersistedCatalog();
+      unawaited(_loadTaggingMode());
+      unawaited(_loadCollapseVersions());
+      // The MCP's model tools ask the running app rather than restating its
+      // texture and rig logic, so the bridge is up for as long as the window
+      // is. Not in tests: binding a port is not a widget test's business.
+      AtlasBridge.instance.bindCatalog(() => assets);
+      unawaited(AtlasBridge.instance.start());
     } else {
       loadingPersisted = false;
     }
@@ -354,7 +658,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
   /// Filtering a sorted list yields a sorted list, so searching no longer has
   /// to re-sort tens of thousands of assets on every keystroke.
   List<AssetItem> get sortedAssets {
-    final key = '$catalogRevision|${sortMode.name}|$_listEpoch';
+    // The epoch is in the key only for the one mode whose order can change
+    // without the catalog changing. The other three things that bump it --
+    // a classification result, a texture validation, ignoring an asset --
+    // change what the list *shows*, not the order it is in, and re-sorting
+    // for them cost 6.7 s of frozen window each time one landed.
+    final epoch = sortMode == AssetSortMode.type ? '$_listEpoch' : '';
+    final key = '$catalogRevision|${sortMode.name}|$epoch';
     if (_sortedCache == null || _sortedCacheKey != key) {
       _sortedCache = sortAssets(assets, sortMode);
       _sortedCacheKey = key;
@@ -373,42 +683,54 @@ class _CatalogScreenState extends State<CatalogScreen> {
     cache: _unqueriedCache,
     cachedKey: _unqueriedCacheKey,
     store: _storeUnqueried,
-  );
+  ).rows;
 
-  List<AssetItem> get filteredAssets => _assetsMatching(
+  List<AssetItem> get filteredAssets => _matchingFiltered.rows;
+
+  /// The other copies of a shown row, where it stands for more than one.
+  /// Empty while collapsing is off, because then every file has its own row.
+  Map<String, List<AssetItem>> get versionMembers =>
+      _matchingFiltered.membersById;
+
+  CollapsedAssets get _matchingFiltered => _assetsMatching(
     query: query,
     cache: _filteredCache,
     cachedKey: _filteredCacheKey,
     store: _storeFiltered,
   );
 
-  List<AssetItem>? _unqueriedCache;
+  CollapsedAssets? _unqueriedCache;
   String? _unqueriedCacheKey;
-  void _storeUnqueried(List<AssetItem> value, String key) {
+  void _storeUnqueried(CollapsedAssets value, String key) {
     _unqueriedCache = value;
     _unqueriedCacheKey = key;
   }
 
-  void _storeFiltered(List<AssetItem> value, String key) {
+  void _storeFiltered(CollapsedAssets value, String key) {
     _filteredCache = value;
     _filteredCacheKey = key;
   }
 
-  List<AssetItem> _assetsMatching({
+  CollapsedAssets _assetsMatching({
     required String query,
-    required List<AssetItem>? cache,
+    required CollapsedAssets? cache,
     required String? cachedKey,
-    required void Function(List<AssetItem>, String) store,
+    required void Function(CollapsedAssets, String) store,
   }) {
-    final lower = query.trim().toLowerCase();
+    final parsed = parseAssetQuery(query);
     final cacheKey = [
-      lower,
+      query.trim().toLowerCase(),
       typeFilter,
       rigFilter,
       AnimationCharacter.instance.rigFamily ?? '',
+      AnimationCharacter.instance.rigSignature ?? '',
+      // The character's own path, because an unnamed rig is matched by the
+      // container it shipped in rather than by its family name.
+      AnimationCharacter.instance.path.value ?? '',
       modelTextureFilter,
       hideIgnored,
       hideZipAssets,
+      collapseVersions,
       folderFilter ?? '',
       sortMode.name,
       catalogRevision,
@@ -416,7 +738,37 @@ class _CatalogScreenState extends State<CatalogScreen> {
     ].join('|');
     if (cache != null && cachedKey == cacheKey) return cache;
 
+    // Bones beat family names wherever both rigs are known. The index is
+    // built once per catalog, not once per pass.
+    final rigIndex = rigFilter == 'compatible'
+        ? rigIndexFor(assets, rigBonesBySignature)
+        : null;
+    final characterSignature = AnimationCharacter.instance.rigSignature;
+
+    // Only an unnamed rig needs this, and finding it is a scan of the
+    // catalog, so it is done once per filter pass and only when it can
+    // matter -- never per asset, and never for the three named families.
+    String? characterContainer;
+    if (rigFilter == 'compatible' &&
+        rigFamilyByName(AnimationCharacter.instance.rigFamily) ==
+            RigFamily.other) {
+      final chosen = AnimationCharacter.instance.path.value;
+      if (chosen != null) {
+        final key = normalizePathKey(chosen);
+        for (final asset in sortedAssets) {
+          if (normalizePathKey(asset.path) == key) {
+            characterContainer = assetContainerKey(asset);
+            break;
+          }
+        }
+      }
+    }
+
     final matches = sortedAssets.where((asset) {
+      // A query that cannot be read matches nothing, rather than matching
+      // everything: the box says what is wrong with it, and a list that
+      // quietly ignored the scoping would be worse than an empty one.
+      if (!parsed.isValid) return false;
       if (hideIgnored && asset.ignored) return false;
       if (folderFilter != null &&
           !isUnderFolder(asset.relativePath, folderFilter!)) {
@@ -434,17 +786,16 @@ class _CatalogScreenState extends State<CatalogScreen> {
         }
         if (!assetIsCharacterModel(asset)) return false;
       } else if (typeFilter == 'animation') {
-        // Only a parse can tell an animation clip from a mesh, so ask for one
-        // and leave the asset out of the list until the answer arrives.
-        if (asset.type == 'model' && asset.ext == 'fbx') {
-          if (asset.modelKind == null) {
-            _scheduleModelKindClassification([asset]);
-            return false;
-          }
-          if (asset.modelKind != 'animation') return false;
-        } else if (asset.effectiveType != 'animation') {
-          return false;
+        // A parse is still the authority, and is still asked for. But the
+        // list no longer waits on it: effectiveType falls back to the folder
+        // name, so a rescan that empties modelKind no longer empties this
+        // filter. Before this, it showed nothing and queued 34,801 probes.
+        if (asset.type == 'model' &&
+            asset.ext == 'fbx' &&
+            asset.modelKind == null) {
+          _scheduleModelKindClassification([asset]);
         }
+        if (asset.effectiveType != 'animation') return false;
       } else if (typeFilter != 'all' && asset.effectiveType != typeFilter) {
         return false;
       }
@@ -452,6 +803,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
         asset: asset,
         rigFilter: rigFilter,
         characterRig: AnimationCharacter.instance.rigFamily,
+        characterContainer: characterContainer,
+        characterSignature: characterSignature,
+        rigIndex: rigIndex,
       )) {
         return false;
       }
@@ -466,12 +820,22 @@ class _CatalogScreenState extends State<CatalogScreen> {
           return false;
         }
       }
-      if (lower.isEmpty) return true;
-      return assetMatchesSearch(asset.searchText, lower);
+      if (parsed.isEmpty) return true;
+      return assetMatchesQuery(parsed, asset.queryValue);
     }).toList();
 
-    store(matches, cacheKey);
-    return matches;
+    // One row per model, where the user has asked for that. Done after
+    // filtering rather than before it, so a filter still sees every file:
+    // "characters with no texture" means the files, and only the rows the
+    // answer is shown as are collapsed.
+    final result = collapseVersions
+        ? collapseAssetVersions(matches)
+        : CollapsedAssets(
+            rows: List<AssetItem>.unmodifiable(matches),
+            membersById: const {},
+          );
+    store(result, cacheKey);
+    return result;
   }
 
   /// Invalidate the memoised list after a change that filtering depends on.
@@ -609,9 +973,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
       if (asset != null) {
         asset.modelKind = decoded.kind;
         asset.rigFamily = decoded.rig;
+        asset.rigSignature = decoded.signature;
+      }
+      final signature = decoded.signature;
+      if (signature != null && decoded.bones.isNotEmpty) {
+        rigBonesBySignature.putIfAbsent(signature, () => decoded.bones);
       }
       _modelKindInFlight.remove(entry.key);
     }
+    // The catalog list is the same object with changed items in it, so the
+    // index's generation key has not moved. Drop it by hand or a newly
+    // classified rig would not appear in anyone's list until a rescan.
+    resetRigIndex();
     _modelKindClassified += kinds.length;
 
     setState(() {
@@ -674,6 +1047,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
     _activeScan?.cancel();
     _searchDebounce?.cancel();
     searchController.dispose();
+    folderFilterController.dispose();
+    unawaited(AtlasBridge.instance.stop());
     super.dispose();
   }
 
@@ -681,13 +1056,33 @@ class _CatalogScreenState extends State<CatalogScreen> {
     try {
       final snapshot = await db.loadCatalog();
       if (!mounted) return;
+      // Before the list is built from it: the chosen character's stored rig
+      // family may predate a change to the rig rules, and the filter reads
+      // that copy rather than the column.
+      await AnimationCharacter.instance.refreshRigFrom(snapshot.assets);
+      if (!mounted) return;
+      // A catalog saved before a rule change is missing whatever the change
+      // added -- Unreal files, most recently -- and would otherwise report
+      // "0" as if that were the truth about the library. Saying so is the
+      // least the app can do; the rescan is the user's to start.
+      final rules = int.tryParse(await db.readSetting(catalogRulesKey) ?? '');
+      final stale =
+          snapshot.assets.isNotEmpty &&
+          (rules == null || rules < scanRulesVersion);
+      if (!mounted) return;
       setState(() {
+        catalogRulesStale = stale;
         sourceRoots
           ..clear()
           ..addAll(snapshot.sourceRoots);
         assets
           ..clear()
           ..addAll(snapshot.assets);
+        rigBonesBySignature
+          ..clear()
+          ..addAll(snapshot.rigBones);
+        resetRigIndex();
+        resetTwinIndex();
         modelHasValidTextures.clear();
         MeshLoadCache.clear();
         ModelThumbnailCache.clear();
@@ -704,6 +1099,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
           status = const ScanStatus('Ready', 'Choose a folder to catalog.');
         }
       });
+      // Here rather than in initState: tagging needs the catalog, and
+      // before the restore finishes there is nothing to render.
+      if (widget.options.tagAll &&
+          widget.enablePersistence &&
+          assets.isNotEmpty) {
+        unawaited(_startVisualTagging(const TagScope()));
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -716,6 +1118,10 @@ class _CatalogScreenState extends State<CatalogScreen> {
   Future<void> _persistCatalog() async {
     if (!widget.enablePersistence) return;
     await db.saveCatalog(assets: assets, sourceRoots: sourceRoots.toList());
+    // A catalog written now was scanned under the current rules; a stale
+    // banner, if one was up, comes down with the next restore.
+    await db.writeSetting(catalogRulesKey, '$scanRulesVersion');
+    if (mounted) setState(() => catalogRulesStale = false);
   }
 
   /// Runs a persistence call without blocking the caller, but surfaces a
@@ -1057,7 +1463,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     await scanFolder(path);
   }
 
-  Future<void> scanFolder(String rootPath) async {
+  /// Walk a folder and fold the result into the catalog.
+  ///
+  /// `force` re-derives every classification instead of carrying the ones
+  /// whose files have not changed. For when the derivation changed, not the
+  /// files.
+  Future<void> scanFolder(String rootPath, {bool force = false}) async {
     if (scanning) return;
     setState(() {
       scanning = true;
@@ -1097,11 +1508,27 @@ class _CatalogScreenState extends State<CatalogScreen> {
     }
 
     if (!mounted) return;
+    CarryTally carried = const CarryTally(unchanged: 0, changed: 0, added: 0);
     setState(() {
       _activeScan = null;
       sourceRoots.add(rootPath);
+      // What a file *is* does not change because the folder was walked
+      // again. Classification is an importer run per FBX -- 34,801 of them
+      // in this library -- and the first rescan after it landed threw every
+      // one away, which emptied the Character and Animation filters until
+      // the whole lot had been probed a second time. Ids are content
+      // independent, so the answers carry across by id -- but only for the
+      // files that have not changed, or the catalog would be repeating
+      // something that was true of a different file.
+      final remembered = <String, AssetItem>{
+        for (final asset in assets)
+          if (asset.sourceRoot == rootPath) asset.id: asset,
+      };
+      carried = tallyCarry(result.assets, remembered, force: force);
       assets.removeWhere((asset) => asset.sourceRoot == rootPath);
-      assets.addAll(result.assets);
+      assets.addAll(
+        carryClassification(result.assets, remembered, force: force),
+      );
       MeshLoadCache.clear();
       ModelThumbnailCache.clear();
       catalogRevision += 1;
@@ -1118,14 +1545,22 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _pruneHistoryToVisibleAssets();
       scanning = false;
       status = ScanStatus(
-        'Scan complete',
-        '${result.assets.length} cataloged, ${result.skippedUnsupported} skipped, ${result.skippedBinaryObj} binary OBJ ignored',
+        force ? 'Rescan complete (forced)' : 'Scan complete',
+        '${result.assets.length} cataloged (${carried.summary}), '
+            '${result.skippedUnsupported} skipped, '
+            '${result.skippedBinaryObj} binary OBJ ignored',
       );
     });
     if (modelTextureFilter != 'all') {
       _scheduleModelTextureValidation(result.assets);
     }
     await _persistCatalog();
+    // Directive: point Atlas at a folder and the tagging queues itself.
+    // Only for a folder with something new in it, so a rescan that changed
+    // nothing does not start an hours-long job unasked.
+    if (carried.added > 0 && widget.enablePersistence) {
+      unawaited(_startVisualTagging(TagScope(folder: rootPath)));
+    }
   }
 
   void removeSource(String rootPath) {
@@ -1332,6 +1767,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
           .where((asset) => asset.effectiveType == 'animation')
           .length,
       'audio': assets.where((asset) => asset.effectiveType == 'audio').length,
+      'unreal': assets
+          .where((asset) => asset.effectiveType == 'unreal')
+          .length,
     };
 
     return Scaffold(
@@ -1375,6 +1813,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       modelTextureFilter: modelTextureFilter,
                       hideIgnored: hideIgnored,
                       hideZipAssets: hideZipAssets,
+                      collapseVersions: collapseVersions,
+                      onCollapseVersionsChanged: (value) =>
+                          unawaited(_setCollapseVersions(value)),
                       sourceRoots: sourceRoots.toList()..sort(),
                       folderRoots: folderRoots,
                       selectedFolder: folderFilter,
@@ -1388,14 +1829,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           }
                         });
                       },
-                      onTypeChanged: (value) => setState(() {
-                        typeFilter = value;
-                        // A query typed against one type almost never means
-                        // anything against the next, and leaving it set makes
-                        // the new type look empty.
-                        searchController.clear();
-                        _onSearchChanged('');
-                      }),
+                      // Changing the type changes the type and nothing
+                      // else. This used to clear the search as well, on the
+                      // theory that a query typed against one type means
+                      // nothing against the next; the empty-list line in
+                      // SearchAndSummary answers that worry without throwing
+                      // away what the user typed.
+                      onTypeChanged: (value) =>
+                          setState(() => typeFilter = value),
                       onModelTextureFilterChanged: (value) {
                         setState(() {
                           modelTextureFilter = value;
@@ -1429,6 +1870,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         });
                       },
                       onRemoveSource: removeSource,
+                      folderFilter: folderTreeFilter,
+                      folderFilterController: folderFilterController,
+                      onFolderFilterChanged: (value) =>
+                          setState(() => folderTreeFilter = value),
+                      catalogRulesStale: catalogRulesStale,
+                      onRescanAll: _rescanAllSources,
+                      onForceRescanAll: () =>
+                          unawaited(_rescanAllSources(force: true)),
                     ),
                     VerticalResizeHandle(
                       onDrag: (delta) {
@@ -1464,6 +1913,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                             child: gridMode
                                 ? AssetGrid(
                                     assets: visible,
+                                    versionMembers: versionMembers,
                                     active: active,
                                     selectedIds: selectedIds,
                                     onActivate: _activateAsset,
@@ -1471,6 +1921,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                   )
                                 : AssetList(
                                     assets: visible,
+                                    versionMembers: versionMembers,
                                     active: active,
                                     selectedIds: selectedIds,
                                     onActivate: _activateAsset,
@@ -1497,11 +1948,26 @@ class _CatalogScreenState extends State<CatalogScreen> {
                         asset: active,
                         allAssets: assets,
                         catalogRevision: catalogRevision,
+                        rigBones: rigBonesBySignature,
                         onActivateAsset: _activateAsset,
                       ),
                     ),
                   ],
                 ),
+              ),
+              // Last in the column, so it sits along the bottom edge: a job
+              // that runs for hours should be glanceable and never in the
+              // way of the thing being looked at.
+              VisualTaggingStrip(
+                progress: _tagProgress,
+                unavailable: _tagUnavailable,
+                mode: _taggingMode,
+                onModeChanged: (mode) => unawaited(_setTaggingMode(mode)),
+                onPause: () => _tagQueue?.pause(),
+                onResume: () => _tagQueue?.resumeRun(),
+                onStop: () => _tagQueue?.stop(),
+                onStart: () =>
+                    unawaited(_startVisualTagging(const TagScope())),
               ),
             ],
           ),
@@ -1828,6 +2294,16 @@ bool isUnderFolder(String relativePath, String folderPath) {
   return normalized == folderPath || normalized.startsWith('$folderPath/');
 }
 
+/// Whether [node] or anything under it has [needle] in its name.
+bool folderTreeMatches(FolderNode node, String needle) {
+  if (needle.isEmpty) return true;
+  if (node.name.toLowerCase().contains(needle)) return true;
+  for (final child in node.childrenByName.values) {
+    if (folderTreeMatches(child, needle)) return true;
+  }
+  return false;
+}
+
 class FolderTreeView extends StatelessWidget {
   const FolderTreeView({
     required this.roots,
@@ -1835,6 +2311,7 @@ class FolderTreeView extends StatelessWidget {
     required this.expandedFolders,
     required this.onSelect,
     required this.onToggleExpanded,
+    this.filter = '',
     super.key,
   });
 
@@ -1843,6 +2320,11 @@ class FolderTreeView extends StatelessWidget {
   final Set<String> expandedFolders;
   final ValueChanged<String?> onSelect;
   final ValueChanged<String> onToggleExpanded;
+
+  /// Only folders whose name -- or a descendant's -- contains this are shown,
+  /// and the path down to each match is held open. Three hundred packs under
+  /// one root is a long list to scroll for the one you want.
+  final String filter;
 
   @override
   Widget build(BuildContext context) {
@@ -1853,26 +2335,43 @@ class FolderTreeView extends StatelessWidget {
       );
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        _FolderRow(
-          label: 'All folders',
-          count: null,
-          depth: 0,
-          selected: selectedFolder == null,
-          expandable: false,
-          expanded: false,
-          onTap: () => onSelect(null),
-          onToggleExpanded: () {},
+    final needle = filter.trim().toLowerCase();
+    final rows = <Widget>[
+      _FolderRow(
+        label: 'All folders',
+        count: null,
+        depth: 0,
+        selected: selectedFolder == null,
+        expandable: false,
+        expanded: false,
+        onTap: () => onSelect(null),
+        onToggleExpanded: () {},
+      ),
+      for (final root in roots) ..._buildNode(root, 0, needle),
+    ];
+    if (needle.isNotEmpty && rows.length == 1) {
+      rows.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 6),
+          child: Text(
+            'No folder has that in its name.',
+            style: TextStyle(color: Colors.black54, fontSize: 12),
+          ),
         ),
-        for (final root in roots) ..._buildNode(root, 0),
-      ],
-    );
+      );
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows);
   }
 
-  List<Widget> _buildNode(FolderNode node, int depth) {
-    final expanded = expandedFolders.contains(node.path);
+  List<Widget> _buildNode(FolderNode node, int depth, String needle) {
+    if (!folderTreeMatches(node, needle)) return const [];
+    // While filtering, a node is open whenever something under it matches:
+    // the point of the filter is to reach the match, not to find it closed.
+    final selfMatches =
+        needle.isNotEmpty && node.name.toLowerCase().contains(needle);
+    final expanded = needle.isEmpty
+        ? expandedFolders.contains(node.path)
+        : !selfMatches || expandedFolders.contains(node.path);
     return [
       _FolderRow(
         label: node.name,
@@ -1886,7 +2385,7 @@ class FolderTreeView extends StatelessWidget {
       ),
       if (expanded)
         for (final child in node.sortedChildren)
-          ..._buildNode(child, depth + 1),
+          ..._buildNode(child, depth + 1, needle),
     ];
   }
 }
@@ -1985,6 +2484,8 @@ class FilterPanel extends StatelessWidget {
     required this.modelTextureFilter,
     required this.hideIgnored,
     required this.hideZipAssets,
+    required this.collapseVersions,
+    required this.onCollapseVersionsChanged,
     required this.sourceRoots,
     required this.folderRoots,
     required this.selectedFolder,
@@ -1997,6 +2498,12 @@ class FilterPanel extends StatelessWidget {
     required this.onHideIgnoredChanged,
     required this.onHideZipAssetsChanged,
     required this.onRemoveSource,
+    required this.folderFilter,
+    required this.folderFilterController,
+    required this.onFolderFilterChanged,
+    required this.catalogRulesStale,
+    required this.onRescanAll,
+    required this.onForceRescanAll,
     super.key,
   });
 
@@ -2012,6 +2519,8 @@ class FilterPanel extends StatelessWidget {
   final String modelTextureFilter;
   final bool hideIgnored;
   final bool hideZipAssets;
+  final bool collapseVersions;
+  final ValueChanged<bool> onCollapseVersionsChanged;
   final List<String> sourceRoots;
   final List<FolderNode> folderRoots;
   final String? selectedFolder;
@@ -2021,6 +2530,12 @@ class FilterPanel extends StatelessWidget {
   final ValueChanged<String> onTypeChanged;
   final ValueChanged<String> onRigFilterChanged;
   final ValueChanged<String> onModelTextureFilterChanged;
+  final String folderFilter;
+  final TextEditingController folderFilterController;
+  final ValueChanged<String> onFolderFilterChanged;
+  final bool catalogRulesStale;
+  final VoidCallback onRescanAll;
+  final VoidCallback onForceRescanAll;
   final ValueChanged<bool> onHideIgnoredChanged;
   final ValueChanged<bool> onHideZipAssetsChanged;
   final ValueChanged<String> onRemoveSource;
@@ -2034,6 +2549,50 @@ class FilterPanel extends StatelessWidget {
         child: ListView(
           padding: const EdgeInsets.all(14),
           children: [
+            if (catalogRulesStale)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xfffff4e0),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xffe0c080)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'This catalog was scanned under older rules, so it '
+                        'is missing file types added since -- Unreal assets, '
+                        'most recently. The counts below understate what the '
+                        'folders hold until they are rescanned.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                      const SizedBox(height: 6),
+                      FilledButton.tonal(
+                        onPressed: onRescanAll,
+                        child: const Text('Rescan all folders'),
+                      ),
+                      const SizedBox(height: 4),
+                      // Separate, and named for what it costs. The ordinary
+                      // rescan keeps every probe result whose file has not
+                      // changed; this one throws them away, which for this
+                      // library is hours of importer runs. Worth having --
+                      // the probe itself improves sometimes, and no
+                      // comparison of timestamps can detect that -- but not
+                      // worth reaching for by accident.
+                      TextButton(
+                        onPressed: onForceRescanAll,
+                        child: const Text(
+                          'Force full rescan (re-probes everything)',
+                          style: TextStyle(fontSize: 11),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             const Text('Types', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             for (final type in [
@@ -2044,6 +2603,7 @@ class FilterPanel extends StatelessWidget {
               'character',
               'animation',
               'audio',
+              'unreal',
             ])
               Padding(
                 padding: const EdgeInsets.only(bottom: 6),
@@ -2056,6 +2616,10 @@ class FilterPanel extends StatelessWidget {
                       : type == 'character'
                       ? 'Models with a skeleton, read from the bones rather '
                             'than the file name.'
+                      : type == 'unreal'
+                      ? 'Unreal asset files. Listed so a pack that ships '
+                            'nothing else is not mistaken for an empty '
+                            'folder; they cannot be previewed.'
                       : '',
                   child: ChoiceChip(
                     selected: typeFilter == type,
@@ -2151,18 +2715,53 @@ class FilterPanel extends StatelessWidget {
               subtitle: const Text('Exclude assets indexed inside archives'),
               onChanged: (value) => onHideZipAssetsChanged(value ?? true),
             ),
+            CheckboxListTile(
+              dense: true,
+              value: collapseVersions,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Collapse versions'),
+              subtitle: const Text(
+                'One row per model, not one per engine build',
+              ),
+              onChanged: (value) => onCollapseVersionsChanged(value ?? true),
+            ),
             const Divider(height: 28),
             const Text(
               'Folders',
               style: TextStyle(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 4),
+            TextField(
+              controller: folderFilterController,
+              onChanged: onFolderFilterChanged,
+              decoration: InputDecoration(
+                isDense: true,
+                prefixIcon: const Icon(Icons.filter_alt_outlined, size: 18),
+                hintText: 'Filter folders',
+                suffixIcon: folderFilter.isEmpty
+                    ? null
+                    : IconButton(
+                        icon: const Icon(Icons.close, size: 16),
+                        onPressed: () {
+                          folderFilterController.clear();
+                          onFolderFilterChanged('');
+                        },
+                      ),
+                border: const OutlineInputBorder(),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 8,
+                  vertical: 8,
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
             FolderTreeView(
               roots: folderRoots,
               selectedFolder: selectedFolder,
               expandedFolders: expandedFolders,
               onSelect: onFolderSelected,
               onToggleExpanded: onFolderExpandToggled,
+              filter: folderFilter,
             ),
             const Divider(height: 28),
             const Text(
@@ -2275,7 +2874,15 @@ class SearchAndSummary extends StatelessWidget {
                   controller: controller,
                   decoration: InputDecoration(
                     prefixIcon: const Icon(Icons.search),
-                    hintText: 'Search name, folder, or tag',
+                    hintText: 'Search, or scope it: tag=grungy name=door',
+                    // Parsed here rather than plumbed down from the list,
+                    // because a refusal is a property of the text in the box
+                    // and nothing else. parseAssetQuery is a scan of a short
+                    // string, and build already runs on every keystroke.
+                    errorText: parseAssetQuery(controller.text).error,
+                    helperText: controller.text.trim().isEmpty
+                        ? 'name, path, tag, type, ext, rig -- `or` to widen'
+                        : null,
                     border: const OutlineInputBorder(),
                     isDense: true,
                     suffixIcon: controller.text.isEmpty
@@ -2361,6 +2968,35 @@ class SearchAndSummary extends StatelessWidget {
                 ),
             ],
           ),
+          // An empty list after a filter change used to be explained by
+          // clearing the search. The search now survives, so the list explains
+          // itself instead -- otherwise the view looks broken rather than
+          // filtered.
+          if (visibleCount == 0 && controller.text.trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Still searching for "${controller.text.trim()}". '
+                      'Nothing in this view matches.',
+                      style: const TextStyle(color: Colors.black54),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      controller.clear();
+                      onChanged('');
+                    },
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    child: const Text('Clear search'),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );
@@ -2374,15 +3010,60 @@ IconData iconForAssetType(String effectiveType) => switch (effectiveType) {
   'audio' => Icons.graphic_eq,
   'animation' => Icons.directions_run,
   'model' => Icons.view_in_ar_outlined,
+  'unreal' => Icons.videogame_asset_outlined,
   _ => Icons.insert_drive_file_outlined,
 };
 
 typedef AssetSelectCallback =
     void Function(AssetItem asset, bool selected, {bool range});
 
+/// What a collapsed row stands for: `x7`, with the files behind it listed
+/// on hover.
+///
+/// The count is of rows the list would have shown without collapsing, not
+/// of every copy in the catalog, so that turning the toggle off accounts
+/// for exactly what the badge claimed.
+class VersionCountBadge extends StatelessWidget {
+  const VersionCountBadge({required this.members, super.key});
+
+  final List<AssetItem> members;
+
+  @override
+  Widget build(BuildContext context) {
+    final byExt = <String, int>{};
+    for (final member in members) {
+      final ext = member.ext.toUpperCase();
+      byExt[ext] = (byExt[ext] ?? 0) + 1;
+    }
+    final summary = [
+      for (final entry in byExt.entries)
+        entry.value > 1 ? '${entry.value} x ${entry.key}' : entry.key,
+    ].join(', ');
+
+    return Tooltip(
+      message: '${members.length} files of this model: $summary'
+          '\n\n${members.map((member) => member.path).join('\n')}',
+      waitDuration: const Duration(milliseconds: 400),
+      child: Container(
+        margin: const EdgeInsets.only(right: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.secondaryContainer,
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Text(
+          'x${members.length}',
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
 class AssetList extends StatelessWidget {
   const AssetList({
     required this.assets,
+    required this.versionMembers,
     required this.active,
     required this.selectedIds,
     required this.onActivate,
@@ -2392,6 +3073,11 @@ class AssetList extends StatelessWidget {
   });
 
   final List<AssetItem> assets;
+
+  /// The files each row stands for, by row id, where a row stands for more
+  /// than one. Empty while collapsing is off.
+  final Map<String, List<AssetItem>> versionMembers;
+
   final AssetItem? active;
   final Set<String> selectedIds;
   final ValueChanged<AssetItem> onActivate;
@@ -2478,6 +3164,8 @@ class AssetList extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 6),
+                  if (versionMembers[asset.id] case final members?)
+                    VersionCountBadge(members: members),
                   Text(
                     asset.ext.toUpperCase(),
                     style: const TextStyle(fontSize: 11, color: Colors.black45),
@@ -2543,6 +3231,7 @@ class AssetList extends StatelessWidget {
 class AssetGrid extends StatelessWidget {
   const AssetGrid({
     required this.assets,
+    required this.versionMembers,
     required this.active,
     required this.selectedIds,
     required this.onActivate,
@@ -2551,6 +3240,10 @@ class AssetGrid extends StatelessWidget {
   });
 
   final List<AssetItem> assets;
+
+  /// The files each tile stands for, by row id. See [AssetList].
+  final Map<String, List<AssetItem>> versionMembers;
+
   final AssetItem? active;
   final Set<String> selectedIds;
   final ValueChanged<AssetItem> onActivate;
@@ -2575,6 +3268,7 @@ class AssetGrid extends StatelessWidget {
         final asset = assets[index];
         final isSelected = selectedIds.contains(asset.id);
         return AssetGridTile(
+          versionMembers: versionMembers[asset.id],
           asset: asset,
           allAssets: assets,
           isActive: active?.id == asset.id,
@@ -2594,6 +3288,7 @@ class AssetGrid extends StatelessWidget {
 class AssetGridTile extends StatelessWidget {
   const AssetGridTile({
     required this.asset,
+    required this.versionMembers,
     required this.allAssets,
     required this.isActive,
     required this.isSelected,
@@ -2604,6 +3299,10 @@ class AssetGridTile extends StatelessWidget {
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+
+  /// The files this tile stands for, or null when it is the only copy.
+  final List<AssetItem>? versionMembers;
+
   final bool isActive;
   final bool isSelected;
   final VoidCallback onActivate;
@@ -2665,6 +3364,12 @@ class AssetGridTile extends StatelessWidget {
                             size: 16,
                             color: Colors.black45,
                           ),
+                        ),
+                      if (versionMembers case final members?)
+                        Positioned(
+                          bottom: 2,
+                          right: 2,
+                          child: VersionCountBadge(members: members),
                         ),
                     ],
                   ),
@@ -2941,12 +3646,52 @@ class ZipThumbnailCache {
   static void clear() => _entries.clear();
 }
 
+/// What the preview panel shows for an asset.
+///
+/// A value rather than a chain of `if`s inside the widget, because the bug this
+/// replaces was in the dispatch itself: every type that was not `image` or
+/// `model` fell through to the audio player, which handed Unreal bytes to a
+/// plugin that crashes the process on malformed input. A plain function can be
+/// asserted over every type without pumping a widget or loading a plugin.
+enum PreviewKind {
+  image,
+  model,
+
+  /// A model inside an archive in a format the in-memory reader cannot open.
+  zipModelUnsupported,
+  audio,
+
+  /// Unreal's own cooked assets. Indexed, never previewable.
+  unreal,
+
+  /// Catalogued, but nothing here can draw it.
+  none,
+}
+
+PreviewKind previewKindFor(AssetItem item) {
+  if (item.type == 'image') return PreviewKind.image;
+  if (item.type == 'model') {
+    if (!previewableModelExts.contains(item.ext)) {
+      return PreviewKind.zipModelUnsupported;
+    }
+    if (isZipVirtualPath(item.path) &&
+        !inArchiveModelExts.contains(item.ext)) {
+      return PreviewKind.zipModelUnsupported;
+    }
+    return PreviewKind.model;
+  }
+  if (item.type == 'audio') return PreviewKind.audio;
+  if (item.type == 'unreal') return PreviewKind.unreal;
+  return PreviewKind.none;
+}
+
 class PreviewPanel extends StatefulWidget {
   const PreviewPanel({
     required this.asset,
     required this.allAssets,
     required this.catalogRevision,
     required this.onActivateAsset,
+    this.rigBones = const {},
     super.key,
   });
 
@@ -2955,12 +3700,36 @@ class PreviewPanel extends StatefulWidget {
   final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
 
+  /// The bone names behind each rig signature, for the pairing lists.
+  final Map<String, List<String>> rigBones;
+
   @override
   State<PreviewPanel> createState() => _PreviewPanelState();
 }
 
 class _PreviewPanelState extends State<PreviewPanel> {
   double detailsWidth = 360;
+
+  /// The other half of a pairing being tried out: a clip when a model is
+  /// selected, a model when a clip is selected.
+  ///
+  /// Deliberately not [AnimationCharacter]: that is the character Mike chose
+  /// and it drives every clip preview in the app. Auditioning is "show me
+  /// this pair now", and it must not quietly replace a choice he made.
+  AssetItem? audition;
+
+  void _setAudition(AssetItem? asset) => setState(() => audition = asset);
+
+  @override
+  void didUpdateWidget(covariant PreviewPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Selecting something else ends the audition: it was a pairing with the
+    // old selection, and keeping it would play a clip against a model the
+    // user is no longer looking at.
+    if (oldWidget.asset?.path != widget.asset?.path && audition != null) {
+      audition = null;
+    }
+  }
 
   // Same reason as the diagnostics panel: a future built inline in build()
   // re-read and re-inflated the archive entry on every rebuild.
@@ -3017,6 +3786,9 @@ class _PreviewPanelState extends State<PreviewPanel> {
                   allAssets: widget.allAssets,
                   catalogRevision: widget.catalogRevision,
                   onActivateAsset: widget.onActivateAsset,
+                  rigBones: widget.rigBones,
+                  audition: audition,
+                  onAudition: _setAudition,
                 ),
               ),
             ],
@@ -3026,8 +3798,131 @@ class _PreviewPanelState extends State<PreviewPanel> {
     );
   }
 
+  /// The pairing being auditioned, drawn in place of the still model.
+  Widget _auditionPreview(AssetItem item, AssetItem other) {
+    final model = item.effectiveType == 'animation' ? other : item;
+    final clip = item.effectiveType == 'animation' ? item : other;
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.play_circle_outline, size: 18),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'Auditioning ${clip.name} on ${model.name}',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: () => _setAudition(null),
+                icon: const Icon(Icons.stop, size: 16),
+                label: const Text('Stop'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: FutureBuilder<MeshModel>(
+            // The clip is read the same way the still preview reads a model,
+            // so an audition costs the same one import and hits the same
+            // cache the next time.
+            future: MeshLoadCache.load(clip, allAssets: widget.allAssets),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(child: CircularProgressIndicator());
+              }
+              final loaded = snapshot.data;
+              if (loaded == null || loaded.skeleton == null) {
+                return Center(
+                  child: Text('${clip.name} carries no motion to play.'),
+                );
+              }
+              return AnimationClipPreview(
+                mesh: loaded,
+                allAssets: widget.allAssets,
+                clipPath: clip.path,
+                auditionCharacterPath: model.path,
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The twin's picture, with a line saying whose it is.
+  ///
+  /// The details panel goes on describing the selected file -- its path, its
+  /// size, its type. Only the picture is borrowed, and the banner says so,
+  /// because a .uasset that silently showed a model would be claiming Atlas
+  /// can read Unreal's format.
+  Widget _twinPreview(AssetItem item, AssetItem twin) {
+    return Column(
+      children: [
+        DecoratedBox(
+          decoration: BoxDecoration(
+            color: const Color(0xfff2f5f9),
+            border: Border.all(color: Colors.black12),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: [
+                const Icon(Icons.link, size: 16, color: Colors.black54),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    item.type == 'unreal'
+                        ? 'Showing the ${twin.ext.toUpperCase()} twin: '
+                              '${twin.name}. .${item.ext} files can only be '
+                              'opened in Unreal Engine.'
+                        : 'Showing the ${twin.ext.toUpperCase()} twin: '
+                              '${twin.name}. Atlas cannot read .${item.ext} '
+                              'yet.',
+                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => widget.onActivateAsset(twin),
+                  child: const Text('Open it'),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Expanded(
+          child: ModelPreview(
+            asset: twin,
+            allAssets: widget.allAssets,
+            catalogRevision: widget.catalogRevision,
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _previewFor(AssetItem item) {
-    if (item.type == 'image') {
+    final other = audition;
+    if (other != null) return _auditionPreview(item, other);
+    final kind = previewKindFor(item);
+
+    // A file Atlas cannot draw, with a file beside it that it can: 56% of
+    // the .uasset files in this library have an FBX or OBJ twin, and every
+    // DAE and glTF does.
+    if (kind == PreviewKind.unreal ||
+        kind == PreviewKind.none ||
+        kind == PreviewKind.zipModelUnsupported) {
+      final twin = previewableTwinOf(item, widget.allAssets);
+      if (twin != null) return _twinPreview(item, twin);
+    }
+
+    if (kind == PreviewKind.image) {
       if (isZipVirtualPath(item.path)) {
         return FutureBuilder<Uint8List?>(
           future: _zipBytesFor(item),
@@ -3079,12 +3974,11 @@ class _PreviewPanelState extends State<PreviewPanel> {
       );
     }
 
-    if (item.type == 'model') {
-      if (isZipVirtualPath(item.path) &&
-          item.ext != 'obj' &&
-          item.ext != 'fbx') {
-        return _unsupportedZipModelPreview(item);
-      }
+    if (kind == PreviewKind.zipModelUnsupported) {
+      return _unsupportedZipModelPreview(item);
+    }
+
+    if (kind == PreviewKind.model) {
       return ModelPreview(
         asset: item,
         allAssets: widget.allAssets,
@@ -3092,13 +3986,30 @@ class _PreviewPanelState extends State<PreviewPanel> {
       );
     }
 
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        border: Border.all(color: Colors.black12),
-        borderRadius: BorderRadius.circular(8),
-        color: const Color(0xfff2f5f9),
-      ),
-      child: AudioPreview(asset: item),
+    if (kind == PreviewKind.audio) {
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.black12),
+          borderRadius: BorderRadius.circular(8),
+          color: const Color(0xfff2f5f9),
+        ),
+        child: AudioPreview(asset: item),
+      );
+    }
+
+    final String message;
+    if (kind == PreviewKind.unreal) {
+      message = 'Unreal asset. It can only be opened in Unreal Engine.';
+    } else if (item.ext.isEmpty) {
+      message = 'No preview for this file.';
+    } else {
+      message = 'No preview for .${item.ext.toUpperCase()} files.';
+    }
+
+    return PlainPreview(
+      icon: iconForAssetType(item.type),
+      name: item.name,
+      message: message,
     );
   }
 
@@ -3118,6 +4029,56 @@ class _PreviewPanelState extends State<PreviewPanel> {
             'Use Copy to extract this asset if you need external-tool preview.',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.black54),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The panel for an asset nothing can draw: an icon, the file name, and why.
+///
+/// Styled from `_unsupportedZipModelPreview` so it reads as the same app.
+class PlainPreview extends StatelessWidget {
+  const PlainPreview({
+    required this.icon,
+    required this.name,
+    required this.message,
+    super.key,
+  });
+
+  final IconData icon;
+  final String name;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(8),
+        color: const Color(0xfff2f5f9),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 48, color: Colors.black26),
+              const SizedBox(height: 12),
+              Text(
+                name,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.black54),
+              ),
+            ],
           ),
         ),
       ),
@@ -3160,7 +4121,10 @@ bool looksLikePlayableAudio(List<int> bytes, String ext) {
     case 'midi':
       return startsWith([0x4D, 0x54, 0x68, 0x64]);
   }
-  return true;
+  // An extension this function does not know is not audio. It used to answer
+  // true here, which is only safe if nothing but audio can reach the player --
+  // and the preview panel's fall-through meant .uasset could.
+  return false;
 }
 
 class AudioPreview extends StatefulWidget {
@@ -3358,9 +4322,12 @@ class ModelPreview extends StatefulWidget {
 
 class _ModelPreviewState extends State<ModelPreview> {
   late Future<MeshModel> meshFuture;
-  double yaw = -0.6;
-  double pitch = 0.35;
-  double zoom = 1;
+  final ViewportCamera camera = ViewportCamera();
+  double get yaw => camera.yaw;
+  double get pitch => camera.pitch;
+  double get zoom => camera.zoom;
+  double get panX => camera.panX;
+  double get panY => camera.panY;
   RenderMode renderMode = RenderMode.textured;
   int checkerSquareSize = 16;
   String? uvSetOverride;
@@ -3370,6 +4337,113 @@ class _ModelPreviewState extends State<ModelPreview> {
   /// A texture the user picked by hand, overriding whatever resolved.
   String? chosenTexturePath;
   bool showVariantGrid = false;
+  bool showAttachments = false;
+  bool showSlots = false;
+
+  /// Whether a modular kit is drawn one variant per slot, or whole.
+  ///
+  /// True by default, because a kit drawn whole is eight heads in the same
+  /// place. Turning it off is how you see what the file actually holds.
+  bool slotsApplied = true;
+
+  /// Which variant each slot is showing, by [ObjectSlot.key] so the choice
+  /// survives a reload -- picking a different texture rebuilds the mesh, and
+  /// losing the assembly to that would be its own bug.
+  final Map<String, int> slotChoice = <String, int>{};
+
+  /// The mesh most recently drawn, kept so a re-dress does not blank the view.
+  MeshModel? _shownMesh;
+
+  /// Attachment asset paths currently worn, in the order they were put on.
+  final Set<String> wornPaths = <String>{};
+
+  /// Set when the grid mode is chosen by hand; null means read it off the
+  /// model, which is right far more often than not.
+  VariantGridMode? variantModeChoice;
+
+  /// Memoised, because finding variants walks the whole catalog and counting
+  /// coverage walks every face. Both depend only on the loaded mesh, and doing
+  /// either per frame while the camera drags would cost more than the feature
+  /// is worth.
+  MeshModel? _variantsFor;
+  List<AssetItem> _variants = const [];
+  bool _stackedByMaterial = false;
+  bool _stackedByObject = false;
+  List<ObjectSlot> _slots = const [];
+  Int32List _objectFaceCounts = Int32List(0);
+
+  /// Depends on the catalog rather than the mesh, but is measured with it so
+  /// the whole walk happens once per model rather than once per frame.
+  List<AssetItem> _attachments = const [];
+
+  void _measureVariants(MeshModel mesh) {
+    if (identical(_variantsFor, mesh)) return;
+    _variantsFor = mesh;
+    _variants = findTextureVariants(
+      mesh: mesh,
+      model: widget.asset,
+      allAssets: widget.allAssets,
+    );
+    _stackedByMaterial = materialsAreStackedVariants(mesh);
+    _stackedByObject = objectsAreStackedVariants(mesh);
+    // A character sheet is taken apart by [visibleObject] instead; see
+    // [modelIsModularKit].
+    _slots = _stackedByObject ? const [] : objectSlotsOf(mesh);
+    _objectFaceCounts = objectFaceCounts(mesh);
+    _attachments = mesh.skeleton == null
+        ? const []
+        : findAttachmentCandidates(
+            character: widget.asset,
+            allAssets: widget.allAssets,
+          );
+  }
+
+  List<AssetItem> attachmentsFor(MeshModel mesh) {
+    _measureVariants(mesh);
+    return _attachments;
+  }
+
+  List<AssetItem> textureVariantsOf(MeshModel mesh) {
+    _measureVariants(mesh);
+    return _variants;
+  }
+
+  /// The kit's interchangeable slots, or nothing when this is not a kit.
+  List<ObjectSlot> slotsOf(MeshModel mesh) {
+    _measureVariants(mesh);
+    return _slots.length >= modularKitMinimumSlots ? _slots : const [];
+  }
+
+  /// The nodes the current slot choice leaves out, or null for the whole file.
+  Uint8List? hiddenObjectsOf(MeshModel mesh) {
+    final slots = slotsOf(mesh);
+    if (!slotsApplied || slots.isEmpty) return null;
+    return hiddenObjectsFor(
+      objectCount: mesh.objectNames.length,
+      slots: slots,
+      choice: [for (final slot in slots) slotChoice[slot.key] ?? 0],
+    );
+  }
+
+  /// How many of the file's faces [hidden] leaves on screen.
+  int shownFaceCount(MeshModel mesh, Uint8List? hidden) {
+    if (hidden == null) return mesh.faces.length;
+    var shown = mesh.faces.length;
+    final limit = math.min(hidden.length, _objectFaceCounts.length);
+    for (var i = 0; i < limit; i += 1) {
+      if (hidden[i] != 0) shown -= _objectFaceCounts[i];
+    }
+    return shown;
+  }
+
+  /// The grid mode a file asks for by its shape, before the user says.
+  VariantGridMode naturalVariantMode(MeshModel mesh) {
+    _measureVariants(mesh);
+    if (_stackedByObject) return VariantGridMode.object;
+    if (_stackedByMaterial) return VariantGridMode.material;
+    return VariantGridMode.texture;
+  }
+
   bool useBaseTexture = true;
   bool useNormalMaps = true;
   bool useEmissiveMaps = true;
@@ -3394,15 +4468,76 @@ class _ModelPreviewState extends State<ModelPreview> {
       fallbackCheckerSquareSize: checkerSquareSize,
     );
     final chosen = chosenTexturePath;
-    if (chosen == null) return mesh;
     // Not cached: the cache is keyed on the file, and this is the user's
     // choice rather than anything the file said.
-    return applyChosenTexture(mesh, chosen);
+    final MeshModel textured;
+    if (chosen == null) {
+      textured = mesh;
+    } else if (chosen == noTextureChoice) {
+      // "None" is a decision, and it has to beat the inferred texture the
+      // load applied -- otherwise there would be no way to turn a wrong
+      // guess off.
+      textured = mesh.withMaterials([
+        for (final material in mesh.materials) material.withoutBaseTexture(),
+      ]);
+    } else {
+      textured = await applyChosenTexture(mesh, chosen);
+    }
+    return _dress(textured);
+  }
+
+  Future<MeshModel> _dress(MeshModel character) => wornPaths.isEmpty
+      ? Future.value(character)
+      : dressCharacter(
+          character,
+          wornPaths: wornPaths,
+          allAssets: widget.allAssets,
+        );
+
+  /// Whether this model is the one clips are played on.
+  bool get _isAnimationCharacter =>
+      AnimationCharacter.instance.path.value == widget.asset.path;
+
+  /// Puts a piece on or takes it off.
+  ///
+  /// One piece per body part is the rule, because that is what a body has
+  /// room for: choosing a second helmet replaces the first. Shift held keeps
+  /// the first as well, for the cases where two pieces genuinely share a
+  /// socket -- a beard under a mask.
+  void _toggleAttachment(AssetItem asset) {
+    final keyboard = HardwareKeyboard.instance;
+    final keepOthers = keyboard.isShiftPressed || keyboard.isControlPressed;
+    setState(() {
+      if (wornPaths.remove(asset.path)) {
+        // Taken off.
+      } else {
+        if (!keepOthers) {
+          final point = attachPointFor(asset.name)?.name;
+          wornPaths.removeWhere((path) {
+            final name = path.split(RegExp(r'[/\\]')).last;
+            return attachPointFor(name)?.name == point;
+          });
+        }
+        wornPaths.add(asset.path);
+      }
+      _outfitChanged();
+    });
+  }
+
+  void _outfitChanged() {
+    meshFuture = _loadCurrentMesh();
+    // The character clips play on wears what it was dressed in here.
+    if (_isAnimationCharacter) {
+      AnimationCharacter.instance.setWorn(wornPaths);
+    }
   }
 
   @override
   void initState() {
     super.initState();
+    if (_isAnimationCharacter) {
+      wornPaths.addAll(AnimationCharacter.instance.worn);
+    }
     meshFuture = _loadCurrentMesh();
   }
 
@@ -3417,10 +4552,19 @@ class _ModelPreviewState extends State<ModelPreview> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.asset.id != widget.asset.id ||
         oldWidget.catalogRevision != widget.catalogRevision) {
+      // A grid mode chosen for one model says nothing about the next, and
+      // neither does an outfit: the next character is a different rig --
+      // unless it is the animation character, which keeps what it wears.
+      variantModeChoice = null;
+      _shownMesh = null;
+      slotChoice.clear();
+      slotsApplied = true;
+      wornPaths.clear();
+      if (_isAnimationCharacter) {
+        wornPaths.addAll(AnimationCharacter.instance.worn);
+      }
       meshFuture = _loadCurrentMesh();
-      yaw = -0.6;
-      pitch = 0.35;
-      zoom = 1;
+      camera.reset();
       uvSetOverride = null;
       // A texture chosen for one model means nothing for the next.
       chosenTexturePath = null;
@@ -3436,7 +4580,15 @@ class _ModelPreviewState extends State<ModelPreview> {
         child: FutureBuilder<MeshModel>(
           future: meshFuture,
           builder: (context, snapshot) {
-            if (snapshot.connectionState != ConnectionState.done) {
+            // Dressing or re-texturing a model replaces the future, and the
+            // spinner that used to fill that gap threw away the whole view --
+            // the camera held, but the grid, the panel and its scroll position
+            // all came back from scratch. The last mesh stands in until the
+            // next is ready. A different model starts from nothing, since
+            // showing the previous one would be showing the wrong thing.
+            final mesh = snapshot.data ?? (snapshot.hasError ? null : _shownMesh);
+            if (mesh == null &&
+                snapshot.connectionState != ConnectionState.done) {
               return const Center(child: CircularProgressIndicator());
             }
             if (snapshot.hasError) {
@@ -3451,7 +4603,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                 ),
               );
             }
-            final mesh = snapshot.data!;
+            _shownMesh = mesh!;
             if (mesh.isAnimationOnly) {
               return AnimationClipPreview(
                 mesh: mesh,
@@ -3459,6 +4611,27 @@ class _ModelPreviewState extends State<ModelPreview> {
                 clipPath: widget.asset.path,
               );
             }
+            final variants = textureVariantsOf(mesh);
+            final cellCounts = {
+              VariantGridMode.texture: variants.length,
+              VariantGridMode.material: mesh.materials.length,
+              VariantGridMode.object: mesh.objectNames.length,
+            };
+            final availableModes = [
+              for (final mode in VariantGridMode.values)
+                if (cellCounts[mode]! > 1) mode,
+            ];
+            // Textures are what "variants" means to almost every model
+            // here, so that is the default -- except for a file that turns out
+            // to be several whole models in one, where taking it apart along
+            // whichever seam actually separates them is the entire point.
+            final wantedVariantMode =
+                variantModeChoice ?? naturalVariantMode(mesh);
+            final effectiveVariantMode = availableModes.contains(wantedVariantMode)
+                ? wantedVariantMode
+                : availableModes.firstOrNull ?? VariantGridMode.texture;
+            final variantCells = cellCounts[effectiveVariantMode]!;
+
             return Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -3467,13 +4640,58 @@ class _ModelPreviewState extends State<ModelPreview> {
                 // the viewport costs a little height and covers nothing.
                 ModelToolbarBar(
                   children: [
-                    if (mesh.materials.length > 1)
+                    if (variantCells > 1)
                       FilterChip(
                         avatar: const Icon(Icons.grid_view, size: 16),
-                        label: Text('Variants (${mesh.materials.length})'),
+                        label: Text('Variants ($variantCells)'),
                         selected: showVariantGrid,
                         onSelected: (next) =>
                             setState(() => showVariantGrid = next),
+                      ),
+                    // Only worth asking when the answers differ. A character
+                    // has palettes and one material; a stacked file has a
+                    // dozen bodies and one palette.
+                    if (showVariantGrid && availableModes.length > 1)
+                      SegmentedButton<VariantGridMode>(
+                        segments: [
+                          for (final mode in availableModes)
+                            ButtonSegment(
+                              value: mode,
+                              label: Text(
+                                switch (mode) {
+                                  VariantGridMode.texture =>
+                                    'By texture (${cellCounts[mode]})',
+                                  VariantGridMode.material =>
+                                    'By material (${cellCounts[mode]})',
+                                  VariantGridMode.object =>
+                                    'By object (${cellCounts[mode]})',
+                                },
+                              ),
+                            ),
+                        ],
+                        selected: {effectiveVariantMode},
+                        showSelectedIcon: false,
+                        onSelectionChanged: (next) =>
+                            setState(() => variantModeChoice = next.first),
+                      ),
+                    if (slotsOf(mesh).isNotEmpty)
+                      FilterChip(
+                        avatar: const Icon(Icons.tune, size: 16),
+                        label: Text('Slots (${slotsOf(mesh).length})'),
+                        selected: showSlots,
+                        onSelected: (next) => setState(() => showSlots = next),
+                      ),
+                    if (attachmentsFor(mesh).isNotEmpty)
+                      FilterChip(
+                        avatar: const Icon(Icons.checkroom, size: 16),
+                        label: Text(
+                          wornPaths.isEmpty
+                              ? 'Attachments (${attachmentsFor(mesh).length})'
+                              : 'Attachments (${wornPaths.length} on)',
+                        ),
+                        selected: showAttachments,
+                        onSelected: (next) =>
+                            setState(() => showAttachments = next),
                       ),
                     if (mesh.skin != null)
                       ValueListenableBuilder<String?>(
@@ -3486,6 +4704,8 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     ? null
                                     : widget.asset.path,
                                 rig: widget.asset.rigFamily,
+                                signature: widget.asset.rigSignature,
+                                wearing: wornPaths,
                               ),
                             ),
                       ),
@@ -3584,6 +4804,13 @@ class _ModelPreviewState extends State<ModelPreview> {
                           widget.allAssets,
                         ),
                         chosenPath: chosenTexturePath,
+                        inferred: inferredTextureSourceOf(mesh),
+                        inferredName: mesh.materials
+                            .map((m) => m.textureName)
+                            .firstWhere(
+                              (name) => name.isNotEmpty,
+                              orElse: () => '',
+                            ),
                         onChosen: (path) => setState(() {
                           chosenTexturePath = path;
                           meshFuture = _loadCurrentMesh();
@@ -3719,48 +4946,75 @@ class _ModelPreviewState extends State<ModelPreview> {
                     ),
                   ],
                 ),
+                if (showSlots && slotsOf(mesh).isNotEmpty)
+                  SlotPickerPanel(
+                    slots: slotsOf(mesh),
+                    objectNames: mesh.objectNames,
+                    choice: slotChoice,
+                    applied: slotsApplied,
+                    onChoose: (key, index) =>
+                        setState(() => slotChoice[key] = index),
+                    onApplied: (next) => setState(() => slotsApplied = next),
+                    onReset: () => setState(() => slotChoice.clear()),
+                  ),
+                if (showAttachments && mesh.skeleton != null)
+                  AttachmentPanel(
+                    candidates: attachmentsFor(mesh),
+                    skeleton: mesh.skeleton!,
+                    worn: wornPaths,
+                    onToggle: _toggleAttachment,
+                    onClear: () => setState(() {
+                      wornPaths.clear();
+                      _outfitChanged();
+                    }),
+                  ),
                 Expanded(
-                  child: Listener(
-                    onPointerSignal: (event) {
-                      if (event is PointerScrollEvent) {
-                        _touchInteraction();
-                        setState(() {
-                          zoom = (zoom * (event.scrollDelta.dy > 0 ? .9 : 1.1))
-                              .clamp(.35, 4)
-                              .toDouble();
-                        });
-                      }
+                  child: ViewportController(
+                    camera: camera,
+                    onChanged: () {
+                      _touchInteraction();
+                      setState(() {});
                     },
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onPanUpdate: (details) {
-                        _touchInteraction();
-                        setState(() {
-                          yaw += details.delta.dx * .01;
-                          pitch = (pitch + details.delta.dy * .01)
-                              .clamp(-1.45, 1.45)
-                              .toDouble();
-                        });
-                      },
-                      child: Stack(
+                    child: Stack(
                         children: [
                           Positioned.fill(
                             // Wireframe is lines only, where per-pixel depth
                             // buys nothing; everything filled goes through the
                             // rasteriser so interpenetrating and coplanar faces
                             // resolve correctly.
-                            child: showVariantGrid
-                                ? MaterialVariantGrid(
-                                    mesh: mesh,
-                                    yaw: yaw,
-                                    pitch: pitch,
-                                    zoom: zoom,
-                                    renderMode: renderMode,
-                                    lightingMode: lightingMode,
-                                    cullBackFaces: cullBackFaces,
-                                    interacting: interacting,
-                                    uvSetOverride: uvSetOverride,
-                                  )
+                            child: showVariantGrid && variantCells > 1
+                                ? (effectiveVariantMode ==
+                                          VariantGridMode.texture
+                                      ? TextureVariantGrid(
+                                          mesh: mesh,
+                                          variants: variants,
+                                          yaw: yaw,
+                                          pitch: pitch,
+                                          zoom: zoom,
+                                          renderMode: renderMode,
+                                          lightingMode: lightingMode,
+                                          cullBackFaces: cullBackFaces,
+                                          interacting: interacting,
+                                          uvSetOverride: uvSetOverride,
+                                        )
+                                      : CellVariantGrid(
+                                          mesh: mesh,
+                                          cells:
+                                              effectiveVariantMode ==
+                                                  VariantGridMode.object
+                                              ? CellVariantGrid.byObject(mesh)
+                                              : CellVariantGrid.byMaterial(
+                                                  mesh,
+                                                ),
+                                          yaw: yaw,
+                                          pitch: pitch,
+                                          zoom: zoom,
+                                          renderMode: renderMode,
+                                          lightingMode: lightingMode,
+                                          cullBackFaces: cullBackFaces,
+                                          interacting: interacting,
+                                          uvSetOverride: uvSetOverride,
+                                        ))
                                 : renderMode == RenderMode.wireframe
                                 ? CustomPaint(
                                     painter: MeshPainter(
@@ -3768,10 +5022,13 @@ class _ModelPreviewState extends State<ModelPreview> {
                                       yaw: yaw,
                                       pitch: pitch,
                                       zoom: zoom,
+                                      panX: panX,
+                                      panY: panY,
                                       renderMode: renderMode,
                                       uvSetOverride: uvSetOverride,
                                       lightingMode: lightingMode,
                                       cullBackFaces: cullBackFaces,
+                                      hiddenObjects: hiddenObjectsOf(mesh),
                                       // Wireframe draws no surface, so the
                                       // shading channels do not apply to it.
                                       useNormalMaps: useNormalMaps,
@@ -3782,6 +5039,8 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     yaw: yaw,
                                     pitch: pitch,
                                     zoom: zoom,
+                                    panX: panX,
+                                    panY: panY,
                                     renderMode: renderMode,
                                     lightingMode: lightingMode,
                                     cullBackFaces: cullBackFaces,
@@ -3790,6 +5049,7 @@ class _ModelPreviewState extends State<ModelPreview> {
                                     useEmissiveMaps: useEmissiveMaps,
                                     useSpecular: useSpecular,
                                     uvSetOverride: uvSetOverride,
+                                    hiddenObjects: hiddenObjectsOf(mesh),
                                     interacting: interacting,
                                   ),
                           ),
@@ -3808,12 +5068,21 @@ class _ModelPreviewState extends State<ModelPreview> {
                               child: Builder(
                                 builder: (context) {
                                   final total = mesh.faces.length;
-                                  final capped = total > maxRenderedFaces;
+                                  final shown = shownFaceCount(
+                                    mesh,
+                                    hiddenObjectsOf(mesh),
+                                  );
+                                  final capped = shown > maxRenderedFaces;
                                   final summary =
                                       '${mesh.name} · ${mesh.vertices.length} verts · $total faces';
-                                  if (!capped) return Text(summary);
+                                  // Hiding geometry is never silent, slots
+                                  // included: say how much is on screen.
+                                  final assembled = shown == total
+                                      ? ''
+                                      : ' · assembled: $shown faces';
+                                  if (!capped) return Text('$summary$assembled');
                                   return Text(
-                                    '$summary · face cap: showing '
+                                    '$summary$assembled · face cap: showing '
                                     '$maxRenderedFaces nearest',
                                     style: const TextStyle(
                                       color: Color(0xffb3540a),
@@ -3826,7 +5095,6 @@ class _ModelPreviewState extends State<ModelPreview> {
                           ),
                         ],
                       ),
-                    ),
                   ),
                 ),
               ],
@@ -3936,7 +5204,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
   late final Ticker _ticker;
   Duration _elapsed = Duration.zero;
   bool _playing = true;
-  double _yaw = 0.4;
+  final ViewportCamera _camera = ViewportCamera(yaw: 0.4, pitch: 0);
   MeshModel? _character;
   String? _characterError;
   RasterScene? _restScene;
@@ -3977,6 +5245,23 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       if (!_playing) return;
       setState(() => _elapsed = elapsed);
     })..start();
+    // The outfit can change while a clip is open -- a helmet put on in the
+    // model preview -- and the character here has to be re-dressed to match.
+    AnimationCharacter.instance.outfitRevision.addListener(_onOutfitChanged);
+    _loadCharacter();
+  }
+
+  void _onOutfitChanged() {
+    if (!mounted) return;
+    // Everything derived from the old mesh: a dressed character has more
+    // vertices, so a cached scene or position buffer would be the wrong size.
+    _character = null;
+    _characterError = null;
+    _restScene = null;
+    _posedPositions = null;
+    _plan = null;
+    _boneWorld = null;
+    _retargetNote = null;
     _loadCharacter();
   }
 
@@ -4007,7 +5292,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     if (rest == null) return;
     // A character with no bones in common with the clip cannot be driven by it
     // at all; say so rather than showing a bind pose with no explanation.
-    if (rigBoneOverlap(rest, widget.skeleton) < minimumRigOverlap) {
+    if (!rigMatch(rest, widget.skeleton)) {
       _plan = null;
       _boneWorld = null;
       _retargetNote =
@@ -4101,9 +5386,9 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
       return;
     }
     try {
-      final mesh = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
+      final bare = await MeshLoadCache.load(asset, allAssets: widget.allAssets);
       if (!mounted) return;
-      if (mesh.skin == null) {
+      if (bare.skin == null) {
         setState(() {
           _character = null;
           _characterError =
@@ -4111,6 +5396,14 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
         });
         return;
       }
+      // Wearing what it was dressed in. The pieces are skinned to their
+      // sockets, so from here on the clip moves them like any other part.
+      final mesh = await dressCharacter(
+        bare,
+        wornPaths: AnimationCharacter.instance.worn,
+        allAssets: widget.allAssets,
+      );
+      if (!mounted) return;
       await _buildPlan(mesh);
       if (!mounted) return;
       setState(() {
@@ -4125,6 +5418,7 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
 
   @override
   void dispose() {
+    AnimationCharacter.instance.outfitRevision.removeListener(_onOutfitChanged);
     _ticker.dispose();
     super.dispose();
   }
@@ -4174,15 +5468,15 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
             ),
           ),
         Expanded(
-          child: GestureDetector(
-            onHorizontalDragUpdate: (details) =>
-                setState(() => _yaw += details.delta.dx * 0.01),
+          child: ViewportController(
+            camera: _camera,
+            onChanged: () => setState(() {}),
             child: character == null
                 ? CustomPaint(
                     painter: SkeletonPainter(
                       skeleton: skeleton,
                       frame: frame,
-                      yaw: _yaw,
+                      yaw: _camera.yaw,
                     ),
                     child: const SizedBox.expand(),
                   )
@@ -4190,9 +5484,11 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
                     mesh: character,
                     sceneOverride: _poseScene(character, skeleton, frame),
                     sceneRevision: frame,
-                    yaw: _yaw,
-                    pitch: 0,
-                    zoom: 1,
+                    yaw: _camera.yaw,
+                    pitch: _camera.pitch,
+                    zoom: _camera.zoom,
+                    panX: _camera.panX,
+                    panY: _camera.panY,
                     renderMode: RenderMode.textured,
                     lightingMode: LightingMode.corner,
                     cullBackFaces: false,
@@ -4253,6 +5549,7 @@ class AnimationClipPreview extends StatelessWidget {
     required this.mesh,
     this.allAssets = const [],
     this.clipPath = '',
+    this.auditionCharacterPath,
     super.key,
   });
 
@@ -4263,6 +5560,14 @@ class AnimationClipPreview extends StatelessWidget {
 
   /// Where this clip came from, so its reference rig can be found beside it.
   final String clipPath;
+
+  /// Play on this character instead of the chosen one, for one audition.
+  ///
+  /// Set from a pairing list. It deliberately does not touch
+  /// [AnimationCharacter]: trying a clip on a model is a look, not a
+  /// decision, and silently replacing the character the user chose would be
+  /// a change they never asked for and would have to undo.
+  final String? auditionCharacterPath;
 
   String get _duration {
     if (mesh.durationSeconds <= 0) return 'unknown';
@@ -4276,15 +5581,22 @@ class AnimationClipPreview extends StatelessWidget {
       return Column(
         children: [
           Expanded(
-            child: ValueListenableBuilder<String?>(
-              valueListenable: AnimationCharacter.instance.path,
-              builder: (context, characterPath, _) => SkeletonPlayer(
-                skeleton: skeleton,
-                characterPath: characterPath,
-                allAssets: allAssets,
-                clipPath: clipPath,
-              ),
-            ),
+            child: auditionCharacterPath != null
+                ? SkeletonPlayer(
+                    skeleton: skeleton,
+                    characterPath: auditionCharacterPath,
+                    allAssets: allAssets,
+                    clipPath: clipPath,
+                  )
+                : ValueListenableBuilder<String?>(
+                    valueListenable: AnimationCharacter.instance.path,
+                    builder: (context, characterPath, _) => SkeletonPlayer(
+                      skeleton: skeleton,
+                      characterPath: characterPath,
+                      allAssets: allAssets,
+                      clipPath: clipPath,
+                    ),
+                  ),
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
@@ -4395,7 +5707,11 @@ class RasterModelView extends StatefulWidget {
     this.sceneOverride,
     this.sceneRevision,
     this.visibleMaterial = -1,
+    this.visibleObject = -1,
+    this.hiddenObjects,
     this.uvSetOverride,
+    this.panX = 0,
+    this.panY = 0,
     super.key,
   });
 
@@ -4429,6 +5745,16 @@ class RasterModelView extends StatefulWidget {
   /// Restrict drawing to one material; negative draws all of them.
   final int visibleMaterial;
 
+  /// Restrict drawing to one of the file's nodes; negative draws all of them.
+  final int visibleObject;
+
+  /// See [RasterRequest.hiddenObjects].
+  final Uint8List? hiddenObjects;
+
+  /// See [RasterRequest.panX].
+  final double panX;
+  final double panY;
+
   @override
   State<RasterModelView> createState() => _RasterModelViewState();
 }
@@ -4448,7 +5774,10 @@ class _RasterModelViewState extends State<RasterModelView> {
   }
 
   String _keyFor(Size size, double scale) => [
-    identityHashCode(widget.mesh),
+    // Named rather than hashed: `identityHashCode` can be handed out again
+    // for a different mesh once the first is collected, and this key decides
+    // whether the image on screen still matches the model.
+    sceneNameFor(widget.mesh, widget.uvSetOverride),
     widget.yaw.toStringAsFixed(4),
     widget.pitch.toStringAsFixed(4),
     widget.zoom.toStringAsFixed(4),
@@ -4461,6 +5790,10 @@ class _RasterModelViewState extends State<RasterModelView> {
     widget.useSpecular,
     widget.sceneRevision ?? '',
     widget.visibleMaterial,
+    widget.visibleObject,
+    hiddenObjectsDigest(widget.hiddenObjects),
+    widget.panX,
+    widget.panY,
     widget.uvSetOverride ?? '',
     size.width.round(),
     size.height.round(),
@@ -4483,10 +5816,9 @@ class _RasterModelViewState extends State<RasterModelView> {
       // mesh rather than per frame. Animation hands us a scene it already
       // holds, whose positions it swaps in place.
       final override = widget.sceneOverride;
+      String? sceneKey;
       if (override == null) {
-        final sceneKey =
-            '${identityHashCode(widget.mesh)}|'
-            '${widget.uvSetOverride ?? ''}';
+        sceneKey = sceneNameFor(widget.mesh, widget.uvSetOverride);
         if (_scene == null || _sceneKey != sceneKey) {
           _scene = RasterScene.fromMesh(
             widget.mesh,
@@ -4507,18 +5839,30 @@ class _RasterModelViewState extends State<RasterModelView> {
         lightingMode: widget.lightingMode,
         cullBackFaces: widget.cullBackFaces,
         visibleMaterial: widget.visibleMaterial,
+        visibleObject: widget.visibleObject,
+        hiddenObjects: widget.hiddenObjects,
+        panX: widget.panX,
+        panY: widget.panY,
         useBaseTexture: widget.useBaseTexture,
         useNormalMaps: widget.useNormalMaps,
         useEmissiveMaps: widget.useEmissiveMaps,
         useSpecular: widget.useSpecular,
       );
 
-      // Coarse frames are small and wanted immediately; spending an isolate
-      // hop on them would add more latency than it saves. The sharp frame is
-      // the one that would stall the window, so that one goes to a worker.
-      final raster = widget.interacting
+      // Every frame goes to the worker, coarse ones included. They used to be
+      // drawn here, on the grounds that spawning an isolate for one costs more
+      // than it saves -- true of [rasterizeSceneInIsolate], which spawns one
+      // per call, and the reason this is a worker that stays alive instead.
+      // Drawing them here meant each frame of a drag was time the window could
+      // not lay out, paint, or read the mouse, and it is 8 ms for an ordinary
+      // kit model and 36-47 ms for the large meshes in this library.
+      //
+      // An animated scene is the exception: its positions are replaced in
+      // place 30 times a second, so there is no stable scene for the worker to
+      // hold and it would have to be sent the geometry every frame.
+      final raster = sceneKey == null
           ? rasterizeScene(request)
-          : await rasterizeSceneInIsolate(request);
+          : await RenderWorker.shared.render(request, sceneKey: sceneKey);
       final image = await imageFromRaster(raster);
       if (!mounted) {
         image.dispose();
@@ -4568,8 +5912,8 @@ class _RasterModelViewState extends State<RasterModelView> {
 /// A software rasteriser with a depth buffer.
 ///
 /// The canvas painter sorts whole faces by depth and draws them back to front.
-/// That cannot resolve geometry that interpenetrates or sits coplanar — window
-/// frames flush with a wall, roof details flush with a roof — because the
+/// That cannot resolve geometry that interpenetrates or sits coplanar â€” window
+/// frames flush with a wall, roof details flush with a roof â€” because the
 /// answer differs *within* a face. Those cases showed up as notches and stray
 /// slivers along polygon edges. Depth per pixel is the only thing that fixes
 /// it, so this walks the triangles itself and keeps a z value per pixel.
@@ -4610,6 +5954,7 @@ class RasterScene {
     required this.positions,
     required this.triangleIndices,
     required this.triangleMaterial,
+    required this.triangleObject,
     required this.triangleUvs,
     required this.triangleHasUv,
     required this.triangleTint,
@@ -4630,6 +5975,7 @@ class RasterScene {
     positions: replacement,
     triangleIndices: triangleIndices,
     triangleMaterial: triangleMaterial,
+    triangleObject: triangleObject,
     triangleTint: triangleTint,
     triangleUvs: triangleUvs,
     triangleHasUv: triangleHasUv,
@@ -4640,6 +5986,7 @@ class RasterScene {
   /// Three vertex indices per triangle.
   final Int32List triangleIndices;
   final Int32List triangleMaterial;
+  final Int32List triangleObject;
 
   /// Six values per triangle: u, v for each corner.
   final Float32List triangleUvs;
@@ -4651,9 +5998,28 @@ class RasterScene {
   final List<RasterMaterial> materials;
   final int totalTriangles;
 
+  /// Stands in for a scene the receiver already holds.
+  ///
+  /// [RenderWorker] puts this in the message instead of the real scene; see
+  /// [RasterRequest.withScene]. Rendering it draws nothing, which is the point
+  /// -- if a protocol mistake ever let it reach the rasteriser, the frame comes
+  /// back empty rather than wrong.
+  static final RasterScene placeholder = RasterScene(
+    positions: Float32List(0),
+    triangleIndices: Int32List(0),
+    triangleMaterial: Int32List(0),
+    triangleObject: Int32List(0),
+    triangleUvs: Float32List(0),
+    triangleHasUv: Uint8List(0),
+    triangleTint: Int32List(0),
+    materials: const [],
+    totalTriangles: 0,
+  );
+
   static RasterScene fromMesh(MeshModel mesh, {String? uvSetOverride}) {
     final triangles = <int>[];
     final triMaterial = <int>[];
+    final triObject = <int>[];
     final triUvs = <double>[];
     final triHasUv = <int>[];
     final triTint = <int>[];
@@ -4688,6 +6054,7 @@ class RasterScene {
       for (var i = 1; i + 1 < indices.length; i += 1) {
         triangles.addAll([indices[0], indices[i], indices[i + 1]]);
         triMaterial.add(face.materialIndex);
+        triObject.add(face.objectIndex);
         triTint.add(packedTint);
         if (hasUv && i == 1) {
           triUvs.addAll([
@@ -4719,6 +6086,7 @@ class RasterScene {
       positions: positions,
       triangleIndices: Int32List.fromList(triangles),
       triangleMaterial: Int32List.fromList(triMaterial),
+      triangleObject: Int32List.fromList(triObject),
       triangleUvs: Float32List.fromList(triUvs),
       triangleHasUv: Uint8List.fromList(triHasUv),
       triangleTint: Int32List.fromList(triTint),
@@ -4853,6 +6221,10 @@ RasterResult rasterizeMesh({
   int backgroundArgb = 0xffe9edf3,
   int maxFaces = maxRenderedFaces,
   int visibleMaterial = -1,
+  int visibleObject = -1,
+  Uint8List? hiddenObjects,
+  double panX = 0,
+  double panY = 0,
 }) {
   return rasterizeScene(
     RasterRequest(
@@ -4872,8 +6244,82 @@ RasterResult rasterizeMesh({
       backgroundArgb: backgroundArgb,
       maxFaces: maxFaces,
       visibleMaterial: visibleMaterial,
+      visibleObject: visibleObject,
+      hiddenObjects: hiddenObjects,
+      panX: panX,
+      panY: panY,
     ),
   );
+}
+
+/// The [budget] triangles nearest the camera, without sorting the rest.
+///
+/// A histogram over the perspective divide, which is monotonic in depth: count
+/// how many triangles fall in each of [_depthBuckets] bands, walk the bands
+/// from nearest until the budget is used up, and take everything above that
+/// band. Three linear passes instead of an n-log-n sort, and it never
+/// allocates a boxed list.
+///
+/// The cut is approximate at the boundary band -- triangles there are taken in
+/// index order rather than by exact depth -- which does not matter: this only
+/// runs when a model is too big to draw honestly anyway, and the overlay says
+/// so.
+Int32List _nearestTriangles(
+  RasterScene scene,
+  Float32List invW,
+  int triangleCount,
+  int budget,
+) {
+  final nearest = Float32List(triangleCount);
+  var low = double.infinity;
+  var high = double.negativeInfinity;
+  for (var i = 0; i < triangleCount; i += 1) {
+    final a = scene.triangleIndices[i * 3];
+    final b = scene.triangleIndices[i * 3 + 1];
+    final c = scene.triangleIndices[i * 3 + 2];
+    final value = math.max(invW[a], math.max(invW[b], invW[c]));
+    nearest[i] = value;
+    if (value < low) low = value;
+    if (value > high) high = value;
+  }
+
+  final span = high - low;
+  if (!(span > 0)) {
+    // Every triangle at one depth: nothing to choose between, take the first.
+    final flat = Int32List(budget);
+    for (var i = 0; i < budget; i += 1) {
+      flat[i] = i;
+    }
+    return flat;
+  }
+
+  final counts = Int32List(_depthBuckets);
+  final bucketOf = Int32List(triangleCount);
+  for (var i = 0; i < triangleCount; i += 1) {
+    // Bucket 0 is the nearest, so the scan below walks forward.
+    var bucket = (((high - nearest[i]) / span) * (_depthBuckets - 1)).floor();
+    if (bucket < 0) bucket = 0;
+    if (bucket >= _depthBuckets) bucket = _depthBuckets - 1;
+    bucketOf[i] = bucket;
+    counts[bucket] += 1;
+  }
+
+  var cutoff = _depthBuckets - 1;
+  var running = 0;
+  for (var bucket = 0; bucket < _depthBuckets; bucket += 1) {
+    running += counts[bucket];
+    if (running >= budget) {
+      cutoff = bucket;
+      break;
+    }
+  }
+
+  final picked = Int32List(budget);
+  var written = 0;
+  for (var i = 0; i < triangleCount && written < budget; i += 1) {
+    if (bucketOf[i] <= cutoff) picked[written++] = i;
+  }
+  return written == budget ? picked : Int32List.sublistView(picked, 0, written);
 }
 
 /// Everything one frame needs, in a single sendable object.
@@ -4895,6 +6341,10 @@ class RasterRequest {
     this.backgroundArgb = 0xffe9edf3,
     this.maxFaces = maxRenderedFaces,
     this.visibleMaterial = -1,
+    this.visibleObject = -1,
+    this.hiddenObjects,
+    this.panX = 0,
+    this.panY = 0,
   });
 
   final RasterScene scene;
@@ -4927,6 +6377,61 @@ class RasterRequest {
   /// exactly the same depth, which no depth buffer can settle. Drawn one at a
   /// time they are twelve characters.
   final int visibleMaterial;
+
+  /// Restrict drawing to one node of the file; negative draws all of them.
+  ///
+  /// The other way to take a character sheet apart, and the one that works
+  /// when the material split does not follow the characters: Ancient Empire's
+  /// sheet puts all eleven bodies in one material, and the nodes are the only
+  /// seam left.
+  final int visibleObject;
+
+  /// Nodes not to draw, one byte per node, non-zero meaning hidden.
+  ///
+  /// How a modular kit is drawn as one model: a mech ships eight heads and ten
+  /// shoulder plates in the same file, all at the same joints, and this is the
+  /// mask that leaves one of each. Null draws everything.
+  ///
+  /// A mask rather than a set because the frame goes to a worker isolate, and
+  /// typed bytes cross that boundary without being rebuilt.
+  final Uint8List? hiddenObjects;
+
+  /// Where the model's origin sits on screen, as a fraction of the shorter
+  /// side from the centre. Zero is centred; positive x is right, positive y
+  /// is up. A fraction rather than pixels so the same camera frames the same
+  /// view at any size.
+  final double panX;
+  final double panY;
+
+  /// The same frame, to be drawn from another copy of the same scene.
+  ///
+  /// [RenderWorker] sends the frame with [RasterScene.placeholder] in place of
+  /// the real scene and the worker puts its own held copy back, because an
+  /// isolate message is a deep copy: sending the scene with every frame would
+  /// copy the whole flattened model -- megabytes on a large one -- for each
+  /// frame of a drag.
+  RasterRequest withScene(RasterScene replacement) => RasterRequest(
+    scene: replacement,
+    yaw: yaw,
+    pitch: pitch,
+    zoom: zoom,
+    width: width,
+    height: height,
+    renderMode: renderMode,
+    lightingMode: lightingMode,
+    cullBackFaces: cullBackFaces,
+    useBaseTexture: useBaseTexture,
+    useNormalMaps: useNormalMaps,
+    useEmissiveMaps: useEmissiveMaps,
+    useSpecular: useSpecular,
+    backgroundArgb: backgroundArgb,
+    maxFaces: maxFaces,
+    visibleMaterial: visibleMaterial,
+    visibleObject: visibleObject,
+    hiddenObjects: hiddenObjects,
+    panX: panX,
+    panY: panY,
+  );
 }
 
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
@@ -4942,11 +6447,23 @@ RasterResult rasterizeScene(RasterRequest request) {
   final bgG = (request.backgroundArgb >> 8) & 0xff;
   final bgB = request.backgroundArgb & 0xff;
   final bgA = (request.backgroundArgb >> 24) & 0xff;
-  for (var i = 0; i < pixels.length; i += 4) {
-    pixels[i] = bgR;
-    pixels[i + 1] = bgG;
-    pixels[i + 2] = bgB;
-    pixels[i + 3] = bgA;
+  // A word at a time rather than a byte at a time. [pixels] is RGBA in memory
+  // order, so on a little-endian host the first byte is the low byte of the
+  // word; every platform this app builds for is little-endian, and the
+  // fallback below keeps the picture right if that ever stops being true.
+  if (Endian.host == Endian.little) {
+    Uint32List.view(pixels.buffer).fillRange(
+      0,
+      width * height,
+      (bgA << 24) | (bgB << 16) | (bgG << 8) | bgR,
+    );
+  } else {
+    for (var i = 0; i < pixels.length; i += 4) {
+      pixels[i] = bgR;
+      pixels[i + 1] = bgG;
+      pixels[i + 2] = bgB;
+      pixels[i + 3] = bgA;
+    }
   }
   // Larger is nearer, so the buffer starts at "infinitely far".
   depth.fillRange(0, depth.length, -double.infinity);
@@ -4959,9 +6476,10 @@ RasterResult rasterizeScene(RasterRequest request) {
   final viewY = Float32List(vertexCount);
   final viewZ = Float32List(vertexCount);
 
-  final centerX = width / 2;
-  final centerY = height / 2;
-  final scale = math.min(width, height) * .38 * request.zoom;
+  final shorter = math.min(width, height);
+  final centerX = width / 2 + request.panX * shorter;
+  final centerY = height / 2 - request.panY * shorter;
+  final scale = shorter * .38 * request.zoom;
   final sy = math.sin(request.yaw);
   final cy = math.cos(request.yaw);
   final sx = math.sin(request.pitch);
@@ -4985,19 +6503,14 @@ RasterResult rasterizeScene(RasterRequest request) {
   }
 
   final triangleCount = scene.totalTriangles;
-  var order = List<int>.generate(triangleCount, (i) => i);
-  if (request.maxFaces >= 0 && order.length > request.maxFaces) {
-    // Order no longer matters for correctness, but a budget still does: keep
-    // the nearest triangles when a mesh is enormous.
-    final nearest = Float32List(triangleCount);
-    for (var i = 0; i < triangleCount; i += 1) {
-      final a = scene.triangleIndices[i * 3];
-      final b = scene.triangleIndices[i * 3 + 1];
-      final c = scene.triangleIndices[i * 3 + 2];
-      nearest[i] = math.max(invW[a], math.max(invW[b], invW[c]));
-    }
-    order.sort((a, b) => nearest[b].compareTo(nearest[a]));
-    order = order.sublist(0, request.maxFaces);
+  // Null means "every triangle, in order", which is the overwhelmingly common
+  // case. Building a List<int> of every index cost more than the drawing did
+  // on a large model: 261,410 boxed integers allocated per frame, and then a
+  // comparison sort over them that made the *capped* render slower than the
+  // uncapped one -- 576ms against 233ms.
+  Int32List? order;
+  if (request.maxFaces >= 0 && triangleCount > request.maxFaces) {
+    order = _nearestTriangles(scene, invW, triangleCount, request.maxFaces);
   }
 
   final (lx, ly, lz) = request.lightingMode == LightingMode.top
@@ -5007,7 +6520,10 @@ RasterResult rasterizeScene(RasterRequest request) {
   final textured = request.renderMode == RenderMode.textured;
 
   var drawn = 0;
-  for (final triangleIndex in order) {
+  final hiddenObjects = request.hiddenObjects;
+  final drawCount = order?.length ?? triangleCount;
+  for (var orderIndex = 0; orderIndex < drawCount; orderIndex += 1) {
+    final triangleIndex = order == null ? orderIndex : order[orderIndex];
     final i0 = scene.triangleIndices[triangleIndex * 3];
     final i1 = scene.triangleIndices[triangleIndex * 3 + 1];
     final i2 = scene.triangleIndices[triangleIndex * 3 + 2];
@@ -5024,6 +6540,18 @@ RasterResult rasterizeScene(RasterRequest request) {
     if (request.visibleMaterial >= 0 &&
         materialIndex != request.visibleMaterial) {
       continue;
+    }
+    if (request.visibleObject >= 0 &&
+        scene.triangleObject[triangleIndex] != request.visibleObject) {
+      continue;
+    }
+    if (hiddenObjects != null) {
+      final object = scene.triangleObject[triangleIndex];
+      if (object >= 0 &&
+          object < hiddenObjects.length &&
+          hiddenObjects[object] != 0) {
+        continue;
+      }
     }
     drawn += 1;
 
@@ -5278,8 +6806,311 @@ RasterResult rasterizeScene(RasterRequest request) {
 
 /// Renders a frame on a worker isolate, so a full-resolution frame does not
 /// stall the window.
+///
+/// Spawns an isolate per call, which is why the viewer does not use this for
+/// the frames of a drag -- see [RenderWorker].
 Future<RasterResult> rasterizeSceneInIsolate(RasterRequest request) {
   return Isolate.run(() => rasterizeScene(request));
+}
+
+/// A name for a mesh's flattened scene, unique for as long as the mesh lives.
+///
+/// [RenderWorker] holds its scenes under this name, so a name that can repeat
+/// would draw the wrong model: `identityHashCode` is not unique -- it may be
+/// handed out again for a different object once the first is collected. An
+/// [Expando] hangs the name on the mesh itself, so it is unique while the mesh
+/// exists and collected along with it.
+final Expando<String> _sceneNames = Expando<String>('raster scene name');
+var _sceneNameCount = 0;
+
+/// The name of the scene flattened from [mesh] under [uvSetOverride].
+///
+/// The UV set is part of the name because it changes the flattened scene --
+/// [RasterScene.fromMesh] bakes the chosen UVs in -- while leaving the mesh
+/// the same object.
+String sceneNameFor(MeshModel mesh, String? uvSetOverride) {
+  final name = _sceneNames[mesh] ??= 'mesh${_sceneNameCount += 1}';
+  return '$name|${uvSetOverride ?? ''}';
+}
+
+/// One frame asked of the render worker.
+///
+/// [scene] is null in the ordinary case: the worker holds the scene under
+/// [sceneKey] from an earlier frame, and [request] carries
+/// [RasterScene.placeholder] in its place. The worker asks for it when it does
+/// not have it.
+class RenderFrameMessage {
+  const RenderFrameMessage({
+    required this.id,
+    required this.sceneKey,
+    required this.request,
+    this.scene,
+  });
+
+  final int id;
+  final String sceneKey;
+  final RasterRequest request;
+  final RasterScene? scene;
+}
+
+/// A rendered frame, a request for the scene, or a failure.
+///
+/// The frame travels as a plain [RasterResult], which copies its pixel buffer
+/// across. [TransferableTypedData] would move it instead, and was tried: the
+/// round trip for a frame with nothing in it to draw measured 4.4 ms either
+/// way, against 0.2 ms for the same trip at 1x1, so the cost that scales with
+/// the buffer is allocating and reclaiming it, not copying it. Keeping the
+/// plain result avoids a class whose bytes may be read only once.
+class RenderFrameReply {
+  const RenderFrameReply.frame(this.id, RasterResult this.result)
+    : needsScene = false,
+      error = null;
+  const RenderFrameReply.needsScene(this.id)
+    : result = null,
+      needsScene = true,
+      error = null;
+  const RenderFrameReply.failed(this.id, String this.error)
+    : result = null,
+      needsScene = false;
+
+  final int id;
+  final RasterResult? result;
+
+  /// The worker does not hold the scene this frame named; send it and retry.
+  final bool needsScene;
+  final String? error;
+}
+
+/// How many flattened scenes the worker keeps.
+///
+/// One would be enough for the viewer alone, but a variant grid draws the same
+/// mesh in many cells and the animation preview sits beside the still view, so
+/// a single slot would have two views evicting each other's scene every frame
+/// and paying the transfer again each time. Three covers the cases that exist
+/// and bounds what the worker holds.
+const renderWorkerSceneSlots = 3;
+
+/// Worker entry point. Top-level by necessity: isolates are spawned by
+/// function reference, and a closure here would capture its surroundings.
+Future<void> renderWorkerEntry(SendPort host) async {
+  final port = ReceivePort();
+  host.send(port.sendPort);
+
+  // Insertion-ordered, so the oldest key is the first one -- this is the
+  // eviction order.
+  final held = <String, RasterScene>{};
+
+  await for (final message in port) {
+    if (message is! RenderFrameMessage) break;
+
+    final offered = message.scene;
+    if (offered != null) {
+      held.remove(message.sceneKey);
+      held[message.sceneKey] = offered;
+      while (held.length > renderWorkerSceneSlots) {
+        held.remove(held.keys.first);
+      }
+    }
+
+    final scene = held[message.sceneKey];
+    if (scene == null) {
+      host.send(RenderFrameReply.needsScene(message.id));
+      continue;
+    }
+
+    try {
+      host.send(
+        RenderFrameReply.frame(
+          message.id,
+          rasterizeScene(message.request.withScene(scene)),
+        ),
+      );
+    } catch (error) {
+      host.send(RenderFrameReply.failed(message.id, error.toString()));
+    }
+  }
+  port.close();
+}
+
+/// The rasteriser on an isolate that stays alive between frames.
+///
+/// The viewer used to draw moving frames by calling [rasterizeScene] straight
+/// on the UI isolate, because the alternative on offer was
+/// [rasterizeSceneInIsolate], which spawns an isolate per call. So every frame
+/// of a drag was time the window could not lay out, paint, or read the mouse.
+/// Measured at half resolution in a 900x700 panel, steady state: 8 ms a frame
+/// for an ordinary kit model, and 36-47 ms for the 33k- and 133k-face meshes
+/// in this library -- 21 frames a second before the rest of the frame is
+/// counted, which is what "not real time" was.
+///
+/// This keeps one isolate and one set of flattened scenes, so a frame costs a
+/// message with a camera in it. The UI isolate is then free while the frame is
+/// drawn, and the raster cost stops being added to the cost of the rebuild.
+class RenderWorker {
+  RenderWorker._();
+
+  static RenderWorker? _shared;
+
+  /// The process-wide worker. Views share it deliberately: frames then queue
+  /// behind each other instead of competing for cores with the UI isolate.
+  static RenderWorker get shared => _shared ??= RenderWorker._();
+
+  Isolate? _isolate;
+  SendPort? _send;
+  ReceivePort? _receive;
+  Future<void>? _starting;
+
+  var _nextId = 0;
+  final Map<int, _PendingFrame> _pending = {};
+
+  /// How many times a flattened scene has been sent across to the worker.
+  ///
+  /// The whole point of a worker that stays alive is that this counts scenes
+  /// and not frames, so a drag of a hundred frames sends one. Read by the
+  /// tests; nothing in the app depends on it.
+  var sceneTransfers = 0;
+
+  /// True once the worker is up. Tests use it to tell "fell back to this
+  /// isolate" from "rendered elsewhere".
+  bool get running => _send != null;
+
+  Future<void> _start() async {
+    final receive = ReceivePort();
+    _receive = receive;
+    final ready = Completer<SendPort>();
+
+    receive.listen((message) {
+      if (message is SendPort) {
+        if (!ready.isCompleted) ready.complete(message);
+        return;
+      }
+      if (message is RenderFrameReply) {
+        _settle(message);
+        return;
+      }
+      // A null is the exit notification: the worker died, so nothing in
+      // flight will ever be answered.
+      if (message == null) _failAll('the render worker stopped');
+    });
+
+    _isolate = await Isolate.spawn(
+      renderWorkerEntry,
+      receive.sendPort,
+      onExit: receive.sendPort,
+      errorsAreFatal: true,
+      debugName: 'raster',
+    );
+    _send = await ready.future;
+  }
+
+  void _settle(RenderFrameReply reply) {
+    final pending = _pending[reply.id];
+    if (pending == null) return;
+
+    if (reply.needsScene) {
+      // First frame for this scene, or the worker has since evicted it.
+      sceneTransfers += 1;
+      _send?.send(
+        RenderFrameMessage(
+          id: pending.id,
+          sceneKey: pending.sceneKey,
+          request: pending.request.withScene(RasterScene.placeholder),
+          scene: pending.scene,
+        ),
+      );
+      return;
+    }
+
+    _pending.remove(reply.id);
+    final result = reply.result;
+    if (result != null) {
+      pending.completer.complete(result);
+    } else {
+      pending.completer.completeError(
+        StateError(reply.error ?? 'the render worker failed'),
+      );
+    }
+  }
+
+  void _failAll(String reason) {
+    _send = null;
+    _isolate = null;
+    _starting = null;
+    _receive?.close();
+    _receive = null;
+    final waiting = _pending.values.toList();
+    _pending.clear();
+    for (final pending in waiting) {
+      pending.completer.completeError(StateError(reason));
+    }
+  }
+
+  /// Renders [request]'s frame, keeping its scene on the worker under
+  /// [sceneKey] so later frames for the same scene need not carry it.
+  ///
+  /// Falls back to drawing on this isolate if the worker cannot be started:
+  /// a viewer that draws while stalling the window is better than one that
+  /// shows nothing.
+  Future<RasterResult> render(
+    RasterRequest request, {
+    required String sceneKey,
+  }) async {
+    try {
+      await (_starting ??= _start());
+    } catch (error) {
+      _failAll('the render worker could not start: $error');
+      return rasterizeScene(request);
+    }
+
+    final send = _send;
+    if (send == null) return rasterizeScene(request);
+
+    final id = _nextId += 1;
+    final pending = _PendingFrame(
+      id: id,
+      sceneKey: sceneKey,
+      request: request,
+      scene: request.scene,
+    );
+    _pending[id] = pending;
+
+    // The scene is left out on purpose; the worker asks when it needs it.
+    send.send(
+      RenderFrameMessage(
+        id: id,
+        sceneKey: sceneKey,
+        request: request.withScene(RasterScene.placeholder),
+      ),
+    );
+    return pending.completer.future;
+  }
+
+  /// Stops the worker. The app never needs this -- the isolate costs nothing
+  /// idle and lives as long as the window -- but a test that leaves it running
+  /// never finishes.
+  void dispose() {
+    _isolate?.kill(priority: Isolate.immediate);
+    _failAll('the render worker was disposed');
+    if (identical(_shared, this)) _shared = null;
+  }
+}
+
+class _PendingFrame {
+  _PendingFrame({
+    required this.id,
+    required this.sceneKey,
+    required this.request,
+    required this.scene,
+  });
+
+  final int id;
+  final String sceneKey;
+
+  /// Kept whole, scene included, so the frame can be sent again with the
+  /// scene attached when the worker says it does not hold it.
+  final RasterRequest request;
+  final RasterScene scene;
+  final completer = Completer<RasterResult>();
 }
 
 /// Blinn-Phong highlight for a normal under a light.
@@ -5341,8 +7172,11 @@ class MeshPainter extends CustomPainter {
     required this.renderMode,
     required this.lightingMode,
     required this.cullBackFaces,
+    this.panX = 0,
+    this.panY = 0,
     this.useNormalMaps = true,
     this.uvSetOverride,
+    this.hiddenObjects,
   });
 
   final MeshModel mesh;
@@ -5354,11 +7188,21 @@ class MeshPainter extends CustomPainter {
   final String? uvSetOverride;
   final bool cullBackFaces;
   final bool useNormalMaps;
+  final double panX;
+  final double panY;
+
+  /// See [RasterRequest.hiddenObjects]. Wireframe honours a kit's slots too:
+  /// the point of looking at a wireframe is to see the shape you picked.
+  final Uint8List? hiddenObjects;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height / 2);
-    final scale = math.min(size.width, size.height) * .38 * zoom;
+    final shorter = math.min(size.width, size.height);
+    final center = Offset(
+      size.width / 2 + panX * shorter,
+      size.height / 2 - panY * shorter,
+    );
+    final scale = shorter * .38 * zoom;
     final sy = math.sin(yaw);
     final cy = math.cos(yaw);
     final sx = math.sin(pitch);
@@ -5424,6 +7268,11 @@ class MeshPainter extends CustomPainter {
     for (var index = 0; index < faces.length; index += 1) {
       final face = faces[index];
       if (face.indices.any((i) => i < 0 || i >= projected.length)) continue;
+      final mask = hiddenObjects;
+      if (mask != null) {
+        final object = face.objectIndex;
+        if (object >= 0 && object < mask.length && mask[object] != 0) continue;
+      }
       depths[index] = _faceDepth(projected, face);
       if (cullBackFaces && face.indices.length >= 3) {
         final p0 = projected[face.indices[0]];
@@ -5787,14 +7636,26 @@ class MeshPainter extends CustomPainter {
         oldDelegate.lightingMode != lightingMode ||
         oldDelegate.cullBackFaces != cullBackFaces ||
         oldDelegate.useNormalMaps != useNormalMaps ||
-        oldDelegate.uvSetOverride != uvSetOverride;
+        oldDelegate.uvSetOverride != uvSetOverride ||
+        hiddenObjectsDigest(oldDelegate.hiddenObjects) !=
+            hiddenObjectsDigest(hiddenObjects);
   }
 }
 
 /// Upper bound on triangles drawn per frame. When a mesh exceeds it the
 /// viewer draws the nearest [maxRenderedFaces] and says so in the overlay --
 /// it must never quietly drop geometry in an inspection tool.
-const maxRenderedFaces = 14000;
+///
+/// This was 14,000, which is a 2015 number. A 261,410-face mech rasterises
+/// in 233ms at 640x640 -- fine for the settled frame, which runs on a worker
+/// isolate -- while the cap drew 8,349 of its faces and showed a handful of
+/// disconnected fragments floating in space. The cap is a safety valve for
+/// something pathological, not a quality setting, so it sits well above any
+/// real model.
+const maxRenderedFaces = 400000;
+
+/// Buckets used to pick the nearest faces without sorting them all.
+const _depthBuckets = 1024;
 
 /// Diffuse term for a face, optionally perturbed by a normal map.
 ///
@@ -5960,27 +7821,61 @@ extension AssetSortModeLabel on AssetSortMode {
 
 /// Sorts a copy of [assets]. Ties always fall back to the relative path so the
 /// order is total and does not wobble between rebuilds.
+/// The catalog in display order.
+///
+/// Each asset's sort keys are computed once, before the sort, rather than
+/// inside the comparator. Sorting 480,826 assets is about 9.1 million
+/// comparisons, and lowercasing two paths in each of them allocated some 18
+/// million strings: the pass took 6.7 s, during which the window is frozen,
+/// against 0.8 s for the same order computed this way. The tie-break on
+/// path is why the string was built even for the three modes that do not
+/// otherwise look at it.
 List<AssetItem> sortAssets(List<AssetItem> assets, AssetSortMode mode) {
-  int byPath(AssetItem a, AssetItem b) =>
-      a.relativePath.toLowerCase().compareTo(b.relativePath.toLowerCase());
+  final keyed = List<_SortKey>.generate(assets.length, (index) {
+    final asset = assets[index];
+    return _SortKey(
+      asset: asset,
+      path: asset.sortPathKey,
+      text: switch (mode) {
+        AssetSortMode.name => asset.name.toLowerCase(),
+        AssetSortMode.type => asset.effectiveType,
+        _ => '',
+      },
+    );
+  }, growable: false);
 
-  final sorted = [...assets];
-  sorted.sort((a, b) {
+  keyed.sort((a, b) {
     final primary = switch (mode) {
       AssetSortMode.path => 0,
-      AssetSortMode.name => a.name.toLowerCase().compareTo(
-        b.name.toLowerCase(),
-      ),
+      AssetSortMode.name => a.text.compareTo(b.text),
       // Largest first: when sorting by size you are usually hunting for the
       // heavy assets.
-      AssetSortMode.size => b.size.compareTo(a.size),
-      AssetSortMode.modified => b.modified.compareTo(a.modified),
-      AssetSortMode.type => a.effectiveType.compareTo(b.effectiveType),
+      AssetSortMode.size => b.asset.size.compareTo(a.asset.size),
+      AssetSortMode.modified => b.asset.modified.compareTo(a.asset.modified),
+      AssetSortMode.type => a.text.compareTo(b.text),
     };
     if (primary != 0) return primary;
-    return byPath(a, b);
+    return a.path.compareTo(b.path);
   });
-  return sorted;
+
+  return [for (final entry in keyed) entry.asset];
+}
+
+/// One asset with its sort keys already computed.
+class _SortKey {
+  const _SortKey({
+    required this.asset,
+    required this.path,
+    required this.text,
+  });
+
+  final AssetItem asset;
+
+  /// The tie-break, lower-cased once.
+  final String path;
+
+  /// The primary key for the two modes that sort on text; empty otherwise.
+  final String text;
 }
 
 enum RenderMode { textured, solid, wireframe }
@@ -6037,6 +7932,9 @@ class AssetDetailsPanel extends StatelessWidget {
     required this.allAssets,
     required this.catalogRevision,
     required this.onActivateAsset,
+    this.rigBones = const {},
+    this.audition,
+    this.onAudition,
     super.key,
   });
 
@@ -6044,6 +7942,16 @@ class AssetDetailsPanel extends StatelessWidget {
   final List<AssetItem> allAssets;
   final int catalogRevision;
   final ValueChanged<AssetItem> onActivateAsset;
+
+  /// The bone names behind each rig signature, for the pairing lists.
+  final Map<String, List<String>> rigBones;
+
+  /// The pairing currently being tried out, if any.
+  final AssetItem? audition;
+
+  /// Start or stop an audition. Null when the panel is shown somewhere that
+  /// has no preview to play it in.
+  final ValueChanged<AssetItem?>? onAudition;
 
   @override
   Widget build(BuildContext context) {
@@ -6096,6 +8004,19 @@ class AssetDetailsPanel extends StatelessWidget {
               runSpacing: 8,
               children: item.tags.map((tag) => Chip(label: Text(tag))).toList(),
             ),
+            TwinFormatsList(
+              item: item,
+              allAssets: allAssets,
+              onActivateAsset: onActivateAsset,
+            ),
+            RigPairingList(
+              item: item,
+              allAssets: allAssets,
+              rigBones: rigBones,
+              audition: audition,
+              onAudition: onAudition,
+              onActivateAsset: onActivateAsset,
+            ),
             if (item.type == 'model') ...[
               const SizedBox(height: 14),
               ModelTextureDiagnostics(
@@ -6107,6 +8028,306 @@ class AssetDetailsPanel extends StatelessWidget {
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// The same model in other formats, and the ones that might be it.
+///
+/// Shown only when there is something to show. A pack ships one FBX zip and
+/// up to seven Unreal zips of the same models, so the Unreal line is usually
+/// a count with the containers under it rather than seven separate lines.
+class TwinFormatsList extends StatelessWidget {
+  const TwinFormatsList({
+    required this.item,
+    required this.allAssets,
+    required this.onActivateAsset,
+    super.key,
+  });
+
+  final AssetItem item;
+  final List<AssetItem> allAssets;
+  final ValueChanged<AssetItem> onActivateAsset;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!twinEligible(item)) return const SizedBox.shrink();
+    final twins = twinIndexFor(allAssets).twinsOf(item);
+    if (twins.isEmpty) return const SizedBox.shrink();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (twins.same.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          const Text(
+            'Same model, other formats',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 4),
+          ..._formatLines(twins.same, false),
+        ],
+        if (twins.possible.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          const Text(
+            'Possibly the same model',
+            style: TextStyle(fontWeight: FontWeight.w700, color: Colors.black54),
+          ),
+          const Text(
+            'Same file name, a pack name that does not quite match.',
+            style: TextStyle(fontSize: 11, color: Colors.black54),
+          ),
+          const SizedBox(height: 4),
+          ..._formatLines(twins.possible, true),
+        ],
+      ],
+    );
+  }
+
+  List<Widget> _formatLines(List<AssetItem> twins, bool uncertain) {
+    final byExt = <String, List<AssetItem>>{};
+    for (final twin in twins) {
+      byExt.putIfAbsent(twin.ext.toUpperCase(), () => []).add(twin);
+    }
+    final extensions = byExt.keys.toList()..sort();
+    return [
+      for (final ext in extensions)
+        _TwinFormatLine(
+          label: byExt[ext]!.length == 1
+              ? ext
+              : '$ext x${byExt[ext]!.length}',
+          twins: byExt[ext]!,
+          uncertain: uncertain,
+          onActivateAsset: onActivateAsset,
+        ),
+    ];
+  }
+}
+
+class _TwinFormatLine extends StatelessWidget {
+  const _TwinFormatLine({
+    required this.label,
+    required this.twins,
+    required this.uncertain,
+    required this.onActivateAsset,
+  });
+
+  final String label;
+  final List<AssetItem> twins;
+  final bool uncertain;
+  final ValueChanged<AssetItem> onActivateAsset;
+
+  @override
+  Widget build(BuildContext context) {
+    final colour = uncertain ? Colors.black54 : null;
+    if (twins.length == 1) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 72,
+              child: Text(
+                label,
+                style: TextStyle(fontSize: 12, color: colour),
+              ),
+            ),
+            Expanded(
+              child: InkWell(
+                onTap: () => onActivateAsset(twins.single),
+                child: Text(
+                  containerDisplayName(twins.single),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: uncertain ? Colors.black54 : Colors.blue.shade800,
+                    decoration: TextDecoration.underline,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return Theme(
+      data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+      child: ExpansionTile(
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(left: 16, bottom: 4),
+        dense: true,
+        visualDensity: VisualDensity.compact,
+        title: Text(label, style: TextStyle(fontSize: 12, color: colour)),
+        children: [
+          for (final twin in twins)
+            InkWell(
+              onTap: () => onActivateAsset(twin),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    containerDisplayName(twin),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: uncertain ? Colors.black54 : Colors.blue.shade800,
+                      decoration: TextDecoration.underline,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The other half of a pairing: the clips that drive this model, or the
+/// models this clip drives.
+///
+/// Built from rig signatures, so the question answered is "do these two rigs
+/// hold the same bones" rather than "do these two files carry the same
+/// family label". Nothing is shown for a file with no rig -- an empty
+/// heading on every prop in the library would be noise.
+class RigPairingList extends StatelessWidget {
+  const RigPairingList({
+    required this.item,
+    required this.allAssets,
+    required this.rigBones,
+    required this.onActivateAsset,
+    this.audition,
+    this.onAudition,
+    super.key,
+  });
+
+  final AssetItem item;
+  final List<AssetItem> allAssets;
+  final Map<String, List<String>> rigBones;
+  final AssetItem? audition;
+  final ValueChanged<AssetItem?>? onAudition;
+  final ValueChanged<AssetItem> onActivateAsset;
+
+  @override
+  Widget build(BuildContext context) {
+    final signature = item.rigSignature;
+    if (signature == null || signature.isEmpty || rigBones.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final isClip = item.effectiveType == 'animation';
+    if (!isClip && item.modelKind != 'mesh') return const SizedBox.shrink();
+
+    final index = rigIndexFor(allAssets, rigBones);
+    final found = isClip ? index.modelsFor(item) : index.clipsFor(item);
+    if (found.isEmpty) return const SizedBox.shrink();
+
+    final heading = isClip
+        ? 'Models this clip drives (${found.length})'
+        : 'Animations for this model (${found.length})';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 14),
+        Text(heading, style: const TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 6),
+        SizedBox(
+          // A fixed height inside the panel's own ListView: an unbounded
+          // list inside a scrolling list has no height to lay out in, and
+          // the Sidekick rig has 346 clips, so this is a builder.
+          height: 240,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.white,
+              border: Border.all(color: Colors.black12),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: ListView.builder(
+              itemCount: found.length,
+              itemBuilder: (context, position) {
+                final other = found[position];
+                final playing = audition?.path == other.path;
+                return _RigPairingRow(
+                  other: other,
+                  playing: playing,
+                  onPlay: onAudition == null
+                      ? null
+                      : () => onAudition!(playing ? null : other),
+                  onOpen: () => onActivateAsset(other),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _RigPairingRow extends StatelessWidget {
+  const _RigPairingRow({
+    required this.other,
+    required this.playing,
+    required this.onPlay,
+    required this.onOpen,
+  });
+
+  final AssetItem other;
+  final bool playing;
+  final VoidCallback? onPlay;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      child: Row(
+        children: [
+          if (onPlay != null)
+            IconButton(
+              tooltip: playing ? 'Stop' : 'Audition this pairing',
+              visualDensity: VisualDensity.compact,
+              icon: Icon(
+                playing ? Icons.stop_circle_outlined : Icons.play_circle_outline,
+                size: 18,
+              ),
+              onPressed: onPlay,
+            ),
+          Expanded(
+            child: InkWell(
+              onTap: onOpen,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      other.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontWeight: playing ? FontWeight.w700 : FontWeight.w400,
+                      ),
+                    ),
+                    Text(
+                      containerDisplayName(other),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -6312,7 +8533,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
   /// The mesh itself, so the panel can tell "this material is a flat colour"
   /// apart from "this model's textures are missing". Shares the cached import.
   Future<MeshModel>? _loadMesh() {
-    if (!_previewableModelExts.contains(widget.asset.ext)) return null;
+    if (!previewableModelExts.contains(widget.asset.ext)) return null;
     return MeshLoadCache.load(widget.asset, allAssets: widget.allAssets);
   }
 
@@ -6322,7 +8543,7 @@ class _ModelTextureDiagnosticsState extends State<ModelTextureDiagnostics> {
     final allAssets = widget.allAssets;
     final onActivateAsset = widget.onActivateAsset;
     final nearby = findNearbyTextures(asset, allAssets);
-    if (_previewableModelExts.contains(asset.ext)) {
+    if (previewableModelExts.contains(asset.ext)) {
       return FutureBuilder<MeshModel>(
         future: meshFuture,
         builder: (context, meshSnapshot) =>
@@ -6501,6 +8722,104 @@ bool assetIsCharacterModel(AssetItem asset) {
   return rig != null && rig != RigFamily.none.name;
 }
 
+/// Whether a rescan found the same file it saw last time.
+///
+/// Modified time and size together. Either alone is too weak: a re-export can
+/// land on the same byte count, and copying a file about changes its timestamp
+/// without changing a thing inside it. Both matching is the signal that
+/// everything already learned about it still holds.
+bool assetLooksUnchanged(AssetItem fresh, AssetItem known) =>
+    fresh.size == known.size &&
+    fresh.modified.millisecondsSinceEpoch ==
+        known.modified.millisecondsSinceEpoch;
+
+/// The fresh scan results with what an earlier catalog already knew about the
+/// same files copied across. Matched by id, which is built from the source
+/// root and relative path and so survives a rescan.
+///
+/// Only for files that have not changed. What is carried is all *derived from
+/// the bytes* -- which kind of model it is, which rig, which images it
+/// asks for -- so a file that has been re-exported has to be re-derived or
+/// the catalog states something about it that was true of a different file.
+/// An earlier version carried it regardless, reasoning that a probe is cheap
+/// to be wrong about; it is not, because classification is persisted and only
+/// ever computed when absent, so one wrong answer never heals.
+///
+/// `ignored` is carried either way. That is the user's decision about a path,
+/// not a fact about the bytes, and re-exporting a file they hid is no reason
+/// to put it back in front of them.
+///
+/// Pass `force` to re-derive everything. That is for when the *derivation*
+/// has changed rather than the files -- a better probe, a new rig family --
+/// which no comparison of timestamps can detect.
+List<AssetItem> carryClassification(
+  List<AssetItem> fresh,
+  Map<String, AssetItem> remembered, {
+  bool force = false,
+}) {
+  for (final asset in fresh) {
+    final known = remembered[asset.id];
+    if (known == null) continue;
+    // Deliberately not conditional: an ignore is about the path.
+    if (known.ignored) asset.ignored = true;
+    if (force || !assetLooksUnchanged(asset, known)) continue;
+    asset.modelKind ??= known.modelKind;
+    asset.rigFamily ??= known.rigFamily;
+    // The link between a texture and the models that use it, learned only by
+    // importing a model. Dropping it meant re-importing the library.
+    asset.referencedByModel =
+        asset.referencedByModel || known.referencedByModel;
+  }
+  return fresh;
+}
+
+/// How much a rescan was able to keep, for the status line.
+///
+/// Worth reporting rather than inferring: "4 changed" is the difference
+/// between a rescan that cost nothing and one that has just thrown away a
+/// day of probing.
+class CarryTally {
+  const CarryTally({
+    required this.unchanged,
+    required this.changed,
+    required this.added,
+  });
+
+  final int unchanged;
+  final int changed;
+  final int added;
+
+  String get summary {
+    final parts = <String>[
+      if (unchanged > 0) '$unchanged unchanged',
+      if (changed > 0) '$changed changed',
+      if (added > 0) '$added new',
+    ];
+    return parts.isEmpty ? 'nothing to compare' : parts.join(', ');
+  }
+}
+
+CarryTally tallyCarry(
+  List<AssetItem> fresh,
+  Map<String, AssetItem> remembered, {
+  bool force = false,
+}) {
+  var unchanged = 0;
+  var changed = 0;
+  var added = 0;
+  for (final asset in fresh) {
+    final known = remembered[asset.id];
+    if (known == null) {
+      added += 1;
+    } else if (!force && assetLooksUnchanged(asset, known)) {
+      unchanged += 1;
+    } else {
+      changed += 1;
+    }
+  }
+  return CarryTally(unchanged: unchanged, changed: changed, added: added);
+}
+
 /// Whether an asset passes the rig filter.
 ///
 /// `all` passes everything. `compatible` keeps only files built on the same
@@ -6512,14 +8831,32 @@ bool assetPassesRigFilter({
   required AssetItem asset,
   required String rigFilter,
   required String? characterRig,
+  String? characterContainer,
+  String? characterSignature,
+  RigIndex? rigIndex,
 }) {
   if (rigFilter == 'all') return true;
   if (asset.rigFamily == null) return true;
   if (rigFilter == 'compatible') {
     if (characterRig == null) return true;
+    // Bones first, where both rigs are known: the family is a label with
+    // four values and the signature is the thing itself. This is what lets
+    // the Dogs pack pair with its own clips without the container stopgap,
+    // and what keeps two unrelated `other` rigs apart even inside one zip.
+    final byBones = rigIndex?.compatible(characterSignature, asset.rigSignature);
+    if (byBones != null) return byBones;
+    final assetFamily = rigFamilyByName(asset.rigFamily);
+    final characterFamily = rigFamilyByName(characterRig);
+    // The container is only consulted for an unnamed rig, and reading it per
+    // asset is not free -- this runs once per asset in the list on every
+    // keystroke.
+    final unnamed =
+        assetFamily == RigFamily.other || characterFamily == RigFamily.other;
     return rigFamiliesCompatible(
-      rigFamilyByName(asset.rigFamily),
-      rigFamilyByName(characterRig),
+      assetFamily,
+      characterFamily,
+      containerA: unnamed ? assetContainerKey(asset) : null,
+      containerB: unnamed ? characterContainer : null,
     );
   }
   return asset.rigFamily == rigFilter;
@@ -6539,16 +8876,27 @@ RigFamily rigFamilyByName(String? name) {
 /// in one map, so the two facts share a string rather than needing a second
 /// map threaded through every layer.
 class FbxClassification {
-  const FbxClassification({required this.kind, required this.rig});
+  const FbxClassification({
+    required this.kind,
+    required this.rig,
+    this.signature,
+    this.bones = const [],
+  });
 
-  /// Reads the encoded form. An older value with no rig reads as unknown,
-  /// which is what a catalog written before this existed will hold.
+  /// Reads the encoded form, in any of the three it has had: `kind`,
+  /// `kind#rig`, and `kind#rig#signature#bone\u0001bone`. A catalog written
+  /// before a field existed reads as null for it rather than failing.
   factory FbxClassification.decode(String value) {
-    final split = value.indexOf('#');
-    if (split < 0) return FbxClassification(kind: value, rig: null);
+    final parts = value.split('#');
+    if (parts.length == 1) return FbxClassification(kind: value, rig: null);
+    final bones = parts.length > 3 && parts[3].isNotEmpty
+        ? parts[3].split('\u0001')
+        : const <String>[];
     return FbxClassification(
-      kind: value.substring(0, split),
-      rig: value.substring(split + 1),
+      kind: parts[0],
+      rig: parts[1],
+      signature: parts.length > 2 && parts[2].isNotEmpty ? parts[2] : null,
+      bones: bones,
     );
   }
 
@@ -6558,7 +8906,21 @@ class FbxClassification {
   /// The [RigFamily] name, or null when the file was never probed for one.
   final String? rig;
 
-  String encode() => rig == null ? kind : '$kind#$rig';
+  /// The rig's identity, from [rigSignatureOf]. Null for a file with no bones
+  /// or one probed before signatures existed.
+  final String? signature;
+
+  /// The bone names behind [signature], so the names can be stored once per
+  /// signature rather than once per file.
+  final List<String> bones;
+
+  String encode() {
+    if (rig == null) return kind;
+    if (signature == null) return '$kind#$rig';
+    // The separator is a control character no bone name holds; `#` is already
+    // taken by the field separator and `_` and `/` are common in rig names.
+    return '$kind#$rig#$signature#${bones.join('\u0001')}';
+  }
 }
 
 /// The skeleton a model or clip is built on.
@@ -6578,7 +8940,18 @@ enum RigFamily {
   /// The plain Unreal mannequin: `root/pelvis/spine_01/thigh_l`.
   unreal,
 
-  /// A prop, or a mesh with no skeleton at all.
+  /// A real skeleton Atlas has no name for.
+  ///
+  /// Not a failure to read the file: the bones are there and the file can be
+  /// animated, they are simply not one of the three rigs above. The Dogs
+  /// pack's 82-bone rig and Kenney's 58-bone Blender rigs are the examples
+  /// here. 91 of the library's 796 clips land here, every one of them with a
+  /// real skeleton, and before this they were stored as [none] and could
+  /// never be paired with anything -- including the mesh shipped beside them
+  /// on the very same rig.
+  other,
+
+  /// No bones at all. A prop. Nothing can animate it.
   none,
 }
 
@@ -6587,29 +8960,119 @@ extension RigFamilyLabel on RigFamily {
     RigFamily.polygon => 'Polygon',
     RigFamily.sidekick => 'Sidekick',
     RigFamily.unreal => 'Unreal',
+    RigFamily.other => 'Other rig',
     RigFamily.none => 'No rig',
   };
 }
 
-/// Classifies a rig from the marker bones the importer's probe reported.
+/// Classifies a rig from the marker bones the importer's probe reported, and
+/// the number of bones it found.
 ///
-/// Order matters: Sidekick carries every mannequin bone as well as its own, so
-/// it has to be checked first or it reads as plain Unreal.
-RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
+/// One rule, mirrored exactly by `rig_family_from_markers` in
+/// `work/atlas_mcp/atlas_mcp.py`; both are tested against
+/// `work/atlas_mcp/fixtures/rig_families.json`, which owns it. Two
+/// implementations of the same rule in two languages is the arrangement that
+/// always drifts, and this one had: graded against which clip rig actually
+/// names each character's bones, over 800 rigged characters, the Python rule
+/// was right 786 times and this one 480 -- it called 303 rigged characters
+/// rigless. The rule below is the Python one, plus the bone count and the
+/// "two markers" test.
+///
+/// In order:
+///
+///  1. no bones at all is [RigFamily.none] -- a prop, whatever its names;
+///  2. any Sidekick attachment or IK bone is [RigFamily.sidekick], first,
+///     because a Sidekick rig carries every mannequin bone as well and would
+///     otherwise read as plain Unreal;
+///  3. **two or more** Polygon markers is [RigFamily.polygon];
+///  4. **two or more** mannequin markers is [RigFamily.unreal];
+///  5. anything else with bones is [RigFamily.other].
+///
+/// Two markers rather than one, because one generic name decided a family:
+/// Kenney's 58-bone Blender rig shares exactly `Hips` with the Polygon rig and
+/// nothing else, and 13 clips were stored as `polygon` on that basis.
+RigFamily rigFamilyFromMarkers(
+  Iterable<String> markers, {
+  required int bones,
+}) {
+  if (bones <= 0) return RigFamily.none;
   final present = markers.toSet();
   if (present.any(
-    (m) => m == 'hipAttachFront' || m == 'hipAttach_l' || m == 'hipAttach_r',
+    (m) =>
+        m == 'hipAttachFront' ||
+        m == 'hipAttach_l' ||
+        m == 'ik_hand_gun' ||
+        m == 'ik_hand_root',
   )) {
     return RigFamily.sidekick;
   }
-  if (present.contains('pelvis') || present.contains('thigh_l')) {
-    return RigFamily.unreal;
+  var polygon = 0;
+  var unreal = 0;
+  for (final marker in present) {
+    if (marker == 'Hips' ||
+        marker == 'UpperLeg_R' ||
+        marker == 'Clavicle_L' ||
+        marker == 'Spine_01') {
+      polygon += 1;
+    } else if (marker == 'pelvis' ||
+        marker == 'thigh_l' ||
+        marker == 'clavicle_l' ||
+        marker == 'spine_01') {
+      unreal += 1;
+    }
   }
-  if (present.contains('Hips') || present.contains('UpperLeg_R')) {
-    return RigFamily.polygon;
-  }
-  return RigFamily.none;
+  if (polygon >= 2) return RigFamily.polygon;
+  if (unreal >= 2) return RigFamily.unreal;
+  return RigFamily.other;
 }
+
+/// A rig's identity: the set of bone names it holds.
+///
+/// Lower-cased, so two exports of one rig that differ only in case are one
+/// rig -- which is the whole finding behind the case-folded lookup. Sorted,
+/// so the order the exporter happened to write them in cannot matter. Then
+/// hashed, because the names themselves are stored once per signature in
+/// `rig_bones` and every asset row only needs the key.
+///
+/// FNV-1a rather than a cryptographic hash: this is an identity key over
+/// about fifty distinct rigs, not something anyone could want to forge, and
+/// it is a dozen lines of arithmetic that Python computes identically with no
+/// dependency added on either side. `work/atlas_mcp/fixtures/rig_signatures.json`
+/// owns the definition and both languages are tested against it.
+///
+/// Empty for a file with no bones: a prop has no rig to identify.
+String rigSignatureOf(Iterable<String> boneNames) {
+  final names = <String>[];
+  for (final name in boneNames) {
+    if (name.isEmpty) continue;
+    names.add(name.toLowerCase());
+  }
+  if (names.isEmpty) return '';
+  names.sort();
+  // FNV-1a, 64-bit. Dart's int is a signed 64-bit two's-complement value and
+  // both operations wrap, which is the arithmetic FNV wants; Python masks to
+  // the same 64 bits.
+  var hash = -3750763034362895579; // 0xcbf29ce484222325 as a signed int64
+  for (var index = 0; index < names.length; index += 1) {
+    if (index > 0) hash = _fnvByte(hash, 0x0A);
+    for (final unit in names[index].codeUnits) {
+      hash = _fnvByte(hash, unit & 0xFF);
+      if (unit > 0xFF) hash = _fnvByte(hash, (unit >> 8) & 0xFF);
+    }
+  }
+  // Printed as unsigned, in two halves. `toUnsigned(64)` cannot help here:
+  // there is no non-negative int64 for a value with the top bit set, so it
+  // returns the negative number unchanged and `toRadixString` writes a minus
+  // sign -- which is a signature Python would never produce, for the half of
+  // all rigs whose hash happens to land above 2^63.
+  final high = (hash >> 32) & 0xFFFFFFFF;
+  final low = hash & 0xFFFFFFFF;
+  final hex = high.toRadixString(16).padLeft(8, '0') +
+      low.toRadixString(16).padLeft(8, '0');
+  return hex.substring(0, 12);
+}
+
+int _fnvByte(int hash, int byte) => (hash ^ byte) * 0x100000001b3;
 
 /// The family a loaded skeleton belongs to, read from its own bone names.
 ///
@@ -6617,28 +9080,1588 @@ RigFamily rigFamilyFromMarkers(Iterable<String> markers) {
 /// clip loaded for playback already carries its bones in memory, so its family
 /// can be named without going back to the file.
 RigFamily rigFamilyOfSkeleton(SkeletonAnimation skeleton) =>
-    rigFamilyFromMarkers(skeleton.bones.map((bone) => bone.name));
+    rigFamilyFromMarkers(
+      skeleton.bones.map((bone) => bone.name),
+      bones: skeleton.bones.length,
+    );
+
+// --- The texture the pack's author assigned ------------------------------
+//
+// 14% of the FBX meshes in this library name no texture at all. The War
+// Robot is one: one material called `SciFiSpaceBase4`, zero texture
+// references, and the material name does not encode the atlas either -- the
+// atlas it is actually assigned is `Material_01_A`.
+//
+// The pack carries the answer somewhere else. Unity stores an authored
+// chain: a .prefab names a material by GUID, the .mat names its `_MainTex`
+// by GUID, and every .meta maps a GUID to a path. For the robot that chain
+// resolves to PolygonSciFiSpace_Texture_01_A.png, which 42 of the pack's 43
+// character prefabs are assigned, and 544 of its 662 prefabs overall.
+//
+// So this reads the answer where there is one, and guesses only where there
+// is not -- and says on screen which of the two happened, because a wrong
+// texture is worse than no texture: the tagging queue embeds the picture
+// Atlas draws.
+
+/// Where an inferred texture came from, worst to best.
+enum TextureSource {
+  /// Nothing was inferred. Flat colour.
+  none,
+
+  /// A filename rule. A guess, and labelled as one.
+  guessed,
+
+  /// The texture most of this pack's prefabs are assigned.
+  packDefault,
+
+  /// The texture this model's own prefab is assigned.
+  prefab,
+}
+
+extension TextureSourceLabel on TextureSource {
+  /// What the picker says in place of `Texture: auto`.
+  String get label => switch (this) {
+    TextureSource.prefab => "from the pack's prefab",
+    TextureSource.packDefault => 'pack default',
+    TextureSource.guessed => 'guessed',
+    TextureSource.none => '',
+  };
+}
+
+class InferredTexture {
+  const InferredTexture({required this.path, required this.source});
+
+  final String path;
+  final TextureSource source;
+}
+
+/// Where a loaded mesh's texture came from, when it came from inference.
+///
+/// On the object rather than in it: [MeshModel] is copied by several
+/// `with*` helpers, and a field would have to be threaded through every one
+/// of them to survive. The copy that matters is the one `applyChosenTexture`
+/// returns, and this is set on that.
+final Expando<TextureSource> _inferredTextureSource =
+    Expando<TextureSource>('inferred texture source');
+
+TextureSource inferredTextureSourceOf(MeshModel mesh) =>
+    _inferredTextureSource[mesh] ?? TextureSource.none;
+
+void setInferredTextureSource(MeshModel mesh, TextureSource source) {
+  _inferredTextureSource[mesh] = source;
+}
+
+/// What a Unity build says about its own materials.
+class UnityTextureChain {
+  const UnityTextureChain({
+    required this.byModelStem,
+    required this.dominant,
+    required this.prefabsResolved,
+    required this.prefabsTotal,
+  });
+
+  static const empty = UnityTextureChain(
+    byModelStem: {},
+    dominant: null,
+    prefabsResolved: 0,
+    prefabsTotal: 0,
+  );
+
+  /// Prefab stem (lower-cased, `sm_`/`sk_` stripped) to the project path of
+  /// the texture its material assigns.
+  final Map<String, String> byModelStem;
+
+  /// The texture the most prefabs are assigned, where one is dominant
+  /// enough to stand for the pack.
+  final String? dominant;
+
+  final int prefabsResolved;
+  final int prefabsTotal;
+
+  bool get isEmpty => byModelStem.isEmpty && dominant == null;
+}
+
+final _unityGuidPattern = RegExp(r'guid: ([0-9a-f]{32})');
+
+/// The material slots that hold a model's base colour, best first.
+///
+/// `_MainTex` is Unity's built-in name and what the older packs use.
+/// `_BaseMap` is URP's. `_Albedo_Map` is Synty's own shader, which the 2022
+/// and later builds ship: of the 73 materials in Dungeon Realms 2022, 56
+/// reference a texture and only 5 do it through `_MainTex`, so a reader
+/// that knew only that name saw 17 of 1,529 prefabs and called an FX circle
+/// the pack's atlas.
+const _unityBaseTextureSlots = [
+  '_MainTex',
+  '_BaseMap',
+  '_Albedo_Map',
+  '_AlbedoMap',
+  '_BaseColorMap',
+];
+
+final _unityBaseTexturePatterns = [
+  for (final slot in _unityBaseTextureSlots)
+    RegExp(
+      '- $slot:' r'\s*\n\s*m_Texture: \{fileID: \d+(?:, guid: ([0-9a-f]{32}))?',
+    ),
+];
+const _unityImageExtensions = {'png', 'tga', 'psd', 'jpg', 'jpeg'};
+
+/// A prefab or FBX stem with Synty's mesh prefix removed.
+///
+/// The prefabs are named `SM_`, the skinned FBX `SK_`, and the same model
+/// has both. Stripping the prefix matched 614 of 667 FBX in the SciFiSpace
+/// source zip to a prefab.
+String unityModelStem(String fileName) {
+  var stem = twinStem(fileName);
+  for (final prefix in const ['sm_', 'sk_']) {
+    if (stem.startsWith(prefix)) {
+      stem = stem.substring(prefix.length);
+      break;
+    }
+  }
+  return stem;
+}
+
+/// Reads a Unity build's prefab -> material -> `_MainTex` chain.
+///
+/// Plain YAML text inside an archive Atlas already opens. The files are not
+/// in the catalog -- a `.meta` is type `other` and the scanner skips those --
+/// so the archive is read directly.
+UnityTextureChain readUnityTextureChain(String archivePath) {
+  final cached = _unityChainCache[normalizePathKey(archivePath)];
+  if (cached != null) return cached;
+  final chain = _readUnityTextureChain(archivePath);
+  if (_unityChainCache.length >= _maxUnityChainCacheEntries) {
+    _unityChainCache.remove(_unityChainCache.keys.first);
+  }
+  _unityChainCache[normalizePathKey(archivePath)] = chain;
+  return chain;
+}
+
+final _unityChainCache = <String, UnityTextureChain>{};
+const _maxUnityChainCacheEntries = 24;
+
+void resetUnityChainCache() {
+  _unityChainCache.clear();
+  resetUnitySidecarCache();
+}
+
+UnityTextureChain _readUnityTextureChain(String archivePath) {
+  if (extensionOf(archivePath) == 'unitypackage') {
+    return _readUnityPackageChain(archivePath);
+  }
+  final archive = _loadCachedArchive(archivePath);
+  if (archive == null) return UnityTextureChain.empty;
+
+  final guidToPath = <String, String>{};
+  final materialEntries = <String, ArchiveFile>{};
+  final prefabEntries = <ArchiveFile>[];
+  for (final entry in archive.files) {
+    if (!entry.isFile) continue;
+    final name = entry.name.replaceAll('\\', '/');
+    if (name.endsWith('.meta')) {
+      final text = _unityEntryText(entry, 4096);
+      if (text == null) continue;
+      final guid = _unityGuidPattern.firstMatch(text)?.group(1);
+      if (guid != null) {
+        guidToPath[guid] = name.substring(0, name.length - 5);
+      }
+    } else if (name.endsWith('.mat')) {
+      materialEntries[name] = entry;
+    } else if (name.endsWith('.prefab')) {
+      prefabEntries.add(entry);
+    }
+  }
+  if (prefabEntries.isEmpty || materialEntries.isEmpty) {
+    return UnityTextureChain.empty;
+  }
+
+  return _unityChainFrom(
+    guidToPath: guidToPath,
+    materials: materialEntries,
+    prefabs: {
+      for (final entry in prefabEntries) entry.name: entry,
+    },
+  );
+}
+
+/// The half both readers share: resolve every prefab through its materials,
+/// count what the pack uses, and decide whether it has one default.
+///
+/// [materials] and [prefabs] are keyed by the path inside the pack -- the
+/// entry name in a zip, the `pathname` line in a `.unitypackage`.
+UnityTextureChain _unityChainFrom({
+  required Map<String, String> guidToPath,
+  required Map<String, ArchiveFile> materials,
+  required Map<String, ArchiveFile> prefabs,
+}) {
+  final materialTexture = <String, String?>{};
+  String? textureOf(String materialPath) {
+    if (materialTexture.containsKey(materialPath)) {
+      return materialTexture[materialPath];
+    }
+    final entry = materials[materialPath];
+    final text = entry == null ? null : _unityEntryText(entry, 65536);
+    String? answer;
+    if (text != null) {
+      for (final pattern in _unityBaseTexturePatterns) {
+        final guid = pattern.firstMatch(text)?.group(1);
+        final path = guid == null ? null : guidToPath[guid];
+        if (path != null && _unityImageExtensions.contains(extensionOf(path))) {
+          answer = path;
+          break;
+        }
+      }
+    }
+    materialTexture[materialPath] = answer;
+    return answer;
+  }
+
+  final usedByPrefabs = <String, int>{};
+  final perPrefab = <String, Set<String>>{};
+  var resolved = 0;
+  for (final prefab in prefabs.entries) {
+    final text = _unityEntryText(prefab.value, 1 << 20);
+    if (text == null) continue;
+    final textures = <String>{};
+    for (final match in _unityGuidPattern.allMatches(text)) {
+      final path = guidToPath[match.group(1)];
+      if (path == null || !path.endsWith('.mat')) continue;
+      final texture = textureOf(path);
+      if (texture != null) textures.add(texture);
+    }
+    if (textures.isEmpty) continue;
+    resolved += 1;
+    for (final texture in textures) {
+      usedByPrefabs[texture] = (usedByPrefabs[texture] ?? 0) + 1;
+    }
+    perPrefab[unityModelStem(prefab.key.split('/').last)] = textures;
+  }
+  if (resolved == 0) return UnityTextureChain.empty;
+
+  String? dominant;
+  var best = 0;
+  for (final entry in usedByPrefabs.entries) {
+    if (entry.value > best ||
+        (entry.value == best && dominant != null && entry.key.compareTo(dominant) < 0)) {
+      best = entry.value;
+      dominant = entry.key;
+    }
+  }
+  // Half the prefabs that resolve anything, or the pack has no one default.
+  // SciFiCity's most-used texture covers 31 of 647 prefabs and the pack
+  // really does spread across Signs, NeonSigns, Billboards and Road;
+  // answering nothing there is the right answer, not a failure.
+  if (dominant != null && best * 2 < resolved) dominant = null;
+  // And the prefabs that resolved have to be a real share of the pack.
+  // Otherwise a build whose materials this reader does not understand
+  // answers confidently from the handful it did read -- which is how an FX
+  // circle became Dungeon Realms' atlas on the strength of 17 prefabs out
+  // of 1,529.
+  if (dominant != null && resolved * 5 < prefabs.length) dominant = null;
+  // And on more than a handful: the locomotion pack holds three
+  // prefabs, and one of them agreeing with itself is not a default.
+  if (dominant != null && resolved < 8) dominant = null;
+
+  final byStem = <String, String>{};
+  for (final entry in perPrefab.entries) {
+    if (entry.value.length == 1) {
+      byStem[entry.key] = entry.value.single;
+      continue;
+    }
+    // A prefab can name several materials and so resolve several textures --
+    // 14% of them in PolygonAncientEmpire. Atlas draws one texture, and
+    // counting material references cannot break the tie, so the pack's own
+    // default decides; where it is not among them, this prefab says nothing
+    // and tier 2 answers.
+    if (dominant != null && entry.value.contains(dominant)) {
+      byStem[entry.key] = dominant;
+    }
+  }
+
+  return UnityTextureChain(
+    byModelStem: byStem,
+    dominant: dominant,
+    prefabsResolved: resolved,
+    prefabsTotal: prefabs.length,
+  );
+}
+
+/// The same chain out of a `.unitypackage`.
+///
+/// 83 of the 93 Unity builds here are this format and only 10 are zips, so
+/// without this the authored answer covers 7 packs instead of about 90.
+///
+/// A `.unitypackage` is a gzipped tar: one directory per asset, *named by
+/// the GUID*, holding `asset` (the bytes), `asset.meta` and `pathname` (one
+/// line, the path the file had in the project). Two consequences. The
+/// GUID-to-path map comes free -- no `.meta` parsing at all in this format.
+/// And no entry name says what the file is, so the tar is walked once for
+/// the pathnames and once for the bytes of the few that turn out to be
+/// materials and prefabs.
+///
+/// Decompressed to a temporary file rather than to memory: the largest of
+/// these is 364 MB compressed, and holding the whole tar would be worse
+/// than writing it down once and reading it back.
+UnityTextureChain _readUnityPackageChain(String packagePath) {
+  final source = File(packagePath);
+  if (!source.existsSync()) return UnityTextureChain.empty;
+  final scratch = File(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}'
+    'atlas_unitypackage_${source.statSync().modified.millisecondsSinceEpoch}_'
+    '${packagePath.hashCode.toUnsigned(32).toRadixString(16)}.tar',
+  );
+  InputFileStream? packed;
+  try {
+    if (!scratch.existsSync()) {
+      packed = InputFileStream(packagePath);
+      final out = OutputFileStream(scratch.path);
+      GZipDecoder().decodeStream(packed, out);
+      out.closeSync();
+      packed.closeSync();
+      packed = null;
+    }
+  } catch (error) {
+    fbxLog('Unpacking $packagePath failed: $error');
+    try {
+      packed?.closeSync();
+    } catch (_) {}
+    return UnityTextureChain.empty;
+  }
+
+  InputFileStream? tarStream;
+  try {
+    tarStream = InputFileStream(scratch.path);
+    final tar = TarDecoder().decodeStream(tarStream);
+    final guidToPath = <String, String>{};
+    for (final entry in tar.files) {
+      final name = entry.name.replaceAll('\\', '/');
+      if (!name.endsWith('/pathname')) continue;
+      final guid = name.substring(0, name.length - '/pathname'.length);
+      final text = _unityEntryText(entry, 8192);
+      if (text == null) continue;
+      final line = const LineSplitter().convert(text).firstOrNull?.trim();
+      if (line != null && line.isNotEmpty) guidToPath[guid] = line;
+    }
+    if (guidToPath.isEmpty) return UnityTextureChain.empty;
+
+    final materialBytes = <String, ArchiveFile>{};
+    final prefabEntries = <String, ArchiveFile>{};
+    for (final entry in tar.files) {
+      final name = entry.name.replaceAll('\\', '/');
+      if (!name.endsWith('/asset')) continue;
+      final guid = name.substring(0, name.length - '/asset'.length);
+      final path = guidToPath[guid];
+      if (path == null) continue;
+      if (path.endsWith('.mat')) {
+        materialBytes[path] = entry;
+      } else if (path.endsWith('.prefab')) {
+        prefabEntries[path] = entry;
+      }
+    }
+    if (prefabEntries.isEmpty || materialBytes.isEmpty) {
+      return UnityTextureChain.empty;
+    }
+    return _unityChainFrom(
+      guidToPath: guidToPath,
+      materials: materialBytes,
+      prefabs: prefabEntries,
+    );
+  } catch (error) {
+    fbxLog('Reading $packagePath failed: $error');
+    return UnityTextureChain.empty;
+  } finally {
+    try {
+      tarStream?.closeSync();
+    } catch (_) {}
+  }
+}
+
+String? _unityEntryText(ArchiveFile entry, int limit) {
+  if (entry.size > limit) return null;
+  try {
+    return utf8.decode(archiveEntryBytes(entry), allowMalformed: true);
+  } catch (error) {
+    return null;
+  }
+}
+
+/// The folders already searched for Unity sidecars, and what they hold.
+final _unitySidecarsByFolder = <String, List<String>>{};
+
+void resetUnitySidecarCache() => _unitySidecarsByFolder.clear();
+
+/// Unity builds of [asset]'s product that are files on disk rather than
+/// catalog entries.
+///
+/// 83 of the 93 Unity builds in this library are `.unitypackage`, and Atlas
+/// does not index those: every entry inside one is named by a GUID, so the
+/// rows would be thousands of unreadable names per pack. They sit beside the
+/// source zip, so they are found by looking there.
+List<String> unityPackageSidecarsFor(AssetItem asset) {
+  final zip = parseZipVirtualPath(asset.path);
+  final container = zip?.zipPath ?? asset.path;
+  final cut = lastPathSeparator(container);
+  if (cut <= 0) return const [];
+  final folder = container.substring(0, cut);
+  final product = twinProductKey(containerDisplayName(asset));
+  if (product.isEmpty) return const [];
+
+  final known = _unitySidecarsByFolder[normalizePathKey(folder)];
+  final List<String> packages;
+  if (known != null) {
+    packages = known;
+  } else {
+    final found = <String>[];
+    try {
+      for (final entity in Directory(folder).listSync(followLinks: false)) {
+        if (entity is! File) continue;
+        if (extensionOf(entity.path) != 'unitypackage') continue;
+        found.add(entity.path);
+      }
+    } catch (error) {
+      fbxLog('Listing $folder for Unity packages failed: $error');
+    }
+    found.sort();
+    _unitySidecarsByFolder[normalizePathKey(folder)] = found;
+    packages = found;
+  }
+
+  return [
+    for (final path in packages)
+      if (twinProductKey(
+              path.substring(lastPathSeparator(path) + 1)) ==
+          product)
+        path,
+  ];
+}
+
+/// One asset from each Unity build in the catalog, by product key.
+///
+/// Built once per catalog revision. Walking the catalog here instead cost
+/// every model that names no texture a pass over 480,826 rows, which is
+/// most of why a forced re-embed measured 5,249 ms a model.
+final Map<String, List<AssetItem>> _unityBuildsByProduct = {};
+int? _unityBuildsIdentity;
+
+Map<String, List<AssetItem>> _unityBuildIndex(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  if (_unityBuildsIdentity == identity) return _unityBuildsByProduct;
+  _unityBuildsByProduct.clear();
+  final seen = <String>{};
+  for (final asset in allAssets) {
+    final zip = parseZipVirtualPath(asset.path);
+    if (zip == null) continue;
+    final container = containerDisplayName(asset);
+    if (!container.toLowerCase().contains('unity')) continue;
+    if (!seen.add(normalizePathKey(zip.zipPath))) continue;
+    final product = twinProductKey(container);
+    if (product.isEmpty) continue;
+    _unityBuildsByProduct.putIfAbsent(product, () => []).add(asset);
+  }
+  _unityBuildsIdentity = identity;
+  return _unityBuildsByProduct;
+}
+
+void resetUnityBuildIndex() {
+  _unityBuildsByProduct.clear();
+  _unityBuildsIdentity = null;
+}
+
+/// The Unity builds of the same product as [asset], nearest first.
+List<AssetItem> unityBuildsFor(AssetItem asset, List<AssetItem> allAssets) {
+  final product = twinProductKey(containerDisplayName(asset));
+  if (product.isEmpty) return const [];
+  return _unityBuildIndex(allAssets)[product] ?? const [];
+}
+
+/// The image in [allAssets] whose name matches this Unity project path.
+///
+/// The chain gives `PolygonSciFiSpace/Textures/X.png` inside the Unity zip;
+/// what Atlas can draw is the copy in the source zip, or that same entry.
+AssetItem? _textureAssetFor(
+  String unityPath,
+  AssetItem model,
+  List<AssetItem> allAssets,
+) {
+  final wanted = unityPath.split('/').last.toLowerCase();
+  final container = assetContainerKey(model);
+  // The index relinking already builds, bucketed by base name and by
+  // container and rebuilt once per catalog revision. Walking the catalog
+  // here instead took a tagging pass from about 150 models a minute to 9.9,
+  // with the machine 89% idle -- not busy, waiting.
+  final named = _textureIndexOf(allAssets).byBaseName[twinStem(wanted)];
+  if (named == null || named.isEmpty) return null;
+  for (final asset in named) {
+    if (assetContainerKey(asset) == container) return asset;
+  }
+  return named.first;
+}
+
+/// The texture to draw a model with when the file itself names none.
+///
+/// Four tiers, first answer wins: the model's own prefab, the pack's
+/// dominant assignment, a filename rule, nothing.
+InferredTexture? findInferredTexture(
+  AssetItem model,
+  List<AssetItem> allAssets,
+) {
+  for (final build in unityBuildsFor(model, allAssets)) {
+    final zip = parseZipVirtualPath(build.path);
+    if (zip == null) continue;
+    final chain = readUnityTextureChain(zip.zipPath);
+    if (chain.isEmpty) continue;
+
+    final own = chain.byModelStem[unityModelStem(model.name)];
+    if (own != null) {
+      final asset = _textureAssetFor(own, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(path: asset.path, source: TextureSource.prefab);
+      }
+    }
+    final dominant = chain.dominant;
+    if (dominant != null) {
+      final asset = _textureAssetFor(dominant, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(
+          path: asset.path,
+          source: TextureSource.packDefault,
+        );
+      }
+    }
+  }
+
+  // Then the Unity builds that are not catalog entries: the .unitypackage
+  // files beside the source zip, which is 83 of the 93 Unity builds here.
+  for (final package in unityPackageSidecarsFor(model)) {
+    final chain = readUnityTextureChain(package);
+    if (chain.isEmpty) continue;
+    final own = chain.byModelStem[unityModelStem(model.name)];
+    if (own != null) {
+      final asset = _textureAssetFor(own, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(path: asset.path, source: TextureSource.prefab);
+      }
+    }
+    final dominant = chain.dominant;
+    if (dominant != null) {
+      final asset = _textureAssetFor(dominant, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(
+          path: asset.path,
+          source: TextureSource.packDefault,
+        );
+      }
+    }
+  }
+
+  final guessed = guessTextureByName(model, allAssets);
+  return guessed == null
+      ? null
+      : InferredTexture(path: guessed.path, source: TextureSource.guessed);
+}
+
+/// The words in a container's name that say which pack it is.
+///
+/// The build words and the version runs are what differ between two builds
+/// of one pack, so they say nothing about which pack it is; anything under
+/// four letters is too short to be evidence.
+Set<String> _packNameWords(String containerName) {
+  var name = containerName.toLowerCase();
+  final dot = name.lastIndexOf('.');
+  if (dot > 0 && name.length - dot <= 15) name = name.substring(0, dot);
+  return {
+    for (final word in name.split(_nonAlphanumericPattern))
+      if (word.length >= 4 &&
+          !_twinBuildWords.contains(word) &&
+          !_versionRunPattern.hasMatch(word))
+        word,
+  };
+}
+
+const _textureFolderNames = {'textures', '_textures'};
+const _textureVariantFolders = {
+  'alts',
+  'alt',
+  'fx',
+  'fx_textures',
+  'emissive',
+  'normals',
+  'masks',
+  'skybox',
+  'ui',
+  'particles',
+};
+const _nonBaseTextureWords = [
+  'mask',
+  'emissive',
+  'skybox',
+  'flare',
+  'dirt',
+  'gradient',
+  'glow',
+  'trail',
+  'normal',
+  'roughness',
+  'metallic',
+  'specular',
+];
+
+/// The pack's base atlas, guessed from file names.
+///
+/// Only reached when no Unity build says otherwise. Validated against the
+/// authored answer over the seven packs that have both: it agrees on five,
+/// and the two it missed are why the rule reads as it does -- the word
+/// `texture` is not required (PolygonNature's atlas is `PolygonNature_01.png`)
+/// and a pack with no single base atlas gets no answer at all.
+AssetItem? guessTextureByName(AssetItem model, List<AssetItem> allAssets) {
+  final productTokens = _packNameWords(containerDisplayName(model));
+  final candidates = <AssetItem>[];
+  final depths = <String, int>{};
+  // This model's own container only, through the helper that knows how the
+  // texture index keys one -- `zip:<path>` or `root:<root>`, not the
+  // catalog's container key. It also caches per container, which is the
+  // shape of a tagging pass: hundreds of models from one pack in a row.
+  // Walking the whole catalog here instead took a pass from about 150
+  // models a minute to 9.9, with the machine 89% idle.
+  for (final asset in _sameContainerTextures(model.path, allAssets)) {
+    final parts = asset.path.replaceAll('\\', '/').toLowerCase().split('/');
+    var anchor = -1;
+    for (var i = 0; i < parts.length - 1; i += 1) {
+      if (_textureFolderNames.contains(parts[i])) anchor = i;
+    }
+    if (anchor < 0) continue;
+    final below = parts.sublist(anchor + 1, parts.length - 1);
+    if (below.any(_textureVariantFolders.contains)) continue;
+    final name = parts.last;
+    if (textureChannelWord(name).isNotEmpty) continue;
+    if (_nonBaseTextureWords.any(name.contains)) continue;
+    candidates.add(asset);
+    depths[asset.id] = below.length;
+  }
+  if (candidates.isEmpty) return null;
+
+  // Does this file name say which pack it belongs to? Either spelling
+  // counts: `Pack_Texture_01_A.png` in POLYGON_Pack names it in a word of
+  // its own, and `PolygonSciFiSpace_Texture_01_A.png` glues the pack's two
+  // words into one. Substring, both directions, over words long enough that
+  // a coincidence is unlikely.
+  int shared(AssetItem asset) {
+    final stem = twinStem(asset.name).replaceAll(RegExp(r'[^a-z0-9]'), '');
+    var count = 0;
+    for (final word in productTokens) {
+      if (stem.contains(word) || word.contains(stem)) count += 1;
+    }
+    return count;
+  }
+
+  // A name has to say which pack it belongs to, unless it is the only
+  // candidate: a pack of Signs, NeonSigns and Billboards and nothing else
+  // has no base atlas, and must answer nothing rather than pick one.
+  final named = candidates.where((asset) => shared(asset) > 0).toList();
+  final pool = candidates.length == 1 ? candidates : named;
+  if (pool.isEmpty) return null;
+
+  int endingRank(AssetItem asset) {
+    final stem = twinStem(asset.name);
+    if (stem.endsWith('_01_a')) return 3;
+    if (stem.endsWith('_01')) return 2;
+    if (stem.endsWith('_a')) return 1;
+    return 0;
+  }
+
+  int compare(AssetItem a, AssetItem b) {
+    final byDepth = (depths[a.id] ?? 0).compareTo(depths[b.id] ?? 0);
+    if (byDepth != 0) return byDepth;
+    final bySharing = shared(b).compareTo(shared(a));
+    if (bySharing != 0) return bySharing;
+    final byTokens = textureNameTokens(
+      a.name,
+    ).length.compareTo(textureNameTokens(b.name).length);
+    if (byTokens != 0) return byTokens;
+    final byEnding = endingRank(b).compareTo(endingRank(a));
+    if (byEnding != 0) return byEnding;
+    // Never scan order: a tie broken by chance is a different picture on
+    // two machines with the same library.
+    return normalizePathKey(a.path).compareTo(normalizePathKey(b.path));
+  }
+
+  final ranked = [...pool]..sort(compare);
+  if (ranked.length > 1) {
+    final first = ranked[0];
+    final second = ranked[1];
+    final tied = (depths[first.id] ?? 0) == (depths[second.id] ?? 0) &&
+        shared(first) == shared(second) &&
+        textureNameTokens(first.name).length ==
+            textureNameTokens(second.name).length;
+    // Two equally good base atlases means the pack has no default, and
+    // picking by alphabet would be a coin toss baked into every render.
+    if (tied) return null;
+  }
+  return ranked.first;
+}
+
+/// Whether a mesh is in the state an inferred texture is for: UVs to put one
+/// on, and no texture of its own named, embedded or already applied.
+bool meshWantsInferredTexture(MeshModel mesh) {
+  if (mesh.faces.isEmpty) return false;
+  var hasUvs = false;
+  for (final face in mesh.faces) {
+    if (face.uvs.isNotEmpty) {
+      hasUvs = true;
+      break;
+    }
+  }
+  if (!hasUvs) return false;
+  for (final material in mesh.materials) {
+    // A model that names a texture which then fails to resolve is missing
+    // one, not unnamed: the diagnostics report that, and covering it with a
+    // guess would hide a real problem.
+    if (material.textures.isNotEmpty) return false;
+    if (material.resolvedTextures.isNotEmpty) return false;
+    if (material.textureImage != null) return false;
+  }
+  return true;
+}
+
+// --- Twins: the same model in another format or another build ------------
+//
+// Half this library is the same models twice. 120,481 .uasset files carry
+// 48,282 distinct names; 15,928 of those names also exist as an FBX or an
+// OBJ, which covers 67,999 of the uassets -- 56%. Every DAE and every glTF
+// has a same-name FBX or OBJ in its own pack, and so do 2,843 of the 3,035
+// GLB. A Synty pack ships as one FBX zip beside up to seven Unreal zips of
+// the same models.
+//
+// So the question "what is this file" often has a better answer in another
+// file, and the one that matters most: a .uasset cannot be drawn, but its
+// FBX twin can.
+
+/// Words in a container name that say which build it is, not which pack.
+const _twinBuildWords = {
+  'sourcefiles',
+  'source',
+  'files',
+  'unreal',
+  'unity',
+  'ue4',
+  'ue5',
+  'project',
+  'projects',
+};
+
+/// The container's own name, for reading rather than for comparing.
+///
+/// [assetContainerKey] is a whole path, because two packs can be named the
+/// same under different roots; the last segment is what a person calls it.
+String containerDisplayName(AssetItem asset) {
+  // From the asset's own path, not from the key: the key is lower-cased for
+  // comparing, and a pack name shown in lower case reads as a different file
+  // from the one on disk.
+  final zip = parseZipVirtualPath(asset.path);
+  final source = zip?.zipPath ?? assetContainerKey(asset);
+  // The hoisted pattern, not `RegExp(...)` written here: this runs once per
+  // asset while a catalog-wide index is built, and a pattern compiled per
+  // call cost 4.7 s of frozen window on 480,826 assets.
+  final cut = lastPathSeparator(source);
+  final name = cut < 0 ? source : source.substring(cut + 1);
+  return name.isEmpty ? source : name;
+}
+
+/// The product a container belongs to, as a word with no punctuation.
+///
+/// `POLYGON_SciFiSpace_SourceFiles.zip`, `POLYGON_SciFiSpace_Unreal_4_19.zip`
+/// and `POLYGON_SciFi_Space_Unreal_5_4_v1_14_0.zip` are three builds of one
+/// pack, and nothing but the name says so. Dropping the build words, the
+/// version runs and every separator leaves `polygonscifispace` for all three.
+String twinProductKey(String containerName) {
+  // Memoised because this library holds 480,826 assets in a few hundred
+  // containers: the answer for one container name is asked for once per
+  // asset while any of the three catalog-wide indexes is built. The map is
+  // bounded by the number of distinct container names, not by assets.
+  final known = _twinProductKeyCache[containerName];
+  if (known != null) return known;
+
+  var name = containerName.toLowerCase();
+  // A container is a zip, a .unitypackage, or a folder. Drop a trailing
+  // extension of any kind: the format a pack arrived in is not part of which
+  // pack it is, and the Unity builds sit beside the zips under one name.
+  final dot = name.lastIndexOf('.');
+  if (dot > 0 && name.length - dot <= 15) name = name.substring(0, dot);
+  final words = name.split(_nonAlphanumericPattern);
+  final buffer = StringBuffer();
+  for (final word in words) {
+    if (word.isEmpty) continue;
+    if (_twinBuildWords.contains(word)) continue;
+    // A version run: `v4`, `4`, `19`, `2019`, `v1`. Numbers never identify a
+    // pack here, and every one of them differs between builds of one pack.
+    if (_versionRunPattern.hasMatch(word)) continue;
+    for (final unit in word.codeUnits) {
+      if (unit >= 0x61 && unit <= 0x7A) buffer.writeCharCode(unit);
+    }
+  }
+  final key = buffer.toString();
+  _twinProductKeyCache[containerName] = key;
+  return key;
+}
+
+/// A version run in a container's name: `v4`, `4`, `19`, `2019`, `v1`.
+///
+/// Hoisted, like the two patterns beside it. Compiling it inside the loop
+/// above -- once per word, once per asset -- was most of a 4.7 s pause in
+/// the window the first time a `.uasset` was clicked.
+final _versionRunPattern = RegExp(r'^v?[0-9]+$');
+
+/// One entry per distinct container name. Cleared only by the tests, which
+/// is also why it is not an LRU: nothing in a session invalidates it,
+/// because a container's name does not change while Atlas is open.
+final _twinProductKeyCache = <String, String>{};
+
+void resetTwinProductKeyCache() {
+  _twinProductKeyCache.clear();
+}
+
+/// A file name with no extension, lower-cased.
+String twinStem(String fileName) {
+  final dot = fileName.lastIndexOf('.');
+  final stem = dot <= 0 ? fileName : fileName.substring(0, dot);
+  return stem.toLowerCase();
+}
+
+/// Unreal names that are not models and never pair with one.
+///
+/// Of the 120,481 uassets here, the ones left over after the models are
+/// textures (`T_`, 13,965), materials, blueprints, physics assets and
+/// skeletons. Pairing `T_Crate_01.uasset` with `Crate_01.fbx` would be a
+/// different feature -- a texture is not another format of the model.
+bool twinEligible(AssetItem asset) {
+  if (asset.type != 'model' && asset.type != 'unreal') return false;
+  if (asset.type != 'unreal') return true;
+  final stem = twinStem(asset.name);
+  if (stem.endsWith('_physicsasset') || stem.endsWith('_skeleton')) {
+    return false;
+  }
+  for (final prefix in const ['t_', 'm_', 'mi_', 'mat_', 'mf_', 'bp_']) {
+    if (stem.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
+/// The key two files share when they are the same model: the product they
+/// came from, and the name they were given. Empty when the asset cannot
+/// take part.
+String twinKeyFor(AssetItem asset) {
+  if (!twinEligible(asset)) return '';
+  final stem = twinStem(asset.name);
+  if (stem.isEmpty) return '';
+  return '${twinProductKey(containerDisplayName(asset))}|$stem';
+}
+
+/// Where the collapse setting is kept between runs.
+const collapseVersionsKey = 'list.collapseVersions';
+
+/// A list with one row per model instead of one row per file.
+class CollapsedAssets {
+  const CollapsedAssets({required this.rows, required this.membersById});
+
+  /// The rows to show, in the order their groups first appeared.
+  final List<AssetItem> rows;
+
+  /// Every member of a group of two or more, by the id of the row shown for
+  /// it, the shown row included. Groups of one are absent, so a lookup
+  /// returning null means "this row is the only copy".
+  final Map<String, List<AssetItem>> membersById;
+
+  static const empty = CollapsedAssets(rows: [], membersById: {});
+}
+
+/// How good a representative this file is for its group: lower is better.
+///
+/// A drawable format first, because the row that has a picture is the one
+/// worth showing: `SK_Chr_BR_War_Robot_01.fbx` rather than one of the six
+/// `.uasset` builds of it. Then by extension and path, which is the order
+/// [TwinIndex] lists a group in, so the choice does not depend on which
+/// sort mode the list happens to be in.
+int _representativeRank(AssetItem asset) =>
+    previewableModelExts.contains(asset.ext) ? 0 : 1;
+
+/// Collapse the engine-version and format copies of one model into one row.
+///
+/// `war_robot_01` is in this library seven times: the source FBX and six
+/// `.uasset` builds for Unreal 4.19 through 5.1. Searching for it returned
+/// seven rows that are all the same model, which is what this answers.
+///
+/// Grouped by [twinKeyFor] -- same pack, same file name -- so it never
+/// reaches across packs: two `pipe_end` files in different kits stay two
+/// rows. A file that cannot take part in pairing at all (a texture, a
+/// material, a `_Skeleton.uasset`) is its own row, unchanged.
+///
+/// [ordered] is expected to be in display order and the result keeps it:
+/// each group takes the position where it first appeared.
+CollapsedAssets collapseAssetVersions(List<AssetItem> ordered) {
+  if (ordered.isEmpty) return CollapsedAssets.empty;
+
+  // Insertion-ordered, which is what keeps the result in display order.
+  final groups = <String, List<AssetItem>>{};
+  final loners = <AssetItem>[];
+  // The slot each group takes in the output, so a group's position is where
+  // its first member was rather than where the map happens to put it.
+  final order = <Object>[];
+
+  for (final asset in ordered) {
+    final key = asset.twinKey;
+    if (key.isEmpty) {
+      loners.add(asset);
+      order.add(asset);
+      continue;
+    }
+    final existing = groups[key];
+    if (existing == null) {
+      groups[key] = <AssetItem>[asset];
+      order.add(key);
+    } else {
+      existing.add(asset);
+    }
+  }
+
+  final rows = <AssetItem>[];
+  final membersById = <String, List<AssetItem>>{};
+  for (final slot in order) {
+    if (slot is AssetItem) {
+      rows.add(slot);
+      continue;
+    }
+    final members = groups[slot as String]!;
+    if (members.length == 1) {
+      rows.add(members.first);
+      continue;
+    }
+    var best = members.first;
+    for (final member in members.skip(1)) {
+      if (_representativeRank(member) < _representativeRank(best)) {
+        best = member;
+      }
+    }
+    rows.add(best);
+    membersById[best.id] = List<AssetItem>.unmodifiable(members);
+  }
+
+  return CollapsedAssets(
+    rows: List<AssetItem>.unmodifiable(rows),
+    membersById: Map<String, List<AssetItem>>.unmodifiable(membersById),
+  );
+}
+
+/// One model's other copies, in both strengths.
+class TwinGroup {
+  const TwinGroup({required this.same, required this.possible});
+
+  /// Same product, same name. The same model, as far as a name can say.
+  final List<AssetItem> same;
+
+  /// Same name, a product key that does not match, and a name distinctive
+  /// enough that the coincidence is unlikely. Shown separately and never
+  /// used for a preview.
+  final List<AssetItem> possible;
+
+  bool get isEmpty => same.isEmpty && possible.isEmpty;
+}
+
+/// Every twin relationship in a catalog, built once per revision.
+class TwinIndex {
+  TwinIndex._(this._byKey, this._byStem, this._productsByStem);
+
+  factory TwinIndex.of(List<AssetItem> allAssets) {
+    final byKey = <String, List<AssetItem>>{};
+    final byStem = <String, List<AssetItem>>{};
+    final productsByStem = <String, Set<String>>{};
+    for (final asset in allAssets) {
+      if (!twinEligible(asset)) continue;
+      final stem = twinStem(asset.name);
+      if (stem.isEmpty) continue;
+      final product = twinProductKey(containerDisplayName(asset));
+      byKey.putIfAbsent('$product|$stem', () => []).add(asset);
+      byStem.putIfAbsent(stem, () => []).add(asset);
+      // Only the model side counts towards "one product": the whole point of
+      // the weaker tier is a model in one product and its Unreal build in a
+      // container named differently, and seven Unreal zips must not look
+      // like seven products.
+      if (asset.type == 'model') {
+        productsByStem.putIfAbsent(stem, () => <String>{}).add(product);
+      }
+    }
+    return TwinIndex._(byKey, byStem, productsByStem);
+  }
+
+  final Map<String, List<AssetItem>> _byKey;
+  final Map<String, List<AssetItem>> _byStem;
+  final Map<String, Set<String>> _productsByStem;
+
+  /// How distinctive a name has to be before a cross-product match is worth
+  /// showing. `pipe_end` in a Kenney kit and an unrelated `pipe_end.uasset`
+  /// are not the same model.
+  static const _minimumPossibleStem = 8;
+
+  TwinGroup twinsOf(AssetItem asset) {
+    if (!twinEligible(asset)) {
+      return const TwinGroup(same: [], possible: []);
+    }
+    final stem = twinStem(asset.name);
+    final product = twinProductKey(containerDisplayName(asset));
+    final same = <AssetItem>[];
+    for (final other in _byKey['$product|$stem'] ?? const <AssetItem>[]) {
+      if (other.id != asset.id) same.add(other);
+    }
+
+    final possible = <AssetItem>[];
+    final products = _productsByStem[stem] ?? const <String>{};
+    final distinctive =
+        stem.length >= _minimumPossibleStem && stem.contains('_');
+    if (distinctive && products.length <= 1) {
+      for (final other in _byStem[stem] ?? const <AssetItem>[]) {
+        if (other.id == asset.id) continue;
+        if (twinProductKey(containerDisplayName(other)) == product) continue;
+        possible.add(other);
+      }
+    }
+    return TwinGroup(
+      same: _ordered(same),
+      possible: _ordered(possible),
+    );
+  }
+
+  List<AssetItem> _ordered(List<AssetItem> found) {
+    if (found.isEmpty) return const [];
+    final sorted = [...found]
+      ..sort((a, b) {
+        final byExt = a.ext.compareTo(b.ext);
+        if (byExt != 0) return byExt;
+        return normalizePathKey(a.path).compareTo(normalizePathKey(b.path));
+      });
+    return List<AssetItem>.unmodifiable(sorted);
+  }
+}
+
+TwinIndex? _twinIndex;
+int? _twinIndexIdentity;
+
+/// The twin index for this catalog, built on first use. Same generation key
+/// as the other catalog-wide indexes.
+TwinIndex twinIndexFor(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final known = _twinIndex;
+  if (known != null && _twinIndexIdentity == identity) return known;
+  final index = TwinIndex.of(allAssets);
+  _twinIndex = index;
+  _twinIndexIdentity = identity;
+  return index;
+}
+
+void resetTwinIndex() {
+  _twinIndex = null;
+  _twinIndexIdentity = null;
+}
+
+/// The twin to draw when the selected file cannot be drawn itself.
+///
+/// FBX before OBJ on purpose: these packs ship the OBJ in centimetres with
+/// nothing in the file to say so, which is the note at the units check in
+/// [loadMesh]. Only a "same model" twin -- a guess is not worth a picture.
+AssetItem? previewableTwinOf(AssetItem asset, List<AssetItem> allAssets) {
+  final twins = twinIndexFor(allAssets).twinsOf(asset);
+  for (final ext in const ['fbx', 'obj', 'stl']) {
+    for (final other in twins.same) {
+      if (other.ext != ext) continue;
+      if (previewKindFor(other) != PreviewKind.model) continue;
+      return other;
+    }
+  }
+  return null;
+}
+
+/// Which clips drive which models, over a whole catalog.
+///
+/// Built from rig signatures rather than from pairs. Storing the verdict for
+/// every pair would be 2,147 characters x 796 clips, about 1.7 million rows,
+/// all of which would have to be rewritten the day the rule changed. The
+/// facts are the bone names, and rigs repeat hard: 224 clips sampled here
+/// hold 12 distinct rigs and 800 characters hold 42. So the answer is
+/// computed between *signatures* -- a few hundred pairs for the library --
+/// and remembered.
+///
+/// Built once per catalog revision, never in `build()`.
+class RigIndex {
+  RigIndex({required this.bonesBySignature});
+
+  /// The bone names behind each signature, from the catalog's `rig_bones`.
+  final Map<String, List<String>> bonesBySignature;
+
+  final Map<String, List<AssetItem>> clipsBySignature = {};
+  final Map<String, List<AssetItem>> charactersBySignature = {};
+  final Map<String, bool> _verdicts = {};
+
+  void add(AssetItem asset) {
+    final signature = asset.rigSignature;
+    if (signature == null || signature.isEmpty) return;
+    if (asset.effectiveType == 'animation') {
+      clipsBySignature.putIfAbsent(signature, () => []).add(asset);
+    } else if (asset.modelKind == 'mesh') {
+      charactersBySignature.putIfAbsent(signature, () => []).add(asset);
+    }
+  }
+
+  /// Whether a clip on [clipSignature] may drive a character on
+  /// [characterSignature]. Unknown bones mean no answer rather than a guess.
+  bool? compatible(String? characterSignature, String? clipSignature) {
+    if (characterSignature == null ||
+        clipSignature == null ||
+        characterSignature.isEmpty ||
+        clipSignature.isEmpty) {
+      return null;
+    }
+    final key = '$characterSignature|$clipSignature';
+    final known = _verdicts[key];
+    if (known != null) return known;
+    final characterBones = bonesBySignature[characterSignature];
+    final clipBones = bonesBySignature[clipSignature];
+    if (characterBones == null || clipBones == null) return null;
+    final answer = rigMatchNames(characterBones, clipBones);
+    _verdicts[key] = answer;
+    return answer;
+  }
+
+  /// Every clip that can drive [model], nearest first: the model's own
+  /// container, then by path so the order cannot depend on the scan.
+  List<AssetItem> clipsFor(AssetItem model) =>
+      _sorted(model, _matching(model.rigSignature, clipsBySignature, true));
+
+  /// Every rigged mesh [clip] can drive.
+  List<AssetItem> modelsFor(AssetItem clip) =>
+      _sorted(clip, _matching(clip.rigSignature, charactersBySignature, false));
+
+  List<AssetItem> _matching(
+    String? signature,
+    Map<String, List<AssetItem>> candidates,
+    bool signatureIsCharacter,
+  ) {
+    if (signature == null || signature.isEmpty) return const [];
+    final found = <AssetItem>[];
+    for (final entry in candidates.entries) {
+      final answer = signatureIsCharacter
+          ? compatible(signature, entry.key)
+          : compatible(entry.key, signature);
+      if (answer == true) found.addAll(entry.value);
+    }
+    return found;
+  }
+
+  List<AssetItem> _sorted(AssetItem anchor, List<AssetItem> found) {
+    if (found.isEmpty) return const [];
+    final container = assetContainerKey(anchor);
+    final sorted = [...found]..sort((a, b) {
+      final aHere = assetContainerKey(a) == container ? 0 : 1;
+      final bHere = assetContainerKey(b) == container ? 0 : 1;
+      if (aHere != bHere) return aHere - bHere;
+      return normalizePathKey(a.path).compareTo(normalizePathKey(b.path));
+    });
+    return List<AssetItem>.unmodifiable(sorted);
+  }
+}
+
+RigIndex? _rigIndex;
+int? _rigIndexIdentity;
+
+/// The index for this catalog, built on first use and kept until the catalog
+/// changes. Same generation key as [findNearbyTextures]: a rescan hands out
+/// new AssetItem objects, which arrives here as a new identity.
+RigIndex rigIndexFor(
+  List<AssetItem> allAssets,
+  Map<String, List<String>> bonesBySignature,
+) {
+  final identity =
+      identityHashCode(allAssets) ^ allAssets.length ^ bonesBySignature.length;
+  final known = _rigIndex;
+  if (known != null && _rigIndexIdentity == identity) return known;
+  final index = RigIndex(bonesBySignature: bonesBySignature);
+  for (final asset in allAssets) {
+    index.add(asset);
+  }
+  _rigIndex = index;
+  _rigIndexIdentity = identity;
+  return index;
+}
+
+/// Forgets the index. For tests, and for a catalog replaced in place.
+void resetRigIndex() {
+  _rigIndex = null;
+  _rigIndexIdentity = null;
+}
 
 /// Whether a clip can drive a model without retargeting between skeletons.
 ///
 /// Two files of the same family share bone names, which is what posing needs.
-/// Across families they share none, so no amount of correction helps.
-bool rigFamiliesCompatible(RigFamily a, RigFamily b) {
+/// Across families they share none, so no amount of correction helps -- with
+/// one exception and one special case.
+///
+/// The exception is Unreal and Sidekick. The Sidekick rig *is* the Unreal
+/// mannequin with attachment and IK bones added, so a Sidekick clip names
+/// every bone an Unreal character has. Requiring equal names meant that for
+/// the 348 characters stored as `unreal` -- the War Robot among them -- "only
+/// animations for my character" passed 0 of 796 clips, because the library
+/// holds no `unreal` clips at all: 359 are polygon, 346 sidekick, 91 other.
+///
+/// The special case is [RigFamily.other]: two rigs nobody has named are the
+/// same rig only if they shipped together, so this asks for the container as
+/// well. That is a stopgap -- the Dogs pack's mesh and its 88 clips are in one
+/// zip, which is the shape of the evidence available before WP5 stores a real
+/// bone signature. Without containers to compare, `other` drives nothing.
+bool rigFamiliesCompatible(
+  RigFamily a,
+  RigFamily b, {
+  String? containerA,
+  String? containerB,
+}) {
   if (a == RigFamily.none || b == RigFamily.none) return false;
+  if (a == RigFamily.other || b == RigFamily.other) {
+    return a == b && containerA != null && containerA == containerB;
+  }
+  if (a == RigFamily.unreal && b == RigFamily.sidekick) return true;
+  if (a == RigFamily.sidekick && b == RigFamily.unreal) return true;
   return a == b;
 }
 
-/// Whether an asset matches a search box that treats spaces as "and".
+// --- The filter grammar, shared with the MCP -----------------------------
+//
+// `tag=grungy name=door` scopes each term to one field; a plain word still
+// searches name, path and tags together, which is what the box did before and
+// is still what most searches are. Spaces mean and, `or` groups the terms
+// either side of it, and there are no parentheses -- so `a or b c` is
+// (a or b) and c, which is how it reads aloud.
+//
+// work/atlas_mcp/fixtures/search_queries.json holds the cases this and
+// parse_asset_query in atlas_mcp.py are both tested against. The app and the
+// MCP have to answer a search identically, so neither side owns the grammar:
+// the fixture does, and a case added there fails on whichever side has not
+// caught up.
+
+/// The fields a term can name. A plain word gets the internal field 'any',
+/// which is deliberately not spellable: `any=dog` is a typo, and saying so is
+/// more use than accepting it.
+const assetQueryNamedFields = <String>[
+  'name',
+  'path',
+  'tag',
+  'type',
+  'ext',
+  'rig',
+];
+
+/// Fields holding one value out of a fixed set, where a substring would
+/// mislead: `type=mod` must not quietly mean every model.
+const assetQueryExactFields = <String>{'type', 'ext', 'rig'};
+
+/// Recognised only so the refusal can say what it is waiting for. A field
+/// that is going to exist deserves a different answer from one that never
+/// will, and "unknown field" would send someone looking for a typo.
+const assetQueryReservedFields = <String, String>{
+  'look':
+      'look= is reserved for visual search -- finding assets that look '
+      'grungy or gray rather than ones named that. Ask find_similar '
+      'instead: ranking by appearance needs a cutoff to become a filter, '
+      'and a ranked list is the more useful answer. It reads the vectors '
+      'the tagging pass writes (tag_assets.py).',
+};
+
+/// What `type=` accepts: [AssetItem.effectiveType], which is the type the
+/// list and the dropdown both show.
+const assetQueryTypeValues = <String>{
+  'model',
+  'animation',
+  'image',
+  'texture',
+  'audio',
+  'unreal',
+  'other',
+};
+
+const _assetQueryQuotes = <String>{'"', "'"};
+
+/// One term: a field to look in, and the text to find there.
+class AssetQueryTerm {
+  const AssetQueryTerm(this.field, this.value);
+
+  /// One of [assetQueryNamedFields], or 'any' for a plain word.
+  final String field;
+
+  /// Lowercased, and normalised for the field it belongs to.
+  final String value;
+
+  bool matches(String Function(String field) valueOf) {
+    final actual = valueOf(field);
+    return assetQueryExactFields.contains(field)
+        ? actual == value
+        : actual.contains(value);
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is AssetQueryTerm && other.field == field && other.value == value;
+
+  @override
+  int get hashCode => Object.hash(field, value);
+
+  @override
+  String toString() => '$field=$value';
+}
+
+/// A read query: clauses that all have to hold, each holding the alternatives
+/// an `or` collected.
+class AssetQuery {
+  const AssetQuery(this.clauses) : error = null;
+
+  /// A query that could not be read, carrying what to say about it. The
+  /// clauses are empty, so matching on one by mistake lets everything
+  /// through rather than nothing -- callers check [isValid] first.
+  const AssetQuery.rejected(String message)
+    : clauses = const <List<AssetQueryTerm>>[],
+      error = message;
+
+  final List<List<AssetQueryTerm>> clauses;
+
+  /// Why the query could not be read, in words to put under the box.
+  final String? error;
+
+  bool get isValid => error == null;
+  bool get isEmpty => clauses.isEmpty;
+}
+
+/// One token of a query: its text, plus which characters came from inside
+/// quotes.
 ///
-/// "Jump Fem" finds `A_Jump_Running_Femn.fbx` without the words being adjacent
-/// or in that order, which matters when the thing you remember about a file is
-/// two pieces of its name rather than a substring of it.
-bool assetMatchesSearch(String searchText, String query) {
-  final terms = query.toLowerCase().split(' ').where((t) => t.isNotEmpty);
-  for (final term in terms) {
-    if (!searchText.contains(term)) return false;
+/// Keeping the origin of every character is the whole point. `"name=dog"` and
+/// `name="dog"` produce the same letters and mean different things, and the
+/// only thing separating them is where the quotes sat.
+class _QueryToken {
+  final StringBuffer _text = StringBuffer();
+  final StringBuffer _mask = StringBuffer();
+
+  void add(String chunk, {required bool fromQuote}) {
+    _text.write(chunk);
+    _mask.write((fromQuote ? 'q' : '.') * chunk.length);
+  }
+
+  String get body => _text.toString();
+
+  bool get hasQuote => _mask.toString().contains('q');
+
+  /// Where an unquoted `=` splits field from value, or -1 for none. Only the
+  /// first one splits, so `name=a=b` searches names for `a=b`.
+  int get unquotedEquals {
+    final text = body;
+    final mask = _mask.toString();
+    for (var index = 0; index < text.length; index += 1) {
+      if (text[index] == '=' && mask[index] == '.') return index;
+    }
+    return -1;
+  }
+}
+
+bool _isQuerySpace(String character) => character.trim().isEmpty;
+
+/// Split a query into tokens, keeping quoted runs whole.
+List<_QueryToken> _scanAssetQuery(String text) {
+  final tokens = <_QueryToken>[];
+  var index = 0;
+  while (index < text.length) {
+    if (_isQuerySpace(text[index])) {
+      index += 1;
+      continue;
+    }
+    final token = _QueryToken();
+    while (index < text.length && !_isQuerySpace(text[index])) {
+      final quote = text[index];
+      if (_assetQueryQuotes.contains(quote)) {
+        index += 1;
+        final start = index;
+        while (index < text.length && text[index] != quote) {
+          index += 1;
+        }
+        if (index >= text.length) {
+          throw const FormatException(
+            'Unclosed quote in the search. Close it, or drop both quotes.',
+          );
+        }
+        token.add(text.substring(start, index), fromQuote: true);
+        index += 1;
+      } else {
+        final start = index;
+        while (index < text.length &&
+            !_isQuerySpace(text[index]) &&
+            !_assetQueryQuotes.contains(text[index])) {
+          index += 1;
+        }
+        token.add(text.substring(start, index), fromQuote: false);
+      }
+    }
+    tokens.add(token);
+  }
+  return tokens;
+}
+
+/// One normalised term, or a [FormatException] saying why not.
+AssetQueryTerm _assetQueryTerm(String? rawField, String rawValue) {
+  var field = 'any';
+  if (rawField != null) {
+    field = rawField.trim().toLowerCase();
+    if (field.isEmpty) {
+      throw const FormatException(
+        'A search term cannot start with `=`. Write field=value, or a plain '
+        'word to search everything.',
+      );
+    }
+    final reserved = assetQueryReservedFields[field];
+    if (reserved != null) throw FormatException(reserved);
+    if (!assetQueryNamedFields.contains(field)) {
+      throw FormatException(
+        "Unknown search field '$field'. Use one of: "
+        "${assetQueryNamedFields.join(', ')} -- or a plain word, which "
+        'searches name, path and tags together.',
+      );
+    }
+  }
+
+  var value = rawValue.trim().toLowerCase();
+  if (field == 'ext') {
+    value = value.replaceFirst(RegExp(r'^\.+'), '');
+  } else if (field == 'path') {
+    // A path typed with Windows separators has to find the forward slashes
+    // the catalog stores.
+    value = value.replaceAll('\\', '/');
+  }
+  if (value.isEmpty) {
+    throw FormatException(
+      '$field= has no value, so it would match everything. Give it one, or '
+      'remove it.',
+    );
+  }
+  if (field == 'type' && !assetQueryTypeValues.contains(value)) {
+    throw FormatException(
+      "Unknown type '$value' in type=. Use one of: "
+      "${assetQueryTypeValues.join(', ')}.",
+    );
+  }
+  return AssetQueryTerm(field, value);
+}
+
+/// Read a filter box into something that can be matched.
+///
+/// Mirrors parse_asset_query in atlas_mcp.py, including the wording of every
+/// refusal. An empty query is no constraint, which is a reasonable thing to
+/// ask for and not an error.
+AssetQuery parseAssetQuery(String text) {
+  final List<_QueryToken> tokens;
+  try {
+    tokens = _scanAssetQuery(text);
+  } on FormatException catch (error) {
+    return AssetQuery.rejected(error.message);
+  }
+
+  const danglingOr = AssetQuery.rejected(
+    '`or` needs a search term either side of it.',
+  );
+  final clauses = <List<AssetQueryTerm>>[];
+  var pendingOr = false;
+
+  for (final token in tokens) {
+    final body = token.body;
+    final split = token.unquotedEquals;
+    final word = body.trim().toLowerCase();
+
+    // `and` is a noise word, kept for people who type what they mean.
+    // Quoting escapes both, so "or" stays a searchable term.
+    if (split < 0 && !token.hasQuote && (word == 'and' || word == 'or')) {
+      if (pendingOr || (word == 'or' && clauses.isEmpty)) return danglingOr;
+      pendingOr = word == 'or';
+      continue;
+    }
+
+    final AssetQueryTerm term;
+    try {
+      term = _assetQueryTerm(
+        split < 0 ? null : body.substring(0, split),
+        split < 0 ? body : body.substring(split + 1),
+      );
+    } on FormatException catch (error) {
+      return AssetQuery.rejected(error.message);
+    }
+
+    if (pendingOr) {
+      clauses.last.add(term);
+      pendingOr = false;
+    } else {
+      clauses.add(<AssetQueryTerm>[term]);
+    }
+  }
+
+  if (pendingOr) return danglingOr;
+  return AssetQuery(clauses);
+}
+
+/// Whether an asset passes a parsed query.
+///
+/// Mirrors query_matches in atlas_mcp.py. [valueOf] hands back the text for
+/// one field, so this stays a function of the grammar rather than of
+/// [AssetItem] -- which is what makes it testable against the fixture.
+bool assetMatchesQuery(
+  AssetQuery query,
+  String Function(String field) valueOf,
+) {
+  for (final clause in query.clauses) {
+    var passed = false;
+    for (final term in clause) {
+      if (term.matches(valueOf)) {
+        passed = true;
+        break;
+      }
+    }
+    if (!passed) return false;
   }
   return true;
+}
+
+/// A directory named for animation, for a file nothing has probed yet.
+///
+/// Mirrors looks_like_animation in atlas_mcp.py, and is a guess: the probe
+/// outranks it wherever there is a probed answer. Measured against the probe
+/// on 100 sampled FBX -- 98% precision, 100% recall, the single miss being
+/// the reference character mesh that ships inside the animation pack.
+///
+/// Built from what is in the library rather than guessed. Every FBX path
+/// containing "anim" comes to two real directories, `Animations` (784 files)
+/// and `ANIMATION_Base_Locomotion_SourceFiles_v3.zip!` (721), against
+/// filenames like `SM_Prop_Hunting_Animal_Head_01.fbx`. Hence both halves:
+/// only directories are read, because every false positive in the library is
+/// a filename; and `anim`/`anims` must be the whole segment while
+/// `animation` may be a prefix, or `Props/Animal_Pen.fbx` reads as a clip.
+final _animationSegment = RegExp(r'^(anims?$|animation)', caseSensitive: false);
+
+/// Collision hulls ship beside the clips they belong to, and a hull is a mesh
+/// however it is filed.
+final _notAnimationSegment = RegExp(
+  r'^(collision|collider)',
+  caseSensitive: false,
+);
+
+bool looksLikeAnimation(String relativePath) {
+  final parts = relativePath.replaceAll('\\', '/').split('/');
+  // Drop the filename: the directories are the evidence.
+  final folders = parts.length > 1 ? parts.sublist(0, parts.length - 1)
+      : const <String>[];
+  for (final folder in folders) {
+    if (_notAnimationSegment.hasMatch(folder)) return false;
+  }
+  return folders.any(_animationSegment.hasMatch);
 }
 
 /// Model formats the preview can import and therefore introspect.
@@ -6646,19 +10669,271 @@ bool assetMatchesSearch(String searchText, String query) {
 /// OBJ is here because the parser now keeps `vt` and `usemtl`; before that it
 /// produced geometry with no texture information, so there was nothing for the
 /// discovery panel to say about one.
-const _previewableModelExts = {'fbx', 'obj'};
+/// The model formats Atlas can draw.
+///
+/// GLB and glTF read through cgltf in the same importer. DAE is not here on
+/// purpose: all 3,045 of them have a same-name FBX or OBJ in their own pack,
+/// so a COLLADA reader would add no model that cannot already be seen.
+const previewableModelExts = {'fbx', 'obj', 'stl', 'glb', 'gltf'};
+
+/// The model formats that can be read from inside an archive.
+///
+/// A `.gltf` keeps its geometry in a separate `.bin` beside it. An entry in
+/// a zip arrives as bytes with no folder to look in, so a loose `.gltf` on
+/// disk reads and one inside an archive does not -- it falls back to its
+/// twin, which every glTF in this library has.
+const inArchiveModelExts = {'fbx', 'obj', 'stl', 'glb'};
 
 /// One material, with its resolved texture shown rather than described.
 ///
 /// "Is this model textured?" is a question a swatch answers instantly, and a
 /// list of paths does not: a model can resolve its atlas correctly and still
 /// look grey, because that is the part of the atlas it uses.
+/// The tagging strip: one line, and only when there is something to say.
+///
+/// Visual tagging runs for hours and is meant to be forgotten about, so this
+/// is deliberately small and deliberately silent when idle. It appears when
+/// a run starts, and when something is wrong that the person can act on.
+class VisualTaggingStrip extends StatelessWidget {
+  const VisualTaggingStrip({
+    required this.progress,
+    required this.unavailable,
+    required this.onPause,
+    required this.onResume,
+    required this.onStop,
+    required this.onStart,
+    this.mode = TaggingMode.balanced,
+    this.onModeChanged,
+    super.key,
+  });
+
+  final TagProgress progress;
+
+  /// How hard a run may push the machine, and how to change it.
+  final TaggingMode mode;
+  final ValueChanged<TaggingMode>? onModeChanged;
+
+  /// Why tagging cannot run -- no Python, no script -- or null.
+  final String? unavailable;
+
+  final VoidCallback onPause;
+  final VoidCallback onResume;
+  final VoidCallback onStop;
+  final VoidCallback onStart;
+
+  /// The four modes, as a menu rather than a row of buttons.
+  ///
+  /// A changed mode takes effect on the next run: the worker is started
+  /// with its thread count and restarting it mid-batch would throw away
+  /// renders already paid for.
+  Widget _modePicker() {
+    final change = onModeChanged;
+    if (change == null) return const SizedBox.shrink();
+    return PopupMenuButton<TaggingMode>(
+      tooltip: 'How hard tagging may push this machine',
+      initialValue: mode,
+      onSelected: change,
+      itemBuilder: (context) => [
+        for (final candidate in TaggingMode.values)
+          PopupMenuItem<TaggingMode>(
+            value: candidate,
+            child: Text(
+              '${candidate.label} - ${candidate.describe}',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              mode.label,
+              style: const TextStyle(fontSize: 11, color: Color(0xff55606e)),
+            ),
+            const Icon(Icons.arrow_drop_down, size: 16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final problem = unavailable;
+    if (problem != null) {
+      return _bar(
+        background: const Color(0xfffff4e0),
+        border: const Color(0xffe0c080),
+        child: Row(
+          children: [
+            const Icon(Icons.info_outline, size: 15),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(problem, style: const TextStyle(fontSize: 11)),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Idle still shows a row, because the button to leave idle lives in it.
+    // Returning an empty box here made the only way to start visual tagging
+    // unreachable: the strip appeared once a run was going, which is after
+    // the point at which anyone needed it.
+    if (progress.state == TagState.idle) {
+      return _bar(
+        background: const Color(0xfff7f8fa),
+        border: const Color(0xffdfe3ea),
+        child: Row(
+          children: [
+            const Icon(Icons.auto_awesome, size: 14, color: Color(0xff6b7a8d)),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text(
+                'Visual tagging has not been started. It renders each model '
+                'and learns what it looks like, in the background.',
+                style: TextStyle(fontSize: 11, color: Color(0xff55606e)),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            _modePicker(),
+            TextButton(
+              onPressed: onStart,
+              child: const Text(
+                'Start visual tagging',
+                style: TextStyle(fontSize: 11),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final fraction = progress.fraction;
+    return _bar(
+      background: const Color(0xfff2f6fb),
+      border: const Color(0xffc8d6e5),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 120,
+            child: LinearProgressIndicator(
+              value: progress.isBusy ? fraction : (fraction ?? 0),
+              minHeight: 4,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              progress.summary,
+              style: const TextStyle(fontSize: 11),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (progress.assetsPerMinute > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Text(
+                '${progress.assetsPerMinute.toStringAsFixed(0)}/min',
+                style: const TextStyle(fontSize: 11, color: Color(0xff55606e)),
+              ),
+            ),
+          // Which stage the run is waiting in. The two totals are what say
+          // whether more lanes would help, and the answer has been guessed
+          // wrong here five times out of six.
+          if (progress.renderWaitMs + progress.workerWaitMs > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Tooltip(
+                message:
+                    'Time the lanes spent waiting: '
+                    '${(progress.renderWaitMs / 1000).toStringAsFixed(0)}s '
+                    'rendering, '
+                    '${(progress.workerWaitMs / 1000).toStringAsFixed(0)}s '
+                    'embedding. The larger one is the limit.',
+                child: Text(
+                  progress.renderWaitMs >= progress.workerWaitMs
+                      ? 'render-bound'
+                      : 'embed-bound',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xff55606e),
+                  ),
+                ),
+              ),
+            ),
+          _modePicker(),
+          if (progress.failed > 0 || progress.givenUp > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Text(
+                [
+                  if (progress.failed > 0) '${progress.failed} failed',
+                  if (progress.givenUp > 0) '${progress.givenUp} skipped',
+                ].join(', '),
+                style: const TextStyle(fontSize: 11, color: Color(0xff8a6d3b)),
+              ),
+            ),
+          // Two IconButtons rather than ToggleButtons: a Tooltip placed as a
+          // direct child of ToggleButtons corrupts the Windows accessibility
+          // tree and the app hard-crashes inside flutter_windows.dll on the
+          // next window resize.
+          if (progress.state == TagState.running)
+            IconButton(
+              tooltip: 'Pause visual tagging',
+              icon: const Icon(Icons.pause, size: 16),
+              onPressed: onPause,
+            ),
+          if (progress.state == TagState.paused && progress.remaining > 0)
+            IconButton(
+              tooltip: 'Resume visual tagging',
+              icon: const Icon(Icons.play_arrow, size: 16),
+              onPressed: onResume,
+            ),
+          if (progress.isBusy)
+            IconButton(
+              tooltip: 'Stop after the current batch',
+              icon: const Icon(Icons.stop, size: 16),
+              onPressed: onStop,
+            ),
+          if (!progress.isBusy && progress.state != TagState.finished)
+            IconButton(
+              tooltip: 'Start visual tagging',
+              icon: const Icon(Icons.auto_awesome, size: 16),
+              onPressed: onStart,
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bar({
+    required Color background,
+    required Color border,
+    required Widget child,
+  }) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+    decoration: BoxDecoration(
+      color: background,
+      border: Border(top: BorderSide(color: border)),
+    ),
+    child: child,
+  );
+}
+
 /// The one-line status under a material's swatch.
 ///
 /// "flat colour" and "asked for a texture and did not get one" look identical
 /// on screen but mean opposite things: the first is how a collision hull is
 /// supposed to look, the second is a broken link worth chasing.
-String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
+String materialSummaryLine(
+  MeshMaterial material, {
+  int? width,
+  int? height,
+  TextureSource inferred = TextureSource.none,
+}) {
   final extras = <String>[
     if (material.hasNormalMap) 'normal map',
     if (material.hasEmissiveMap) 'emissive map',
@@ -6667,7 +10942,10 @@ String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
 
   if (width != null && height != null) {
     final embedded = material.hasEmbeddedTexture ? ' (embedded)' : '';
-    return 'textured ${width}x$height$embedded$suffix';
+    final source = inferred == TextureSource.none
+        ? ''
+        : ' (${inferred.label})';
+    return 'textured ${width}x$height$embedded$source$suffix';
   }
   if (material.texturesMissing) {
     final count = material.textures.length;
@@ -6676,6 +10954,12 @@ String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
   }
   return 'flat colour, no texture$suffix';
 }
+
+/// The hand-picked value that means "draw this one flat".
+///
+/// A path nothing can resolve, chosen so it survives being stored beside
+/// real paths in the same setting.
+const noTextureChoice = 'none:flat-colour';
 
 /// Picks a texture for a model by hand, from what was scanned beside it.
 ///
@@ -6688,6 +10972,8 @@ class TexturePickerButton extends StatelessWidget {
     required this.candidates,
     required this.chosenPath,
     required this.onChosen,
+    this.inferred = TextureSource.none,
+    this.inferredName,
     super.key,
   });
 
@@ -6696,6 +10982,14 @@ class TexturePickerButton extends StatelessWidget {
 
   /// Null clears the choice and goes back to whatever resolved on its own.
   final ValueChanged<String?> onChosen;
+
+  /// Which tier answered, when the texture on screen was inferred rather
+  /// than named by the file. Said out loud: a guess and an authored answer
+  /// look identical once applied, and only one of them is evidence.
+  final TextureSource inferred;
+
+  /// The inferred texture's file name, for the same line.
+  final String? inferredName;
 
   @override
   Widget build(BuildContext context) {
@@ -6721,7 +11015,12 @@ class TexturePickerButton extends StatelessWidget {
         children: [
           Flexible(
             child: Text(
-              chosenName == null ? 'Texture: auto' : 'Texture: $chosenName',
+              chosenName != null
+                  ? 'Texture: $chosenName'
+                  : inferred == TextureSource.none
+                  ? 'Texture: auto'
+                  : 'Texture: ${inferred.label}'
+                        '${inferredName == null ? '' : ' - $inferredName'}',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -6738,6 +11037,12 @@ class TexturePickerButton extends StatelessWidget {
               const PopupMenuItem<String?>(
                 value: null,
                 child: Text('Auto (whatever the model asks for)'),
+              ),
+              // So a wrong inference can be turned off for one model
+              // without turning the feature off for the library.
+              const PopupMenuItem<String?>(
+                value: noTextureChoice,
+                child: Text('None (flat colour)'),
               ),
               const PopupMenuDivider(),
               for (final asset in candidates.take(40))
@@ -6790,9 +11095,25 @@ class AnimationCharacterButton extends StatelessWidget {
 /// material -- which drawn together fight for identical pixels at identical
 /// depth and read as a mess of z-fighting. Drawn one per cell they are twelve
 /// characters.
-class MaterialVariantGrid extends StatelessWidget {
-  const MaterialVariantGrid({
+/// What a grid cell stands for.
+///
+/// Two different questions wear the same shape. "What does this model look
+/// like in each of its palettes" is about textures and is the common one;
+/// "what is actually stacked in this file" is about materials, and only
+/// matters for the files that hide a dozen characters in one mesh.
+enum VariantGridMode { texture, material, object }
+
+/// Shows a model once per texture, side by side.
+///
+/// The materials are left alone and each cell puts one atlas on all of them,
+/// exactly as picking that texture by hand would. For the models this is for
+/// -- a Synty character with one material and four palettes -- that is the
+/// whole story; for a multi-material model it flattens the materials
+/// together, which is a fair price for seeing the palettes at all.
+class TextureVariantGrid extends StatefulWidget {
+  const TextureVariantGrid({
     required this.mesh,
+    required this.variants,
     required this.yaw,
     required this.pitch,
     required this.zoom,
@@ -6805,6 +11126,7 @@ class MaterialVariantGrid extends StatelessWidget {
   });
 
   final MeshModel mesh;
+  final List<AssetItem> variants;
   final double yaw;
   final double pitch;
   final double zoom;
@@ -6815,67 +11137,780 @@ class MaterialVariantGrid extends StatelessWidget {
   final String? uvSetOverride;
 
   @override
+  State<TextureVariantGrid> createState() => _TextureVariantGridState();
+}
+
+class _TextureVariantGridState extends State<TextureVariantGrid> {
+  late Future<List<MeshModel?>> _meshes;
+
+  @override
+  void initState() {
+    super.initState();
+    _meshes = _applyAll();
+  }
+
+  @override
+  void didUpdateWidget(covariant TextureVariantGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Only the mesh and the list matter. Rebuilding these on a camera drag
+    // would decode every image again, once per frame.
+    if (!identical(oldWidget.mesh, widget.mesh) ||
+        !_sameVariants(oldWidget.variants, widget.variants)) {
+      _meshes = _applyAll();
+    }
+  }
+
+  bool _sameVariants(List<AssetItem> a, List<AssetItem> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i += 1) {
+      if (a[i].path != b[i].path) return false;
+    }
+    return true;
+  }
+
+  Future<List<MeshModel?>> _applyAll() async {
+    final built = <MeshModel?>[];
+    for (final variant in widget.variants) {
+      try {
+        built.add(await applyChosenTexture(widget.mesh, variant.path));
+      } catch (error) {
+        // A format Flutter and the image package both refuse is a cell that
+        // says so, not a grid that fails.
+        fbxLog('Variant texture ${variant.name} could not be read: $error');
+        built.add(null);
+      }
+    }
+    return built;
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final count = mesh.materials.length;
-    if (count <= 1) {
+    return FutureBuilder<List<MeshModel?>>(
+      future: _meshes,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final meshes = snapshot.data!;
+        return PagedGrid(
+          itemCount: meshes.length,
+          itemBuilder: (context, index) {
+            final variant = widget.variants[index];
+            final mesh = meshes[index];
+            return VariantGridCell(
+              label: variant.name,
+              child: mesh == null
+                  ? const Center(
+                      child: Text(
+                        'Could not read this image.',
+                        style: TextStyle(color: Colors.black54, fontSize: 11),
+                      ),
+                    )
+                  : RasterModelView(
+                      mesh: mesh,
+                      yaw: widget.yaw,
+                      pitch: widget.pitch,
+                      zoom: widget.zoom,
+                      renderMode: widget.renderMode,
+                      lightingMode: widget.lightingMode,
+                      cullBackFaces: widget.cullBackFaces,
+                      useBaseTexture: true,
+                      useNormalMaps: true,
+                      useEmissiveMaps: true,
+                      useSpecular: true,
+                      interacting: widget.interacting,
+                      uvSetOverride: widget.uvSetOverride,
+                    ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+/// One framed, captioned cell of either grid.
+class VariantGridCell extends StatelessWidget {
+  const VariantGridCell({
+    required this.label,
+    required this.child,
+    super.key,
+  });
+
+  final String label;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        children: [
+          Expanded(child: child),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One cell of a [CellVariantGrid]: a label and which slice of the mesh to
+/// draw.
+class VariantCell {
+  const VariantCell({
+    required this.label,
+    this.material = -1,
+    this.object = -1,
+  });
+
+  final String label;
+  final int material;
+  final int object;
+}
+
+/// How many cells a page holds. Three by three keeps each cell large enough
+/// to read a face on.
+const variantCellsPerPage = 9;
+
+/// A grid that turns pages instead of scrolling.
+///
+/// The viewport's wheel is the zoom, and a scrolling grid took the same
+/// wheel: one notch both zoomed every cell and slid the grid, which is the
+/// worst of both. Pages leave the wheel to the camera, and a page is built
+/// from rows of expanded cells rather than a scroll view so there is nothing
+/// for the wheel to move.
+class PagedGrid extends StatefulWidget {
+  const PagedGrid({
+    required this.itemCount,
+    required this.itemBuilder,
+    super.key,
+  });
+
+  final int itemCount;
+  final Widget Function(BuildContext context, int index) itemBuilder;
+
+  @override
+  State<PagedGrid> createState() => _PagedGridState();
+}
+
+class _PagedGridState extends State<PagedGrid> {
+  int page = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = math.max(1, (widget.itemCount / variantCellsPerPage).ceil());
+    if (page >= pages) page = pages - 1;
+    final start = page * variantCellsPerPage;
+    final end = math.min(widget.itemCount, start + variantCellsPerPage);
+    final onPage = end - start;
+    final columns = math.max(1, math.sqrt(onPage).ceil());
+    final rows = math.max(1, (onPage / columns).ceil());
+
+    return Column(
+      children: [
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(4),
+            child: Column(
+              children: [
+                for (var row = 0; row < rows; row += 1)
+                  Expanded(
+                    child: Row(
+                      children: [
+                        for (var column = 0; column < columns; column += 1)
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.all(4),
+                              child: start + row * columns + column < end
+                                  ? widget.itemBuilder(
+                                      context,
+                                      start + row * columns + column,
+                                    )
+                                  : const SizedBox.shrink(),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        if (pages > 1)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                IconButton(
+                  tooltip: 'Previous page',
+                  icon: const Icon(Icons.chevron_left),
+                  onPressed: page > 0 ? () => setState(() => page -= 1) : null,
+                ),
+                Text('Page ${page + 1} of $pages'),
+                IconButton(
+                  tooltip: 'Next page',
+                  icon: const Icon(Icons.chevron_right),
+                  onPressed: page + 1 < pages
+                      ? () => setState(() => page += 1)
+                      : null,
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// Shows a model once per slice, side by side.
+///
+/// A slice is a material or a node of the file. Both exist for the same
+/// reason: some files are several complete models standing in one place --
+/// `SimplePeople3.fbx` holds twelve, one per material; `Characters.fbx` in
+/// Dungeon Realms holds eleven, one per node -- which drawn together fight
+/// for identical pixels at identical depth and read as a mess of z-fighting.
+/// Drawn one per cell they are twelve characters.
+class CellVariantGrid extends StatelessWidget {
+  const CellVariantGrid({
+    required this.mesh,
+    required this.cells,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.renderMode,
+    required this.lightingMode,
+    required this.cullBackFaces,
+    required this.interacting,
+    this.uvSetOverride,
+    super.key,
+  });
+
+  final MeshModel mesh;
+  final List<VariantCell> cells;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final RenderMode renderMode;
+  final LightingMode lightingMode;
+  final bool cullBackFaces;
+  final bool interacting;
+  final String? uvSetOverride;
+
+  /// One cell per material.
+  static List<VariantCell> byMaterial(MeshModel mesh) => [
+    for (var i = 0; i < mesh.materials.length; i += 1)
+      VariantCell(
+        label: mesh.materials[i].name.isEmpty
+            ? 'Material $i'
+            : mesh.materials[i].name,
+        material: i,
+      ),
+  ];
+
+  /// One cell per node of the file.
+  static List<VariantCell> byObject(MeshModel mesh) => [
+    for (var i = 0; i < mesh.objectNames.length; i += 1)
+      VariantCell(
+        label: mesh.objectNames[i].isEmpty ? 'Object $i' : mesh.objectNames[i],
+        object: i,
+      ),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    if (cells.length <= 1) {
       return const Center(
         child: Text(
-          'This model has one material, so there is nothing to compare.',
+          'There is only one of these, so there is nothing to compare.',
           style: TextStyle(color: Colors.black54),
         ),
       );
     }
-
-    // As square as the count allows, so cells stay large.
-    final columns = math.max(1, math.sqrt(count).ceil());
-    return GridView.builder(
-      padding: const EdgeInsets.all(8),
-      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: columns,
-        mainAxisSpacing: 8,
-        crossAxisSpacing: 8,
-      ),
-      itemCount: count,
+    return PagedGrid(
+      itemCount: cells.length,
       itemBuilder: (context, index) {
-        final material = mesh.materials[index];
-        return DecoratedBox(
-          decoration: BoxDecoration(
-            border: Border.all(color: Colors.black12),
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: Column(
-            children: [
-              Expanded(
-                child: RasterModelView(
-                  mesh: mesh,
-                  yaw: yaw,
-                  pitch: pitch,
-                  zoom: zoom,
-                  renderMode: renderMode,
-                  lightingMode: lightingMode,
-                  cullBackFaces: cullBackFaces,
-                  useBaseTexture: true,
-                  useNormalMaps: true,
-                  useEmissiveMaps: true,
-                  useSpecular: true,
-                  interacting: interacting,
-                  uvSetOverride: uvSetOverride,
-                  visibleMaterial: index,
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                child: Text(
-                  material.name.isEmpty ? 'Material $index' : material.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 11),
-                ),
-              ),
-            ],
+        final cell = cells[index];
+        return VariantGridCell(
+          label: cell.label,
+          child: RasterModelView(
+            mesh: mesh,
+            yaw: yaw,
+            pitch: pitch,
+            zoom: zoom,
+            renderMode: renderMode,
+            lightingMode: lightingMode,
+            cullBackFaces: cullBackFaces,
+            useBaseTexture: true,
+            useNormalMaps: true,
+            useEmissiveMaps: true,
+            useSpecular: true,
+            interacting: interacting,
+            uvSetOverride: uvSetOverride,
+            visibleMaterial: cell.material,
+            visibleObject: cell.object,
           ),
         );
       },
+    );
+  }
+}
+
+/// An attachment's file name with the boilerplate taken off.
+///
+/// `SM_Chr_Attach_Dwarf_Beard_04.fbx` becomes `Dwarf Beard 04`. Purely for the
+/// chip label: every pack prefixes the same four tokens, so leaving them on
+/// means every chip starts with the same eleven characters and the part that
+/// tells them apart is the part that gets ellipsised away.
+String attachmentDisplayName(String fileName) {
+  const boilerplate = {'sm', 'sk', 'chr', 'attach', 'fbx', 'obj'};
+  final words = fileName
+      .replaceFirst(RegExp(r'\\.[^.]+$'), '')
+      .split(RegExp(r'[^A-Za-z0-9]+'))
+      .where((word) => word.isNotEmpty && !boilerplate.contains(word.toLowerCase()));
+  return words.isEmpty ? fileName : words.join(' ');
+}
+
+/// Which variant of each interchangeable part a modular kit is wearing.
+///
+/// A kit ships every option in the one file, each at the joint it hangs from:
+/// the Polygon mech has eight heads, ten shoulder plates and twelve chest
+/// weapons per side, 215 nodes in all. Drawn together they interpenetrate,
+/// which is the difference between looking at a mech and looking at every
+/// mech at once. One variant per slot is the default; the rest are a click.
+class SlotPickerPanel extends StatelessWidget {
+  const SlotPickerPanel({
+    required this.slots,
+    required this.objectNames,
+    required this.choice,
+    required this.applied,
+    required this.onChoose,
+    required this.onApplied,
+    required this.onReset,
+    super.key,
+  });
+
+  final List<ObjectSlot> slots;
+  final List<String> objectNames;
+
+  /// Which variant each slot shows, by [ObjectSlot.key]; absent means the
+  /// first, and [slotChoiceNone] means the slot is empty.
+  final Map<String, int> choice;
+
+  /// False while the whole file is drawn at once, which disables the picks.
+  final bool applied;
+  final void Function(String key, int index) onChoose;
+  final ValueChanged<bool> onApplied;
+  final VoidCallback onReset;
+
+  String _nameOf(int object) =>
+      object >= 0 && object < objectNames.length ? objectNames[object] : '';
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 260),
+      decoration: const BoxDecoration(
+        color: Color(0xfffafbfe),
+        border: Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: SingleChildScrollView(
+        key: const PageStorageKey('slot-picker-panel'),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'A modular kit: every option ships in the one file, at the '
+                    'joint it hangs from. One of each is drawn -- pick another, '
+                    'or leave a slot empty.',
+                    style: TextStyle(color: Colors.black54, fontSize: 11),
+                  ),
+                ),
+                TextButton(onPressed: onReset, child: const Text('Reset')),
+                const Text(
+                  'Draw every variant',
+                  style: TextStyle(fontSize: 11),
+                ),
+                Switch(
+                  value: !applied,
+                  onChanged: (next) => onApplied(!next),
+                ),
+              ],
+            ),
+            for (final slot in slots)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 1),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 150,
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          slotDisplayName(slot.key),
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 11,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Wrap(
+                        spacing: 4,
+                        runSpacing: 4,
+                        children: [
+                          for (var i = 0; i < slot.objects.length; i += 1)
+                            ChoiceChip(
+                              visualDensity: VisualDensity.compact,
+                              label: Text(
+                                slotVariantLabel(
+                                  key: slot.key,
+                                  objectName: _nameOf(slot.objects[i]),
+                                ),
+                                style: const TextStyle(fontSize: 10),
+                              ),
+                              selected:
+                                  applied && (choice[slot.key] ?? 0) == i,
+                              onSelected: applied
+                                  ? (_) => onChoose(slot.key, i)
+                                  : null,
+                            ),
+                          ChoiceChip(
+                            visualDensity: VisualDensity.compact,
+                            label: const Text(
+                              'none',
+                              style: TextStyle(fontSize: 10),
+                            ),
+                            selected: applied &&
+                                (choice[slot.key] ?? 0) == slotChoiceNone,
+                            onSelected: applied
+                                ? (_) => onChoose(slot.key, slotChoiceNone)
+                                : null,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The kit a character can wear, grouped by where it goes.
+///
+/// Only pieces this rig can actually hold are listed. A Polygon character has
+/// no shoulder or knee joints to hang anything from, so offering its pack's
+/// pauldrons would be offering something that cannot be done.
+class AttachmentPanel extends StatelessWidget {
+  const AttachmentPanel({
+    required this.candidates,
+    required this.skeleton,
+    required this.worn,
+    required this.onToggle,
+    required this.onClear,
+    super.key,
+  });
+
+  final List<AssetItem> candidates;
+  final SkeletonAnimation skeleton;
+  final Set<String> worn;
+  final void Function(AssetItem asset) onToggle;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    // Grouped in the table's own order, so the head comes before the hands
+    // however the files happen to be named.
+    final grouped = <String, List<AssetItem>>{};
+    for (final point in attachPoints) {
+      for (final asset in candidates) {
+        if (attachPointFor(asset.name)?.name != point.name) continue;
+        if (attachmentBoneFor(
+              attachmentName: asset.name,
+              skeleton: skeleton,
+            ) ==
+            null) {
+          continue;
+        }
+        grouped.putIfAbsent(point.name, () => <AssetItem>[]).add(asset);
+      }
+    }
+
+    if (grouped.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Text(
+          'This pack has attachments, but none of them fit this rig.',
+          style: TextStyle(color: Colors.black54, fontSize: 12),
+        ),
+      );
+    }
+
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 200),
+      decoration: const BoxDecoration(
+        color: Color(0xfffafbfe),
+        border: Border(bottom: BorderSide(color: Colors.black12)),
+      ),
+      child: SingleChildScrollView(
+        key: const PageStorageKey('attachment-panel'),
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'One piece per body part; hold Shift or Ctrl to add another. '
+                    'Placed by name: the file says nothing about where it goes.',
+                    style: TextStyle(color: Colors.black54, fontSize: 11),
+                  ),
+                ),
+                if (worn.isNotEmpty)
+                  TextButton(onPressed: onClear, child: const Text('Take off all')),
+              ],
+            ),
+            for (final entry in grouped.entries) ...[
+              Padding(
+                padding: const EdgeInsets.only(top: 6, bottom: 4),
+                child: Text(
+                  entry.key,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 11,
+                  ),
+                ),
+              ),
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: [
+                  for (final asset in entry.value)
+                    FilterChip(
+                      label: Text(
+                        attachmentDisplayName(asset.name),
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                      selected: worn.contains(asset.path),
+                      onSelected: (_) => onToggle(asset),
+                    ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// The camera of a 3D viewport: where it looks from and where the model sits.
+class ViewportCamera {
+  ViewportCamera({
+    this.yaw = -0.6,
+    this.pitch = 0.35,
+    this.zoom = 1,
+    this.panX = 0,
+    this.panY = 0,
+  });
+
+  double yaw;
+  double pitch;
+  double zoom;
+  double panX;
+  double panY;
+
+  /// Back to the framing a model opens with.
+  void reset() {
+    yaw = -0.6;
+    pitch = 0.35;
+    zoom = 1;
+    panX = 0;
+    panY = 0;
+  }
+}
+
+/// How fast the wheel zooms: one notch is this many times closer or further.
+const viewportZoomStep = 1.1;
+const viewportZoomMin = 0.2;
+const viewportZoomMax = 6.0;
+
+/// How far a key held for one second flies, as a fraction of the view.
+const viewportFlySpeed = 0.9;
+
+/// Mouse and keyboard for a 3D viewport, the way an engine viewport works.
+///
+/// Hold the left button and move to look around; the cursor disappears while
+/// held and comes back when released, so the drag can go as far as it likes.
+/// Hold the right or middle button to pan. The wheel zooms. While any button
+/// is held, W/S move the model closer and further, A/D and Q/E slide it, so
+/// a long drag is not the only way to get somewhere. Dragging up tilts the
+/// view so the model turns *towards* you, which is what a hand on a globe
+/// does; the earlier version had it backwards.
+///
+/// One controller serves the model preview and the animation preview, which
+/// used to have two different sets of controls -- the animation one could not
+/// zoom or tilt at all, which is most of why it felt wrong.
+class ViewportController extends StatefulWidget {
+  const ViewportController({
+    required this.camera,
+    required this.onChanged,
+    required this.child,
+    super.key,
+  });
+
+  final ViewportCamera camera;
+
+  /// Called whenever the camera moves. The caller redraws.
+  final VoidCallback onChanged;
+  final Widget child;
+
+  @override
+  State<ViewportController> createState() => _ViewportControllerState();
+}
+
+class _ViewportControllerState extends State<ViewportController>
+    with SingleTickerProviderStateMixin {
+  int _buttonsDown = 0;
+  Ticker? _flyTicker;
+  Duration _lastTick = Duration.zero;
+  final FocusNode _focus = FocusNode(debugLabel: 'viewport');
+
+  @override
+  void dispose() {
+    _flyTicker?.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _startFlying() {
+    _lastTick = Duration.zero;
+    _flyTicker ??= createTicker(_fly);
+    if (!_flyTicker!.isActive) _flyTicker!.start();
+  }
+
+  void _stopFlying() {
+    _flyTicker?.stop();
+  }
+
+  /// Applies whatever keys are held, once per frame while a button is down.
+  void _fly(Duration elapsed) {
+    final dt = _lastTick == Duration.zero
+        ? 0.0
+        : (elapsed - _lastTick).inMicroseconds / 1e6;
+    _lastTick = elapsed;
+    if (dt <= 0) return;
+    final keys = HardwareKeyboard.instance.logicalKeysPressed;
+    var moved = false;
+    final camera = widget.camera;
+    final step = viewportFlySpeed * dt;
+    if (keys.contains(LogicalKeyboardKey.keyW)) {
+      camera.zoom = (camera.zoom * (1 + step)).clamp(viewportZoomMin, viewportZoomMax);
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyS)) {
+      camera.zoom = (camera.zoom / (1 + step)).clamp(viewportZoomMin, viewportZoomMax);
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyA)) {
+      camera.panX += step;
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyD)) {
+      camera.panX -= step;
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyE)) {
+      camera.panY -= step;
+      moved = true;
+    }
+    if (keys.contains(LogicalKeyboardKey.keyQ)) {
+      camera.panY += step;
+      moved = true;
+    }
+    if (moved) widget.onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final camera = widget.camera;
+    return Focus(
+      focusNode: _focus,
+      child: MouseRegion(
+        // The cursor goes away while a button is held so the drag reads as
+        // grabbing the view rather than sliding a pointer across it.
+        cursor: _buttonsDown != 0
+            ? SystemMouseCursors.none
+            : SystemMouseCursors.basic,
+        child: Listener(
+          behavior: HitTestBehavior.opaque,
+          onPointerDown: (event) {
+            _focus.requestFocus();
+            setState(() => _buttonsDown = event.buttons);
+            _startFlying();
+          },
+          onPointerUp: (event) {
+            setState(() => _buttonsDown = event.buttons);
+            if (event.buttons == 0) _stopFlying();
+          },
+          onPointerCancel: (event) {
+            setState(() => _buttonsDown = 0);
+            _stopFlying();
+          },
+          onPointerMove: (event) {
+            if (event.buttons == 0) return;
+            final size = context.size;
+            final shorter = size == null
+                ? 400.0
+                : math.max(1.0, math.min(size.width, size.height));
+            if (event.buttons & kPrimaryMouseButton != 0) {
+              camera.yaw += event.delta.dx * .01;
+              camera.pitch = (camera.pitch - event.delta.dy * .01)
+                  .clamp(-1.45, 1.45)
+                  .toDouble();
+            } else {
+              camera.panX += event.delta.dx / shorter;
+              camera.panY -= event.delta.dy / shorter;
+            }
+            widget.onChanged();
+          },
+          onPointerSignal: (event) {
+            if (event is! PointerScrollEvent) return;
+            camera.zoom =
+                (camera.zoom *
+                        (event.scrollDelta.dy > 0
+                            ? 1 / viewportZoomStep
+                            : viewportZoomStep))
+                    .clamp(viewportZoomMin, viewportZoomMax)
+                    .toDouble();
+            widget.onChanged();
+          },
+          child: widget.child,
+        ),
+      ),
     );
   }
 }
@@ -7173,7 +12208,7 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
   AssetItem asset,
   List<AssetItem> allAssets,
 ) async {
-  if (!_previewableModelExts.contains(asset.ext)) return const [];
+  if (!previewableModelExts.contains(asset.ext)) return const [];
   textureReferenceScanCount += 1;
   // Shares the import with the 3D preview instead of spawning a second helper.
   final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
@@ -7185,23 +12220,14 @@ Future<List<TextureDiscoveryEntry>> loadModelTextureReferenceEntries(
       allowFallbackLookup: false,
     );
     final existingPath = resolved ?? path;
+    final byPath = _catalogByNormalizedPath(allAssets);
+    final key = normalizePathKey(existingPath);
     final exists = isZipVirtualPath(existingPath)
-        ? allAssets.any(
-            (candidate) =>
-                normalizePathKey(candidate.path) ==
-                normalizePathKey(existingPath),
-          )
+        ? byPath.containsKey(key)
         : File(existingPath).existsSync();
-    AssetItem? jumpAsset;
-    if (exists) {
-      final key = normalizePathKey(existingPath);
-      for (final candidate in allAssets) {
-        if (normalizePathKey(candidate.path) == key) {
-          jumpAsset = candidate;
-          break;
-        }
-      }
-    }
+    // The same lookup the existence test just did, so a loose texture that
+    // is on disk but outside the catalog still jumps nowhere, as before.
+    final jumpAsset = exists ? byPath[key] : null;
     // The label is built from `exists`; nothing may parse it back out.
     late final String label;
     if (resolved == null || resolved == path) {
@@ -7259,6 +12285,21 @@ String assetIdRelativePathFromStored({
 
 String normalizePathKey(String value) {
   return value.trim().toLowerCase().replaceAll('/', '\\');
+}
+
+/// The last `/` or `\` in a path, or -1.
+///
+/// Not `lastIndexOf(RegExp(...))`: a `Pattern` search walks the string from
+/// the front for every position it tries, and these paths are long. Over the
+/// catalog that one call was 2.6 s of the 4.3 s the two index builds spent,
+/// which is 2.6 s of frozen window. A scan backwards over code units is the
+/// same answer in 0.1 s.
+int lastPathSeparator(String value) {
+  for (var index = value.length - 1; index >= 0; index -= 1) {
+    final unit = value.codeUnitAt(index);
+    if (unit == 0x2F || unit == 0x5C) return index;
+  }
+  return -1;
 }
 
 // Shared by the texture scoring paths, which run per candidate per material.
@@ -7351,6 +12392,48 @@ bool textureChannelsAgree(String requestedBase, String candidateBase) =>
 final _pathSeparatorPattern = RegExp(r'[\\/]');
 final _paletteTailPattern = RegExp(r'(?:^|_)(texture|tex)(?:_|$).*');
 
+/// How many words a texture name puts in front of its palette tail.
+///
+/// `PolygonSciFiSpace_Texture_01_A` says one thing before `Texture_01_A`;
+/// `PolygonSciFiSpace_Signs_Texture_01_A` says two, and that second word is a
+/// different atlas rather than a spelling of the same one. Used to separate
+/// candidates whose tails match, which otherwise tie.
+int _qualifierCount(String base) {
+  final match = _paletteTailPattern.firstMatch(base);
+  final head = match == null ? base : base.substring(0, match.start);
+  return textureNameTokens(head).length;
+}
+
+int? _catalogByPathIdentity;
+Map<String, AssetItem>? _catalogByPathCache;
+
+/// The catalog keyed on its own normalized paths.
+///
+/// Three places asked the catalog the same question -- is this exact path in
+/// it, and which asset is it -- and all three answered by walking all 221,183
+/// assets, normalizing each path on the way past. That walk measures 284 ms,
+/// and [resolveTextureReference] paid it once per texture reference, so a
+/// model with a dozen materials paid it thirty times. It was more than the
+/// rest of the render put together.
+///
+/// Exact equality is what a map is for, so the answers are identical and the
+/// walks are gone. Where a path appears twice the first asset wins, which is
+/// what the loops this replaced did.
+///
+/// It costs about 20 MB beside a catalog of this size, which is the trade.
+Map<String, AssetItem> _catalogByNormalizedPath(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _catalogByPathCache;
+  if (cached != null && _catalogByPathIdentity == identity) return cached;
+  final byPath = <String, AssetItem>{};
+  for (final asset in allAssets) {
+    byPath.putIfAbsent(normalizePathKey(asset.path), () => asset);
+  }
+  _catalogByPathIdentity = identity;
+  _catalogByPathCache = byPath;
+  return byPath;
+}
+
 String? resolveTextureReference(
   String modelPath,
   String texturePath, {
@@ -7376,10 +12459,9 @@ String? resolveTextureReference(
       zipModel.zipPath,
       zipRelativeEntry,
     );
-    final hasZipCandidate = allAssets.any(
-      (asset) =>
-          normalizePathKey(asset.path) == normalizePathKey(zipVirtualCandidate),
-    );
+    final hasZipCandidate = _catalogByNormalizedPath(
+      allAssets,
+    ).containsKey(normalizePathKey(zipVirtualCandidate));
     if (hasZipCandidate) {
       fbxLog(
         'Resolved ZIP-relative texture path: $trimmed -> $zipVirtualCandidate',
@@ -7475,96 +12557,249 @@ bool canRelinkAcrossContainers({
   return hints.any((hint) => candidateLower.contains(hint));
 }
 
-/// The candidate textures for one model, split by container.
+/// Whether [asset] sits in the same container as the model described by
+/// [modelPathLower] and [zipModel].
 ///
-/// Partitioning the catalog is the expensive part of relinking: it walks every
-/// asset, parsing zip virtual paths as it goes. A model with twelve materials
-/// asks for thirty-odd textures and each one repeated the whole walk, which on
-/// a 26,000-asset catalog cost about a second of frozen UI per model. The
-/// split depends only on the model and the catalog, so it is done once.
-class _RelinkCandidates {
-  const _RelinkCandidates(
-    this.sameContainer,
-    this.otherContainers,
-    this.otherByBaseName,
-  );
-
-  final List<AssetItem> sameContainer;
-  final List<AssetItem> otherContainers;
-
-  /// Assets outside the model's container, keyed by file name without its
-  /// extension.
-  ///
-  /// Crossing containers demands an exact name match, so this turns a walk of
-  /// the whole catalog per reference into a lookup. With 26,000 assets and a
-  /// model asking for thirty textures, that walk was the load.
-  final Map<String, List<AssetItem>> otherByBaseName;
+/// This is the definition of "beside the model" that the index below encodes,
+/// and the one the equivalence test holds it to.
+bool _textureSitsBeside(
+  AssetItem asset,
+  String modelPathLower,
+  ZipVirtualPath? zipModel,
+) {
+  if (zipModel != null) {
+    final zipCandidate = parseZipVirtualPath(asset.path);
+    return zipCandidate != null &&
+        normalizePathKey(zipCandidate.zipPath) ==
+            normalizePathKey(zipModel.zipPath);
+  }
+  if (isZipVirtualPath(asset.path)) return false;
+  final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
+  return modelPathLower.startsWith(sourceLower);
 }
 
-String? _relinkCacheModelPath;
-int? _relinkCacheAssets;
-_RelinkCandidates? _relinkCache;
-
-/// Partitions [allAssets] for [modelPath], reusing the last answer.
+/// Which container [asset] lives in, or null when it lives in none.
 ///
-/// One entry is enough: every reference in a model is resolved back to back,
-/// so the cache is hot for exactly as long as it is useful.
-_RelinkCandidates _relinkCandidatesFor(
-  String modelPath,
-  List<AssetItem> allAssets,
-) {
-  final assetsIdentity = identityHashCode(allAssets) ^ allAssets.length;
-  final cached = _relinkCache;
-  if (cached != null &&
-      _relinkCacheModelPath == modelPath &&
-      _relinkCacheAssets == assetsIdentity) {
-    return cached;
+/// A `zip:` path that parses to nothing is in no container rather than in
+/// every one, which is what the walk this replaced did with it.
+String? _textureContainerKey(AssetItem asset) {
+  if (isZipVirtualPath(asset.path)) {
+    final zip = parseZipVirtualPath(asset.path);
+    if (zip == null) return null;
+    return 'zip:${normalizePathKey(zip.zipPath)}';
   }
+  return 'root:${asset.sourceRoot.toLowerCase().replaceAll('\\', '/')}';
+}
 
-  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
-  final zipModel = parseZipVirtualPath(modelPath);
-  final same = <AssetItem>[];
-  final other = <AssetItem>[];
-  final otherByBaseName = <String, List<AssetItem>>{};
-  for (final asset in allAssets) {
+/// The textures in one container, and where each sat in the catalog.
+class _ContainerTextures {
+  _ContainerTextures(this.assets, this.catalogIndices);
+
+  final List<AssetItem> assets;
+
+  /// Read only when a model sits under several nested source roots, where the
+  /// buckets have to be merged back into the order the catalog had them in.
+  final List<int> catalogIndices;
+}
+
+/// Every texture in the catalog, bucketed by container and by name.
+///
+/// Relinking used to partition the catalog per model, keeping one cached
+/// answer keyed on the model path. That is the right trade for somebody
+/// clicking through models, and the wrong one for a run that renders the
+/// library: every asset is a different model, so every model paid a walk of
+/// the whole catalog. The walk cost 169 ms at 26,000 assets, which is what
+/// the catalog held when that cache was written, and 2,032 ms at the 221,183
+/// it holds now -- the whole of the two seconds a render took.
+///
+/// Nothing in the partition depended on the model path, only on which
+/// container the model is in, so it is built once per catalog and every model
+/// after the first reads it instead of rebuilding it.
+class _TextureIndex {
+  _TextureIndex(this.byContainer, this.byBaseName, this.sourceRootKeys);
+
+  final Map<String, _ContainerTextures> byContainer;
+
+  /// File name without its extension -> the textures carrying that name.
+  ///
+  /// Crossing containers demands an exact name match, so this is the whole of
+  /// that search rather than a filter over the catalog.
+  final Map<String, List<AssetItem>> byBaseName;
+
+  /// The distinct source roots of the textures outside archives, normalized
+  /// the way [_textureSitsBeside] compares them.
+  final List<String> sourceRootKeys;
+}
+
+int? _textureIndexIdentity;
+_TextureIndex? _textureIndexCache;
+
+_TextureIndex _textureIndexOf(List<AssetItem> allAssets) {
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final cached = _textureIndexCache;
+  if (cached != null && _textureIndexIdentity == identity) return cached;
+
+  final byContainer = <String, _ContainerTextures>{};
+  final byBaseName = <String, List<AssetItem>>{};
+  final roots = <String>{};
+  for (var index = 0; index < allAssets.length; index += 1) {
+    final asset = allAssets[index];
     if (!textureExts.contains(asset.ext)) continue;
-    bool isSame;
-    if (zipModel != null) {
-      final zipCandidate = parseZipVirtualPath(asset.path);
-      isSame =
-          zipCandidate != null &&
-          normalizePathKey(zipCandidate.zipPath) ==
-              normalizePathKey(zipModel.zipPath);
-    } else if (isZipVirtualPath(asset.path)) {
-      isSame = false;
-    } else {
-      final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
-      isSame = modelPathLower.startsWith(sourceLower);
-    }
-    if (isSame) {
-      same.add(asset);
-    } else {
-      other.add(asset);
-      final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
-      (otherByBaseName[base] ??= <AssetItem>[]).add(asset);
-    }
+    // twinStem, not a regex replace: the same answer for every name with an
+    // extension, without a pattern walk per texture, and the lookup side in
+    // `_textureAssetFor` keys on twinStem -- so the two now agree by
+    // construction rather than by both happening to strip the same thing.
+    final base = twinStem(asset.name);
+    (byBaseName[base] ??= <AssetItem>[]).add(asset);
+    final key = _textureContainerKey(asset);
+    if (key == null) continue;
+    if (key.startsWith('root:')) roots.add(key.substring('root:'.length));
+    final bucket =
+        byContainer[key] ??= _ContainerTextures(<AssetItem>[], <int>[]);
+    bucket.assets.add(asset);
+    bucket.catalogIndices.add(index);
   }
 
-  final result = _RelinkCandidates(same, other, otherByBaseName);
-  _relinkCacheModelPath = modelPath;
-  _relinkCacheAssets = assetsIdentity;
-  _relinkCache = result;
+  final result = _TextureIndex(byContainer, byBaseName, roots.toList());
+  _textureIndexIdentity = identity;
+  _textureIndexCache = result;
   return result;
 }
 
+/// The containers a model belongs to.
+///
+/// More than one only where source roots nest: a deeper root and the root
+/// above it both prefix the model's path, and the walk this replaced counted
+/// the textures under both as sitting beside the model.
+List<String> _modelContainerKeys(String modelPath, _TextureIndex index) {
+  final zipModel = parseZipVirtualPath(modelPath);
+  if (zipModel != null) {
+    return <String>['zip:${normalizePathKey(zipModel.zipPath)}'];
+  }
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  return <String>[
+    for (final root in index.sourceRootKeys)
+      if (modelPathLower.startsWith(root)) 'root:$root',
+  ];
+}
+
+String? _sameContainerCacheKey;
+int? _sameContainerCacheIdentity;
+List<AssetItem>? _sameContainerCache;
+
+/// The textures that sit beside [modelPath], in the order the catalog has
+/// them.
+///
+/// Cached on the container rather than on the model, which is the whole
+/// point: a pass over one pack asks about hundreds of models and answers all
+/// of them from the same list.
+List<AssetItem> _sameContainerTextures(
+  String modelPath,
+  List<AssetItem> allAssets,
+) {
+  final index = _textureIndexOf(allAssets);
+  final keys = _modelContainerKeys(modelPath, index);
+  if (keys.isEmpty) return const <AssetItem>[];
+
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  final signature = keys.join('|');
+  final cached = _sameContainerCache;
+  if (cached != null &&
+      _sameContainerCacheKey == signature &&
+      _sameContainerCacheIdentity == identity) {
+    return cached;
+  }
+
+  List<AssetItem> resolved;
+  if (keys.length == 1) {
+    resolved = index.byContainer[keys.first]?.assets ?? const <AssetItem>[];
+  } else {
+    final merged = <(int, AssetItem)>[];
+    for (final key in keys) {
+      final bucket = index.byContainer[key];
+      if (bucket == null) continue;
+      for (var slot = 0; slot < bucket.assets.length; slot += 1) {
+        merged.add((bucket.catalogIndices[slot], bucket.assets[slot]));
+      }
+    }
+    merged.sort((first, second) => first.$1.compareTo(second.$1));
+    resolved = [for (final entry in merged) entry.$2];
+  }
+
+  _sameContainerCacheKey = signature;
+  _sameContainerCacheIdentity = identity;
+  _sameContainerCache = resolved;
+  return resolved;
+}
+
+/// The textures named [requestedBase] that do not sit beside [modelPath].
+List<AssetItem> _otherContainerTextures(
+  String modelPath,
+  String requestedBase,
+  List<AssetItem> allAssets,
+) {
+  final index = _textureIndexOf(allAssets);
+  final named = index.byBaseName[requestedBase];
+  if (named == null) return const <AssetItem>[];
+  final beside = _modelContainerKeys(modelPath, index);
+  return [
+    for (final asset in named)
+      if (!beside.contains(_textureContainerKey(asset))) asset,
+  ];
+}
+
+/// [_sameContainerTextures] by walking the catalog instead of indexing it.
+///
+/// Kept because it is the definition the index has to agree with: the
+/// equivalence test runs both over awkward catalogs and compares. Reached
+/// from the app only through `byScan`, which nothing in the app passes.
+List<AssetItem> relinkSameContainerByScan(
+  String modelPath,
+  List<AssetItem> allAssets,
+) {
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
+  return [
+    for (final asset in allAssets)
+      if (textureExts.contains(asset.ext) &&
+          _textureSitsBeside(asset, modelPathLower, zipModel))
+        asset,
+  ];
+}
+
+/// [_otherContainerTextures] by walking the catalog. The reference the index
+/// is checked against.
+List<AssetItem> relinkOtherContainersByScan(
+  String modelPath,
+  String requestedBase,
+  List<AssetItem> allAssets,
+) {
+  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
+  final zipModel = parseZipVirtualPath(modelPath);
+  return [
+    for (final asset in allAssets)
+      if (textureExts.contains(asset.ext) &&
+          !_textureSitsBeside(asset, modelPathLower, zipModel) &&
+          asset.name.toLowerCase().replaceAll(_extensionPattern, '') ==
+              requestedBase)
+        asset,
+  ];
+}
+
+/// Pass `byScan: true` to answer from a walk of the catalog rather than from
+/// the index. It exists so the equivalence test can compare the two end to
+/// end -- the question that matters is not whether the partitions match but
+/// whether the same texture still wins.
 String? findDeterministicTextureRelink(
   String modelPath,
   String texturePath,
-  List<AssetItem> allAssets,
-) {
+  List<AssetItem> allAssets, {
+  bool byScan = false,
+}) {
   if (allAssets.isEmpty) return null;
-  final candidates = _relinkCandidatesFor(modelPath, allAssets);
-  final sourceCandidates = candidates.sameContainer;
+  final sourceCandidates = byScan
+      ? relinkSameContainerByScan(modelPath, allAssets)
+      : _sameContainerTextures(modelPath, allAssets);
 
   final requestedBase = texturePath
       .split(_pathSeparatorPattern)
@@ -7610,6 +12845,21 @@ String? findDeterministicTextureRelink(
     if (requestedPaletteTail.isNotEmpty &&
         candidatePaletteTail == requestedPaletteTail) {
       value += 105;
+      // A matching tail is not enough on its own, because a pack holds
+      // several atlases that share one: PolygonSciFiSpace_Texture_01_A and
+      // PolygonSciFiSpace_Signs_Texture_01_A both end in Texture_01_A, both
+      // scored 105 + 25, and the tie was broken alphabetically -- which put
+      // the signs sheet ahead of the atlas every model in the pack wants.
+      // SM_Prop_Turret_Base_Double_01 drew in signage.
+      //
+      // What separates them is the qualifier in front of the tail. The
+      // request names one thing before its tail (PolygonSciFiCity) and so
+      // does the atlas (PolygonSciFiSpace); the signs sheet names two. A
+      // request that does carry a qualifier prefers a candidate that also
+      // does, by the same count.
+      if (_qualifierCount(base) == _qualifierCount(requestedBase)) {
+        value += 15;
+      }
     }
 
     // Common singular/plural drift eg. window -> windows.
@@ -7667,8 +12917,9 @@ String? findDeterministicTextureRelink(
       [
         // Only a name that already matches can qualify, so the rest of the
         // catalog is never visited.
-        for (final asset
-            in candidates.otherByBaseName[requestedBase] ?? const <AssetItem>[])
+        for (final asset in byScan
+            ? relinkOtherContainersByScan(modelPath, requestedBase, allAssets)
+            : _otherContainerTextures(modelPath, requestedBase, allAssets))
           if (canRelinkAcrossContainers(
             texturePath: texturePath,
             candidatePath: asset.path,
@@ -7770,6 +13021,175 @@ Set<String> tokenSet(String value) {
       .toSet();
 }
 
+/// One texture, read and decoded once: its pixels, its size, its average.
+///
+/// Pixels rather than a [ui.Image], deliberately. The image a material holds
+/// is displayed, and widgets dispose what they are given, so handing the same
+/// [ui.Image] to every material that wants this texture would be a
+/// use-after-dispose waiting to happen. Each caller gets a fresh image built
+/// from these pixels instead, which is a copy of some megabytes against the
+/// hundreds of milliseconds that reading and decoding the file cost.
+class TextureBitmap {
+  const TextureBitmap({
+    required this.rgba,
+    required this.width,
+    required this.height,
+    required this.averageColor,
+  });
+
+  final Uint8List rgba;
+  final int width;
+  final int height;
+  final Color? averageColor;
+
+  int get byteCount => rgba.lengthInBytes;
+}
+
+final _textureBitmapCache = <String, TextureBitmap>{};
+final _textureBitmapInFlight = <String, Future<TextureBitmap?>>{};
+var _textureBitmapBytes = 0;
+
+/// Forgets every decoded texture. Test visibility, and for a settings change
+/// that should take effect without a restart.
+void clearTextureBitmapCache() {
+  _textureBitmapCache.clear();
+  _textureBitmapBytes = 0;
+}
+
+/// Test visibility: how many textures are held, and how much they weigh.
+int get textureBitmapCacheCount => _textureBitmapCache.length;
+int get textureBitmapCacheBytes => _textureBitmapBytes;
+
+/// Identifies the bytes a decoded texture came from.
+///
+/// A texture inside an archive is identified by the archive's own state, the
+/// same way the archive cache does it, because that is what changes when the
+/// pack is replaced on disk.
+String? _textureStateKey(String path) {
+  try {
+    final zip = parseZipVirtualPath(path);
+    if (zip != null) {
+      final archive = _archiveStateKey(zip.zipPath);
+      if (archive == null) return null;
+      return 'zip:$archive:${zip.entryPath}';
+    }
+    final stat = File(path).statSync();
+    if (stat.type == FileSystemEntityType.notFound) return null;
+    return '${stat.size}:${stat.modified.millisecondsSinceEpoch}';
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Reads and decodes [path], or hands back what a previous read decoded.
+///
+/// Every asset in a pack names the same atlas, and the whole of it used to be
+/// read off disk and decoded again for each one. On this library the largest
+/// textures cost 300-1,700 ms each in read and decode, so a pass over a pack
+/// paid that per asset for bytes it had already had.
+///
+/// Returns null when the file cannot be read or decoded, and remembers
+/// nothing in that case, so a texture that only becomes readable later is not
+/// written off permanently.
+Future<TextureBitmap?> textureBitmap(String path) async {
+  final state = _textureStateKey(path);
+  // Unreadable or gone: fall through to the uncached read, which fails the
+  // same way it always did rather than differently.
+  if (state == null) return _readTextureBitmap(path);
+
+  final key = '${normalizePathKey(path)}|$state';
+  final cached = _textureBitmapCache[key];
+  if (cached != null) {
+    // Promote for LRU eviction, as the archive cache does.
+    _textureBitmapCache.remove(key);
+    _textureBitmapCache[key] = cached;
+    return cached;
+  }
+
+  // Four render lanes asking for one pack's atlas at the same moment would
+  // otherwise each read and decode their own copy of it.
+  final inFlight = _textureBitmapInFlight[key];
+  if (inFlight != null) return inFlight;
+
+  final work = _readTextureBitmap(path);
+  _textureBitmapInFlight[key] = work;
+  try {
+    final bitmap = await work;
+    if (bitmap == null) return null;
+    // One texture bigger than the whole budget is used and not kept, rather
+    // than emptying the cache to hold it alone.
+    if (bitmap.byteCount <= maxTextureBitmapCacheBytes) {
+      _textureBitmapCache[key] = bitmap;
+      _textureBitmapBytes += bitmap.byteCount;
+      while (_textureBitmapBytes > maxTextureBitmapCacheBytes &&
+          _textureBitmapCache.isNotEmpty) {
+        final oldest = _textureBitmapCache.keys.first;
+        final evicted = _textureBitmapCache.remove(oldest);
+        _textureBitmapBytes -= evicted?.byteCount ?? 0;
+      }
+    }
+    return bitmap;
+  } finally {
+    _textureBitmapInFlight.remove(key);
+  }
+}
+
+Future<TextureBitmap?> _readTextureBitmap(String path) async {
+  try {
+    final bytes = await readAssetBytes(path);
+    if (bytes == null || bytes.isEmpty) return null;
+    final image = await decodeImage(bytes);
+    final width = image.width;
+    final height = image.height;
+    final byteData = await image.toByteData(
+      format: ui.ImageByteFormat.rawRgba,
+    );
+    image.dispose();
+    if (byteData == null) return null;
+    final rgba = byteData.buffer.asUint8List();
+    return TextureBitmap(
+      rgba: rgba,
+      width: width,
+      height: height,
+      averageColor: averageColorOfRgba(rgba),
+    );
+  } catch (error) {
+    fbxLog('Texture decode failed: $path ($error)');
+    return null;
+  }
+}
+
+/// A [ui.Image] over [rgba], which is a copy rather than a decode.
+Future<ui.Image> imageFromRgba(Uint8List rgba, int width, int height) {
+  final done = Completer<ui.Image>();
+  ui.decodeImageFromPixels(
+    rgba,
+    width,
+    height,
+    ui.PixelFormat.rgba8888,
+    done.complete,
+  );
+  return done.future;
+}
+
+Future<TextureBitmap?> firstTextureBitmap(List<String> paths) async {
+  for (final path in paths) {
+    if (!imageExts.contains(extensionOf(path))) continue;
+    final bitmap = await textureBitmap(path);
+    if (bitmap != null) {
+      fbxLog('Texture bitmap: $path (${bitmap.width}x${bitmap.height})');
+      return bitmap;
+    }
+    // Try the next texture candidate.
+  }
+  if (paths.isNotEmpty) {
+    fbxLog(
+      'No decodable texture image found in candidates: ${paths.join('; ')}',
+    );
+  }
+  return null;
+}
+
 Future<Color?> firstTextureAverageColor(List<String> paths) async {
   for (final path in paths) {
     if (!imageExts.contains(extensionOf(path))) continue;
@@ -7780,25 +13200,9 @@ Future<Color?> firstTextureAverageColor(List<String> paths) async {
 }
 
 Future<ui.Image?> firstTextureImage(List<String> paths) async {
-  for (final path in paths) {
-    if (!imageExts.contains(extensionOf(path))) continue;
-    try {
-      final bytes = await readAssetBytes(path);
-      if (bytes == null || bytes.isEmpty) continue;
-      final image = await decodeImage(bytes);
-      fbxLog('Decoded texture image: $path (${image.width}x${image.height})');
-      return image;
-    } catch (error) {
-      fbxLog('Texture decode failed: $path ($error)');
-      // Try the next texture candidate.
-    }
-  }
-  if (paths.isNotEmpty) {
-    fbxLog(
-      'No decodable texture image found in candidates: ${paths.join('; ')}',
-    );
-  }
-  return null;
+  final bitmap = await firstTextureBitmap(paths);
+  if (bitmap == null) return null;
+  return imageFromRgba(bitmap.rgba, bitmap.width, bitmap.height);
 }
 
 Future<ui.Image> createCheckerboardTextureImage({
@@ -7825,32 +13229,31 @@ Future<ui.Image> createCheckerboardTextureImage({
   return picture.toImage(size, size);
 }
 
-Future<Color?> averageImageColor(String path) async {
-  try {
-    final bytes = await readAssetBytes(path);
-    if (bytes == null || bytes.isEmpty) return null;
-    final image = await decodeImage(bytes);
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    image.dispose();
-    if (byteData == null) return null;
-    final data = byteData.buffer.asUint8List();
-    var r = 0;
-    var g = 0;
-    var b = 0;
-    var samples = 0;
-    final stride = math.max(4, (data.length / 256).floor() ~/ 4 * 4);
-    for (var index = 0; index + 3 < data.length; index += stride) {
-      if (data[index + 3] < 16) continue;
-      r += data[index];
-      g += data[index + 1];
-      b += data[index + 2];
-      samples += 1;
-    }
-    if (samples == 0) return null;
-    return Color.fromARGB(255, r ~/ samples, g ~/ samples, b ~/ samples);
-  } catch (_) {
-    return null;
+/// The average colour of raw RGBA pixels, ignoring the nearly transparent.
+///
+/// Sampled on a stride rather than read in full: 256 samples describe an
+/// atlas well enough to tint a thumbnail, and reading every texel of a 4K
+/// texture to produce one colour would cost more than the decode did.
+Color? averageColorOfRgba(Uint8List data) {
+  var r = 0;
+  var g = 0;
+  var b = 0;
+  var samples = 0;
+  final stride = math.max(4, (data.length / 256).floor() ~/ 4 * 4);
+  for (var index = 0; index + 3 < data.length; index += stride) {
+    if (data[index + 3] < 16) continue;
+    r += data[index];
+    g += data[index + 1];
+    b += data[index + 2];
+    samples += 1;
   }
+  if (samples == 0) return null;
+  return Color.fromARGB(255, r ~/ samples, g ~/ samples, b ~/ samples);
+}
+
+Future<Color?> averageImageColor(String path) async {
+  final bitmap = await textureBitmap(path);
+  return bitmap?.averageColor;
 }
 
 Future<ui.Image> decodeImage(Uint8List bytes) {
@@ -7938,6 +13341,10 @@ Future<ScanHandle> startFolderScan(
   String rootPath, {
   required void Function(ScanStatus status) onStatus,
 }) async {
+  // A scan walks the same archives the preview cache may be holding open, and
+  // an open handle stops Windows replacing the file underneath it. Let go
+  // before the walk rather than racing it.
+  closeCachedArchives();
   final port = ReceivePort();
   final completer = Completer<ScanResult>();
 
@@ -8082,22 +13489,16 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
     );
   }
 
-  final zipSize = await zipFile.length();
-  if (zipSize > maxZipIntrospectionBytes) {
-    fbxLog(
-      'Skipping ZIP introspection for large archive: $zipPath ($zipSize bytes)',
-    );
-    return const ZipAssetScanResult(
-      assets: [],
-      skippedUnsupported: 0,
-      skippedBinaryObj: 0,
-      entriesInspected: 0,
-    );
-  }
-
+  // Read through the archive's own directory rather than loading the file.
+  // Every entry below needs only its name, its size and -- for an OBJ -- its
+  // first few bytes, all of which the directory and an on-demand inflate
+  // provide. Slurping instead is what forced the byte cap this scan used to
+  // give up at, and a scan is the one place giving up is invisible: the
+  // archive simply contributed no rows.
+  InputFileStream? stream;
   try {
-    final bytes = await zipFile.readAsBytes();
-    final archive = ZipDecoder().decodeBytes(bytes, verify: false);
+    stream = InputFileStream(zipPath);
+    final archive = ZipDecoder().decodeStream(stream, verify: false);
     final zipRelative = relativeTo(zipPath, rootPath).replaceAll('\\', '/');
     final assets = <AssetItem>[];
     var skippedUnsupported = 0;
@@ -8121,8 +13522,10 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       }
 
       if (ext == 'obj') {
-        final content = entry.content;
-        if (isLikelyBinaryObjBytes(content)) {
+        // Read without letting the entry keep its decompressed bytes: a pack
+        // ships hundreds of OBJs and `entry.content` caches every one of them
+        // on the archive for as long as the scan holds it.
+        if (isLikelyBinaryObjBytes(archiveEntryBytes(entry))) {
           skippedBinaryObj += 1;
           continue;
         }
@@ -8168,6 +13571,12 @@ Future<ZipAssetScanResult> scanZipAssetEntries({
       skippedBinaryObj: 0,
       entriesInspected: 0,
     );
+  } finally {
+    // The scan is done with this archive; nothing should still hold the file
+    // open once its rows exist.
+    try {
+      stream?.closeSync();
+    } catch (_) {}
   }
 }
 
@@ -8233,7 +13642,72 @@ class ZipVirtualPath {
   final String entryPath;
 }
 
-final _zipArchiveCache = <String, Archive>{};
+/// An archive held open so its entries can be read one at a time.
+///
+/// The stream is the point: entries inflate straight out of the file, so the
+/// cost of having an archive open is its directory rather than its size, and a
+/// 2GB archive is as cheap to browse as a small one.
+class _OpenArchive {
+  _OpenArchive({required this.stream, required this.archive, required this.key});
+
+  final InputFileStream stream;
+  final Archive archive;
+
+  /// Size and modification time when it was opened, so a rebuilt archive is
+  /// noticed rather than served stale out of the cache.
+  final String key;
+
+  void close() {
+    try {
+      stream.closeSync();
+    } catch (_) {}
+  }
+}
+
+final _zipArchiveCache = <String, _OpenArchive>{};
+Timer? _zipArchiveIdleTimer;
+
+/// Closes every open archive handle.
+///
+/// Called when reading goes quiet, and directly before a scan: a scan walks
+/// the same archives, and on Windows a handle this cache is holding would stop
+/// the user moving or replacing the file underneath it.
+void closeCachedArchives() {
+  _zipArchiveIdleTimer?.cancel();
+  _zipArchiveIdleTimer = null;
+  for (final open in _zipArchiveCache.values) {
+    open.close();
+  }
+  _zipArchiveCache.clear();
+}
+
+void _touchZipArchiveIdleTimer() {
+  _zipArchiveIdleTimer?.cancel();
+  _zipArchiveIdleTimer = Timer(zipArchiveIdleTimeout, closeCachedArchives);
+}
+
+/// Identifies the bytes an open archive was read from.
+String? _archiveStateKey(String zipPath) {
+  try {
+    final stat = File(zipPath).statSync();
+    if (stat.type == FileSystemEntityType.notFound) return null;
+    return '${stat.size}:${stat.modified.millisecondsSinceEpoch}';
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Reads one entry without the archive keeping its decompressed bytes.
+///
+/// `ArchiveFile.content` caches what it inflates on the entry, which for a
+/// long-lived archive means the memory the streaming read just saved comes
+/// back as soon as anything browses it. Decompressing into an output stream
+/// hands back the same bytes and keeps nothing.
+Uint8List archiveEntryBytes(ArchiveFile entry) {
+  final out = OutputMemoryStream();
+  entry.decompress(out);
+  return out.getBytes();
+}
 
 ZipVirtualPath? parseZipVirtualPath(String value) {
   if (!isZipVirtualPath(value)) return null;
@@ -8245,46 +13719,65 @@ ZipVirtualPath? parseZipVirtualPath(String value) {
   return ZipVirtualPath(zipPath: zipPath, entryPath: entryPath);
 }
 
-Future<Archive?> _readArchiveFromDisk(String zipPath) async {
-  final file = File(zipPath);
-  if (!file.existsSync()) return null;
-  final length = await file.length();
-  if (length > maxZipIntrospectionBytes) return null;
-  final bytes = await file.readAsBytes();
-  return ZipDecoder().decodeBytes(bytes, verify: false);
+_OpenArchive? _openArchive(String zipPath) {
+  final stateKey = _archiveStateKey(zipPath);
+  if (stateKey == null) return null;
+  InputFileStream? stream;
+  try {
+    stream = InputFileStream(zipPath);
+    return _OpenArchive(
+      stream: stream,
+      archive: ZipDecoder().decodeStream(stream, verify: false),
+      key: stateKey,
+    );
+  } catch (error) {
+    fbxLog('Opening archive failed for $zipPath: $error');
+    try {
+      stream?.closeSync();
+    } catch (_) {}
+    return null;
+  }
 }
 
-Future<Archive?> _loadCachedArchive(String zipPath) async {
+Archive? _loadCachedArchive(String zipPath) {
   final cacheKey = normalizePathKey(zipPath);
   final cached = _zipArchiveCache[cacheKey];
   if (cached != null) {
-    // Promote recently-used entries to the end for LRU eviction.
-    _zipArchiveCache.remove(cacheKey);
-    _zipArchiveCache[cacheKey] = cached;
-    return cached;
-  }
-  final archive = await _readArchiveFromDisk(zipPath);
-  if (archive != null) {
-    _zipArchiveCache[cacheKey] = archive;
-    while (_zipArchiveCache.length > maxZipArchiveCacheEntries) {
-      _zipArchiveCache.remove(_zipArchiveCache.keys.first);
+    if (cached.key == _archiveStateKey(zipPath)) {
+      // Promote recently-used entries to the end for LRU eviction.
+      _zipArchiveCache.remove(cacheKey);
+      _zipArchiveCache[cacheKey] = cached;
+      _touchZipArchiveIdleTimer();
+      return cached.archive;
     }
+    // Replaced on disk since it was opened.
+    _zipArchiveCache.remove(cacheKey);
+    cached.close();
   }
-  return archive;
-}
-
-Uint8List? _archiveEntryToBytes(ArchiveFile entry) {
-  return entry.content;
+  final open = _openArchive(zipPath);
+  if (open == null) return null;
+  _zipArchiveCache[cacheKey] = open;
+  while (_zipArchiveCache.length > maxZipArchiveCacheEntries) {
+    final oldest = _zipArchiveCache.keys.first;
+    _zipArchiveCache.remove(oldest)?.close();
+  }
+  _touchZipArchiveIdleTimer();
+  return open.archive;
 }
 
 Future<Uint8List?> readZipVirtualAssetBytesByPath(String virtualPath) async {
   final parsed = parseZipVirtualPath(virtualPath);
   if (parsed == null) return null;
-  final archive = await _loadCachedArchive(parsed.zipPath);
+  final archive = _loadCachedArchive(parsed.zipPath);
   if (archive == null) return null;
   final entry = archive.findFile(parsed.entryPath);
   if (entry == null || !entry.isFile) return null;
-  return _archiveEntryToBytes(entry);
+  try {
+    return archiveEntryBytes(entry);
+  } catch (error) {
+    fbxLog('Reading ${parsed.entryPath} from ${parsed.zipPath} failed: $error');
+    return null;
+  }
 }
 
 Future<Uint8List?> readAssetBytes(String path) async {
@@ -8323,6 +13816,7 @@ String typeForExt(String ext) {
   if (imageExts.contains(ext)) return 'image';
   if (audioExts.contains(ext)) return 'audio';
   if (modelExts.contains(ext)) return 'model';
+  if (unrealExts.contains(ext)) return 'unreal';
   return 'other';
 }
 
@@ -8624,7 +14118,1071 @@ bool _shareARoot(AssetItem a, AssetItem b) {
   return normalizePathKey(a.sourceRoot) == normalizePathKey(b.sourceRoot);
 }
 
-List<AssetItem> findNearbyTextures(AssetItem model, List<AssetItem> allAssets) {
+/// The framing a mesh was fitted with, from wherever it was recorded.
+///
+/// Skinned meshes have carried it on their skin since skinning was added;
+/// every mesh carries it directly now. Preferring the direct field means a
+/// character and its hat are read the same way.
+MeshFraming? framingOf(MeshModel mesh) {
+  final direct = mesh.framing;
+  if (direct != null) return direct;
+  final skin = mesh.skin;
+  if (skin == null || skin.normalizeScale <= 0) return null;
+  return MeshFraming(center: skin.normalizeCenter, scale: skin.normalizeScale);
+}
+
+/// A character wearing a piece of kit, as a single mesh.
+///
+/// The whole of the placement is three steps: undo the attachment's framing to
+/// get back the coordinates it was authored in, carry those through the bone's
+/// rest transform, and apply the character's framing so the result lands in
+/// the same box the character is drawn in. Nothing is scaled to fit and
+/// nothing is guessed -- the artist built the helmet at the head joint's
+/// origin at the character's own scale, and this is only putting it back.
+///
+/// Returns null when a step is missing rather than placing the piece badly: no
+/// skeleton, no rest pose, no bone by that name, or a mesh imported before the
+/// importer recorded its framing.
+MeshModel? attachToCharacter({
+  required MeshModel character,
+  required MeshModel attachment,
+  required String boneName,
+  bool alongBone = false,
+}) {
+  final skeleton = character.skeleton;
+  final rest = skeleton?.rest ?? skeleton?.positions.firstOrNull;
+  if (skeleton == null || rest == null) return null;
+  final bone = skeleton.indexOfBone(boneName);
+  if (bone < 0) return null;
+
+  final characterFraming = framingOf(character);
+  final attachmentFraming = framingOf(attachment);
+  if (characterFraming == null || attachmentFraming == null) return null;
+  if (attachment.vertices.isEmpty || attachment.faces.isEmpty) return null;
+
+  // Only the bone's *position* is used. Synty authors a piece hanging the
+  // way it hangs on the character -- a cape points down in its own file --
+  // and expects to be dropped at the socket with its orientation kept. The
+  // rig's bone axes are no help here: Head happens to be the identity on
+  // these characters, so a helmet came out right by luck, while Spine_03 is
+  // cycled x->y->z and swung the cape out sideways. In bind pose the socket
+  // is a place, not a direction.
+  final socket = Vec3(rest[bone * 12 + 9], rest[bone * 12 + 10], rest[bone * 12 + 11]);
+
+  // A held piece is turned so its +Y runs from the bone's parent out through
+  // the bone -- along the forearm for a hand. The one exception to "position
+  // only", and it still uses only positions; see [AttachPoint.held].
+  Float32List? turn;
+  final parent = skeleton.bones[bone].parent;
+  if (alongBone && parent >= 0 && parent < skeleton.bones.length) {
+    turn = _rotationTakingYTo(
+      Vec3(
+        socket.x - rest[parent * 12 + 9],
+        socket.y - rest[parent * 12 + 10],
+        socket.z - rest[parent * 12 + 11],
+      ),
+    );
+  }
+
+  final placed = <Vec3>[];
+  for (final vertex in attachment.vertices) {
+    var original = attachmentFraming.toOriginal(vertex);
+    if (turn != null) original = _rotate(turn, original);
+    placed.add(
+      characterFraming.toEmitted(
+        Vec3(
+          original.x + socket.x,
+          original.y + socket.y,
+          original.z + socket.z,
+        ),
+      ),
+    );
+  }
+
+  final vertexOffset = character.vertices.length;
+  final materialOffset = character.materials.length;
+  final objectOffset = character.objectNames.length;
+  return MeshModel(
+    name: character.name,
+    vertices: [...character.vertices, ...placed],
+    faces: [
+      ...character.faces,
+      for (final face in attachment.faces)
+        MeshFace(
+          [for (final index in face.indices) index + vertexOffset],
+          face.materialIndex + materialOffset,
+          face.uvs,
+          face.uvSets,
+          face.objectIndex + objectOffset,
+        ),
+    ],
+    materials: [...character.materials, ...attachment.materials],
+    objectNames: [...character.objectNames, ...attachment.objectNames],
+    textureFiles: character.textureFiles,
+    // Colours multiply the surface, so a mesh that has none has to be padded
+    // with white rather than left short: a ragged list would tint the wrong
+    // vertices. If the character has none, neither does the result.
+    vertexColors: character.vertexColors.isEmpty
+        ? const []
+        : [
+            ...character.vertexColors,
+            for (var i = 0; i < placed.length; i += 1)
+              (i < attachment.vertexColors.length
+                  ? attachment.vertexColors[i]
+                  : const Color(0xffffffff)),
+          ],
+    kind: character.kind,
+    skeleton: skeleton,
+    skin: _skinWithAttachment(
+      character.skin,
+      skeleton: skeleton,
+      rest: rest,
+      bone: bone,
+      framing: characterFraming,
+      vertexCount: placed.length,
+    ),
+    framing: character.framing,
+  );
+}
+
+/// A column-major 3x3 turning the +Y axis onto [direction], or null when the
+/// direction is too short to have one.
+///
+/// Rodrigues' formula about the axis Y x d. When d is already +Y there is
+/// nothing to do; when it is -Y any half turn will do and the one about X is
+/// taken.
+Float32List? _rotationTakingYTo(Vec3 direction) {
+  final length = math.sqrt(
+    direction.x * direction.x +
+        direction.y * direction.y +
+        direction.z * direction.z,
+  );
+  if (length < 1e-9) return null;
+  final dx = direction.x / length;
+  final dy = direction.y / length;
+  final dz = direction.z / length;
+  // axis = Y x d = (dz, 0, -dx); cos = dy.
+  final ax = dz, az = -dx;
+  final sinAngle = math.sqrt(ax * ax + az * az);
+  final cosAngle = dy;
+  if (sinAngle < 1e-9) {
+    if (cosAngle > 0) return null;
+    return Float32List.fromList([1, 0, 0, 0, -1, 0, 0, 0, -1]);
+  }
+  final kx = ax / sinAngle, kz = az / sinAngle;
+  final t = 1 - cosAngle;
+  // R = I + sin K + (1 - cos) K^2 with K the cross-product matrix of (kx,0,kz).
+  return Float32List.fromList([
+    1 + t * (kx * kx - 1), sinAngle * kz, t * kx * kz,
+    -sinAngle * kz, 1 - t, sinAngle * kx,
+    t * kx * kz, -sinAngle * kx, 1 + t * (kz * kz - 1),
+  ]);
+}
+
+Vec3 _rotate(Float32List m, Vec3 v) => Vec3(
+  m[0] * v.x + m[3] * v.y + m[6] * v.z,
+  m[1] * v.x + m[4] * v.y + m[7] * v.z,
+  m[2] * v.x + m[5] * v.y + m[8] * v.z,
+);
+
+/// The character's skin with every new vertex weighted wholly to one bone.
+///
+/// This is what makes a worn piece move with the animation: the skinning
+/// loop treats it like any other part of the body, and because posing is
+/// relative to the bone's rest transform, however the piece was placed at
+/// rest is where it stays until the bone turns. A bone nothing on the body
+/// was weighted to -- the jaw, often -- is added with a bind matrix built
+/// from its rest pose, which is what the importer would have written for it.
+SkinBinding? _skinWithAttachment(
+  SkinBinding? skin, {
+  required SkeletonAnimation skeleton,
+  required Float32List rest,
+  required int bone,
+  required MeshFraming framing,
+  required int vertexCount,
+}) {
+  if (skin == null) return null;
+  final boneName = skeleton.bones[bone].name;
+  final bonePath = skeleton.bones[bone].path;
+
+  var skinBone = -1;
+  for (var i = 0; i < skin.boneNames.length; i += 1) {
+    final path = i < skin.bonePaths.length ? skin.bonePaths[i] : '';
+    if (path.isNotEmpty && normalizeBonePath(path) == normalizeBonePath(bonePath)) {
+      skinBone = i;
+      break;
+    }
+  }
+  if (skinBone < 0) {
+    for (var i = 0; i < skin.boneNames.length; i += 1) {
+      if (skin.boneNames[i] == boneName) {
+        skinBone = i;
+        break;
+      }
+    }
+  }
+
+  var names = skin.boneNames;
+  var paths = skin.bonePaths;
+  var bindInverse = skin.bindInverse;
+  if (skinBone < 0) {
+    // bindInverse takes an emitted vertex into bone space at the bind pose:
+    // undo the framing, then undo the bone's rest world transform.
+    final restInverse = Float32List(12);
+    if (!invertMatrix(rest, bone * 12, restInverse, 0)) return skin;
+    final denormalize = Float32List.fromList([
+      1 / framing.scale, 0, 0,
+      0, 1 / framing.scale, 0,
+      0, 0, 1 / framing.scale,
+      framing.center.x, framing.center.y, framing.center.z,
+    ]);
+    final combined = Float32List(12);
+    multiplyMatrices(restInverse, 0, denormalize, 0, combined, 0);
+
+    skinBone = skin.boneNames.length;
+    names = [...skin.boneNames, boneName];
+    paths = [
+      ...skin.bonePaths,
+      for (var i = skin.bonePaths.length; i < skin.boneNames.length; i += 1) '',
+      bonePath,
+    ];
+    bindInverse = Float32List(skin.bindInverse.length + 12)
+      ..setAll(0, skin.bindInverse)
+      ..setAll(skin.bindInverse.length, combined);
+  }
+
+  // One influence block per new vertex, wholly on the socket bone.
+  final blocks = skin.influences.length ~/ 8;
+  final influences = Float32List(skin.influences.length + vertexCount * 8)
+    ..setAll(0, skin.influences);
+  final vertexSkin = Int32List(skin.vertexSkin.length + vertexCount)
+    ..setAll(0, skin.vertexSkin);
+  for (var i = 0; i < vertexCount; i += 1) {
+    final base = (blocks + i) * 8;
+    influences[base] = skinBone.toDouble();
+    influences[base + 1] = 1;
+    vertexSkin[skin.vertexSkin.length + i] = blocks + i;
+  }
+
+  return SkinBinding(
+    boneNames: names,
+    bonePaths: paths,
+    bindInverse: bindInverse,
+    influences: influences,
+    vertexSkin: vertexSkin,
+    normalizeCenter: skin.normalizeCenter,
+    normalizeScale: skin.normalizeScale,
+  );
+}
+
+/// A character with everything in [wornPaths] put on it, in that order.
+///
+/// Shared by the model preview and the animation preview so the character
+/// animates wearing exactly what it was dressed in. A piece that cannot be
+/// read, or that this rig has no bone for, is skipped rather than allowed to
+/// fail the whole character.
+Future<MeshModel> dressCharacter(
+  MeshModel character, {
+  required Iterable<String> wornPaths,
+  required List<AssetItem> allAssets,
+}) async {
+  final skeleton = character.skeleton;
+  if (skeleton == null) return character;
+
+  var dressed = character;
+  for (final path in wornPaths) {
+    AssetItem? asset;
+    for (final candidate in allAssets) {
+      if (candidate.path == path) {
+        asset = candidate;
+        break;
+      }
+    }
+    if (asset == null) continue;
+    final bone = attachmentBoneFor(
+      attachmentName: asset.name,
+      skeleton: skeleton,
+    );
+    if (bone == null) continue;
+    try {
+      final piece = await MeshLoadCache.load(asset, allAssets: allAssets);
+      dressed =
+          attachToCharacter(
+            character: dressed,
+            attachment: piece,
+            boneName: bone,
+            alongBone: attachPointFor(asset.name)?.held ?? false,
+          ) ??
+          dressed;
+    } catch (error) {
+      fbxLog('Could not put on ${asset.name}: $error');
+    }
+  }
+  return dressed;
+}
+
+/// Where on a body a piece of kit belongs, and which bone holds it there.
+///
+/// Unlike every other question this app asks about a rig, this one *is*
+/// answered by the name. An attachment FBX records no attach point: a helmet
+/// is a bare mesh sitting at the origin with no skeleton, no socket and no
+/// metadata saying what it goes on. The only thing that says "helmet" is the
+/// word "Helmet". So the guessing is gathered here, in one table, rather than
+/// spread through the code pretending to be inference.
+///
+/// The bone lists are in order of preference and the first one the character
+/// actually has wins. Sidekick rigs name their own sockets -- `headAttach`,
+/// `faceAttach`, `backAttach`, `shoulderAttach_l` -- which is Synty telling us
+/// the answer outright; Polygon has no sockets, so the anatomical bone is used
+/// instead.
+class AttachPoint {
+  const AttachPoint({
+    required this.name,
+    required this.keywords,
+    required this.polygon,
+    required this.sidekick,
+    required this.unreal,
+    this.held = false,
+  });
+
+  /// What this point is called in the UI.
+  final String name;
+
+  /// Words in an attachment's file name that put it here.
+  final List<String> keywords;
+
+  /// Whether a piece here is held rather than worn.
+  ///
+  /// Worn pieces keep the orientation they were authored in: a cape hangs
+  /// down in its file and hangs down on the body. Held pieces do not -- every
+  /// weapon and tool in these packs stands on its grip with the business end
+  /// along +Y, so dropped at the hand unturned a sword stands straight up out
+  /// of the fist and, in a T-pose, pokes past the head. A held piece is turned
+  /// so its +Y runs along the arm, from the elbow out through the hand, which
+  /// is where a straight wrist points it. Positions only, so it is the same
+  /// answer on every rig.
+  final bool held;
+
+  final List<String> polygon;
+  final List<String> sidekick;
+  final List<String> unreal;
+
+  List<String> bonesFor(RigFamily family) => switch (family) {
+    RigFamily.polygon => polygon,
+    RigFamily.sidekick => sidekick,
+    RigFamily.unreal => unreal,
+    // A rig with no name has no table of attachment bones either. Naming one
+    // would be guessing at a hierarchy nobody has read.
+    RigFamily.other => const [],
+    RigFamily.none => const [],
+  };
+}
+
+/// Ordered: the first point whose keyword appears wins, so narrower words come
+/// first. `Dwarf_Beard_Attach_01` has to reach the face and not the head, and
+/// `Hair_Beard_01` names both.
+const attachPoints = <AttachPoint>[
+  AttachPoint(
+    name: 'Face',
+    keywords: [
+      'beard',
+      'moustache',
+      'mustache',
+      'goatee',
+      'sideburn',
+      'faceplate',
+      'gasmask',
+      'facemask',
+      'glasses',
+      'eyepatch',
+      'monocle',
+      'mask',
+      'jaw',
+      'teeth',
+      'tusk',
+    ],
+    polygon: ['Jaw', 'Head'],
+    sidekick: ['faceAttach', 'jaw', 'head'],
+    unreal: ['jaw', 'head'],
+  ),
+  AttachPoint(
+    name: 'Head',
+    keywords: [
+      'helmet',
+      'helm',
+      'hat',
+      'hood',
+      'crown',
+      'tiara',
+      'circlet',
+      'headband',
+      'bandana',
+      'hair',
+      'wig',
+      'horn',
+      'antler',
+      'ear',
+      'head',
+    ],
+    polygon: ['Head', 'Neck'],
+    sidekick: ['headAttach', 'head'],
+    unreal: ['head'],
+  ),
+  AttachPoint(
+    name: 'Back',
+    keywords: [
+      'cape',
+      'cloak',
+      'backpack',
+      'rucksack',
+      'quiver',
+      'scabbard',
+      'sheath',
+      'banner',
+      'wing',
+      'jetpack',
+      'gasbag',
+      'back',
+    ],
+    polygon: ['Spine_03', 'Spine_02'],
+    sidekick: ['backAttach', 'spine_03'],
+    unreal: ['spine_03'],
+  ),
+  AttachPoint(
+    name: 'Shoulder',
+    keywords: ['shoulder', 'pauldron', 'epaulette', 'epaulet', 'spaulder'],
+    polygon: ['Shoulder_R', 'Shoulder_L', 'Clavicle_R'],
+    sidekick: ['shoulderAttach_r', 'shoulderAttach_l'],
+    unreal: ['upperarm_r', 'upperarm_l'],
+  ),
+  AttachPoint(
+    name: 'Elbow',
+    keywords: ['elbow', 'bracer', 'vambrace'],
+    polygon: ['Elbow_R', 'Elbow_L'],
+    sidekick: ['elbowAttach_r', 'elbowAttach_l'],
+    unreal: ['lowerarm_r', 'lowerarm_l'],
+  ),
+  AttachPoint(
+    name: 'Knee',
+    keywords: ['knee', 'greave', 'kneepad'],
+    polygon: ['LowerLeg_R', 'LowerLeg_L'],
+    sidekick: ['kneeAttach_r', 'kneeAttach_l'],
+    unreal: ['calf_r', 'calf_l'],
+  ),
+  AttachPoint(
+    name: 'Hip',
+    keywords: ['belt', 'holster', 'pouch', 'skirt', 'tail', 'hip', 'waist'],
+    polygon: ['Hips', 'Spine_01'],
+    sidekick: ['hipAttachFront', 'hipAttachBack', 'pelvis'],
+    unreal: ['pelvis'],
+  ),
+  AttachPoint(
+    name: 'Hand',
+    keywords: [
+      'sword',
+      'axe',
+      'shield',
+      'staff',
+      'wand',
+      'bow',
+      'gun',
+      'rifle',
+      'pistol',
+      'torch',
+      'lantern',
+      'hammer',
+      'spear',
+      'weapon',
+    ],
+    polygon: ['Hand_R', 'Hand_L'],
+    sidekick: ['prop_r', 'hand_r'],
+    unreal: ['hand_r'],
+    held: true,
+  ),
+];
+
+/// The attach point an attachment's name puts it at, or null.
+///
+/// Whole words only. Matching substrings looked equivalent and was not: `cape`
+/// contains `cap`, so every cloak in the library went on a head, and `prop`
+/// is inside nothing but is itself the name of half a pack's scenery. Names
+/// here are underscore-separated, so splitting on punctuation recovers the
+/// words the artist actually wrote.
+AttachPoint? attachPointFor(String attachmentName) {
+  final tokens = <String>{};
+  for (final raw in attachmentName.toLowerCase().split(RegExp(r'[^a-z0-9]+'))) {
+    if (raw.isEmpty) continue;
+    tokens.add(raw);
+    // `Helmet01` is one word to a splitter and two to a person.
+    final unnumbered = raw.replaceFirst(RegExp(r'[0-9]+$'), '');
+    if (unnumbered.isNotEmpty) tokens.add(unnumbered);
+  }
+  for (final point in attachPoints) {
+    for (final keyword in point.keywords) {
+      if (tokens.contains(keyword)) return point;
+    }
+  }
+  return null;
+}
+
+/// The bone of [skeleton] an attachment named [attachmentName] belongs on.
+///
+/// Returns null when nothing in the name places it, or when the rig has none
+/// of the bones that point uses -- both of which are honest answers, and both
+/// of which leave the piece unattached rather than stuck somewhere wrong.
+String? attachmentBoneFor({
+  required String attachmentName,
+  required SkeletonAnimation skeleton,
+}) {
+  final point = attachPointFor(attachmentName);
+  if (point == null) return null;
+
+  final family = rigFamilyOfSkeleton(skeleton);
+  final wanted = point.bonesFor(family);
+  if (wanted.isEmpty) return null;
+
+  // A name that picks a side gets that side, whichever way the table is
+  // ordered: `Shoulder_L` must not land on the right shoulder just because
+  // the right is listed first.
+  final side = _sideOf(attachmentName);
+  if (side != null) {
+    for (final bone in wanted) {
+      if (_sideOf(bone) != side) continue;
+      final index = skeleton.indexOfBone(bone);
+      if (index >= 0) return skeleton.bones[index].name;
+    }
+  }
+  for (final bone in wanted) {
+    final index = skeleton.indexOfBone(bone);
+    if (index >= 0) return skeleton.bones[index].name;
+  }
+  return null;
+}
+
+/// 'l' or 'r' when a name commits to a side, else null.
+String? _sideOf(String name) {
+  final lower = name.toLowerCase();
+  if (RegExp(r'(^|[_\- ])(l|left)([_\- .]|$)').hasMatch(lower)) return 'l';
+  if (RegExp(r'(^|[_\- ])(r|right)([_\- .]|$)').hasMatch(lower)) return 'r';
+  return null;
+}
+
+/// Models in a character's own pack that look like kit rather than characters.
+///
+/// Two signals, both from the file's name or its folder, because there is
+/// nothing else: the pack puts them under an `Attachments` folder or says
+/// `Attach` in the name, or the name contains a word from [attachPoints].
+/// Anything already known to have a rig of its own is excluded -- that is a
+/// character, not a hat -- and so is the character being dressed.
+List<AssetItem> findAttachmentCandidates({
+  required AssetItem character,
+  required List<AssetItem> allAssets,
+}) {
+  final container = assetContainerKey(character);
+  final found = <AssetItem>[];
+  for (final asset in allAssets) {
+    if (asset.effectiveType != 'model') continue;
+    // FBX only. These packs ship an OBJ twin of every piece, and it is a
+    // trap: the OBJ is in centimetres with nothing in the file to say so,
+    // where the FBX carries its units, so the same helmet would come out a
+    // hundred times too big. Listing both also put two identical chips in
+    // the panel, one of which silently did nothing.
+    if (asset.ext != 'fbx') continue;
+    if (normalizePathKey(asset.path) == normalizePathKey(character.path)) {
+      continue;
+    }
+    if (assetContainerKey(asset) != container) continue;
+    // A rigged model is another character. An unprobed one is still a
+    // candidate: its name has to carry the day either way.
+    final rig = asset.rigFamily;
+    if (rig != null && rig != RigFamily.none.name) continue;
+
+    final lower = asset.path.toLowerCase().replaceAll(pathKeySeparator, '/');
+    final looksLikeKit =
+        lower.contains('attach') || attachPointFor(asset.name) != null;
+    if (!looksLikeKit) continue;
+    found.add(asset);
+  }
+  found.sort(
+    (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+  );
+  return found;
+}
+
+/// How much of the model a material must cover to count as a whole body.
+const stackedVariantCoverage = 0.7;
+
+/// How many whole-body materials make a file a stack rather than a model.
+///
+/// Two could be a model and its separately-materialled interior. Three is a
+/// pattern.
+const stackedVariantMinimum = 3;
+
+/// Whether this file is several complete models sharing one origin.
+///
+/// Some packs ship a character sheet rather than a character:
+/// `Characters.fbx` in Dungeon Realms holds eleven whole bodies standing in
+/// the same place, one material each, and `SimplePeople3.fbx` does the same
+/// with twelve. Drawn together they interpenetrate and read as a mess of
+/// z-fighting, which is what "renders weird" means for these files.
+///
+/// The test is spatial, not nominal: a material that covers the model's full
+/// width and height is not a part of it, it is another copy of it. Parts fail
+/// this -- a roof, a hat, a pair of eyes each occupy their own corner -- so a
+/// normal multi-material model is left alone.
+bool materialsAreStackedVariants(MeshModel mesh) => _wholeBodyGroups(
+      mesh,
+      mesh.materials.length,
+      (face) => face.materialIndex,
+    ) >=
+    stackedVariantMinimum;
+
+/// Whether this file's nodes are several complete models sharing one origin.
+///
+/// The same test as [materialsAreStackedVariants] along the other seam. It is
+/// the one that holds up: Ancient Empire's `characters.fbx` has eleven bodies
+/// and *one* material, and Battle Royale's has twenty-one bodies in five, so
+/// by material neither comes apart at all. By node, every sheet does.
+bool objectsAreStackedVariants(MeshModel mesh) => _wholeBodyGroups(
+      mesh,
+      mesh.objectNames.length,
+      (face) => face.objectIndex,
+    ) >=
+    stackedVariantMinimum;
+
+/// How many of [count] groups each cover most of the model's width and height.
+int _wholeBodyGroups(MeshModel mesh, int count, int Function(MeshFace) groupOf) {
+  if (count < stackedVariantMinimum) return 0;
+  if (mesh.vertices.isEmpty || mesh.faces.isEmpty) return 0;
+
+  var modelMinX = double.infinity, modelMaxX = double.negativeInfinity;
+  var modelMinY = double.infinity, modelMaxY = double.negativeInfinity;
+  for (final vertex in mesh.vertices) {
+    if (vertex.x < modelMinX) modelMinX = vertex.x;
+    if (vertex.x > modelMaxX) modelMaxX = vertex.x;
+    if (vertex.y < modelMinY) modelMinY = vertex.y;
+    if (vertex.y > modelMaxY) modelMaxY = vertex.y;
+  }
+  final modelWidth = modelMaxX - modelMinX;
+  final modelHeight = modelMaxY - modelMinY;
+  if (modelWidth <= 1e-6 || modelHeight <= 1e-6) return 0;
+
+  final minX = List<double>.filled(count, double.infinity);
+  final maxX = List<double>.filled(count, double.negativeInfinity);
+  final minY = List<double>.filled(count, double.infinity);
+  final maxY = List<double>.filled(count, double.negativeInfinity);
+  for (final face in mesh.faces) {
+    final m = groupOf(face);
+    if (m < 0 || m >= count) continue;
+    for (final index in face.indices) {
+      if (index < 0 || index >= mesh.vertices.length) continue;
+      final vertex = mesh.vertices[index];
+      if (vertex.x < minX[m]) minX[m] = vertex.x;
+      if (vertex.x > maxX[m]) maxX[m] = vertex.x;
+      if (vertex.y < minY[m]) minY[m] = vertex.y;
+      if (vertex.y > maxY[m]) maxY[m] = vertex.y;
+    }
+  }
+
+  var wholeBodies = 0;
+  for (var m = 0; m < count; m += 1) {
+    if (minX[m] > maxX[m]) continue;
+    final coversWidth = (maxX[m] - minX[m]) / modelWidth;
+    final coversHeight = (maxY[m] - minY[m]) / modelHeight;
+    if (coversWidth >= stackedVariantCoverage &&
+        coversHeight >= stackedVariantCoverage) {
+      wholeBodies += 1;
+    }
+  }
+  return wholeBodies;
+}
+
+/// How much of the smaller part must lie inside the larger, measured on the
+/// tightest of the three axes, for two parts to count as occupying one place.
+const slotVariantOverlap = 0.5;
+
+/// How many of a name family's pairs must occupy one place before the family
+/// is a slot rather than a row of separate parts.
+const slotVariantAgreement = 0.5;
+
+/// How many slots make a file a kit rather than a model that repeats a part.
+const modularKitMinimumSlots = 3;
+
+/// One interchangeable position on a modular model, and everything that fits.
+///
+/// `geo_c_head_01` through `_08` are eight heads for one neck; drawn together
+/// they interpenetrate. The slot holds all eight and the viewer draws one.
+class ObjectSlot {
+  const ObjectSlot({required this.key, required this.objects});
+
+  /// The shared part of the members' names, lowercased.
+  final String key;
+
+  /// Indices into [MeshModel.objectNames], in the order the file lists them.
+  final List<int> objects;
+}
+
+/// The part of [name] that its numbered variants share.
+///
+/// Everything up to the last all-digit token: `geo_l_shoulder_armor_07` and
+/// `geo_l_shoulder_armor_07_energyShields` both reduce to
+/// `geo_l_shoulder_armor`, and `SM_Mech_Cockpit_01_Monitor_04` keeps the `01`
+/// that belongs to the cockpit rather than the monitor.
+String objectSlotFamily(String name) {
+  final lower = name.toLowerCase();
+  final tokens = lower.split('_');
+  var last = -1;
+  for (var i = 0; i < tokens.length; i += 1) {
+    final token = tokens[i];
+    if (token.isEmpty) continue;
+    var digits = true;
+    for (final unit in token.codeUnits) {
+      if (unit < 0x30 || unit > 0x39) {
+        digits = false;
+        break;
+      }
+    }
+    if (digits) last = i;
+  }
+  // A name that is nothing but a number, or whose only number leads it, has
+  // no family to belong to.
+  if (last <= 0) return lower;
+  return tokens.sublist(0, last).join('_');
+}
+
+/// A label for a slot, with the modelling prefixes and the side letter spelled
+/// out. Same spirit as [attachmentDisplayName]: drop what every name carries.
+String slotDisplayName(String key) {
+  const boilerplate = {'geo', 'sm', 'sk', 'mesh'};
+  final words = <String>[];
+  for (final token in key.split('_')) {
+    if (token.isEmpty) continue;
+    if (boilerplate.contains(token)) continue;
+    // The l/r/c convention these rigs use for sides, as read by [_sideOf].
+    if (token == 'l') {
+      words.add('left');
+    } else if (token == 'r') {
+      words.add('right');
+    } else if (token == 'c') {
+      // Centre, which needs no saying.
+      continue;
+    } else {
+      words.add(token);
+    }
+  }
+  return words.isEmpty ? key : words.join(' ');
+}
+
+/// What distinguishes one variant of a slot from the others.
+///
+/// The tail of the object's name past the part its siblings share, so a slot
+/// reads `01 02 03 ... 07 energyShields 08 heavy` rather than eight numbers
+/// with the interesting ones indistinguishable.
+String slotVariantLabel({required String key, required String objectName}) {
+  var rest = objectName;
+  if (objectName.toLowerCase().startsWith(key)) {
+    rest = objectName.substring(key.length);
+  }
+  final words = rest
+      .split(RegExp(r'[^A-Za-z0-9]+'))
+      .where((word) => word.isNotEmpty);
+  return words.isEmpty ? objectName : words.join(' ');
+}
+
+/// The interchangeable slots of [mesh], in the order the file lists them.
+///
+/// Name families alone will not do this: `geo_l_index_01..03` are the three
+/// segments of a finger and `geo_c_head_01..08` are eight whole heads, and
+/// nothing in the names tells them apart. So the test is spatial, the same
+/// way [objectsAreStackedVariants] is: variants of one slot all contain the
+/// joint they hang from, so their boxes overlap each other, while a row of
+/// separate parts is laid out end to end and barely touches.
+///
+/// Measured over pairs rather than against the family's full extent, because
+/// variants differ wildly in size -- a stub cannon and a long one share a
+/// socket, and neither fills the box the pair of them spans.
+List<ObjectSlot> objectSlotsOf(MeshModel mesh) {
+  final count = mesh.objectNames.length;
+  if (count < 2 || mesh.faces.isEmpty || mesh.vertices.isEmpty) {
+    return const [];
+  }
+
+  final minX = List<double>.filled(count, double.infinity);
+  final maxX = List<double>.filled(count, double.negativeInfinity);
+  final minY = List<double>.filled(count, double.infinity);
+  final maxY = List<double>.filled(count, double.negativeInfinity);
+  final minZ = List<double>.filled(count, double.infinity);
+  final maxZ = List<double>.filled(count, double.negativeInfinity);
+  for (final face in mesh.faces) {
+    final object = face.objectIndex;
+    if (object < 0 || object >= count) continue;
+    for (final index in face.indices) {
+      if (index < 0 || index >= mesh.vertices.length) continue;
+      final vertex = mesh.vertices[index];
+      if (vertex.x < minX[object]) minX[object] = vertex.x;
+      if (vertex.x > maxX[object]) maxX[object] = vertex.x;
+      if (vertex.y < minY[object]) minY[object] = vertex.y;
+      if (vertex.y > maxY[object]) maxY[object] = vertex.y;
+      if (vertex.z < minZ[object]) minZ[object] = vertex.z;
+      if (vertex.z > maxZ[object]) maxZ[object] = vertex.z;
+    }
+  }
+
+  /// How much of the smaller box lies inside the larger, on its worst axis.
+  double sharedPlace(int a, int b) {
+    var worst = 1.0;
+    for (var axis = 0; axis < 3; axis += 1) {
+      final lowA = switch (axis) { 0 => minX[a], 1 => minY[a], _ => minZ[a] };
+      final highA = switch (axis) { 0 => maxX[a], 1 => maxY[a], _ => maxZ[a] };
+      final lowB = switch (axis) { 0 => minX[b], 1 => minY[b], _ => minZ[b] };
+      final highB = switch (axis) { 0 => maxX[b], 1 => maxY[b], _ => maxZ[b] };
+      final smaller = math.min(highA - lowA, highB - lowB);
+      // A part flat on this axis says nothing about it either way.
+      if (smaller <= 1e-6) continue;
+      final shared = math.min(highA, highB) - math.max(lowA, lowB);
+      final fraction = shared <= 0 ? 0.0 : shared / smaller;
+      if (fraction < worst) worst = fraction;
+    }
+    return worst;
+  }
+
+  final families = <String, List<int>>{};
+  final order = <String>[];
+  for (var i = 0; i < count; i += 1) {
+    // An object no face refers to has no box and nothing to compare.
+    if (minX[i] > maxX[i]) continue;
+    final key = objectSlotFamily(mesh.objectNames[i]);
+    final members = families.putIfAbsent(key, () {
+      order.add(key);
+      return <int>[];
+    });
+    members.add(i);
+  }
+
+  final slots = <ObjectSlot>[];
+  for (final key in order) {
+    final members = families[key]!;
+    if (members.length < 2) continue;
+    var together = 0;
+    var pairs = 0;
+    for (var i = 0; i < members.length; i += 1) {
+      for (var j = i + 1; j < members.length; j += 1) {
+        pairs += 1;
+        if (sharedPlace(members[i], members[j]) >= slotVariantOverlap) {
+          together += 1;
+        }
+      }
+    }
+    if (together > pairs * slotVariantAgreement) {
+      slots.add(ObjectSlot(key: key, objects: members));
+    }
+  }
+  return slots;
+}
+
+/// Whether [mesh] is a modular kit: one model with interchangeable parts.
+///
+/// A character sheet passes the slot test too -- eleven bodies in one file are
+/// eleven variants of one slot -- but it is not a kit, and the viewer already
+/// takes it apart one body at a time. What makes a kit is slots in different
+/// places that assemble into a single model, so a file whose nodes are whole
+/// bodies is excluded before anything else is asked.
+bool modelIsModularKit(MeshModel mesh) =>
+    !objectsAreStackedVariants(mesh) &&
+    objectSlotsOf(mesh).length >= modularKitMinimumSlots;
+
+/// Hiding every member of every slot but the chosen one.
+///
+/// [choice] runs parallel to [slots]: an index into that slot's objects, or
+/// [slotChoiceNone] to leave the slot empty. Objects in no slot are the
+/// chassis and are never hidden.
+Uint8List hiddenObjectsFor({
+  required int objectCount,
+  required List<ObjectSlot> slots,
+  required List<int> choice,
+}) {
+  final hidden = Uint8List(objectCount);
+  for (var slot = 0; slot < slots.length; slot += 1) {
+    final members = slots[slot].objects;
+    final chosen = slot < choice.length ? choice[slot] : 0;
+    for (var i = 0; i < members.length; i += 1) {
+      if (i == chosen) continue;
+      final object = members[i];
+      if (object >= 0 && object < objectCount) hidden[object] = 1;
+    }
+  }
+  return hidden;
+}
+
+/// An empty slot: no variant of it is drawn.
+const slotChoiceNone = -1;
+
+/// How many faces each node of the file contributes, so the overlay can say
+/// how much of the model a slot choice is showing without walking the faces
+/// again on every frame.
+Int32List objectFaceCounts(MeshModel mesh) {
+  final counts = Int32List(mesh.objectNames.length);
+  for (final face in mesh.faces) {
+    final object = face.objectIndex;
+    if (object >= 0 && object < counts.length) counts[object] += 1;
+  }
+  return counts;
+}
+
+/// Distinguishes one visibility mask from another for the frame cache,
+/// without turning 215 bytes into a string on every build.
+int hiddenObjectsDigest(Uint8List? hidden) {
+  if (hidden == null) return 0;
+  var digest = 0x811c9dc5;
+  for (var i = 0; i < hidden.length; i += 1) {
+    if (hidden[i] == 0) continue;
+    digest = ((digest ^ (i + 1)) * 0x01000193) & 0x3fffffff;
+  }
+  return digest;
+}
+
+/// How many looks the grid will draw at once.
+///
+/// Each cell decodes its own image and rasterises its own copy of the model,
+/// so this is a real cost rather than a tidiness limit.
+const maxTextureVariants = 12;
+
+/// The interchangeable looks a model has, as texture assets.
+///
+/// A pack ships one atlas and several palette swaps of it, named by suffix: a
+/// material asking for `PolygonAncientWorlds_Texture_01` is served by
+/// `..._01_A`, `..._01_B` and `..._01_C`, each the same atlas in a different
+/// colourway and each fitting this model's UVs exactly. Which is why a Synty
+/// character can have one material and still have four looks -- the variants
+/// are not in the file, they are beside it.
+///
+/// Found by stem: a candidate counts when its name, with exporter noise
+/// stripped, is the requested name or extends it by a suffix. So `_01_A`
+/// counts and `_02_A` does not, which is the difference between the swaps of
+/// one atlas and every other atlas in the pack. The channel word has to agree
+/// as well, or the normal and metallic maps of the same atlas would be offered
+/// as colourways and render as noise.
+///
+/// Scoped to the model's own container, on the same reasoning as the relink:
+/// inside one pack the art is one set, across packs a shared name is a
+/// coincidence.
+List<AssetItem> findTextureVariants({
+  required MeshModel mesh,
+  required AssetItem model,
+  required List<AssetItem> allAssets,
+}) {
+  final stems = <String>{};
+  for (final material in mesh.materials) {
+    for (final reference in [
+      ...material.textures,
+      ...material.resolvedTextures,
+    ]) {
+      final stem = textureStemOf(reference);
+      if (stem.isNotEmpty) stems.add(stem);
+    }
+  }
+  if (stems.isEmpty) return const [];
+
+  final container = assetContainerKey(model);
+  final found = <String, AssetItem>{};
+  for (final asset in allAssets) {
+    if (!textureExts.contains(asset.ext)) continue;
+    if (assetContainerKey(asset) != container) continue;
+    final candidate = textureStemOf(asset.name);
+    if (candidate.isEmpty) continue;
+    for (final stem in stems) {
+      if (!_stemsShareARoot(stem, candidate)) continue;
+      if (!textureChannelsAgree(stem, candidate)) continue;
+      found[normalizePathKey(asset.path)] = asset;
+      break;
+    }
+  }
+
+  final variants =
+      found.values.toList()..sort(
+        (a, b) => normalizePathKey(a.path).compareTo(normalizePathKey(b.path)),
+      );
+  return variants.length > maxTextureVariants
+      ? variants.sublist(0, maxTextureVariants)
+      : variants;
+}
+
+/// A texture reference reduced to a comparable name: no folder, no extension,
+/// no exporter prefix or duplicate-copy suffix.
+String textureStemOf(String reference) {
+  final base = reference.split(_pathSeparatorPattern).last;
+  return stripTextureNameNoise(base.replaceFirst(_extensionPattern, ''));
+}
+
+/// Whether one stem is the other, or the other plus a suffix.
+///
+/// Symmetric, because which of the two names is longer is not fixed: a
+/// material may reference the atlas the artist worked in (`..._01`) while the
+/// pack ships only its swaps (`..._01_A`), or reference a swap directly while
+/// the pack also ships the plain atlas. The separator is required, so `_01`
+/// does not swallow `_010`.
+bool _stemsShareARoot(String stem, String candidate) {
+  if (stem == candidate) return true;
+  return candidate.startsWith('${stem}_') || stem.startsWith('${candidate}_');
+}
+
+int? _nearbyTexturesCatalogIdentity;
+final Map<String, List<AssetItem>> _nearbyTexturesCache = {};
+
+/// How many models' answers to keep. The viewer asks about one model, so a
+/// single entry would do for it -- but [_validateModelTextures] asks about
+/// every model it sweeps, and a one-entry cache would have each sweep evict
+/// the answer the viewer is repainting from. A few hundred lists of
+/// references cost almost nothing beside a catalog of this size.
+const _nearbyTexturesCacheLimit = 256;
+
+/// The textures that sit near a model, remembered between calls.
+///
+/// This is called from inside two `build` methods -- the viewer's texture
+/// picker and the discovery panel -- and the viewport calls `setState` on
+/// every pointer move while the camera is dragged. So the walk below ran once
+/// per frame, over the whole catalog, and each surviving asset paid two regex
+/// replaces in [parentPath].
+///
+/// It was tolerable at 221,183 assets and stopped being tolerable at 327,365,
+/// of which 109,177 carry a texture extension and so get past the cheap
+/// extension check. Nothing about the walk changed; the library grew 48%.
+///
+/// [byScan] forces the walk, so a test can hold the cache to the same answer.
+List<AssetItem> findNearbyTextures(
+  AssetItem model,
+  List<AssetItem> allAssets, {
+  bool byScan = false,
+}) {
+  if (byScan) return _nearbyTexturesByScan(model, allAssets);
+  final identity = identityHashCode(allAssets) ^ allAssets.length;
+  if (_nearbyTexturesCatalogIdentity != identity) {
+    _nearbyTexturesCache.clear();
+    _nearbyTexturesCatalogIdentity = identity;
+  }
+  // Keyed on the id rather than the item: a rescan hands out new AssetItem
+  // objects for the same files, and that arrives here as a new catalog
+  // identity, which clears the map above.
+  final cached = _nearbyTexturesCache[model.id];
+  if (cached != null) return cached;
+  // Unmodifiable, because the list is now shared between every caller that
+  // asks about this model. A caller that sorted or added to it would have
+  // been editing the cache; this makes that a thrown error rather than a
+  // wrong picker two frames later.
+  final found = List<AssetItem>.unmodifiable(
+    _nearbyTexturesByScan(model, allAssets),
+  );
+  if (_nearbyTexturesCache.length >= _nearbyTexturesCacheLimit) {
+    _nearbyTexturesCache.clear();
+  }
+  _nearbyTexturesCache[model.id] = found;
+  return found;
+}
+
+List<AssetItem> _nearbyTexturesByScan(
+  AssetItem model,
+  List<AssetItem> allAssets,
+) {
   final modelDir = parentPath(model.path);
   final modelParent = parentPath(modelDir);
   final modelGrandParent = parentPath(modelParent);
@@ -8705,18 +15263,24 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
   final kinds = <String, String>{};
 
   Archive? archive;
+  InputFileStream? stream;
   if (chunk.containerPath != null) {
     try {
       final file = File(chunk.containerPath!);
-      if (file.existsSync() &&
-          await file.length() <= maxZipIntrospectionBytes) {
-        // Opened once for the whole chunk; entries inflate individually.
-        archive = ZipDecoder().decodeBytes(
-          await file.readAsBytes(),
-          verify: false,
-        );
+      if (file.existsSync()) {
+        // Opened once for the whole chunk; entries inflate individually off
+        // the stream, so the worker's memory is one entry rather than one
+        // archive. This used to skip any container over 128MB, which left
+        // every FBX in it unclassified -- invisible to the character and
+        // animation filters for as long as the catalog lived.
+        stream = InputFileStream(chunk.containerPath!);
+        archive = ZipDecoder().decodeStream(stream, verify: false);
       }
     } catch (_) {
+      try {
+        stream?.closeSync();
+      } catch (_) {}
+      stream = null;
       archive = null;
     }
   }
@@ -8735,7 +15299,7 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
           kinds[assetId] = 'unreadable';
           continue;
         }
-        bytes = entry.content;
+        bytes = archiveEntryBytes(entry);
       }
 
       final result = await runMeshImporter(
@@ -8745,6 +15309,7 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
         probeOnly: true,
       );
       if (result.exitCode != 0) {
+        // The helper ran and said no: that is a verdict about the file.
         kinds[assetId] = 'unreadable';
         continue;
       }
@@ -8752,14 +15317,34 @@ Future<Map<String, String>> classifyFbxChunk(FbxClassifyChunk chunk) async {
       final markers = ((json['rigMarkers'] as List<dynamic>?) ?? const []).map(
         (value) => value.toString(),
       );
+      final boneNames = ((json['boneNames'] as List<dynamic>?) ?? const [])
+          .map((value) => value.toString())
+          .toList();
+      final signature = rigSignatureOf(boneNames);
       kinds[assetId] = FbxClassification(
         kind: json['kind'] == 'animation' ? 'animation' : 'mesh',
-        rig: rigFamilyFromMarkers(markers).name,
+        rig: rigFamilyFromMarkers(
+          markers,
+          // The probe prints this in both of its branches; a file it could
+          // read but found no skeleton in reports zero, which is `none`.
+          bones: (json['bones'] as num?)?.toInt() ?? 0,
+        ).name,
+        signature: signature.isEmpty ? null : signature,
+        bones: boneNames,
       ).encode();
-    } catch (_) {
-      kinds[assetId] = 'unreadable';
+    } catch (error) {
+      // Nothing was ever heard back, so nothing is known about this file.
+      // Writing 'unreadable' here would bake our own failure into the catalog
+      // as a verdict about someone's asset -- the mistake the chunk-level
+      // handler in _runFbxClassification exists to avoid, and which lazy
+      // classification makes permanent, since it skips anything that already
+      // has a kind. Leaving it out means a later pass tries again.
+      fbxLog('Probe failed for $assetPath: $error');
     }
   }
+  try {
+    stream?.closeSync();
+  } catch (_) {}
   return kinds;
 }
 
@@ -8814,17 +15399,44 @@ List<FbxClassifyChunk> buildFbxClassifyChunks({
 /// of bytes instead of megabytes, which is what makes classifying a whole
 /// catalog viable.
 ///
+/// A probe's verdict, and -- when there is not one -- why not.
+///
+/// 'unreadable' is both a real answer about a file and what every failure
+/// collapsed to, so the two were indistinguishable. A probe that fell over
+/// because the helper could not be spawned read exactly like a corrupt FBX,
+/// which made a flaky failure say "expected animation, got unreadable" and
+/// nothing more. [detail] is the difference.
+class FbxProbeResult {
+  const FbxProbeResult(this.kind, {this.detail = ''});
+
+  /// 'mesh', 'animation' or 'unreadable' -- the values the catalog stores.
+  final String kind;
+
+  /// Empty when the probe reached a verdict; otherwise what went wrong.
+  final String detail;
+
+  @override
+  String toString() => detail.isEmpty ? kind : "$kind ($detail)";
+}
+
 /// Returns 'mesh', 'animation', or 'unreadable'.
-Future<String> probeFbxContentKind(AssetItem asset) async {
-  if (asset.ext != 'fbx') return 'mesh';
+Future<String> probeFbxContentKind(AssetItem asset) async =>
+    (await probeFbxContentKindDetailed(asset)).kind;
+
+/// As [probeFbxContentKind], keeping the reason a probe reached no verdict.
+Future<FbxProbeResult> probeFbxContentKindDetailed(AssetItem asset) async {
+  if (asset.ext != 'fbx') return const FbxProbeResult('mesh');
   final helper = meshImporterPath();
-  if (!File(helper).existsSync()) return 'unreadable';
+  if (!File(helper).existsSync()) {
+    return FbxProbeResult('unreadable', detail: 'no helper at $helper');
+  }
   try {
     final bytes = isZipVirtualPath(asset.path)
         ? await readZipVirtualAssetBytesByPath(asset.path)
         : null;
     if (isZipVirtualPath(asset.path) && (bytes == null || bytes.isEmpty)) {
-      return 'unreadable';
+      return const FbxProbeResult('unreadable',
+          detail: 'no bytes for the archive entry');
     }
     final result = await runMeshImporter(
       helper,
@@ -8832,12 +15444,22 @@ Future<String> probeFbxContentKind(AssetItem asset) async {
       inputBytes: bytes,
       probeOnly: true,
     );
-    if (result.exitCode != 0) return 'unreadable';
+    if (result.exitCode != 0) {
+      return FbxProbeResult('unreadable',
+          detail: 'exit ${result.exitCode}: ${_firstLine(result.stderr)}');
+    }
     final json = jsonDecode(result.stdout) as Map<String, dynamic>;
-    return json['kind'] == 'animation' ? 'animation' : 'mesh';
-  } catch (_) {
-    return 'unreadable';
+    return FbxProbeResult(json['kind'] == 'animation' ? 'animation' : 'mesh');
+  } catch (error) {
+    return FbxProbeResult('unreadable', detail: '$error');
   }
+}
+
+String _firstLine(String text) {
+  final trimmed = text.trim();
+  if (trimmed.isEmpty) return 'no stderr';
+  final break_ = trimmed.indexOf('\n');
+  return break_ < 0 ? trimmed : trimmed.substring(0, break_);
 }
 
 /// Shares one in-flight mesh import between everything that needs it.
@@ -8907,16 +15529,14 @@ class MeshLoadCache {
 /// The UVs are the model's own, so a correct atlas lands correctly; a wrong
 /// one is obvious at a glance, which is the point of choosing by hand.
 Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
-  final bytes = await readAssetBytes(texturePath);
-  if (bytes == null || bytes.isEmpty) return mesh;
-  final image = await decodeImage(bytes);
-  Uint8List? pixels;
-  try {
-    final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    pixels = data?.buffer.asUint8List();
-  } catch (error) {
-    fbxLog('Chosen texture readback failed: $error');
-  }
+  // Through the cache, not past it. Every model in a pack is assigned the
+  // same atlas, and reading and decoding a 2048x2048 PNG per model is what
+  // a tagging pass does hundreds of times in a row; textureBitmap already
+  // holds the decoded pixels with an LRU budget.
+  final bitmap = await textureBitmap(texturePath);
+  if (bitmap == null) return mesh;
+  final pixels = bitmap.rgba;
+  final image = await imageFromRgba(pixels, bitmap.width, bitmap.height);
 
   final materials = mesh.materials.isEmpty
       ? [const MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
@@ -8927,21 +15547,189 @@ Future<MeshModel> applyChosenTexture(MeshModel mesh, String texturePath) async {
   ]);
 }
 
+/// The `.mtl` sidecar an OBJ names, read from wherever that OBJ lives.
+///
+/// The catalog is no help here: it holds 0 rows for `mtl`, because a sidecar
+/// is not an asset anyone browses for. So the file is read beside the OBJ --
+/// from the folder, or from the same archive entry's folder -- which is also
+/// the only place the format says to look.
+///
+/// A sidecar that is missing or unreadable is not an error. It leaves every
+/// material the flat grey it had before any of this existed, which is the
+/// right answer for the 559 OBJ files on disk and the 94% of archive entries
+/// that name no library at all.
+Future<Map<String, ObjMaterialDefinition>> loadObjMaterialLibrary(
+  AssetItem asset,
+  String objText,
+) async {
+  final names = objMaterialLibraryNames(objText);
+  if (names.isEmpty) return const {};
+
+  final definitions = <String, ObjMaterialDefinition>{};
+  for (final name in names) {
+    String? text;
+    try {
+      if (isZipVirtualPath(asset.path)) {
+        final zip = parseZipVirtualPath(asset.path);
+        if (zip == null) continue;
+        final bytes = await readZipVirtualAssetBytesByPath(
+          buildZipVirtualPath(
+            zip.zipPath,
+            resolveZipRelativeEntryPath(zip.entryPath, name),
+          ),
+        );
+        if (bytes != null && bytes.isNotEmpty) {
+          text = utf8.decode(bytes, allowMalformed: true);
+        }
+      } else {
+        final relative = name.replaceAll(
+          RegExp(r'[\\/]'),
+          Platform.pathSeparator,
+        );
+        final file = File(
+          '${parentPath(asset.path)}${Platform.pathSeparator}$relative',
+        );
+        if (file.existsSync()) {
+          // Bytes rather than readAsString: an exporter that wrote a material
+          // name in the Windows codepage would otherwise throw here, and lose
+          // the colours of every other material in the file with it.
+          text = utf8.decode(await file.readAsBytes(), allowMalformed: true);
+        }
+      }
+    } on Exception catch (_) {
+      // Unreadable sidecar: the materials stay grey. Deliberately not fatal,
+      // because the geometry is fine and a grey model beats no model.
+    }
+    if (text == null) continue;
+    // Later libraries win on a name collision, which is the order an OBJ
+    // declaring two of them implies.
+    definitions.addAll(parseObjMaterialLibrary(text));
+  }
+  return definitions;
+}
+
+/// Resolves and decodes the base textures an OBJ's sidecar asked for.
+///
+/// Separate from [parseObjMesh] because decoding is asynchronous and the
+/// parser is not, and separate from [loadObjMaterialLibrary] because
+/// resolving a reference to a real file is a question about the catalog
+/// rather than about the sidecar.
+///
+/// `allowFallbackLookup` is off: the sidecar named the file, so a near-miss
+/// guess would be substituting a texture the artist did not ask for. A
+/// reference that does not resolve leaves that material on its `Kd` colour,
+/// and the discovery panel reports the reference as missing.
+Future<MeshModel> withResolvedObjTextures(
+  MeshModel mesh,
+  String modelPath,
+  List<AssetItem> allAssets,
+) async {
+  if (mesh.materials.every((material) => material.textures.isEmpty)) {
+    return mesh;
+  }
+
+  final replacements = <MeshMaterial>[];
+  for (final material in mesh.materials) {
+    final reference = material.textures.isEmpty
+        ? null
+        : material.textures.first;
+    final resolved = reference == null
+        ? null
+        : resolveTextureReference(
+            modelPath,
+            reference,
+            allAssets: allAssets,
+            allowFallbackLookup: false,
+          );
+    if (resolved == null) {
+      replacements.add(material);
+      continue;
+    }
+    // Reads through the texture cache, so an atlas named by several materials
+    // -- which is the normal case in these kits -- is decoded once.
+    final bitmap = await firstTextureBitmap([resolved]);
+    if (bitmap == null) {
+      replacements.add(material);
+      continue;
+    }
+    replacements.add(
+      material.withBaseTexture(
+        path: resolved,
+        image: await imageFromRgba(bitmap.rgba, bitmap.width, bitmap.height),
+        pixels: bitmap.rgba,
+      ),
+    );
+  }
+  return mesh.withMaterials(replacements);
+}
+
 Future<MeshModel> loadMesh(
   AssetItem asset, {
   List<AssetItem> allAssets = const [],
   int fallbackCheckerSquareSize = 16,
 }) async {
   if (asset.ext == 'obj') {
+    String objText;
     if (isZipVirtualPath(asset.path)) {
       final bytes = await readZipVirtualAssetBytesByPath(asset.path);
       if (bytes == null || bytes.isEmpty) {
         throw const FormatException('Could not read OBJ bytes from ZIP entry.');
       }
-      final objText = utf8.decode(bytes, allowMalformed: true);
-      return parseObjMesh(objText, asset.name);
+      objText = utf8.decode(bytes, allowMalformed: true);
+    } else {
+      objText = await File(asset.path).readAsString();
     }
-    return parseObjMesh(await File(asset.path).readAsString(), asset.name);
+    final mesh = parseObjMesh(
+      objText,
+      asset.name,
+      materialLibrary: await loadObjMaterialLibrary(asset, objText),
+    );
+    return _withInferredTexture(
+      await withResolvedObjTextures(mesh, asset.path, allAssets),
+      asset,
+      allAssets,
+    );
+  }
+  if (asset.ext == 'stl') {
+    // Bytes, not text: a binary STL is the common case and decoding it as
+    // text would corrupt the floats before the parser saw them.
+    final bytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : await File(asset.path).readAsBytes();
+    if (bytes == null || bytes.isEmpty) {
+      throw const FormatException('Could not read STL bytes.');
+    }
+    return parseStlMesh(bytes, asset.name);
+  }
+  if (asset.ext == 'glb' || asset.ext == 'gltf') {
+    if (asset.ext == 'gltf' && isZipVirtualPath(asset.path)) {
+      // Its geometry is in a .bin beside it in the archive, and the reader
+      // is handed bytes rather than a folder. Say so rather than drawing an
+      // empty mesh; every glTF here has an FBX or OBJ twin.
+      throw const FormatException(
+        'A .gltf inside an archive keeps its geometry in a separate file. '
+        'Open the FBX or OBJ twin instead.',
+      );
+    }
+    final bytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : null;
+    if (isZipVirtualPath(asset.path) && (bytes == null || bytes.isEmpty)) {
+      throw const FormatException('Could not read GLB bytes from ZIP entry.');
+    }
+    // The same helper: it reads the extension off the label and hands the
+    // file to cgltf, printing the JSON this decoder already reads.
+    return _withInferredTexture(
+      await importFbxWithUfbx(
+        asset.path,
+        asset.name,
+        inputBytes: bytes,
+        allAssets: allAssets,
+        fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+      ),
+      asset,
+      allAssets,
+    );
   }
   if (asset.ext == 'fbx') {
     fbxLog('Loading FBX mesh: ${asset.path}');
@@ -8952,17 +15740,48 @@ Future<MeshModel> loadMesh(
         (zipBytes == null || zipBytes.isEmpty)) {
       throw const FormatException('Could not read FBX bytes from ZIP entry.');
     }
-    return importFbxWithUfbx(
-      asset.path,
-      asset.name,
-      inputBytes: zipBytes,
-      allAssets: allAssets,
-      fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+    return _withInferredTexture(
+      await importFbxWithUfbx(
+        asset.path,
+        asset.name,
+        inputBytes: zipBytes,
+        allAssets: allAssets,
+        fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+      ),
+      asset,
+      allAssets,
     );
   }
   throw FormatException(
     '${asset.ext.toUpperCase()} rendering is not implemented yet.',
   );
+}
+
+/// Puts the pack's own texture on a model that names none.
+///
+/// Here rather than inside the FBX and OBJ importers: both arrive at the
+/// same question, the conditions are about the finished mesh, and
+/// [renderAsset] and the tagging queue come through here too, so the
+/// picture they embed is the picture the viewer draws.
+Future<MeshModel> _withInferredTexture(
+  MeshModel mesh,
+  AssetItem asset,
+  List<AssetItem> allAssets,
+) async {
+  if (allAssets.isEmpty) return mesh;
+  if (!meshWantsInferredTexture(mesh)) return mesh;
+  final inferred = findInferredTexture(asset, allAssets);
+  if (inferred == null) return mesh;
+  final applied = await applyChosenTexture(mesh, inferred.path);
+  // applyChosenTexture hands back the same mesh when the image could not be
+  // read; claiming a texture that did not load would be worse than grey.
+  if (identical(applied, mesh)) return mesh;
+  setInferredTextureSource(applied, inferred.source);
+  fbxLog(
+    'Inferred texture for ${asset.name}: ${inferred.path} '
+    '(${inferred.source.name})',
+  );
+  return applied;
 }
 
 Future<MeshModel> importFbxWithUfbx(
@@ -9027,12 +15846,32 @@ Future<MeshImporterResult> runMeshImporter(
     sourcePath,
   ];
   final process = await Process.start(helper, arguments);
-  if (inputBytes != null) {
-    process.stdin.add(inputBytes);
+
+  // Both pipes are drained at once, and the drains are started before
+  // anything is written. Reading stdout to completion and only then reading
+  // stderr deadlocks whenever the child writes more to stderr than the OS
+  // pipe buffer holds: it blocks on that write, stops writing stdout, and
+  // this side waits forever for a stdout that will never arrive. The debug
+  // path (ASSET_ATLAS_DEBUG_SPACES) writes a line per mesh, which on a
+  // 215-node kit is enough to reach it.
+  final stdoutDone = process.stdout.expand((chunk) => chunk).toList();
+  final stderrDone = process.stderr.expand((chunk) => chunk).toList();
+
+  // A path-based call writes nothing to stdin, so a child that has already
+  // exited leaves a closed pipe here. That is not a failure of the import and
+  // must not be reported as one -- and when bytes *were* owed, the exit code
+  // and stderr say so, which is the verdict that counts.
+  try {
+    if (inputBytes != null) {
+      process.stdin.add(inputBytes);
+    }
+    await process.stdin.close();
+  } on IOException catch (_) {
+    // The child is gone or no longer listening; the exit code decides.
   }
-  await process.stdin.close();
-  final stdoutBytes = await process.stdout.expand((chunk) => chunk).toList();
-  final stderrBytes = await process.stderr.expand((chunk) => chunk).toList();
+
+  final stdoutBytes = await stdoutDone;
+  final stderrBytes = await stderrDone;
   final exitCode = await process.exitCode;
   return MeshImporterResult(
     exitCode: exitCode,
@@ -9100,6 +15939,10 @@ Future<MeshModel> meshModelFromImporterJson(
       ];
     }
   }
+  final objectNames = ((json['objects'] as List<dynamic>?) ?? const [])
+      .map((value) => value.toString())
+      .toList();
+  final faceObjects = (json['faceObjects'] as List<dynamic>?) ?? const [];
   final faces = importedFaces.indexed.map((entry) {
     final faceIndex = entry.$1;
     final item = entry.$2;
@@ -9128,6 +15971,9 @@ Future<MeshModel> meshModelFromImporterJson(
             ]
           : const [],
       namedUvsByFace[faceIndex],
+      faceIndex < faceObjects.length
+          ? (faceObjects[faceIndex] as num).toInt()
+          : 0,
     );
   }).toList();
   final skin = SkinBinding.fromJson(json['skin'] as Map<String, dynamic>?);
@@ -9200,22 +16046,68 @@ Future<MeshModel> meshModelFromImporterJson(
     final uvSet = (material['uvSet'] as String?)?.trim() ?? '';
     final embeddedTextureBase64 =
         (material['embeddedTextureBase64'] as String?) ?? '';
-    final resolvedTextures = textureRefs
-        .map(
-          (texture) => resolveTextureReference(
-            modelPath,
-            texture,
-            allAssets: allAssets,
-            allowFallbackLookup: false,
-          ),
-        )
-        .whereType<String>()
-        .toList();
+    // The base colour may only come from a reference that is a base colour.
+    //
+    // `textures` holds every reference the material names, the normal and
+    // emissive maps included, and the base slot used to take the first of
+    // them that resolved. That is right only while the colour map resolves
+    // first: SM_Wep_Mining_Laser_01 names a colour map and an emissive map,
+    // the colour map resolved to nothing, and the emissive became the base
+    // colour -- so the model drew as a black silhouette with a few bright
+    // spots, while the material still reported a texture as found.
+    //
+    // Two filters, because either can be the one that knows. The importer
+    // declares `normalTexture` and `emissiveTexture` outright, and a name
+    // that says what channel it is says so whether or not it was declared.
+    final declaredChannelRefs = {
+      ((material['normalTexture'] as String?) ?? '').trim(),
+      ((material['emissiveTexture'] as String?) ?? '').trim(),
+    }..removeWhere((reference) => reference.isEmpty);
+    bool isBaseColourRef(String reference) {
+      if (declaredChannelRefs.contains(reference.trim())) return false;
+      final base = reference
+          .split(_pathSeparatorPattern)
+          .last
+          .toLowerCase()
+          .replaceAll(_extensionPattern, '');
+      return textureChannelWord(base).isEmpty;
+    }
+
+    String? resolve(String reference) => resolveTextureReference(
+      modelPath,
+      reference,
+      allAssets: allAssets,
+      allowFallbackLookup: false,
+    );
+
+    // Resolved once each, then split. Resolving twice would pay the relink
+    // twice, and the relink is the expensive half of building a material.
+    final resolutions = [
+      for (final reference in textureRefs)
+        (reference: reference, resolved: resolve(reference)),
+    ];
+    // Every channel, which is what the material genuinely resolved and what
+    // the diagnostics, the palette matching and inspect_model all report. An
+    // emissive map that resolved did resolve; it is simply not a base colour.
+    final resolvedTextures = [
+      for (final each in resolutions)
+        if (each.resolved != null) each.resolved!,
+    ];
+    // Only what may colour a face.
+    final resolvedBaseColours = [
+      for (final each in resolutions)
+        if (each.resolved != null && isBaseColourRef(each.reference))
+          each.resolved!,
+    ];
     fbxLog(
       'Material ${(material['name'] as String?) ?? 'Material'} refs=${textureRefs.length} resolved=${resolvedTextures.length}',
     );
-    final textureColor = await firstTextureAverageColor(resolvedTextures);
+    // Both of these read through the texture cache, so the atlas this
+    // material names is read off disk and decoded once however many
+    // materials and however many assets in the pack point at it.
+    final textureColor = await firstTextureAverageColor(resolvedBaseColours);
     ui.Image? textureImage;
+    Uint8List? texturePixels;
     if (embeddedTextureBase64.isNotEmpty) {
       try {
         textureImage = await decodeImage(base64Decode(embeddedTextureBase64));
@@ -9223,22 +16115,27 @@ Future<MeshModel> meshModelFromImporterJson(
           'Decoded embedded texture for ${(material['name'] as String?) ?? 'Material'} '
           '(${textureImage.width}x${textureImage.height})',
         );
-      } catch (error) {
-        fbxLog('Embedded texture decode failed: $error');
-      }
-    }
-    textureImage ??= await firstTextureImage(resolvedTextures);
-
-    // Read the texture back once so single-texel faces can be filled directly.
-    Uint8List? texturePixels;
-    if (textureImage != null) {
-      try {
+        // Not cached: this one arrives inside the model rather than from a
+        // path, so there is nothing to key it on.
         final data = await textureImage.toByteData(
           format: ui.ImageByteFormat.rawRgba,
         );
         texturePixels = data?.buffer.asUint8List();
       } catch (error) {
-        fbxLog('Texture readback failed: $error');
+        fbxLog('Embedded texture decode failed: $error');
+      }
+    }
+    if (textureImage == null) {
+      // The pixels come from the cache, so single-texel faces can be filled
+      // directly without reading the image back per asset.
+      final bitmap = await firstTextureBitmap(resolvedBaseColours);
+      if (bitmap != null) {
+        textureImage = await imageFromRgba(
+          bitmap.rgba,
+          bitmap.width,
+          bitmap.height,
+        );
+        texturePixels = bitmap.rgba;
       }
     }
 
@@ -9258,14 +16155,14 @@ Future<MeshModel> meshModelFromImporterJson(
       );
       if (resolvedNormal != null) {
         try {
-          final normalImage = await firstTextureImage([resolvedNormal]);
-          if (normalImage != null) {
-            final data = await normalImage.toByteData(
-              format: ui.ImageByteFormat.rawRgba,
-            );
-            normalPixels = data?.buffer.asUint8List();
-            normalWidth = normalImage.width;
-            normalHeight = normalImage.height;
+          // Pixels only: shading reads these on the CPU and nothing displays
+          // a normal map, so no ui.Image is built for it. The one that used
+          // to be built here was never disposed.
+          final normal = await firstTextureBitmap([resolvedNormal]);
+          if (normal != null) {
+            normalPixels = normal.rgba;
+            normalWidth = normal.width;
+            normalHeight = normal.height;
             fbxLog(
               'Normal map for ${(material['name'] as String?) ?? 'Material'}: '
               '$resolvedNormal (${normalWidth}x$normalHeight)',
@@ -9294,14 +16191,12 @@ Future<MeshModel> meshModelFromImporterJson(
       );
       if (resolvedEmissive != null) {
         try {
-          final emissiveImage = await firstTextureImage([resolvedEmissive]);
-          if (emissiveImage != null) {
-            final data = await emissiveImage.toByteData(
-              format: ui.ImageByteFormat.rawRgba,
-            );
-            emissivePixels = data?.buffer.asUint8List();
-            emissiveWidth = emissiveImage.width;
-            emissiveHeight = emissiveImage.height;
+          // Pixels only, for the same reason as the normal map.
+          final emissive = await firstTextureBitmap([resolvedEmissive]);
+          if (emissive != null) {
+            emissivePixels = emissive.rgba;
+            emissiveWidth = emissive.width;
+            emissiveHeight = emissive.height;
           }
         } catch (error) {
           fbxLog('Emissive decode failed: $error');
@@ -9471,7 +16366,70 @@ Future<MeshModel> meshModelFromImporterJson(
     vertexColors: vertexColors,
     skin: skin,
     skeleton: restSkeleton,
+    framing: MeshFraming.fromJson(json),
+    objectNames: objectNames,
   );
+}
+
+/// Where `atlas_embed.py` lives, relative to the app.
+///
+/// Packaged beside the executable in a release; two directories up in a
+/// development checkout, where the app runs from build/windows/.../Release
+/// and the MCP sits in work/atlas_mcp.
+String? embedderScriptPath() {
+  final separator = Platform.pathSeparator;
+  // Walked up from the executable, not from the working directory: a GUI
+  // process is started with whatever directory the launcher happened to be
+  // in, so relative candidates resolve somewhere arbitrary. The first
+  // version of this looked for 'work/atlas_mcp/...' and found nothing.
+  var directory = File(Platform.resolvedExecutable).parent;
+  // Five levels covers build/windows/x64/runner/Release; a few more cost
+  // nothing and survive the layout changing.
+  for (var depth = 0; depth < 8; depth += 1) {
+    for (final relative in <String>[
+      'atlas_mcp${separator}atlas_embed.py',
+      'work${separator}atlas_mcp${separator}atlas_embed.py',
+    ]) {
+      final candidate = File('${directory.path}$separator$relative');
+      if (candidate.existsSync()) return candidate.path;
+    }
+    final parent = directory.parent;
+    if (parent.path == directory.path) break;
+    directory = parent;
+  }
+  return null;
+}
+
+/// The Python that can run the embedder, or null if none of them can.
+///
+/// Probed rather than assumed, and the probe is the embedder's own --
+/// `--probe` loads both towers, so a Python that exists but is missing
+/// onnxruntime is rejected here rather than twenty minutes into a run.
+/// Cached: the probe costs a few seconds.
+String? _cachedPython;
+bool _pythonProbed = false;
+
+Future<String?> findEmbedderPython({String? script}) async {
+  if (_pythonProbed) return _cachedPython;
+  _pythonProbed = true;
+  final target = script ?? embedderScriptPath();
+  if (target == null) return null;
+  for (final candidate in const ['python', 'python3', 'py']) {
+    try {
+      final probe = await Process.run(candidate, [
+        '-P',
+        target,
+        '--probe',
+      ], workingDirectory: File(target).parent.path);
+      if (probe.exitCode == 0) {
+        _cachedPython = candidate;
+        return candidate;
+      }
+    } on ProcessException catch (_) {
+      // Not on PATH under that name; try the next.
+    }
+  }
+  return null;
 }
 
 String meshImporterPath() {
@@ -9490,145 +16448,108 @@ String meshImporterPath() {
   if (File(developmentBuild).existsSync()) return developmentBuild;
   return packaged;
 }
+/// One material as an `.mtl` sidecar describes it.
+///
+/// Only the two fields that change a picture. `Ks`, `Ns`, `Ni` and `illum`
+/// describe a lighting model this renderer does not implement, so reading
+/// them would mean storing numbers nothing looks at.
+class ObjMaterialDefinition {
+  const ObjMaterialDefinition({this.color, this.diffuseTexture});
 
-String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
-  final modelDir = parentPath(modelPath).toLowerCase();
-  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
-  final genericTokens = {
-    'sm',
-    'fbx',
-    'obj',
-    'mesh',
-    'meshes',
-    'model',
-    'models',
-    'asset',
-    'assets',
-    'content',
-    'sourceart',
-    'source',
-    'marketplace',
-    'material',
-    'materials',
-    'levelprototyping',
-    'interactable',
-    'texture',
-    'textures',
-  };
+  /// `Kd`, or null when the material did not state one.
+  final Color? color;
 
-  Set<String> semanticTokens(String value) {
-    return tokenSet(
-      value,
-    ).where((token) => !genericTokens.contains(token)).toSet();
+  /// `map_Kd` verbatim, still relative to the sidecar's own folder.
+  final String? diffuseTexture;
+}
+
+/// The `mtllib` files an OBJ asks for, in the order it names them.
+///
+/// Separate from [parseObjMesh] because the sidecar has to be read before the
+/// mesh can be parsed with it, and the caller is the only one that knows
+/// whether "beside the OBJ" means a folder or an open archive.
+List<String> objMaterialLibraryNames(String objText) {
+  final names = <String>[];
+  for (final rawLine in objText.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (!line.toLowerCase().startsWith('mtllib ')) continue;
+    final name = line.substring(7).trim();
+    if (name.isNotEmpty && !names.contains(name)) names.add(name);
   }
+  return names;
+}
 
-  String relativeFromRoot(String fullPath, String rootPath) {
-    final full = fullPath.toLowerCase().replaceAll('\\', '/');
-    final root = rootPath.toLowerCase().replaceAll('\\', '/');
-    if (full == root) return '';
-    if (full.startsWith('$root/')) {
-      return full.substring(root.length + 1);
-    }
-    return full;
-  }
+/// Reads an `.mtl` sidecar: the per-material colours and diffuse textures.
+///
+/// Nothing read a `.mtl` until now, so every OBJ in the library drew in one
+/// flat grey however many materials it declared. `ship_dark.obj` names five
+/// -- wood, woodDark, iron, window, textile -- and they were all the same
+/// colour on screen.
+///
+/// Measured over the 4,189 OBJ files on disk: 3,429 have a sidecar carrying
+/// `Kd` colours and no texture at all, 201 name a texture with `map_Kd`, and
+/// 559 have no sidecar. So for most of this library the sidecar holds colour
+/// rather than an image, and reading only `map_Kd` would have fixed the rarer
+/// half of the problem.
+///
+/// `Kd` is scaled straight from 0..1 to 0..255 with no gamma step. That is
+/// what the FBX path does with the same quantity, and matching it means an
+/// OBJ and its FBX twin draw the same colour -- which matters more here than
+/// colorimetric correctness, because the twins sit side by side in this
+/// library and a visible difference between them reads as a bug.
+Map<String, ObjMaterialDefinition> parseObjMaterialLibrary(String mtlText) {
+  final definitions = <String, ObjMaterialDefinition>{};
+  var currentName = '';
+  Color? currentColor;
+  String? currentTexture;
 
-  final modelNameTokens = semanticTokens(
-    modelPath.split(RegExp(r'[\\/]')).last,
-  );
-  final baseCandidates = allAssets.where((asset) {
-    if (!imageExts.contains(asset.ext)) return false;
-    final dir = parentPath(asset.path).toLowerCase();
-    if (dir == modelDir) return true;
-    final lowerPath = asset.path.toLowerCase().replaceAll('\\', '/');
-    return lowerPath.contains('/textures/');
-  }).toList();
-
-  if (baseCandidates.isEmpty) return null;
-
-  final sameSourceCandidates = baseCandidates.where((asset) {
-    final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
-    return modelPathLower.startsWith(sourceLower);
-  }).toList();
-  final candidates = sameSourceCandidates.isNotEmpty
-      ? sameSourceCandidates
-      : baseCandidates;
-
-  String? modelSourceRoot;
-  for (final candidate in candidates) {
-    final root = candidate.sourceRoot.toLowerCase().replaceAll('\\', '/');
-    if (modelPathLower.startsWith(root)) {
-      modelSourceRoot = root;
-      break;
-    }
-  }
-  final modelRelativePath = modelSourceRoot == null
-      ? modelPathLower
-      : relativeFromRoot(modelPathLower, modelSourceRoot);
-  final modelRelativeSegments = modelRelativePath.split('/');
-  final modelTokens = semanticTokens(modelRelativePath);
-
-  int score(AssetItem asset) {
-    final assetPathLower = asset.path.toLowerCase().replaceAll('\\', '/');
-    final assetRelativePath = modelSourceRoot == null
-        ? assetPathLower
-        : relativeFromRoot(assetPathLower, modelSourceRoot);
-    final assetRelativeSegments = assetRelativePath.split('/');
-    final assetNameTokens = semanticTokens(asset.name);
-    final assetPathTokens = semanticTokens(assetRelativePath);
-    final nameOverlap = modelNameTokens.intersection(assetNameTokens).length;
-    final pathOverlap = modelTokens.intersection(assetPathTokens).length;
-
-    var value = nameOverlap * 24 + pathOverlap * 14;
-
-    // If there is no semantic overlap at all, do not allow weak path bonuses
-    // to force an unrelated texture.
-    if (nameOverlap == 0 && pathOverlap == 0) {
-      return 0;
-    }
-
-    if (parentPath(asset.path).toLowerCase() == modelDir) value += 6;
-    if (assetPathLower.contains('/textures/')) {
-      value += 4;
-    }
-
-    // Prefer textures that are path-wise close under the same source root.
-    var sharedPrefix = 0;
-    final maxPrefix = math.min(
-      modelRelativeSegments.length,
-      assetRelativeSegments.length,
+  void commit() {
+    if (currentName.isEmpty) return;
+    definitions[currentName] = ObjMaterialDefinition(
+      color: currentColor,
+      diffuseTexture: currentTexture,
     );
-    while (sharedPrefix < maxPrefix &&
-        modelRelativeSegments[sharedPrefix] ==
-            assetRelativeSegments[sharedPrefix]) {
-      sharedPrefix += 1;
+  }
+
+  for (final rawLine in mtlText.split(RegExp(r'\r?\n'))) {
+    final line = rawLine.trim();
+    if (line.isEmpty || line.startsWith('#')) continue;
+    final space = line.indexOf(RegExp(r'\s'));
+    if (space <= 0) continue;
+    final keyword = line.substring(0, space).toLowerCase();
+    final value = line.substring(space + 1).trim();
+
+    if (keyword == 'newmtl') {
+      commit();
+      currentName = value;
+      currentColor = null;
+      currentTexture = null;
+    } else if (keyword == 'kd') {
+      final parts = value.split(RegExp(r'\s+'));
+      if (parts.length < 3) continue;
+      final channels = [
+        for (final part in parts.take(3)) double.tryParse(part),
+      ];
+      if (channels.any((channel) => channel == null)) continue;
+      currentColor = Color.fromARGB(
+        255,
+        (channels[0]!.clamp(0.0, 1.0) * 255).round(),
+        (channels[1]!.clamp(0.0, 1.0) * 255).round(),
+        (channels[2]!.clamp(0.0, 1.0) * 255).round(),
+      );
+    } else if (keyword == 'map_kd') {
+      // The whole remainder, not the last token: a texture path may contain
+      // spaces. The format also allows option flags before the filename
+      // (`map_Kd -o 0 0 0 wood.png`); none of the 357 map_Kd lines in this
+      // library uses one, so rather than guess at where the options end,
+      // leave such a line unread and let the warning say the texture was not
+      // found. A wrong texture is worse than a missing one.
+      if (value.startsWith('-')) continue;
+      if (value.isNotEmpty) currentTexture = value;
     }
-    value += math.min(sharedPrefix * 2, 12);
-
-    return value;
   }
-
-  final scored = <({AssetItem asset, int score})>[];
-  for (final candidate in candidates) {
-    scored.add((asset: candidate, score: score(candidate)));
-  }
-  scored.sort((a, b) => b.score.compareTo(a.score));
-  final top = scored.take(5).toList();
-  for (final entry in top) {
-    fbxLog('Fallback candidate score=${entry.score} path=${entry.asset.path}');
-  }
-
-  final bestScore = top.isEmpty ? 0 : top.first.score;
-  final secondBest = top.length > 1 ? top[1].score : 0;
-  if (top.isEmpty || bestScore < 18 || (bestScore - secondBest) < 6) {
-    fbxLog(
-      'Fallback rejected due to low confidence or ambiguity (bestScore=$bestScore, secondBest=$secondBest) for model=$modelPath',
-    );
-    return null;
-  }
-
-  final selected = top.first.asset.path;
-  fbxLog('Fallback selected texture: $selected');
-  return selected;
+  commit();
+  return definitions;
 }
 
 /// Parses an OBJ, including the parts the first version threw away.
@@ -9636,15 +16557,25 @@ String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
 /// `vt` lines and the `v/vt/vn` corner references were being dropped, so an
 /// OBJ could never be textured no matter what else resolved -- a Synty barn
 /// carries 12k texture coordinates and arrived with none. `usemtl` splits the
-/// mesh into materials and `mtllib` records the sidecar so the texture
-/// resolver can chase it; an OBJ that names neither still parses, it just gets
-/// one unnamed material.
-MeshModel parseObjMesh(String text, String name) {
+/// mesh into materials and the sidecar those names are looked up in gives
+/// each one its colour and texture; an OBJ that names neither still parses,
+/// it just gets one unnamed material.
+///
+/// [materialLibrary] is the sidecar already read, from
+/// [parseObjMaterialLibrary]. It is a parameter rather than a file this
+/// function opens so that the parser stays text-in, mesh-out: the sidecar may
+/// be on disk beside the OBJ or an entry in an archive this function has no
+/// handle on, and [loadMesh] is where that distinction already lives. Empty
+/// is the old behaviour -- every material flat grey.
+MeshModel parseObjMesh(
+  String text,
+  String name, {
+  Map<String, ObjMaterialDefinition> materialLibrary = const {},
+}) {
   final vertices = <Vec3>[];
   final texCoords = <Vec2>[];
   final faces = <MeshFace>[];
   final materialNames = <String>[];
-  final materialLibraries = <String>[];
   var currentMaterial = 0;
 
   int? resolveIndex(String token, int count) {
@@ -9679,11 +16610,6 @@ MeshModel parseObjMesh(String text, String name) {
           ),
         );
       }
-    } else if (line.startsWith('mtllib ')) {
-      final library = line.substring(7).trim();
-      if (library.isNotEmpty && !materialLibraries.contains(library)) {
-        materialLibraries.add(library);
-      }
     } else if (line.startsWith('usemtl ')) {
       final material = line.substring(7).trim();
       final existing = materialNames.indexOf(material);
@@ -9714,22 +16640,151 @@ MeshModel parseObjMesh(String text, String name) {
     throw const FormatException('No OBJ geometry found.');
   }
 
+  const flatGrey = Color(0xffb9c2cc);
   final materials = [
     for (final materialName in materialNames)
-      MeshMaterial(
-        name: materialName,
-        color: const Color(0xffb9c2cc),
-        textures: const [],
-      ),
+      () {
+        final defined = materialLibrary[materialName];
+        final reference = defined?.diffuseTexture;
+        return MeshMaterial(
+          name: materialName,
+          // Grey only when the sidecar is absent or said nothing. A material
+          // the sidecar does describe draws in its own colour, which is what
+          // makes ship_dark's wood, iron and window three colours instead of
+          // one.
+          color: defined?.color ?? flatGrey,
+          textures: reference == null ? const [] : [reference],
+        );
+      }(),
+  ];
+  // The texture references, not the sidecar names. `mtllib` used to go here,
+  // so the only "texture" an OBJ could offer the resolver was `ship_dark.mtl`
+  // -- which is not an image, so it resolved to nothing and was then reported
+  // as a missing texture. The sidecar is read now, so what goes here is what
+  // it asked for.
+  final references = <String>[
+    for (final material in materials)
+      if (material.textures.isNotEmpty) material.textures.first,
   ];
   return MeshModel.normalized(
     name: name,
     vertices: vertices,
     faces: faces,
     materials: materials.isEmpty
-        ? const [MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: [])]
+        ? const [MeshMaterial(name: '', color: flatGrey, textures: [])]
         : materials,
-    textureFiles: materialLibraries,
+    textureFiles: references.toSet().toList(),
+  );
+}
+
+/// Whether these bytes are a binary STL rather than an ASCII one.
+///
+/// The triangle count in the header is the only reliable test. A binary STL
+/// may *begin* with the word "solid" -- several exporters write their product
+/// name into the 80-byte header and it often starts that way -- so sniffing
+/// for that word reads them as ASCII, finds no `vertex` lines, and reports a
+/// file with geometry as having none.
+///
+/// The arithmetic cannot mistake an ASCII file for a binary one. Bytes 80..84
+/// of an ASCII file are text, and the smallest byte text uses is 0x09, so the
+/// little-endian count read there is at least 0x09090909 -- 151 million
+/// triangles, which would need a 7.5 GB file to satisfy.
+bool looksLikeBinaryStl(Uint8List bytes) {
+  if (bytes.length < 84) return false;
+  final declared = ByteData.sublistView(
+    bytes,
+    80,
+    84,
+  ).getUint32(0, Endian.little);
+  if (declared == 0) return false;
+  // Not an exact length match: exporters pad the end, and a file with
+  // trailing bytes is still a file whose triangles are all present.
+  return bytes.length >= 84 + declared * 50;
+}
+
+/// A triangle soup from an STL file, binary or ASCII.
+///
+/// STL is the simplest format in the library and the poorest: triangles, and
+/// nothing else. No UVs, no materials, no units, no object names. So these
+/// draw in the same flat colour an OBJ with no `mtllib` does, which is all
+/// the format can carry -- a grey render of an STL is correct, not a failure
+/// to find its texture.
+///
+/// The per-facet normals are read past. They are routinely zero or wrong in
+/// files exported by CAD tools, and the renderer derives its own from the
+/// winding regardless (see renderer_geometry_test.dart), so storing them
+/// would be storing something nothing reads.
+///
+/// Vertices are not welded. A triangle soup repeats every shared corner, so
+/// this is three vertices per face where a welded mesh would be about one --
+/// but shading here is per face, so welding would change no pixel, and the
+/// largest STL in this library is 0.26 MB, about 5,500 triangles.
+MeshModel parseStlMesh(Uint8List bytes, String name) {
+  final vertices = <Vec3>[];
+  final faces = <MeshFace>[];
+
+  void addTriangle(Vec3 a, Vec3 b, Vec3 c) {
+    final first = vertices.length;
+    vertices
+      ..add(a)
+      ..add(b)
+      ..add(c);
+    faces.add(MeshFace([first, first + 1, first + 2]));
+  }
+
+  if (looksLikeBinaryStl(bytes)) {
+    final declared = ByteData.sublistView(
+      bytes,
+      80,
+      84,
+    ).getUint32(0, Endian.little);
+    final data = ByteData.sublistView(bytes);
+    for (var triangle = 0; triangle < declared; triangle += 1) {
+      // 84 past the header and the count, 50 per triangle, 12 past the
+      // facet normal to reach the first corner.
+      final corner = 84 + triangle * 50 + 12;
+      if (corner + 36 > bytes.length) break;
+      Vec3 at(int offset) => Vec3(
+        data.getFloat32(offset, Endian.little),
+        data.getFloat32(offset + 4, Endian.little),
+        data.getFloat32(offset + 8, Endian.little),
+      );
+      addTriangle(at(corner), at(corner + 12), at(corner + 24));
+    }
+  } else {
+    final text = utf8.decode(bytes, allowMalformed: true);
+    final pending = <Vec3>[];
+    for (final rawLine in text.split(RegExp(r'\r?\n'))) {
+      final line = rawLine.trim();
+      // Lowercased for the keyword only: the convention is lower case and
+      // most writers follow it, but not all of them do.
+      if (!line.toLowerCase().startsWith('vertex')) continue;
+      final parts = line.split(RegExp(r'\s+'));
+      if (parts.length < 4) continue;
+      final x = double.tryParse(parts[1]);
+      final y = double.tryParse(parts[2]);
+      final z = double.tryParse(parts[3]);
+      if (x == null || y == null || z == null) continue;
+      pending.add(Vec3(x, y, z));
+      if (pending.length == 3) {
+        addTriangle(pending[0], pending[1], pending[2]);
+        pending.clear();
+      }
+    }
+    // A facet cut short by a truncated file contributes nothing rather than a
+    // triangle with an invented corner.
+  }
+
+  if (faces.isEmpty) {
+    throw const FormatException('No STL geometry found.');
+  }
+  return MeshModel.normalized(
+    name: name,
+    vertices: vertices,
+    faces: faces,
+    materials: const [
+      MeshMaterial(name: '', color: Color(0xffb9c2cc), textures: []),
+    ],
   );
 }
 
@@ -9796,8 +16851,24 @@ bool vertexColorSetIsUnusable(List<Color> colors) {
   return black >= colors.length * unusableVertexColorFraction;
 }
 
+/// Bumped whenever the scanner's rules change what gets indexed, so a catalog
+/// saved under older rules can say so instead of silently lacking things.
+///
+/// 1: the original rule set. 2: Unreal asset files are indexed. 3: archives
+/// are read through their directory rather than loaded whole, so the ones over
+/// the old 128MB byte cap are indexed instead of skipped -- 49 of them here,
+/// holding 66,441 entries.
+const scanRulesVersion = 3;
+
+/// Settings key for the rules a persisted catalog was scanned under.
+const catalogRulesKey = 'catalog.rules';
+
 /// Settings key for the model clips are played on.
 const animationCharacterKey = 'animation.character.path';
+
+/// Settings key for what that character is wearing: attachment paths, one
+/// per line.
+const animationCharacterWornKey = 'animation.character.worn';
 
 /// Settings key for that character's rig family.
 ///
@@ -9823,6 +16894,22 @@ class AnimationCharacter {
   /// filter. Null until a character with a known rig is chosen.
   String? rigFamily;
 
+  /// The chosen character's rig signature, which is what the filter really
+  /// compares. Not persisted: it is read back from the catalog as the
+  /// catalog loads, so it cannot survive a change to how signatures are
+  /// computed, which is exactly what a stale copy would do.
+  String? rigSignature;
+
+  /// What the chosen character is wearing, as attachment asset paths.
+  ///
+  /// Kept with the character rather than with the preview so the clip
+  /// preview can dress it the same way: a character chosen while wearing a
+  /// helmet animates wearing the helmet.
+  List<String> worn = const [];
+
+  /// Bumps whenever [worn] changes, so an open clip preview re-dresses.
+  final ValueNotifier<int> outfitRevision = ValueNotifier<int>(0);
+
   Future<void> load() async {
     try {
       path.value = await AssetAtlasDatabase.instance.readSetting(
@@ -9831,15 +16918,29 @@ class AnimationCharacter {
       rigFamily = await AssetAtlasDatabase.instance.readSetting(
         animationCharacterRigKey,
       );
+      final wornSetting = await AssetAtlasDatabase.instance.readSetting(
+        animationCharacterWornKey,
+      );
+      worn = wornSetting == null || wornSetting.isEmpty
+          ? const []
+          : wornSetting.split('\n').where((p) => p.isNotEmpty).toList();
     } catch (error) {
       // A missing settings row is not worth failing startup over.
       fbxLog('Could not read the animation character: $error');
     }
   }
 
-  Future<void> set(String? assetPath, {String? rig}) async {
+  Future<void> set(
+    String? assetPath, {
+    String? rig,
+    String? signature,
+    Iterable<String> wearing = const [],
+  }) async {
     rigFamily = assetPath == null ? null : rig;
+    rigSignature = assetPath == null ? null : signature;
+    worn = assetPath == null ? const [] : List.unmodifiable(wearing);
     path.value = assetPath;
+    outfitRevision.value += 1;
     try {
       await AssetAtlasDatabase.instance.writeSetting(
         animationCharacterKey,
@@ -9849,8 +16950,56 @@ class AnimationCharacter {
         animationCharacterRigKey,
         rigFamily,
       );
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterWornKey,
+        worn.join('\n'),
+      );
     } catch (error) {
       fbxLog('Could not save the animation character: $error');
+    }
+  }
+
+  /// Re-reads the chosen character's rig family from the catalog.
+  ///
+  /// The family is kept here beside the path so the "works with my character"
+  /// filter can answer without the catalog being consulted. That copy is
+  /// written once, when the character is chosen, so a change to the rig rules
+  /// -- and the backfill that follows one -- leaves it stale: a character
+  /// stored `unreal` went on being filtered as `unreal` after the column
+  /// said otherwise.
+  Future<void> refreshRigFrom(Iterable<AssetItem> assets) async {
+    final chosen = path.value;
+    if (chosen == null) return;
+    final key = normalizePathKey(chosen);
+    for (final asset in assets) {
+      if (normalizePathKey(asset.path) != key) continue;
+      rigSignature = asset.rigSignature;
+      final fresh = asset.rigFamily;
+      if (fresh == null || fresh == rigFamily) return;
+      rigFamily = fresh;
+      try {
+        await AssetAtlasDatabase.instance.writeSetting(
+          animationCharacterRigKey,
+          fresh,
+        );
+      } catch (error) {
+        fbxLog('Could not save the refreshed character rig: $error');
+      }
+      return;
+    }
+  }
+
+  /// Changes what the chosen character wears without changing the character.
+  Future<void> setWorn(Iterable<String> wearing) async {
+    worn = List.unmodifiable(wearing);
+    outfitRevision.value += 1;
+    try {
+      await AssetAtlasDatabase.instance.writeSetting(
+        animationCharacterWornKey,
+        worn.join('\n'),
+      );
+    } catch (error) {
+      fbxLog('Could not save the outfit: $error');
     }
   }
 }
@@ -10081,10 +17230,18 @@ List<AssetItem> findClipReferenceCharacters(
     if (assetContainerKey(asset) != clipContainer) continue;
     // A clip has no mesh and no bind pose, so it cannot stand in for one.
     if (asset.modelKind == 'animation') continue;
+    // Can this character be driven by the clip, not is it spelt the same.
+    // Everything here is already in the clip's own container, which is what
+    // an unnamed rig is matched by, so both containers are that one.
     if (clipRig != null &&
         clipRig != RigFamily.none &&
         asset.rigFamily != null &&
-        rigFamilyByName(asset.rigFamily) != clipRig) {
+        !rigFamiliesCompatible(
+          rigFamilyByName(asset.rigFamily),
+          clipRig,
+          containerA: clipContainer,
+          containerB: clipContainer,
+        )) {
       continue;
     }
     candidates.add(asset);
@@ -10545,13 +17702,28 @@ double rigAxisDifference(
   // Returning zero here made a rig with nothing in common look like the best
   // possible reference, which is how a Sidekick character got chosen to
   // correct a Polygon clip.
-  if (angles.length < minimumRigOverlap) return double.infinity;
+  if (angles.isEmpty || !rigMatch(characterRest, clip)) {
+    return double.infinity;
+  }
   angles.sort();
   return angles[angles.length ~/ 2];
 }
 
 /// How many bones two rigs must share before they can be compared at all.
 const minimumRigOverlap = 4;
+
+/// How much of a character's rig a clip must name once case is folded.
+///
+/// A count is no longer enough on its own. Exactly, a Polygon rig and a
+/// Sidekick rig share zero bone names; folded, a character shares a median
+/// 27% of its bones with the *wrong* family's rig -- `Spine_01` against
+/// `spine_01`, `Head` against `head` -- which is more than four bones. So the
+/// folded test is a share of the character's own rig, not a tally.
+///
+/// Measured over 800 rigged characters against the 12 distinct clip rigs in
+/// the library: at 0.5, 786 characters match their right rig and 6 match a
+/// wrong one; at 0.4 it is 786 and 8. Hence 0.5.
+const minimumRigMatchFraction = 0.5;
 
 /// How many bones a character's rig shares with a clip.
 ///
@@ -10564,6 +17736,94 @@ int rigBoneOverlap(SkeletonAnimation rig, SkeletonAnimation clip) {
     if (clip.indexOfBone(bone.name, path: bone.path) >= 0) shared += 1;
   }
   return shared;
+}
+
+/// How many of a rig's bones the clip names exactly, and how many once case
+/// is folded. The folded figure includes the exact one.
+({int exact, int folded}) rigBoneMatches(
+  SkeletonAnimation rig,
+  SkeletonAnimation clip,
+) {
+  var exact = 0;
+  var folded = 0;
+  for (final bone in rig.bones) {
+    if (clip.indexOfBone(bone.name, path: bone.path, foldCase: false) >= 0) {
+      exact += 1;
+      folded += 1;
+      continue;
+    }
+    if (clip.indexOfBone(bone.name, path: bone.path) >= 0) folded += 1;
+  }
+  return (exact: exact, folded: folded);
+}
+
+/// Whether a clip may drive a character at all, given how much of the
+/// character's rig the clip names.
+///
+/// The one place this is decided, in the one form both callers can reach:
+/// [rigMatch] counts with the bones in memory and their paths, and
+/// [rigMatchNames] counts from two lists of names out of the catalog. Two
+/// rules, either of which is enough:
+///
+///  * [minimumRigOverlap] bones matched **exactly** -- this is the rule as it
+///    was before case was folded, kept verbatim so that nothing which pairs
+///    today stops pairing;
+///  * or [minimumRigMatchFraction] of the character's bones matched once case
+///    is folded, which is what lets the War Robot's `Pelvis` be driven by a
+///    clip's `pelvis` while keeping a Polygon rig away from Sidekick clips.
+bool rigMatchFromCounts({
+  required int characterBones,
+  required int exact,
+  required int folded,
+}) {
+  if (characterBones <= 0) return false;
+  if (exact >= minimumRigOverlap) return true;
+  return folded / characterBones >= minimumRigMatchFraction;
+}
+
+/// [rigMatchFromCounts] for two loaded skeletons.
+bool rigMatch(SkeletonAnimation character, SkeletonAnimation clip) {
+  final matches = rigBoneMatches(character, clip);
+  return rigMatchFromCounts(
+    characterBones: character.bones.length,
+    exact: matches.exact,
+    folded: matches.folded,
+  );
+}
+
+/// How many of a character's bone names a clip names, exactly and folded.
+///
+/// The catalog's form of [rigBoneMatches]: two lists of names, no paths, no
+/// geometry. Paths can only rescue a bone that names alone would miss, so
+/// this is the conservative count of the two.
+({int exact, int folded}) rigNameMatches(
+  List<String> characterBones,
+  List<String> clipBones,
+) {
+  final clipExact = clipBones.toSet();
+  final clipFolded = {for (final name in clipBones) name.toLowerCase()};
+  var exact = 0;
+  var folded = 0;
+  for (final bone in characterBones) {
+    if (clipExact.contains(bone)) {
+      exact += 1;
+      folded += 1;
+      continue;
+    }
+    if (clipFolded.contains(bone.toLowerCase())) folded += 1;
+  }
+  return (exact: exact, folded: folded);
+}
+
+/// [rigMatchFromCounts] for two rigs known only by their bone names, which is
+/// what a rig signature carries.
+bool rigMatchNames(List<String> characterBones, List<String> clipBones) {
+  final matches = rigNameMatches(characterBones, clipBones);
+  return rigMatchFromCounts(
+    characterBones: characterBones.length,
+    exact: matches.exact,
+    folded: matches.folded,
+  );
 }
 
 /// Poses a character's vertices into a packed buffer.
@@ -10766,6 +18026,71 @@ String normalizeBonePath(String path) {
       .join('/');
 }
 
+/// The answer for a folded key that two differently-spelled bones share.
+///
+/// Matches nothing. Guessing which of the two was meant would drive a limb
+/// from the wrong joint, and a wrong pose is worse than a bind pose. Not seen
+/// in this library -- folding case merged no two distinct names in 1,024
+/// skeletons -- and handled anyway.
+const int _ambiguousBone = -2;
+
+/// Folded-case lookup tables, built once per skeleton on first use.
+///
+/// `indexOfBone` is called per bone inside loops: `rigAxisDifference` calls it
+/// for every bone of a character every time a plan is built, and
+/// `rigBoneOverlap` once per bone of a rig. A folded step that scanned the
+/// bone list or lower-cased in the loop would be paid thousands of times per
+/// clip. [SkeletonAnimation] has a `const` constructor and so cannot hold a
+/// lazily built field; these hang off the object instead, the same pattern as
+/// `_sceneNames`.
+final Expando<Map<String, int>> _foldedBoneNames = Expando<Map<String, int>>(
+  'folded bone names',
+);
+final Expando<Map<String, int>> _foldedBonePaths = Expando<Map<String, int>>(
+  'folded bone paths',
+);
+
+Map<String, int> _foldedBoneNamesOf(SkeletonAnimation skeleton) {
+  final known = _foldedBoneNames[skeleton];
+  if (known != null) return known;
+  final table = _foldTable(skeleton.bones.map((bone) => bone.name));
+  _foldedBoneNames[skeleton] = table;
+  return table;
+}
+
+Map<String, int> _foldedBonePathsOf(SkeletonAnimation skeleton) {
+  final known = _foldedBonePaths[skeleton];
+  if (known != null) return known;
+  final table = _foldTable(
+    skeleton.bones.map((bone) => normalizeBonePath(bone.path)),
+  );
+  _foldedBonePaths[skeleton] = table;
+  return table;
+}
+
+/// Lower-cased key to index, or [_ambiguousBone] where two *different*
+/// spellings collide.
+///
+/// The same spelling appearing twice is not ambiguity: the exact pass above
+/// already answers it, and folding never gets asked.
+Map<String, int> _foldTable(Iterable<String> values) {
+  final table = <String, int>{};
+  final firstSpelling = <String, String>{};
+  var index = 0;
+  for (final value in values) {
+    final key = value.toLowerCase();
+    final seen = firstSpelling[key];
+    if (seen == null) {
+      firstSpelling[key] = value;
+      table[key] = index;
+    } else if (seen != value) {
+      table[key] = _ambiguousBone;
+    }
+    index += 1;
+  }
+  return table;
+}
+
 /// A rig and the motion sampled onto it.
 ///
 /// Positions only, in world space, one sample per frame. That is everything a
@@ -10852,9 +18177,21 @@ class SkeletonAnimation {
 
   /// The bone of this rig with the given name, or -1.
   ///
-  /// Names are how a clip and a character are joined: Synty rigs share them
-  /// exactly, so no mapping table is needed.
-  int indexOfBone(String name, {String? path}) {
+  /// Names are how a clip and a character are joined. Synty rigs share them,
+  /// but not always their case: `SK_Chr_BR_War_Robot_01.fbx` carries `Pelvis`,
+  /// `Thigh_L` and `Hand_L` beside `spine_01` and `calf_l`, while the
+  /// Sidekick clips in the same library write every one of them lower-case.
+  /// Nine joints of that character differ from its clips by case alone --
+  /// hips, legs, feet, arms and hands -- so a walk clip moved its spine and
+  /// left its legs in the bind pose.
+  ///
+  /// Order is the whole safety argument: the three exact forms are tried
+  /// first and unchanged, so every lookup that resolves today resolves to the
+  /// same index. Folding runs only after all three have failed.
+  ///
+  /// [foldCase] false stops after the exact forms, which is how `rigMatch`
+  /// counts what matched exactly and what only matched folded.
+  int indexOfBone(String name, {String? path, bool foldCase = true}) {
     if (path != null && path.isNotEmpty) {
       for (var i = 0; i < bones.length; i += 1) {
         if (bones[i].path == path) return i;
@@ -10872,6 +18209,17 @@ class SkeletonAnimation {
     for (var i = 0; i < bones.length; i += 1) {
       if (bones[i].name == name) return i;
     }
+    if (!foldCase) return -1;
+    if (path != null && path.isNotEmpty) {
+      final folded =
+          _foldedBonePathsOf(this)[normalizeBonePath(path).toLowerCase()];
+      // An ambiguous key stops the search rather than falling through to the
+      // name: if the path cannot say which bone was meant, the name -- which
+      // is weaker -- certainly cannot.
+      if (folded != null) return folded >= 0 ? folded : -1;
+    }
+    final byName = _foldedBoneNamesOf(this)[name.toLowerCase()];
+    if (byName != null && byName >= 0) return byName;
     return -1;
   }
 
@@ -10906,6 +18254,56 @@ class SkeletonAnimation {
 /// geometry is a legitimate asset, not an import failure.
 enum FbxContentKind { mesh, animation }
 
+/// Where a mesh was before the importer fitted it into the viewer's box.
+///
+/// The importer recentres and rescales every mesh so it can be framed, which
+/// throws away both its position and its size. For a lone model that is
+/// harmless. For a piece meant to sit on another model it is everything: a
+/// helmet is authored at the origin of the joint it belongs to, at the
+/// character's own scale, and neither fact survives the fit.
+class MeshFraming {
+  const MeshFraming({required this.center, required this.scale});
+
+  final Vec3 center;
+  final double scale;
+
+  /// Reads the fields the importer emits, or null when they are absent.
+  ///
+  /// Absent means a file imported before the importer emitted them, so the
+  /// caller has to cope rather than assume an identity: pretending the scale
+  /// was 1 would put an attachment in the wrong place at the wrong size, which
+  /// is worse than declining to place it.
+  static MeshFraming? fromJson(Map<String, dynamic> json) {
+    final center = json['framingCenter'] as List<dynamic>?;
+    final scale = (json['framingScale'] as num?)?.toDouble();
+    if (center == null || center.length < 3 || scale == null || scale <= 0) {
+      return null;
+    }
+    return MeshFraming(
+      center: Vec3(
+        (center[0] as num).toDouble(),
+        (center[1] as num).toDouble(),
+        (center[2] as num).toDouble(),
+      ),
+      scale: scale,
+    );
+  }
+
+  /// An emitted vertex put back where the artist built it.
+  Vec3 toOriginal(Vec3 emitted) => Vec3(
+    emitted.x / scale + center.x,
+    emitted.y / scale + center.y,
+    emitted.z / scale + center.z,
+  );
+
+  /// A point in the file's own coordinates, fitted into the viewer's box.
+  Vec3 toEmitted(Vec3 original) => Vec3(
+    (original.x - center.x) * scale,
+    (original.y - center.y) * scale,
+    (original.z - center.z) * scale,
+  );
+}
+
 class MeshModel {
   MeshModel({
     required this.name,
@@ -10918,10 +18316,21 @@ class MeshModel {
     this.animationStacks = 0,
     this.skeleton,
     this.skin,
+    this.framing,
+    this.objectNames = const [],
     this.boneCount = 0,
     this.durationSeconds = 0,
     this.animationNames = const [],
   });
+
+  /// The nodes the importer flattened into this mesh, by name.
+  ///
+  /// Usually one. A character sheet is a dozen: `Characters.fbx` in Dungeon
+  /// Realms is `Chr_Hero_Female_01` through `Chr_Undead_Knight_01`, eleven
+  /// bodies standing in one place, and the material split does not follow
+  /// the node split -- Ancient Empire's sheet puts all eleven in a single
+  /// material -- so the nodes are the only way to take such a file apart.
+  final List<String> objectNames;
 
   /// True when the file carries animation or skeleton data and nothing to draw.
   bool get isAnimationOnly => kind == FbxContentKind.animation;
@@ -10983,6 +18392,10 @@ class MeshModel {
   /// How this mesh's vertices follow that rig, when it is skinned.
   final SkinBinding? skin;
 
+  /// Where this mesh sat before it was fitted into the viewer's box.
+  /// Null for a model imported before the importer emitted it.
+  final MeshFraming? framing;
+
   /// This mesh with different vertex positions. Everything else is shared,
   /// so posing a character per frame does not rebuild its materials.
   MeshModel withVertices(List<Vec3> replacements) => MeshModel(
@@ -10996,6 +18409,8 @@ class MeshModel {
     animationStacks: animationStacks,
     skeleton: skeleton,
     skin: skin,
+    framing: framing,
+    objectNames: objectNames,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -11013,6 +18428,8 @@ class MeshModel {
     animationStacks: animationStacks,
     skeleton: skeleton,
     skin: skin,
+    framing: framing,
+    objectNames: objectNames,
     boneCount: boneCount,
     durationSeconds: durationSeconds,
     animationNames: animationNames,
@@ -11117,6 +18534,13 @@ class MeshModel {
     for (final index in face.indices) {
       if (index < 0 || index >= vertexColors.length) continue;
       final color = vertexColors[index];
+      // Alpha zero is what an exporter writes for a vertex nobody painted,
+      // and it comes out as (0,0,0,0): black, if taken as a colour. The
+      // character sheets carry it on a quarter of their vertices, which
+      // turned whole bodies black while the rest of the set was fine -- so
+      // the all-or-nothing rule on the set could not catch it. Unpainted
+      // means untinted.
+      if (color.a <= 0) continue;
       red += (color.r * 255).round().clamp(0, 255);
       green += (color.g * 255).round().clamp(0, 255);
       blue += (color.b * 255).round().clamp(0, 255);
@@ -11169,6 +18593,52 @@ class MeshMaterial {
   /// Used when the user picks a texture by hand: a model whose materials name
   /// nothing (an OBJ with no `mtllib`) or name a file that is not in the
   /// library still has UVs, so a chosen atlas maps onto it correctly.
+  /// The base texture this material is drawing, by file name, or empty.
+  String get textureName {
+    final path = resolvedTextures.isNotEmpty
+        ? resolvedTextures.first
+        : (textures.isNotEmpty ? textures.first : '');
+    if (path.isEmpty) return '';
+    final cut = path.lastIndexOf(RegExp(r'[\\/]'));
+    return cut < 0 ? path : path.substring(cut + 1);
+  }
+
+  /// The same material with no base texture: flat colour, as it loaded.
+  ///
+  /// What "None" in the picker means. An inferred texture is applied during
+  /// the load, so turning it off cannot be done by simply not applying one.
+  MeshMaterial withoutBaseTexture() {
+    return MeshMaterial(
+      name: name,
+      color: color,
+      textures: textures,
+      resolvedTextures: const [],
+      textureColor: textureColor,
+      textureImage: null,
+      texturePixels: null,
+      textureWidth: 0,
+      textureHeight: 0,
+      normalTexture: normalTexture,
+      normalPixels: normalPixels,
+      normalWidth: normalWidth,
+      normalHeight: normalHeight,
+      emissiveTexture: emissiveTexture,
+      emissivePixels: emissivePixels,
+      emissiveWidth: emissiveWidth,
+      emissiveHeight: emissiveHeight,
+      opacity: opacity,
+      roughness: roughness,
+      metalness: metalness,
+      specularFactor: specularFactor,
+      emissiveFactor: emissiveFactor,
+      emissiveColor: emissiveColor,
+      shaderType: shaderType,
+      shadingModel: shadingModel,
+      uvSet: uvSet,
+      hasEmbeddedTexture: false,
+    );
+  }
+
   MeshMaterial withBaseTexture({
     required String path,
     required ui.Image image,
@@ -11351,9 +18821,13 @@ class MeshFace {
     this.materialIndex = 0,
     this.uvs = const [],
     this.uvSets = const {},
+    this.objectIndex = 0,
   ]);
   final List<int> indices;
   final int materialIndex;
+
+  /// Which node of the file this face came from; see [MeshModel.objectNames].
+  final int objectIndex;
   final List<Vec2> uvs;
   final Map<String, List<Vec2>> uvSets;
 
@@ -11400,6 +18874,7 @@ class AssetItem {
     this.ignored = false,
     this.modelKind,
     this.rigFamily,
+    this.rigSignature,
     this.referencedByModel = false,
   });
 
@@ -11427,14 +18902,48 @@ class AssetItem {
   /// Null means not yet classified; `none` means classified and rigless.
   String? rigFamily;
 
+  /// Which rig this file is on, as [rigSignatureOf] of its bone names.
+  ///
+  /// The family is a label with four possible values; this is the identity.
+  /// Two files with the same signature hold the same bone names, which is
+  /// what decides whether a clip can drive a character -- the names
+  /// themselves live once per signature in the catalog's `rig_bones` table
+  /// rather than once per file. Null for a file with no bones, and for one
+  /// probed before signatures existed.
+  String? rigSignature;
+
   /// Set once some model has been read and found to use this image. Persisted,
   /// because it is only learned by importing a model.
   bool referencedByModel;
+
+  /// Which model this file is a copy of: [twinKeyFor], computed once.
+  ///
+  /// Held per asset because collapsing versions asks it of every row in the
+  /// list, twice per rebuild, and nothing it reads -- the path, the name, the
+  /// type -- changes while Atlas is open.
+  String get twinKey => _twinKey ??= twinKeyFor(this);
+  String? _twinKey;
+
+  /// This asset's folder path, lower-cased, computed once.
+  ///
+  /// Every sort in the app ties on it, and sorting the catalog is 9.1 million
+  /// comparisons: building the string inside the comparator allocated some 18
+  /// million of them. Held per asset rather than per sort so that changing
+  /// the sort mode does not pay for it again.
+  String get sortPathKey => _sortPathKey ??= relativePath.toLowerCase();
+  String? _sortPathKey;
 
   /// The type to show and filter by. An FBX holding only a skeleton and curves
   /// is an animation, not a model, but only a parse can tell you that.
   String get effectiveType {
     if (modelKind == 'animation') return 'animation';
+    // Only where the probe has not spoken: modelKind == 'mesh' is a real
+    // answer and outranks any folder name.
+    if (modelKind == null &&
+        type == 'model' &&
+        looksLikeAnimation(relativePath)) {
+      return 'animation';
+    }
     if (type == 'image' &&
         (referencedByModel || looksLikeTextureLocation(relativePath))) {
       return 'texture';
@@ -11442,12 +18951,34 @@ class AssetItem {
     return type;
   }
 
+  String? _searchName;
+  String? _searchPath;
+  String? _searchTags;
   String? _searchText;
 
-  /// Name, path and tags folded to lowercase once, on first use. Search
-  /// used to lowercase all three for every asset on every keystroke.
-  String get searchText => _searchText ??=
-      '$name\u0000$relativePath\u0000${tags.join(' ')}'.toLowerCase();
+  /// The three fields a query can name, folded to lowercase once on first
+  /// use. Search used to lowercase all three for every asset on every
+  /// keystroke.
+  String get searchName => _searchName ??= name.toLowerCase();
+  String get searchPath => _searchPath ??= relativePath.toLowerCase();
+  String get searchTags => _searchTags ??= tags.join(' ').toLowerCase();
+
+  /// All three at once, for a plain word. The NUL separators are what stop a
+  /// term straddling two fields and matching something that is in neither.
+  String get searchText =>
+      _searchText ??= '$searchName\u0000$searchPath\u0000$searchTags';
+
+  /// The text a query sees for one field. Mirrors row_search_values in
+  /// atlas_mcp.py, field for field.
+  String queryValue(String field) => switch (field) {
+    'name' => searchName,
+    'path' => searchPath,
+    'tag' => searchTags,
+    'type' => effectiveType,
+    'ext' => ext.toLowerCase(),
+    'rig' => rigFamily ?? '',
+    _ => searchText,
+  };
 }
 
 class ScanResult {
@@ -11470,10 +19001,17 @@ class ScanStatus {
 }
 
 class PersistedCatalog {
-  const PersistedCatalog({required this.assets, required this.sourceRoots});
+  const PersistedCatalog({
+    required this.assets,
+    required this.sourceRoots,
+    this.rigBones = const {},
+  });
 
   final List<AssetItem> assets;
   final Set<String> sourceRoots;
+
+  /// The bone names behind each rig signature the assets refer to.
+  final Map<String, List<String>> rigBones;
 }
 
 class AssetAtlasDatabase {
@@ -11489,7 +19027,20 @@ class AssetAtlasDatabase {
   ///        file no longer orphans it from projects and ignore flags
   ///   v4 - model_kind, cached FBX classification (mesh vs animation-only)
   ///   v5 - referenced_by_model, images a model was found to use
-  static const schemaVersion = 7;
+  ///   v6 - settings
+  ///   v7 - rig_family, the skeleton an FBX is built on
+  ///   v8 - rig_signature per asset, and rig_bones: the bone names behind
+  ///        each signature, stored once per rig rather than once per file
+  static const schemaVersion = 8;
+
+  /// Created identically by the v8 upgrade and by a fresh install.
+  static const _rigBonesTable = '''
+    CREATE TABLE IF NOT EXISTS rig_bones (
+      signature TEXT PRIMARY KEY,
+      bone_count INTEGER NOT NULL,
+      bones_json TEXT NOT NULL
+    )
+  ''';
 
   /// Indexes are created identically by [_createSchema] and by the v2 upgrade
   /// so a fresh install and an upgraded install converge; see
@@ -11502,6 +19053,20 @@ class AssetAtlasDatabase {
     'CREATE INDEX IF NOT EXISTS idx_project_assets_project '
         'ON project_assets(project_id)',
   ];
+
+  /// Where the catalog ended up, once [initialize] has run.
+  ///
+  /// Kept because other things belong beside it -- atlas_bridge.json, and
+  /// the embedding store the tagging queue writes. Re-deriving the support
+  /// directory would be right in production and wrong under the test seam
+  /// below, which is exactly the kind of divergence that is invisible until
+  /// a test writes into the real one.
+  String? catalogPath;
+
+  String? get catalogDirectory {
+    final resolved = catalogPath;
+    return resolved == null ? null : File(resolved).parent.path;
+  }
 
   /// [databasePath] is a test seam; production passes nothing and the database
   /// lives in the app support directory.
@@ -11517,6 +19082,7 @@ class AssetAtlasDatabase {
       dbPath =
           '${supportDir.path}${Platform.pathSeparator}asset_atlas_native.db';
     }
+    catalogPath = dbPath;
     _db = await databaseFactory.openDatabase(
       dbPath,
       options: OpenDatabaseOptions(
@@ -11554,6 +19120,12 @@ class AssetAtlasDatabase {
             )
             ''');
           }
+          if (oldVersion < 8) {
+            await db.execute(
+              'ALTER TABLE catalog_assets ADD COLUMN rig_signature TEXT',
+            );
+            await db.execute(_rigBonesTable);
+          }
         },
         onCreate: (db, _) async {
           await db.execute('''
@@ -11572,9 +19144,11 @@ class AssetAtlasDatabase {
               ignored INTEGER NOT NULL DEFAULT 0,
               model_kind TEXT,
               rig_family TEXT,
+              rig_signature TEXT,
               referenced_by_model INTEGER NOT NULL DEFAULT 0
             )
           ''');
+          await db.execute(_rigBonesTable);
           await db.execute('''
             CREATE TABLE catalog_sources (
               root_path TEXT PRIMARY KEY
@@ -11659,6 +19233,7 @@ class AssetAtlasDatabase {
         ignored: (row['ignored'] as int) == 1,
         modelKind: row['model_kind'] as String?,
         rigFamily: row['rig_family'] as String?,
+        rigSignature: row['rig_signature'] as String?,
         referencedByModel: (row['referenced_by_model'] as int? ?? 0) == 1,
       );
     }).toList();
@@ -11688,7 +19263,11 @@ class AssetAtlasDatabase {
       fbxLog('Dropped ${stale.length} AppleDouble entries from the catalog.');
     }
 
-    return PersistedCatalog(assets: assets, sourceRoots: sourceRoots);
+    return PersistedCatalog(
+      assets: assets,
+      sourceRoots: sourceRoots,
+      rigBones: await loadRigBones(),
+    );
   }
 
   /// Rebuilds every asset id in the content-independent v2 format and
@@ -11784,6 +19363,17 @@ class AssetAtlasDatabase {
     'tags_json': jsonEncode(asset.tags),
     'ignored': asset.ignored ? 1 : 0,
     'model_kind': asset.modelKind,
+    // Was missing, and saveCatalog deletes every row before reinserting --
+    // so each save wrote NULL over the whole column. The read at
+    // _assetFromRow and the per-row write at the lazy classifier both
+    // handled it, which is why it looked like it worked: a rig read for one
+    // filter survived until the next scan and then vanished, taking
+    // backfill_rigs.py's 34,801 answers with it. That is the "a rescan
+    // empties rig_family" everyone had learned to expect.
+    'rig_family': asset.rigFamily,
+    // Saved for the same reason rig_family is: saveCatalog replaces every
+    // row, so a column it forgets is a column the next scan empties.
+    'rig_signature': asset.rigSignature,
     'referenced_by_model': asset.referencedByModel ? 1 : 0,
   };
 
@@ -11858,13 +19448,43 @@ class AssetAtlasDatabase {
         final decoded = FbxClassification.decode(entry.value);
         batch.update(
           'catalog_assets',
-          {'model_kind': decoded.kind, 'rig_family': decoded.rig},
+          {
+            'model_kind': decoded.kind,
+            'rig_family': decoded.rig,
+            'rig_signature': decoded.signature,
+          },
           where: 'id = ?',
           whereArgs: [entry.key],
         );
+        // The names go in once per rig. `IGNORE` rather than `REPLACE`: a
+        // signature is the hash of exactly these names, so a row that is
+        // already there says the same thing, and rewriting it would be
+        // thousands of pointless writes on a backfill.
+        if (decoded.signature != null && decoded.bones.isNotEmpty) {
+          batch.insert('rig_bones', {
+            'signature': decoded.signature,
+            'bone_count': decoded.bones.length,
+            'bones_json': jsonEncode(decoded.bones),
+          }, conflictAlgorithm: ConflictAlgorithm.ignore);
+        }
       }
       await batch.commit(noResult: true);
     });
+  }
+
+  /// The bone names behind every signature the catalog knows.
+  ///
+  /// A few dozen rows: 224 clips sampled across this library hold 12 distinct
+  /// rigs, 800 characters hold 42. Read once when the catalog opens.
+  Future<Map<String, List<String>>> loadRigBones() async {
+    await initialize();
+    final rows = await _db!.query('rig_bones');
+    return {
+      for (final row in rows)
+        row['signature'] as String:
+            (jsonDecode(row['bones_json'] as String) as List<dynamic>)
+                .cast<String>(),
+    };
   }
 
   /// Records that a model uses these images, so they read as textures rather
@@ -12078,6 +19698,707 @@ class PersistedProject {
   final String name;
   final String? rootPath;
   final int createdMs;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ---------------------------------------------------------------------------
+// The MCP bridge
+// ---------------------------------------------------------------------------
+
+/// A loopback HTTP server that answers questions only the running app can.
+///
+/// The MCP server reads the catalog directly and answers most questions from
+/// it, but three of them are not in the database: whether a model's textures
+/// actually resolve, whether a file is one model or a sheet of twelve, and
+/// whether a clip will drive a given character. Atlas computes all of that,
+/// here, in this file -- the texture scoring, [objectSlotsOf], the rig
+/// comparison -- and restating any of it in Python would be two copies of
+/// load-bearing logic drifting apart, which is what the `attachPoints` guard
+/// test in `test_atlas_mcp.py` exists to catch.
+///
+/// So the MCP asks the app instead. The cost is that those tools need Atlas
+/// open; the catalog tools go on working without it.
+///
+/// Loopback only, and a token the caller has to echo back: any process on this
+/// machine can reach a listening socket, and this one loads and rasterises
+/// files on request.
+class AtlasBridge {
+  AtlasBridge._();
+
+  static final instance = AtlasBridge._();
+
+  HttpServer? _server;
+  String _token = '';
+  File? _descriptor;
+  List<AssetItem> Function()? _catalog;
+
+  bool get running => _server != null;
+  int? get port => _server?.port;
+
+  /// Where the app's live asset list comes from.
+  ///
+  /// A supplier rather than a copy: the list changes as scans finish, and a
+  /// stale snapshot would answer texture and attachment questions against a
+  /// library that no longer matches the one on screen.
+  void bindCatalog(List<AssetItem> Function() supplier) {
+    _catalog = supplier;
+  }
+
+  List<AssetItem> get _assets => _catalog?.call() ?? const [];
+
+  Future<void> start({Directory? descriptorDirectory}) async {
+    if (_server != null) return;
+    final random = math.Random.secure();
+    _token = List<int>.generate(24, (_) => random.nextInt(256))
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
+
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _server = server;
+
+    final directory =
+        descriptorDirectory ?? await getApplicationSupportDirectory();
+    _descriptor = File(
+      '${directory.path}${Platform.pathSeparator}$atlasBridgeFileName',
+    );
+    try {
+      _descriptor!.writeAsStringSync(
+        jsonEncode({
+          'port': server.port,
+          'token': _token,
+          'version': appVersion,
+          'pid': pid,
+          'started': DateTime.now().toIso8601String(),
+        }),
+      );
+    } catch (error) {
+      // A bridge nobody can find is no reason to fail startup: the app's own
+      // job is unaffected.
+      fbxLog('Bridge descriptor could not be written: $error');
+    }
+
+    server.listen(
+      _handle,
+      onError: (Object error) => fbxLog('Bridge listen error: $error'),
+      cancelOnError: false,
+    );
+    fbxLog('MCP bridge listening on 127.0.0.1:${server.port}');
+  }
+
+  Future<void> stop() async {
+    final server = _server;
+    _server = null;
+    final descriptor = _descriptor;
+    _descriptor = null;
+    if (descriptor != null) {
+      try {
+        if (descriptor.existsSync()) descriptor.deleteSync();
+      } catch (_) {
+        // Leaving a stale descriptor behind is survivable: the port will
+        // refuse the connection and the client says Atlas is not running.
+      }
+    }
+    await server?.close(force: true);
+  }
+
+  Future<void> _handle(HttpRequest request) async {
+    final response = request.response;
+    response.headers.contentType = ContentType.json;
+    try {
+      if (request.headers.value(atlasBridgeTokenHeader) != _token) {
+        response.statusCode = HttpStatus.forbidden;
+        response.write(jsonEncode({'error': 'Bad or missing bridge token.'}));
+        return;
+      }
+
+      final route = request.uri.path;
+      if (route == '/health') {
+        response.write(
+          jsonEncode({
+            'version': appVersion,
+            'assets': _assets.length,
+            'pid': pid,
+          }),
+        );
+        return;
+      }
+
+      final body = await utf8.decoder.bind(request).join();
+      final payload = body.trim().isEmpty
+          ? const <String, Object?>{}
+          : (jsonDecode(body) as Map<String, Object?>);
+
+      final Map<String, Object?> answer;
+      switch (route) {
+        case '/inspect':
+          answer = await bridgeInspect(payload, _assets);
+        case '/rig_compat':
+          answer = await bridgeRigCompat(payload, _assets);
+        case '/render':
+          answer = await bridgeRender(payload, _assets);
+        default:
+          response.statusCode = HttpStatus.notFound;
+          response.write(jsonEncode({'error': 'No route $route.'}));
+          return;
+      }
+      response.write(jsonEncode(answer));
+    } on BridgeRequestException catch (error) {
+      response.statusCode = HttpStatus.badRequest;
+      response.write(jsonEncode({'error': error.message}));
+    } catch (error) {
+      response.statusCode = HttpStatus.internalServerError;
+      response.write(jsonEncode({'error': '$error'}));
+    } finally {
+      try {
+        await response.close();
+      } catch (_) {
+        // The client hung up; nothing left to say.
+      }
+    }
+  }
+}
+
+/// The file Atlas drops its port and token into, beside the catalog database.
+const atlasBridgeFileName = 'atlas_bridge.json';
+
+/// The header the caller echoes its token back in.
+const atlasBridgeTokenHeader = 'X-Atlas-Token';
+
+/// Something the caller asked for that cannot be answered, as opposed to a
+/// fault in answering it. Becomes a 400 and a sentence, not a stack trace.
+class BridgeRequestException implements Exception {
+  const BridgeRequestException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// JSON cannot carry an infinity or a NaN, and two of these measurements are
+/// legitimately both: [rigAxisDifference] returns infinity for "no comparison
+/// possible", and an empty mesh has no bounds. Null says that honestly.
+Object? _jsonNumber(double value) => value.isFinite ? value : null;
+
+/// Finds the one asset a request means.
+///
+/// Exact path first, then a path ending, then a unique name. A name that
+/// matches several files is an error rather than a guess -- picking the first
+/// of eleven `SM_Door_01.fbx` would answer confidently about the wrong file.
+int? _catalogByIdIdentity;
+Map<String, AssetItem>? _catalogByIdCache;
+
+/// The catalog keyed on asset id.
+///
+/// [bridgeFindAsset] accepts an id as well as a path, and the path half is
+/// already answered by [_catalogByNormalizedPath] -- which the render path
+/// builds anyway, so during a tagging pass this is the only new map. Keeping
+/// a second copy of the normalized paths here would have cost another 20 MB
+/// and another half-second to build, to answer a question already answered.
+///
+/// No normalizing: an id is compared verbatim, because that is what the walk
+/// this replaced did.
+Map<String, AssetItem> _catalogById(List<AssetItem> assets) {
+  final identity = identityHashCode(assets) ^ assets.length;
+  final cached = _catalogByIdCache;
+  if (cached != null && _catalogByIdIdentity == identity) return cached;
+  final byId = <String, AssetItem>{};
+  for (final asset in assets) {
+    byId.putIfAbsent(asset.id, () => asset);
+  }
+  _catalogByIdIdentity = identity;
+  _catalogByIdCache = byId;
+  return byId;
+}
+
+AssetItem bridgeFindAsset(
+  String? needle,
+  List<AssetItem> assets, {
+  bool byScan = false,
+}) {
+  final wanted = (needle ?? '').trim();
+  if (wanted.isEmpty) {
+    throw const BridgeRequestException('No path given.');
+  }
+  if (assets.isEmpty) {
+    throw const BridgeRequestException(
+      'Atlas has no catalog loaded yet. Wait for it to finish opening.',
+    );
+  }
+
+  final key = normalizePathKey(wanted);
+  if (byScan) {
+    // The walk the index replaced, kept so the two can be compared: a test
+    // holds them to the same answer and a benchmark to the same question.
+    for (final asset in assets) {
+      if (normalizePathKey(asset.path) == key) return asset;
+      if (asset.id == wanted) return asset;
+    }
+  } else {
+    // Two lookups because the loop asked two different questions: the path
+    // compared normalized, the id verbatim.
+    final byPath = _catalogByNormalizedPath(assets)[key];
+    final byId = _catalogById(assets)[wanted];
+    if (byPath != null && byId != null && !identical(byPath, byId)) {
+      // A needle that is one asset's id and a *different* asset's path. The
+      // walk returned whichever of them came first in the catalog, and two
+      // maps cannot say which that is -- so this one case pays for a walk,
+      // which is right for something that takes an id shaped like a path.
+      for (final asset in assets) {
+        if (identical(asset, byPath) || identical(asset, byId)) return asset;
+      }
+    }
+    final either = byPath ?? byId;
+    if (either != null) return either;
+  }
+
+  final suffixed = <AssetItem>[];
+  final named = <AssetItem>[];
+  final lowerName = wanted.toLowerCase();
+  for (final asset in assets) {
+    if (normalizePathKey(asset.path).endsWith(key)) suffixed.add(asset);
+    if (asset.name.toLowerCase() == lowerName) named.add(asset);
+  }
+  for (final candidates in [suffixed, named]) {
+    if (candidates.length == 1) return candidates.first;
+    if (candidates.length > 1) {
+      final sample = candidates
+          .take(4)
+          .map((a) => a.path)
+          .join('\n  ');
+      throw BridgeRequestException(
+        '$wanted matches ${candidates.length} assets. Give a full path. '
+        'For example:\n  $sample',
+      );
+    }
+  }
+  throw BridgeRequestException('Nothing in the catalog matches $wanted.');
+}
+
+/// What a material asks for and what it got.
+Map<String, Object?> _materialReport(MeshMaterial material) {
+  final textured = material.textureWidth > 0 && material.textureHeight > 0;
+  final resolved = material.resolvedTextures
+      .where((reference) => reference.trim().isNotEmpty)
+      .toList();
+  final missing = material.texturesMissing
+      ? material.textures.where((t) => t.trim().isNotEmpty).toList()
+      : const <String>[];
+  return {
+    'name': material.name,
+    'summary': textured
+        ? materialSummaryLine(
+            material,
+            width: material.textureWidth,
+            height: material.textureHeight,
+          )
+        : materialSummaryLine(material),
+    'textured': textured,
+    'asks': material.textures,
+    'resolved': resolved,
+    'missing': missing,
+    'normalMap': material.hasNormalMap,
+    'emissiveMap': material.hasEmissiveMap,
+    'uvSet': material.uvSet,
+  };
+}
+
+/// The archive a zipped asset lives in, by name. Null for a loose file.
+///
+/// Not [assetContainerKey], which is normalised for comparison -- lowercased,
+/// separators folded -- and so is the wrong thing to show anyone. This is the
+/// name as it reads on disk, and for these packs the archive *is* the pack.
+String? bridgeArchiveName(AssetItem asset) {
+  final zip = parseZipVirtualPath(asset.path);
+  if (zip == null) return null;
+  return zip.zipPath.split(_pathSeparatorPattern).last;
+}
+
+/// Whether this file is one model, a sheet of several, or a kit of parts.
+///
+/// The three cases need different handling downstream and nothing in the file
+/// name distinguishes them, which is why a model asking "can I use this" has
+/// to be told which it is. See [materialsAreStackedVariants] and
+/// [modelIsModularKit] for how each is decided.
+String bridgeModelShape(MeshModel mesh) {
+  if (mesh.isAnimationOnly) return 'animation';
+  if (objectsAreStackedVariants(mesh) || materialsAreStackedVariants(mesh)) {
+    return 'sheet';
+  }
+  if (modelIsModularKit(mesh)) return 'kit';
+  return 'model';
+}
+
+/// Everything the app knows about one model, as JSON.
+Future<Map<String, Object?>> bridgeInspect(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final asset = bridgeFindAsset(payload['path'] as String?, assets);
+  if (asset.effectiveType != 'model' && asset.effectiveType != 'animation') {
+    throw BridgeRequestException(
+      '${asset.name} is a ${asset.effectiveType}, not a model. '
+      'inspect_model reads geometry.',
+    );
+  }
+
+  final mesh = await loadMesh(asset, allAssets: assets);
+  final shape = bridgeModelShape(mesh);
+  final framing = framingOf(mesh);
+
+  var minX = double.infinity, minY = double.infinity, minZ = double.infinity;
+  var maxX = -double.infinity, maxY = -double.infinity, maxZ = -double.infinity;
+  for (final vertex in mesh.vertices) {
+    minX = math.min(minX, vertex.x);
+    minY = math.min(minY, vertex.y);
+    minZ = math.min(minZ, vertex.z);
+    maxX = math.max(maxX, vertex.x);
+    maxY = math.max(maxY, vertex.y);
+    maxZ = math.max(maxZ, vertex.z);
+  }
+
+  // The viewer fits every model into the same box, so the drawn size says
+  // nothing about how big the thing is. The framing scale undoes that, and is
+  // the only way to answer "what units is this in" -- which decides whether a
+  // prop arrives in an Unreal level a hundred times too big.
+  final authoredSize = framing == null || framing.scale <= 0
+      ? null
+      : [
+          (maxX - minX) / framing.scale,
+          (maxY - minY) / framing.scale,
+          (maxZ - minZ) / framing.scale,
+        ];
+
+  final slots = objectSlotsOf(mesh);
+  final warnings = <String>[];
+  var missingTextures = 0;
+  var resolvedTextures = 0;
+  for (final material in mesh.materials) {
+    if (material.texturesMissing) {
+      missingTextures += 1;
+    } else if (material.textureWidth > 0) {
+      resolvedTextures += 1;
+    }
+  }
+  if (missingTextures > 0) {
+    warnings.add(
+      '$missingTextures of ${mesh.materials.length} materials ask for a '
+      'texture that is not in the library. They draw flat.',
+    );
+  }
+  if (shape == 'sheet') {
+    warnings.add(
+      'This file is several whole models standing in the same place, not one '
+      'model. Imported whole they interpenetrate. Take it apart by object.',
+    );
+  }
+  if (shape == 'kit') {
+    warnings.add(
+      'This file is a kit: ${slots.length} slots of interchangeable parts, '
+      'all stacked at their joints. Draw one variant per slot, not all.',
+    );
+  }
+  if (authoredSize == null && asset.ext == 'obj') {
+    warnings.add(
+      'OBJ carries no units. These packs ship OBJ in centimetres beside an '
+      'FBX in metres, so prefer the FBX twin if there is one.',
+    );
+  }
+  if (authoredSize == null && asset.ext == 'stl') {
+    warnings.add(
+      'STL carries no units, no UVs and no materials -- only triangles. It '
+      'is a 3D-printing format, and these kits ship an FBX or OBJ twin '
+      'beside it; prefer that for anything that needs texturing.',
+    );
+  }
+
+  final skeleton = mesh.skeleton;
+  final rigFamily = skeleton == null
+      ? rigFamilyByName(asset.rigFamily)
+      : rigFamilyOfSkeleton(skeleton);
+
+  return {
+    'name': asset.name,
+    'path': asset.path,
+    'container': assetContainerKey(asset),
+    'archive': bridgeArchiveName(asset),
+    'pack': asset.sourceName,
+    'ext': asset.ext,
+    'size': asset.size,
+    'shape': shape,
+    'kind': mesh.isAnimationOnly ? 'animation' : 'mesh',
+    'vertices': mesh.vertices.length,
+    'faces': mesh.faces.length,
+    'objects': mesh.objectNames.length,
+    'objectNames': mesh.objectNames.take(40).toList(),
+    'bounds': mesh.vertices.isEmpty
+        ? null
+        : {
+            'min': [
+              _jsonNumber(minX),
+              _jsonNumber(minY),
+              _jsonNumber(minZ),
+            ],
+            'max': [
+              _jsonNumber(maxX),
+              _jsonNumber(maxY),
+              _jsonNumber(maxZ),
+            ],
+          },
+    'authoredSize': authoredSize?.map(_jsonNumber).toList(),
+    'framingScale': framing == null ? null : _jsonNumber(framing.scale),
+    'materials': [for (final m in mesh.materials) _materialReport(m)],
+    'texturesResolved': resolvedTextures,
+    'texturesMissing': missingTextures,
+    'rig': {
+      'family': rigFamily.name,
+      'label': rigFamily.label,
+      'bones': skeleton?.bones.length ?? mesh.boneCount,
+      'skinned': mesh.skin != null,
+      'frames': skeleton?.frameCount ?? 0,
+      'durationSeconds': _jsonNumber(mesh.durationSeconds),
+      'clips': mesh.animationNames,
+    },
+    'slots': [
+      for (final slot in slots)
+        {
+          'key': slot.key,
+          'label': slotDisplayName(slot.key),
+          'variants': slot.objects.length,
+        },
+    ],
+    'attachments': [
+      for (final candidate in findAttachmentCandidates(
+        character: asset,
+        allAssets: assets,
+      ).take(60))
+        {
+          'name': candidate.name,
+          'path': candidate.path,
+          'point': attachPointFor(candidate.name)?.name,
+        },
+    ],
+    'textureVariants': [
+      for (final variant in findTextureVariants(
+        mesh: mesh,
+        model: asset,
+        allAssets: assets,
+      ))
+        {'name': variant.name, 'path': variant.path},
+    ],
+    'warnings': warnings,
+  };
+}
+
+/// Whether a clip will drive a character, and how well.
+Future<Map<String, Object?>> bridgeRigCompat(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final character = bridgeFindAsset(payload['character'] as String?, assets);
+  final clip = bridgeFindAsset(payload['clip'] as String?, assets);
+
+  final characterMesh = await loadMesh(character, allAssets: assets);
+  final clipMesh = await loadMesh(clip, allAssets: assets);
+
+  final characterRig = characterMesh.skeleton;
+  final clipRig = clipMesh.skeleton;
+  if (characterRig == null) {
+    throw BridgeRequestException(
+      '${character.name} has no skeleton, so nothing can animate it.',
+    );
+  }
+  if (clipRig == null) {
+    throw BridgeRequestException(
+      '${clip.name} carries no skeleton or motion, so it is not a clip.',
+    );
+  }
+
+  final characterFamily = rigFamilyOfSkeleton(characterRig);
+  final clipFamily = rigFamilyOfSkeleton(clipRig);
+  final shared = rigBoneOverlap(characterRig, clipRig);
+  final compatible = rigFamiliesCompatible(characterFamily, clipFamily);
+  final difference = rigAxisDifference(characterRig, clipRig);
+
+  final String verdict;
+  if (!compatible) {
+    verdict =
+        'No. ${characterFamily.label} and ${clipFamily.label} are different '
+        'rigs; they share $shared bones.';
+  } else if (!rigMatch(characterRig, clipRig)) {
+    verdict =
+        'No. Only $shared of ${characterRig.bones.length} bones in common, '
+        'too few to drive this character.';
+  } else if (!difference.isFinite) {
+    verdict = 'Probably not: the rigs cannot be compared in their rest poses.';
+  } else if (difference < 5) {
+    verdict =
+        'Yes. $shared shared bones and rest poses agree to '
+        '${difference.toStringAsFixed(1)} degrees.';
+  } else {
+    verdict =
+        'Playable, but the rest poses differ by '
+        '${difference.toStringAsFixed(1)} degrees over $shared shared bones, '
+        'so expect the limbs to sit wrong unless Atlas retargets it.';
+  }
+
+  return {
+    'character': {
+      'name': character.name,
+      'path': character.path,
+      'family': characterFamily.name,
+      'label': characterFamily.label,
+      'bones': characterRig.bones.length,
+    },
+    'clip': {
+      'name': clip.name,
+      'path': clip.path,
+      'family': clipFamily.name,
+      'label': clipFamily.label,
+      'bones': clipRig.bones.length,
+      'frames': clipRig.frameCount,
+      'durationSeconds': _jsonNumber(clipMesh.durationSeconds),
+    },
+    'sharedBones': shared,
+    'familiesCompatible': compatible,
+    'restPoseDifferenceDegrees': _jsonNumber(difference),
+    'willPlay': compatible && rigMatch(characterRig, clipRig),
+    'verdict': verdict,
+  };
+}
+
+/// Draws a model and hands back a PNG.
+///
+/// The rasteriser is the viewer's own ([rasterizeMesh], pure and synchronous),
+/// so the picture a model is shown is the picture a person would see. A kit is
+/// drawn one variant per slot rather than every part at once, for the same
+/// reason the viewer does it: all of them together is an unreadable pile.
+/// A drawn asset: the picture, and what went into it.
+class RenderedAsset {
+  const RenderedAsset({
+    required this.asset,
+    required this.mesh,
+    required this.raster,
+    required this.png,
+  });
+
+  final AssetItem asset;
+  final MeshModel mesh;
+  final RasterResult raster;
+  final Uint8List png;
+}
+
+/// Draw one asset. The single place a picture of a model is produced.
+///
+/// Both callers matter and they have to agree. The bridge answers
+/// `render_asset` with this, and the visual tagging queue embeds it -- and
+/// the embedding is only meaningful if what was embedded is what the app
+/// shows. One function is the only way to be sure of that; two that are
+/// meant to match would drift the first time either was tuned.
+Future<RenderedAsset> renderAsset(
+  AssetItem asset, {
+  required List<AssetItem> allAssets,
+  int size = 512,
+  double yaw = 0.6,
+  double pitch = 0.35,
+  double zoom = 1.0,
+}) async {
+  if (size < 64 || size > 2048) {
+    throw const BridgeRequestException('size must be between 64 and 2048.');
+  }
+
+  final mesh = await loadMesh(asset, allAssets: allAssets);
+  if (mesh.faces.isEmpty) {
+    throw BridgeRequestException(
+      '${asset.name} has no geometry to draw'
+      '${mesh.isAnimationOnly ? ": it is an animation." : "."}',
+    );
+  }
+
+  final slots = objectSlotsOf(mesh);
+  final hidden = modelIsModularKit(mesh)
+      ? hiddenObjectsFor(
+          objectCount: mesh.objectNames.length,
+          slots: slots,
+          choice: List<int>.filled(slots.length, 0),
+        )
+      : null;
+
+  // On a worker isolate even for a small model. [rasterizeMesh] is
+  // synchronous, and both callers run on the isolate that draws the window:
+  // a mech rasterised in place freezes Atlas for as long as it takes, in
+  // front of a user who did not ask for a picture and cannot see why it
+  // stopped. It matters more for the queue, which draws 31,000 of them.
+  final raster = await rasterizeSceneInIsolate(
+    RasterRequest(
+      scene: RasterScene.fromMesh(mesh),
+      yaw: yaw,
+      pitch: pitch,
+      zoom: zoom,
+      width: size,
+      height: size,
+      renderMode: RenderMode.textured,
+      lightingMode: LightingMode.corner,
+      cullBackFaces: true,
+      hiddenObjects: hidden,
+    ),
+  );
+
+  final image = img.Image.fromBytes(
+    width: raster.width,
+    height: raster.height,
+    bytes: raster.pixels.buffer,
+    numChannels: 4,
+  );
+  return RenderedAsset(
+    asset: asset,
+    mesh: mesh,
+    raster: raster,
+    png: Uint8List.fromList(img.encodePng(image)),
+  );
+}
+
+Future<Map<String, Object?>> bridgeRender(
+  Map<String, Object?> payload,
+  List<AssetItem> assets,
+) async {
+  final drawn = await renderAsset(
+    bridgeFindAsset(payload['path'] as String?, assets),
+    allAssets: assets,
+    size: (payload['size'] as num?)?.toInt() ?? 512,
+    yaw: (payload['yaw'] as num?)?.toDouble() ?? 0.6,
+    pitch: (payload['pitch'] as num?)?.toDouble() ?? 0.35,
+    zoom: (payload['zoom'] as num?)?.toDouble() ?? 1.0,
+  );
+  final raster = drawn.raster;
+
+  return {
+    'name': drawn.asset.name,
+    'path': drawn.asset.path,
+    'width': raster.width,
+    'height': raster.height,
+    'drawnFaces': raster.drawnFaces,
+    'totalFaces': raster.totalFaces,
+    // Not RasterResult.capped, which is true whenever any face went undrawn
+    // -- including the back half of every closed model, culled on purpose.
+    // Reported as "capped" that reads as a truncated mesh, which would have
+    // the caller distrust a picture of the whole thing.
+    'capped': raster.totalFaces > maxRenderedFaces,
+    'faceLimit': maxRenderedFaces,
+    'shape': bridgeModelShape(drawn.mesh),
+    'png': base64Encode(drawn.png),
+  };
 }
 
 

@@ -1,0 +1,295 @@
+{
+  "_comment": [
+    "The search grammar, as data, so Dart and Python cannot drift apart.",
+    "Read by test_atlas_mcp.py (QueryGrammarTest) and by the Flutter app's",
+    "test/search_terms_test.dart. A change here must make both suites agree.",
+    "",
+    "parse: query -> clauses, where clauses are ANDed and the terms inside one",
+    "clause are ORed. A term is [field, value]; value is already lowercased.",
+    "error_contains marks a query that must be rejected, and names a word the",
+    "message has to carry so the message stays useful without being frozen.",
+    "",
+    "match: query + a synthetic asset -> whether it is a hit."
+  ],
+
+  "fields": ["any", "name", "path", "tag", "type", "ext", "rig"],
+  "exact_fields": ["type", "ext", "rig"],
+  "reserved_fields": ["look"],
+
+  "parse": [
+    {"why": "a bare word searches everything",
+     "query": "dog", "clauses": [[["any", "dog"]]]},
+
+    {"why": "spaces are and",
+     "query": "dog house", "clauses": [[["any", "dog"]], [["any", "house"]]]},
+
+    {"why": "case folds",
+     "query": "DoG", "clauses": [[["any", "dog"]]]},
+
+    {"why": "runs of whitespace collapse",
+     "query": "  dog   house  ",
+     "clauses": [[["any", "dog"]], [["any", "house"]]]},
+
+    {"why": "empty is no constraint, not an error",
+     "query": "", "clauses": []},
+    {"why": "whitespace only is no constraint",
+     "query": "   ", "clauses": []},
+
+    {"why": "a field scopes the term to that field alone",
+     "query": "name=dog", "clauses": [[["name", "dog"]]]},
+
+    {"why": "the field name folds too",
+     "query": "NAME=Dog", "clauses": [[["name", "dog"]]]},
+
+    {"why": "every field is reachable",
+     "query": "tag=grungy path=synty type=model ext=fbx rig=polygon",
+     "clauses": [[["tag", "grungy"]], [["path", "synty"]],
+                 [["type", "model"]], [["ext", "fbx"]],
+                 [["rig", "polygon"]]]},
+
+    {"why": "a leading dot on an extension is noise",
+     "query": "ext=.FBX", "clauses": [[["ext", "fbx"]]]},
+
+    {"why": "backslashes in a path term read as forward slashes",
+     "query": "path=Synty\\Models", "clauses": [[["path", "synty/models"]]]},
+
+    {"why": "fields and bare words mix",
+     "query": "tag=grungy barrel",
+     "clauses": [[["tag", "grungy"]], [["any", "barrel"]]]},
+
+    {"why": "and is a noise word, for people who type it",
+     "query": "tag=grungy and name=dog",
+     "clauses": [[["tag", "grungy"]], [["name", "dog"]]]},
+
+    {"why": "or joins the terms either side into one clause",
+     "query": "name=dog or name=cat",
+     "clauses": [[["name", "dog"], ["name", "cat"]]]},
+
+    {"why": "or chains",
+     "query": "name=dog or name=cat or name=bird",
+     "clauses": [[["name", "dog"], ["name", "cat"], ["name", "bird"]]]},
+
+    {"why": "or binds tighter than a space, so this is (a or b) and c",
+     "query": "name=dog or name=cat tag=grungy",
+     "clauses": [[["name", "dog"], ["name", "cat"]], [["tag", "grungy"]]]},
+
+    {"why": "and after an or ends the or group",
+     "query": "name=dog or name=cat and tag=grungy",
+     "clauses": [[["name", "dog"], ["name", "cat"]], [["tag", "grungy"]]]},
+
+    {"why": "or works on bare words too",
+     "query": "dog or cat", "clauses": [[["any", "dog"], ["any", "cat"]]]},
+
+    {"why": "a quoted value keeps its spaces",
+     "query": "name=\"rubbish bin\"", "clauses": [[["name", "rubbish bin"]]]},
+
+    {"why": "a quoted bare term keeps its spaces",
+     "query": "\"rubbish bin\"", "clauses": [[["any", "rubbish bin"]]]},
+
+    {"why": "single quotes work the same",
+     "query": "name='rubbish bin'", "clauses": [[["name", "rubbish bin"]]]},
+
+    {"why": "quoting makes a field name literal",
+     "query": "\"name=dog\"", "clauses": [[["any", "name=dog"]]]},
+
+    {"why": "quoting makes or literal",
+     "query": "\"or\"", "clauses": [[["any", "or"]]]},
+
+    {"why": "an = inside a value is kept, so only the first splits",
+     "query": "name=a=b", "clauses": [[["name", "a=b"]]]},
+
+    {"why": "a word containing = is a field, right or wrong: no silent fallback",
+     "query": "a=b", "error_contains": "a"},
+
+    {"why": "a type value outside the vocabulary is refused, not emptied",
+     "query": "type=mod", "error_contains": "mod"},
+    {"why": "and the refusal lists the types there are",
+     "query": "type=mod", "error_contains": "texture"},
+
+    {"why": "an unknown field is named, not ignored",
+     "query": "colour=red", "error_contains": "colour"},
+
+    {"why": "the error lists what is available",
+     "query": "colour=red", "error_contains": "name"},
+
+    {"why": "an empty field is an error, not a bare term",
+     "query": "=dog", "error_contains": "="},
+
+    {"why": "an empty value is an error, because it would match everything",
+     "query": "name=", "error_contains": "name"},
+
+    {"why": "an empty quoted value is an error for the same reason",
+     "query": "name=\"\"", "error_contains": "name"},
+
+    {"why": "a dangling or has nothing to join",
+     "query": "name=dog or", "error_contains": "or"},
+
+    {"why": "a leading or has nothing to join",
+     "query": "or name=dog", "error_contains": "or"},
+
+    {"why": "an unclosed quote is an error, not a silent truncation",
+     "query": "name=\"rubbish bin", "error_contains": "quote"},
+
+    {"why": "look is reserved and says why it cannot answer yet",
+     "query": "look=grungy", "error_contains": "look"},
+    {"why": "and names the pass it is waiting on",
+     "query": "look=grungy", "error_contains": "tagging"},
+    {"why": "reserved before anything else in the query is judged",
+     "query": "name=door look=grungy", "error_contains": "look"}
+  ],
+
+  "_animation_rule": [
+    "Whether an unprobed FBX reads as an animation clip. The probe is the",
+    "authority wherever it has spoken; this is for the rest, and after a",
+    "rescan that is all of them -- model_kind was 0 of 34,801.",
+    "",
+    "Measured against the probe on 100 sampled FBX: 98% precision, 100%",
+    "recall. The one miss was PolygonSyntyCharacter.fbx, the reference mesh",
+    "that ships inside the animation pack.",
+    "",
+    "Only directories are read, because every false positive in the library",
+    "is a filename (SM_Prop_Hunting_Animal_Head_01.fbx). `anim`/`anims` must",
+    "be a whole segment; `animation` may be a prefix."
+  ],
+
+  "animation_paths": [
+    {"why": "the folder that holds 784 of them",
+     "path": "Synty/Animations/Polygon/Feminine/A_Idle_Crouching_Femn.fbx",
+     "animation": true},
+    {"why": "the pack whose archive name says so, holding 721",
+     "path": "ANIMATION_Base_Locomotion_SourceFiles_v3.zip!/Masc/A_Run.fbx",
+     "animation": true},
+    {"why": "a suffixed folder still counts",
+     "path": "Dog/Animations_Sitting/_POLYGON_Dog_Action_Bark.fbx",
+     "animation": true},
+    {"why": "the short form, whole",
+     "path": "pack/Anim/Idle.fbx", "animation": true},
+    {"why": "and its plural",
+     "path": "pack/Anims/Idle.fbx", "animation": true},
+    {"why": "windows separators read the same",
+     "path": "Synty\\Animations\\Masc\\A_Run.fbx", "animation": true},
+    {"why": "a clip-named file inside the folder",
+     "path": "pack/Animations/Animations_IK.fbx", "animation": true},
+
+    {"why": "a collision hull ships beside the clips and is still a mesh",
+     "path": "ANIMATION_Base_Locomotion.zip!/Collision/SM_Obstacle_01.fbx",
+     "animation": false},
+    {"why": "an ordinary model",
+     "path": "Synty/Models/SM_Prop_Barrel_01.fbx", "animation": false},
+    {"why": "animal is not animation -- this was a real false positive",
+     "path": "Synty/Props/Animal_Pen.fbx", "animation": false},
+    {"why": "nor is an Animals folder",
+     "path": "Synty/Animals/Dog.fbx", "animation": false},
+    {"why": "nor a filename containing it",
+     "path": "Props/SM_Prop_Hunting_Animal_Head_01.fbx", "animation": false},
+    {"why": "nor this one, which is why only folders are read",
+     "path": "Chars/Unity_SK_Animals_Dog_01.fbx", "animation": false},
+    {"why": "a bare filename has no folders to go on",
+     "path": "A_Jump.fbx", "animation": false}
+  ],
+
+  "assets": {
+    "barrel": {
+      "name": "SM_Prop_Barrel_01.fbx",
+      "relative_path": "Synty/POLYGON_Western/Models/SM_Prop_Barrel_01.fbx",
+      "tags": ["model", "fbx", "prop", "barrel", "western", "grungy"],
+      "type": "model", "ext": "fbx", "rig": null
+    },
+    "hero": {
+      "name": "SK_Character_Hero.fbx",
+      "relative_path": "Synty/POLYGON_Western/Characters/SK_Character_Hero.fbx",
+      "tags": ["model", "fbx", "character", "hero"],
+      "type": "model", "ext": "fbx", "rig": "polygon"
+    },
+    "atlas": {
+      "name": "T_Western_01.png",
+      "relative_path": "Synty/POLYGON_Western/Textures/T_Western_01.png",
+      "tags": ["image", "png", "texture", "western"],
+      "type": "texture", "ext": "png", "rig": null
+    }
+  },
+
+  "match": [
+    {"why": "a bare word reaches the name", "query": "barrel",
+     "asset": "barrel", "matches": true},
+    {"why": "a bare word reaches the path", "query": "western",
+     "asset": "hero", "matches": true},
+    {"why": "a bare word reaches the tags", "query": "grungy",
+     "asset": "barrel", "matches": true},
+    {"why": "a bare word that is nowhere misses", "query": "cathedral",
+     "asset": "barrel", "matches": false},
+
+    {"why": "name= does not look in the path", "query": "name=characters",
+     "asset": "hero", "matches": false},
+    {"why": "name= does look in the name", "query": "name=hero",
+     "asset": "hero", "matches": true},
+    {"why": "name= is a substring, not a word", "query": "name=arrel",
+     "asset": "barrel", "matches": true},
+
+    {"why": "path= sees the filename too, because a path ends with it",
+     "query": "path=barrel_01", "asset": "barrel", "matches": true},
+    {"why": "but a folder is only in the path",
+     "query": "path=characters", "asset": "hero", "matches": true},
+    {"why": "path= does look in the path", "query": "path=models",
+     "asset": "barrel", "matches": true},
+
+    {"why": "tag= finds a tag", "query": "tag=grungy",
+     "asset": "barrel", "matches": true},
+    {"why": "tag= does not reach the name", "query": "tag=prop_barrel",
+     "asset": "barrel", "matches": false},
+    {"why": "tag= is a substring of one tag", "query": "tag=grun",
+     "asset": "barrel", "matches": true},
+    {"why": "a tag the asset lacks misses even if the name has it",
+     "query": "tag=sm_prop", "asset": "barrel", "matches": false},
+
+    {"why": "type= is exact", "query": "type=model",
+     "asset": "barrel", "matches": true},
+    {"why": "a type the asset is not", "query": "type=audio",
+     "asset": "barrel", "matches": false},
+    {"why": "type= sees the resolved type, not the stored one",
+     "query": "type=texture", "asset": "atlas", "matches": true},
+
+    {"why": "ext= is exact", "query": "ext=fbx",
+     "asset": "barrel", "matches": true},
+    {"why": "ext= does not prefix match", "query": "ext=fb",
+     "asset": "barrel", "matches": false},
+
+    {"why": "rig= is exact", "query": "rig=polygon",
+     "asset": "hero", "matches": true},
+    {"why": "rig= on an asset with no rig misses", "query": "rig=polygon",
+     "asset": "barrel", "matches": false},
+    {"why": "rig=none names the unrigged, rather than meaning unknown",
+     "query": "rig=none", "asset": "barrel", "matches": false},
+
+    {"why": "two fields both have to hold", "query": "tag=grungy type=model",
+     "asset": "barrel", "matches": true},
+    {"why": "and one failing sinks it", "query": "tag=grungy type=texture",
+     "asset": "barrel", "matches": false},
+
+    {"why": "or needs only one side", "query": "name=hero or name=barrel",
+     "asset": "barrel", "matches": true},
+    {"why": "or across different fields", "query": "tag=grungy or rig=polygon",
+     "asset": "hero", "matches": true},
+    {"why": "or with neither side misses", "query": "name=hero or name=crate",
+     "asset": "barrel", "matches": false},
+    {"why": "(a or b) and c, where c holds",
+     "query": "name=hero or name=barrel type=model",
+     "asset": "barrel", "matches": true},
+    {"why": "(a or b) and c, where c fails",
+     "query": "name=hero or name=barrel type=audio",
+     "asset": "barrel", "matches": false},
+
+    {"why": "an empty query constrains nothing", "query": "",
+     "asset": "barrel", "matches": true},
+
+    {"why": "a quoted phrase matches across a space in the name",
+     "query": "name=\"prop_barrel_01\"", "asset": "barrel", "matches": true},
+
+    {"why": "a bare term cannot straddle name and path",
+     "query": "sm_prop_barrel_01.fbxsynty", "asset": "barrel",
+     "matches": false},
+    {"why": "nor path and tags",
+     "query": "sm_prop_barrel_01.fbxmodel", "asset": "barrel",
+     "matches": false}
+  ]
+}
