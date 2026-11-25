@@ -79,17 +79,44 @@ Playdate framework: N/A
   model at all.
 - Open from earlier: library rescan (catalog on rules v2, app on v3);
   PR #3 awaiting merge. Both backfills are done -- see Progress.
-- The plan's nine work packages are all implemented. What it leaves open, by
-  its own text: the four timed tagging runs in WP9 step 1 (held by 0.6), the
-  re-embedding of models that now draw textured (needs a `--force` flag that
-  does not exist, and a run), grid collapsing of twins, and reading inside a
+- The plan's nine work packages are all implemented. WP9 step 1 and the
+  re-embedding are now done too (2026-11-25, below). What it still leaves
+  open, by its own text: grid collapsing of twins, and reading inside a
   `.uasset` for its class.
+- 2026-11-25, with the machine free: the four modes were timed, the two
+  stages behind them measured, and the models whose picture WP6 changed were
+  re-embedded. `9e78d17` added `--force`, `3fd8b1a` and `aac137f` removed
+  three per-model walks of the 480,826-row catalog and a per-model 2048x2048
+  PNG decode that my own WP6 work had introduced. Measured on this machine:
+  bridge render 372 ms, embed 478/263/154/132 ms at 1/2/6/10 threads, warm
+  pack end to end 760 ms a model, library order about 4 s a model. The thread
+  count is the dial; lanes alone change nothing because four lanes queue
+  behind one worker.
+- The re-embed: `find_changed_models.py` probed all 43,662 mesh FBX and found
+  **7,148 (16%)** whose own file names no texture -- exactly the models WP6
+  now draws with the pack's atlas. `tag_assets.py --force --threads 10
+  --ids-file` took that list: **6,335 embedded in 68 min (645 ms each), 0
+  failed**. The 813 ids it did not take are duplicate-group siblings that
+  `candidates()` never offers -- it returns `min(id)` per `(lower(name),
+  size)` group -- and 795 of the 796 without a vector have a sibling that
+  carries one. The one real gap is `glass.fbx` (Kenney Food Kit), a
+  pre-existing failure.
 - WP3's by-eye acceptance was done offline rather than in the app: the robot
   posed by a Sidekick idle and a forward walk, rendered through Atlas's own
   pose-and-rasterise path, with the controls unchanged. Watching it in the
   window itself is the one check nobody has run.
 
 ## Problems
+- The importer prints bare `nan` into its JSON when a vertex attribute is
+  not finite, which no JSON parser accepts, so the model is unreadable:
+  `glass.fbx` in the Kenney Food Kit fails with "Unexpected character (at
+  character 5742)" on `[0,1,2,0,0,1,0,1,nan,1]`. One model of 43,662 in this
+  library. Fix is to print non-finite floats as 0 in `mesh_importer.cpp`;
+  not done, outside the approved plan.
+- `embeddings.f32` is append-only, so a forced re-embed leaves the old rows
+  behind: 145,442 rows in the file against 138,746 in the index, about 20 MB
+  of 447 MB now dead. Harmless but it will only grow with each forced pass;
+  there is no compaction.
 - PR #3 now carries `a1b37b8`, which is workflow configuration unrelated to
   that PR's subject. Not moved to its own branch — awaiting the user's call.
 - Standing Flutter gate (`flutter analyze` + `flutter test`) conflicts with
@@ -101,6 +128,8 @@ Playdate framework: N/A
   100–400 MB, unmeasured.
 
 ## User Directives
+- 2026-11-25: "the machine is free, run the tagging" -- lifts the 11-24 hold
+  for that run only. The hold stands again by default.
 - 2026-11-24: no full tagging or embedding run while the user is working on
   this machine. Small scoped tests are fine; ask before anything long.
 - 2026-11-24: the catalog rig backfill may be run once the code is right,
