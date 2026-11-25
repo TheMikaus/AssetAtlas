@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.44';
+const appVersion = '1.10.45';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -3358,6 +3358,44 @@ class ZipThumbnailCache {
   static void clear() => _entries.clear();
 }
 
+/// What the preview panel shows for an asset.
+///
+/// A value rather than a chain of `if`s inside the widget, because the bug this
+/// replaces was in the dispatch itself: every type that was not `image` or
+/// `model` fell through to the audio player, which handed Unreal bytes to a
+/// plugin that crashes the process on malformed input. A plain function can be
+/// asserted over every type without pumping a widget or loading a plugin.
+enum PreviewKind {
+  image,
+  model,
+
+  /// A model inside an archive in a format the in-memory reader cannot open.
+  zipModelUnsupported,
+  audio,
+
+  /// Unreal's own cooked assets. Indexed, never previewable.
+  unreal,
+
+  /// Catalogued, but nothing here can draw it.
+  none,
+}
+
+PreviewKind previewKindFor(AssetItem item) {
+  if (item.type == 'image') return PreviewKind.image;
+  if (item.type == 'model') {
+    if (isZipVirtualPath(item.path) &&
+        item.ext != 'obj' &&
+        item.ext != 'stl' &&
+        item.ext != 'fbx') {
+      return PreviewKind.zipModelUnsupported;
+    }
+    return PreviewKind.model;
+  }
+  if (item.type == 'audio') return PreviewKind.audio;
+  if (item.type == 'unreal') return PreviewKind.unreal;
+  return PreviewKind.none;
+}
+
 class PreviewPanel extends StatefulWidget {
   const PreviewPanel({
     required this.asset,
@@ -3444,7 +3482,9 @@ class _PreviewPanelState extends State<PreviewPanel> {
   }
 
   Widget _previewFor(AssetItem item) {
-    if (item.type == 'image') {
+    final kind = previewKindFor(item);
+
+    if (kind == PreviewKind.image) {
       if (isZipVirtualPath(item.path)) {
         return FutureBuilder<Uint8List?>(
           future: _zipBytesFor(item),
@@ -3496,13 +3536,11 @@ class _PreviewPanelState extends State<PreviewPanel> {
       );
     }
 
-    if (item.type == 'model') {
-      if (isZipVirtualPath(item.path) &&
-          item.ext != 'obj' &&
-          item.ext != 'stl' &&
-          item.ext != 'fbx') {
-        return _unsupportedZipModelPreview(item);
-      }
+    if (kind == PreviewKind.zipModelUnsupported) {
+      return _unsupportedZipModelPreview(item);
+    }
+
+    if (kind == PreviewKind.model) {
       return ModelPreview(
         asset: item,
         allAssets: widget.allAssets,
@@ -3510,13 +3548,30 @@ class _PreviewPanelState extends State<PreviewPanel> {
       );
     }
 
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        border: Border.all(color: Colors.black12),
-        borderRadius: BorderRadius.circular(8),
-        color: const Color(0xfff2f5f9),
-      ),
-      child: AudioPreview(asset: item),
+    if (kind == PreviewKind.audio) {
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.black12),
+          borderRadius: BorderRadius.circular(8),
+          color: const Color(0xfff2f5f9),
+        ),
+        child: AudioPreview(asset: item),
+      );
+    }
+
+    final String message;
+    if (kind == PreviewKind.unreal) {
+      message = 'Unreal asset. It can only be opened in Unreal Engine.';
+    } else if (item.ext.isEmpty) {
+      message = 'No preview for this file.';
+    } else {
+      message = 'No preview for .${item.ext.toUpperCase()} files.';
+    }
+
+    return PlainPreview(
+      icon: iconForAssetType(item.type),
+      name: item.name,
+      message: message,
     );
   }
 
@@ -3536,6 +3591,56 @@ class _PreviewPanelState extends State<PreviewPanel> {
             'Use Copy to extract this asset if you need external-tool preview.',
             textAlign: TextAlign.center,
             style: const TextStyle(color: Colors.black54),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The panel for an asset nothing can draw: an icon, the file name, and why.
+///
+/// Styled from `_unsupportedZipModelPreview` so it reads as the same app.
+class PlainPreview extends StatelessWidget {
+  const PlainPreview({
+    required this.icon,
+    required this.name,
+    required this.message,
+    super.key,
+  });
+
+  final IconData icon;
+  final String name;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.black12),
+        borderRadius: BorderRadius.circular(8),
+        color: const Color(0xfff2f5f9),
+      ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 48, color: Colors.black26),
+              const SizedBox(height: 12),
+              Text(
+                name,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.black54),
+              ),
+            ],
           ),
         ),
       ),
@@ -3578,7 +3683,10 @@ bool looksLikePlayableAudio(List<int> bytes, String ext) {
     case 'midi':
       return startsWith([0x4D, 0x54, 0x68, 0x64]);
   }
-  return true;
+  // An extension this function does not know is not audio. It used to answer
+  // true here, which is only safe if nothing but audio can reach the player --
+  // and the preview panel's fall-through meant .uasset could.
+  return false;
 }
 
 class AudioPreview extends StatefulWidget {
