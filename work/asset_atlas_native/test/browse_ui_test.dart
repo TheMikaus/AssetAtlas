@@ -276,6 +276,7 @@ void main() {
           home: Scaffold(
             body: AssetGrid(
               assets: assets,
+              versionMembers: const {},
               active: assets.first,
               selectedIds: const {},
               onActivate: (_) {},
@@ -305,6 +306,7 @@ void main() {
           home: Scaffold(
             body: AssetGrid(
               assets: assets,
+              versionMembers: const {},
               active: null,
               selectedIds: const {},
               onActivate: (asset) => activated = asset,
@@ -335,6 +337,7 @@ void main() {
           home: Scaffold(
             body: AssetList(
               assets: assets,
+              versionMembers: const {},
               active: null,
               selectedIds: const {},
               onActivate: (_) {},
@@ -359,6 +362,7 @@ void main() {
           home: Scaffold(
             body: AssetList(
               assets: assets,
+              versionMembers: const {},
               active: null,
               selectedIds: const {},
               onActivate: (_) {},

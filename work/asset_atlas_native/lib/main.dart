@@ -183,7 +183,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.50';
+const appVersion = '1.10.51';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -312,6 +312,32 @@ class _CatalogScreenState extends State<CatalogScreen> {
 
   /// How hard a tagging run may push this machine. Saved between runs.
   TaggingMode _taggingMode = TaggingMode.balanced;
+
+  /// One row per model instead of one row per file. Saved between runs.
+  ///
+  /// On by default: `war_robot_01` is seven files in this library -- the
+  /// source FBX and six Unreal builds of it -- and seven rows of the same
+  /// robot is not what anyone is looking for.
+  bool collapseVersions = true;
+
+  Future<void> _loadCollapseVersions() async {
+    try {
+      final saved = await db.readSetting(collapseVersionsKey);
+      if (!mounted || saved == null) return;
+      setState(() => collapseVersions = saved == 'true');
+    } catch (error) {
+      fbxLog('Could not read the collapse setting: $error');
+    }
+  }
+
+  Future<void> _setCollapseVersions(bool value) async {
+    setState(() => collapseVersions = value);
+    try {
+      await db.writeSetting(collapseVersionsKey, '$value');
+    } catch (error) {
+      fbxLog('Could not save the collapse setting: $error');
+    }
+  }
 
   Future<void> _loadTaggingMode() async {
     try {
@@ -468,7 +494,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
   int _listEpoch = 0;
   List<AssetItem>? _sortedCache;
   String? _sortedCacheKey;
-  List<AssetItem>? _filteredCache;
+  CollapsedAssets? _filteredCache;
   String? _filteredCacheKey;
   List<FolderNode>? _folderRootsCache;
   int _folderRootsRevision = -1;
@@ -504,6 +530,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       );
       _restorePersistedCatalog();
       unawaited(_loadTaggingMode());
+      unawaited(_loadCollapseVersions());
       // The MCP's model tools ask the running app rather than restating its
       // texture and rig logic, so the bridge is up for as long as the window
       // is. Not in tests: binding a port is not a widget test's business.
@@ -631,7 +658,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
   /// Filtering a sorted list yields a sorted list, so searching no longer has
   /// to re-sort tens of thousands of assets on every keystroke.
   List<AssetItem> get sortedAssets {
-    final key = '$catalogRevision|${sortMode.name}|$_listEpoch';
+    // The epoch is in the key only for the one mode whose order can change
+    // without the catalog changing. The other three things that bump it --
+    // a classification result, a texture validation, ignoring an asset --
+    // change what the list *shows*, not the order it is in, and re-sorting
+    // for them cost 6.7 s of frozen window each time one landed.
+    final epoch = sortMode == AssetSortMode.type ? '$_listEpoch' : '';
+    final key = '$catalogRevision|${sortMode.name}|$epoch';
     if (_sortedCache == null || _sortedCacheKey != key) {
       _sortedCache = sortAssets(assets, sortMode);
       _sortedCacheKey = key;
@@ -650,32 +683,39 @@ class _CatalogScreenState extends State<CatalogScreen> {
     cache: _unqueriedCache,
     cachedKey: _unqueriedCacheKey,
     store: _storeUnqueried,
-  );
+  ).rows;
 
-  List<AssetItem> get filteredAssets => _assetsMatching(
+  List<AssetItem> get filteredAssets => _matchingFiltered.rows;
+
+  /// The other copies of a shown row, where it stands for more than one.
+  /// Empty while collapsing is off, because then every file has its own row.
+  Map<String, List<AssetItem>> get versionMembers =>
+      _matchingFiltered.membersById;
+
+  CollapsedAssets get _matchingFiltered => _assetsMatching(
     query: query,
     cache: _filteredCache,
     cachedKey: _filteredCacheKey,
     store: _storeFiltered,
   );
 
-  List<AssetItem>? _unqueriedCache;
+  CollapsedAssets? _unqueriedCache;
   String? _unqueriedCacheKey;
-  void _storeUnqueried(List<AssetItem> value, String key) {
+  void _storeUnqueried(CollapsedAssets value, String key) {
     _unqueriedCache = value;
     _unqueriedCacheKey = key;
   }
 
-  void _storeFiltered(List<AssetItem> value, String key) {
+  void _storeFiltered(CollapsedAssets value, String key) {
     _filteredCache = value;
     _filteredCacheKey = key;
   }
 
-  List<AssetItem> _assetsMatching({
+  CollapsedAssets _assetsMatching({
     required String query,
-    required List<AssetItem>? cache,
+    required CollapsedAssets? cache,
     required String? cachedKey,
-    required void Function(List<AssetItem>, String) store,
+    required void Function(CollapsedAssets, String) store,
   }) {
     final parsed = parseAssetQuery(query);
     final cacheKey = [
@@ -690,6 +730,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       modelTextureFilter,
       hideIgnored,
       hideZipAssets,
+      collapseVersions,
       folderFilter ?? '',
       sortMode.name,
       catalogRevision,
@@ -783,8 +824,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
       return assetMatchesQuery(parsed, asset.queryValue);
     }).toList();
 
-    store(matches, cacheKey);
-    return matches;
+    // One row per model, where the user has asked for that. Done after
+    // filtering rather than before it, so a filter still sees every file:
+    // "characters with no texture" means the files, and only the rows the
+    // answer is shown as are collapsed.
+    final result = collapseVersions
+        ? collapseAssetVersions(matches)
+        : CollapsedAssets(
+            rows: List<AssetItem>.unmodifiable(matches),
+            membersById: const {},
+          );
+    store(result, cacheKey);
+    return result;
   }
 
   /// Invalidate the memoised list after a change that filtering depends on.
@@ -1762,6 +1813,9 @@ class _CatalogScreenState extends State<CatalogScreen> {
                       modelTextureFilter: modelTextureFilter,
                       hideIgnored: hideIgnored,
                       hideZipAssets: hideZipAssets,
+                      collapseVersions: collapseVersions,
+                      onCollapseVersionsChanged: (value) =>
+                          unawaited(_setCollapseVersions(value)),
                       sourceRoots: sourceRoots.toList()..sort(),
                       folderRoots: folderRoots,
                       selectedFolder: folderFilter,
@@ -1859,6 +1913,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                             child: gridMode
                                 ? AssetGrid(
                                     assets: visible,
+                                    versionMembers: versionMembers,
                                     active: active,
                                     selectedIds: selectedIds,
                                     onActivate: _activateAsset,
@@ -1866,6 +1921,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
                                   )
                                 : AssetList(
                                     assets: visible,
+                                    versionMembers: versionMembers,
                                     active: active,
                                     selectedIds: selectedIds,
                                     onActivate: _activateAsset,
@@ -2428,6 +2484,8 @@ class FilterPanel extends StatelessWidget {
     required this.modelTextureFilter,
     required this.hideIgnored,
     required this.hideZipAssets,
+    required this.collapseVersions,
+    required this.onCollapseVersionsChanged,
     required this.sourceRoots,
     required this.folderRoots,
     required this.selectedFolder,
@@ -2461,6 +2519,8 @@ class FilterPanel extends StatelessWidget {
   final String modelTextureFilter;
   final bool hideIgnored;
   final bool hideZipAssets;
+  final bool collapseVersions;
+  final ValueChanged<bool> onCollapseVersionsChanged;
   final List<String> sourceRoots;
   final List<FolderNode> folderRoots;
   final String? selectedFolder;
@@ -2654,6 +2714,16 @@ class FilterPanel extends StatelessWidget {
               title: const Text('Hide ZIP contents'),
               subtitle: const Text('Exclude assets indexed inside archives'),
               onChanged: (value) => onHideZipAssetsChanged(value ?? true),
+            ),
+            CheckboxListTile(
+              dense: true,
+              value: collapseVersions,
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Collapse versions'),
+              subtitle: const Text(
+                'One row per model, not one per engine build',
+              ),
+              onChanged: (value) => onCollapseVersionsChanged(value ?? true),
             ),
             const Divider(height: 28),
             const Text(
@@ -2947,9 +3017,53 @@ IconData iconForAssetType(String effectiveType) => switch (effectiveType) {
 typedef AssetSelectCallback =
     void Function(AssetItem asset, bool selected, {bool range});
 
+/// What a collapsed row stands for: `x7`, with the files behind it listed
+/// on hover.
+///
+/// The count is of rows the list would have shown without collapsing, not
+/// of every copy in the catalog, so that turning the toggle off accounts
+/// for exactly what the badge claimed.
+class VersionCountBadge extends StatelessWidget {
+  const VersionCountBadge({required this.members, super.key});
+
+  final List<AssetItem> members;
+
+  @override
+  Widget build(BuildContext context) {
+    final byExt = <String, int>{};
+    for (final member in members) {
+      final ext = member.ext.toUpperCase();
+      byExt[ext] = (byExt[ext] ?? 0) + 1;
+    }
+    final summary = [
+      for (final entry in byExt.entries)
+        entry.value > 1 ? '${entry.value} x ${entry.key}' : entry.key,
+    ].join(', ');
+
+    return Tooltip(
+      message: '${members.length} files of this model: $summary'
+          '\n\n${members.map((member) => member.path).join('\n')}',
+      waitDuration: const Duration(milliseconds: 400),
+      child: Container(
+        margin: const EdgeInsets.only(right: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.secondaryContainer,
+          borderRadius: BorderRadius.circular(9),
+        ),
+        child: Text(
+          'x${members.length}',
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
+  }
+}
+
 class AssetList extends StatelessWidget {
   const AssetList({
     required this.assets,
+    required this.versionMembers,
     required this.active,
     required this.selectedIds,
     required this.onActivate,
@@ -2959,6 +3073,11 @@ class AssetList extends StatelessWidget {
   });
 
   final List<AssetItem> assets;
+
+  /// The files each row stands for, by row id, where a row stands for more
+  /// than one. Empty while collapsing is off.
+  final Map<String, List<AssetItem>> versionMembers;
+
   final AssetItem? active;
   final Set<String> selectedIds;
   final ValueChanged<AssetItem> onActivate;
@@ -3045,6 +3164,8 @@ class AssetList extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 6),
+                  if (versionMembers[asset.id] case final members?)
+                    VersionCountBadge(members: members),
                   Text(
                     asset.ext.toUpperCase(),
                     style: const TextStyle(fontSize: 11, color: Colors.black45),
@@ -3110,6 +3231,7 @@ class AssetList extends StatelessWidget {
 class AssetGrid extends StatelessWidget {
   const AssetGrid({
     required this.assets,
+    required this.versionMembers,
     required this.active,
     required this.selectedIds,
     required this.onActivate,
@@ -3118,6 +3240,10 @@ class AssetGrid extends StatelessWidget {
   });
 
   final List<AssetItem> assets;
+
+  /// The files each tile stands for, by row id. See [AssetList].
+  final Map<String, List<AssetItem>> versionMembers;
+
   final AssetItem? active;
   final Set<String> selectedIds;
   final ValueChanged<AssetItem> onActivate;
@@ -3142,6 +3268,7 @@ class AssetGrid extends StatelessWidget {
         final asset = assets[index];
         final isSelected = selectedIds.contains(asset.id);
         return AssetGridTile(
+          versionMembers: versionMembers[asset.id],
           asset: asset,
           allAssets: assets,
           isActive: active?.id == asset.id,
@@ -3161,6 +3288,7 @@ class AssetGrid extends StatelessWidget {
 class AssetGridTile extends StatelessWidget {
   const AssetGridTile({
     required this.asset,
+    required this.versionMembers,
     required this.allAssets,
     required this.isActive,
     required this.isSelected,
@@ -3171,6 +3299,10 @@ class AssetGridTile extends StatelessWidget {
 
   final AssetItem asset;
   final List<AssetItem> allAssets;
+
+  /// The files this tile stands for, or null when it is the only copy.
+  final List<AssetItem>? versionMembers;
+
   final bool isActive;
   final bool isSelected;
   final VoidCallback onActivate;
@@ -3232,6 +3364,12 @@ class AssetGridTile extends StatelessWidget {
                             size: 16,
                             color: Colors.black45,
                           ),
+                        ),
+                      if (versionMembers case final members?)
+                        Positioned(
+                          bottom: 2,
+                          right: 2,
+                          child: VersionCountBadge(members: members),
                         ),
                     ],
                   ),
@@ -7683,27 +7821,61 @@ extension AssetSortModeLabel on AssetSortMode {
 
 /// Sorts a copy of [assets]. Ties always fall back to the relative path so the
 /// order is total and does not wobble between rebuilds.
+/// The catalog in display order.
+///
+/// Each asset's sort keys are computed once, before the sort, rather than
+/// inside the comparator. Sorting 480,826 assets is about 9.1 million
+/// comparisons, and lowercasing two paths in each of them allocated some 18
+/// million strings: the pass took 6.7 s, during which the window is frozen,
+/// against 0.8 s for the same order computed this way. The tie-break on
+/// path is why the string was built even for the three modes that do not
+/// otherwise look at it.
 List<AssetItem> sortAssets(List<AssetItem> assets, AssetSortMode mode) {
-  int byPath(AssetItem a, AssetItem b) =>
-      a.relativePath.toLowerCase().compareTo(b.relativePath.toLowerCase());
+  final keyed = List<_SortKey>.generate(assets.length, (index) {
+    final asset = assets[index];
+    return _SortKey(
+      asset: asset,
+      path: asset.sortPathKey,
+      text: switch (mode) {
+        AssetSortMode.name => asset.name.toLowerCase(),
+        AssetSortMode.type => asset.effectiveType,
+        _ => '',
+      },
+    );
+  }, growable: false);
 
-  final sorted = [...assets];
-  sorted.sort((a, b) {
+  keyed.sort((a, b) {
     final primary = switch (mode) {
       AssetSortMode.path => 0,
-      AssetSortMode.name => a.name.toLowerCase().compareTo(
-        b.name.toLowerCase(),
-      ),
+      AssetSortMode.name => a.text.compareTo(b.text),
       // Largest first: when sorting by size you are usually hunting for the
       // heavy assets.
-      AssetSortMode.size => b.size.compareTo(a.size),
-      AssetSortMode.modified => b.modified.compareTo(a.modified),
-      AssetSortMode.type => a.effectiveType.compareTo(b.effectiveType),
+      AssetSortMode.size => b.asset.size.compareTo(a.asset.size),
+      AssetSortMode.modified => b.asset.modified.compareTo(a.asset.modified),
+      AssetSortMode.type => a.text.compareTo(b.text),
     };
     if (primary != 0) return primary;
-    return byPath(a, b);
+    return a.path.compareTo(b.path);
   });
-  return sorted;
+
+  return [for (final entry in keyed) entry.asset];
+}
+
+/// One asset with its sort keys already computed.
+class _SortKey {
+  const _SortKey({
+    required this.asset,
+    required this.path,
+    required this.text,
+  });
+
+  final AssetItem asset;
+
+  /// The tie-break, lower-cased once.
+  final String path;
+
+  /// The primary key for the two modes that sort on text; empty otherwise.
+  final String text;
 }
 
 enum RenderMode { textured, solid, wireframe }
@@ -9330,7 +9502,7 @@ void resetUnitySidecarCache() => _unitySidecarsByFolder.clear();
 List<String> unityPackageSidecarsFor(AssetItem asset) {
   final zip = parseZipVirtualPath(asset.path);
   final container = zip?.zipPath ?? asset.path;
-  final cut = container.lastIndexOf(RegExp(r'[\\/]'));
+  final cut = lastPathSeparator(container);
   if (cut <= 0) return const [];
   final folder = container.substring(0, cut);
   final product = twinProductKey(containerDisplayName(asset));
@@ -9358,7 +9530,8 @@ List<String> unityPackageSidecarsFor(AssetItem asset) {
 
   return [
     for (final path in packages)
-      if (twinProductKey(path.substring(path.lastIndexOf(RegExp(r'[\\/]')) + 1)) ==
+      if (twinProductKey(
+              path.substring(lastPathSeparator(path) + 1)) ==
           product)
         path,
   ];
@@ -9499,10 +9672,10 @@ Set<String> _packNameWords(String containerName) {
   final dot = name.lastIndexOf('.');
   if (dot > 0 && name.length - dot <= 15) name = name.substring(0, dot);
   return {
-    for (final word in name.split(RegExp(r'[^a-z0-9]+')))
+    for (final word in name.split(_nonAlphanumericPattern))
       if (word.length >= 4 &&
           !_twinBuildWords.contains(word) &&
-          !RegExp(r'^v?[0-9]+$').hasMatch(word))
+          !_versionRunPattern.hasMatch(word))
         word,
   };
 }
@@ -9688,7 +9861,10 @@ String containerDisplayName(AssetItem asset) {
   // from the one on disk.
   final zip = parseZipVirtualPath(asset.path);
   final source = zip?.zipPath ?? assetContainerKey(asset);
-  final cut = source.lastIndexOf(RegExp(r'[\\/]'));
+  // The hoisted pattern, not `RegExp(...)` written here: this runs once per
+  // asset while a catalog-wide index is built, and a pattern compiled per
+  // call cost 4.7 s of frozen window on 480,826 assets.
+  final cut = lastPathSeparator(source);
   final name = cut < 0 ? source : source.substring(cut + 1);
   return name.isEmpty ? source : name;
 }
@@ -9700,25 +9876,50 @@ String containerDisplayName(AssetItem asset) {
 /// pack, and nothing but the name says so. Dropping the build words, the
 /// version runs and every separator leaves `polygonscifispace` for all three.
 String twinProductKey(String containerName) {
+  // Memoised because this library holds 480,826 assets in a few hundred
+  // containers: the answer for one container name is asked for once per
+  // asset while any of the three catalog-wide indexes is built. The map is
+  // bounded by the number of distinct container names, not by assets.
+  final known = _twinProductKeyCache[containerName];
+  if (known != null) return known;
+
   var name = containerName.toLowerCase();
   // A container is a zip, a .unitypackage, or a folder. Drop a trailing
   // extension of any kind: the format a pack arrived in is not part of which
   // pack it is, and the Unity builds sit beside the zips under one name.
   final dot = name.lastIndexOf('.');
   if (dot > 0 && name.length - dot <= 15) name = name.substring(0, dot);
-  final words = name.split(RegExp(r'[^a-z0-9]+'));
+  final words = name.split(_nonAlphanumericPattern);
   final buffer = StringBuffer();
   for (final word in words) {
     if (word.isEmpty) continue;
     if (_twinBuildWords.contains(word)) continue;
     // A version run: `v4`, `4`, `19`, `2019`, `v1`. Numbers never identify a
     // pack here, and every one of them differs between builds of one pack.
-    if (RegExp(r'^v?[0-9]+$').hasMatch(word)) continue;
+    if (_versionRunPattern.hasMatch(word)) continue;
     for (final unit in word.codeUnits) {
       if (unit >= 0x61 && unit <= 0x7A) buffer.writeCharCode(unit);
     }
   }
-  return buffer.toString();
+  final key = buffer.toString();
+  _twinProductKeyCache[containerName] = key;
+  return key;
+}
+
+/// A version run in a container's name: `v4`, `4`, `19`, `2019`, `v1`.
+///
+/// Hoisted, like the two patterns beside it. Compiling it inside the loop
+/// above -- once per word, once per asset -- was most of a 4.7 s pause in
+/// the window the first time a `.uasset` was clicked.
+final _versionRunPattern = RegExp(r'^v?[0-9]+$');
+
+/// One entry per distinct container name. Cleared only by the tests, which
+/// is also why it is not an LRU: nothing in a session invalidates it,
+/// because a container's name does not change while Atlas is open.
+final _twinProductKeyCache = <String, String>{};
+
+void resetTwinProductKeyCache() {
+  _twinProductKeyCache.clear();
 }
 
 /// A file name with no extension, lower-cased.
@@ -9755,6 +9956,101 @@ String twinKeyFor(AssetItem asset) {
   final stem = twinStem(asset.name);
   if (stem.isEmpty) return '';
   return '${twinProductKey(containerDisplayName(asset))}|$stem';
+}
+
+/// Where the collapse setting is kept between runs.
+const collapseVersionsKey = 'list.collapseVersions';
+
+/// A list with one row per model instead of one row per file.
+class CollapsedAssets {
+  const CollapsedAssets({required this.rows, required this.membersById});
+
+  /// The rows to show, in the order their groups first appeared.
+  final List<AssetItem> rows;
+
+  /// Every member of a group of two or more, by the id of the row shown for
+  /// it, the shown row included. Groups of one are absent, so a lookup
+  /// returning null means "this row is the only copy".
+  final Map<String, List<AssetItem>> membersById;
+
+  static const empty = CollapsedAssets(rows: [], membersById: {});
+}
+
+/// How good a representative this file is for its group: lower is better.
+///
+/// A drawable format first, because the row that has a picture is the one
+/// worth showing: `SK_Chr_BR_War_Robot_01.fbx` rather than one of the six
+/// `.uasset` builds of it. Then by extension and path, which is the order
+/// [TwinIndex] lists a group in, so the choice does not depend on which
+/// sort mode the list happens to be in.
+int _representativeRank(AssetItem asset) =>
+    previewableModelExts.contains(asset.ext) ? 0 : 1;
+
+/// Collapse the engine-version and format copies of one model into one row.
+///
+/// `war_robot_01` is in this library seven times: the source FBX and six
+/// `.uasset` builds for Unreal 4.19 through 5.1. Searching for it returned
+/// seven rows that are all the same model, which is what this answers.
+///
+/// Grouped by [twinKeyFor] -- same pack, same file name -- so it never
+/// reaches across packs: two `pipe_end` files in different kits stay two
+/// rows. A file that cannot take part in pairing at all (a texture, a
+/// material, a `_Skeleton.uasset`) is its own row, unchanged.
+///
+/// [ordered] is expected to be in display order and the result keeps it:
+/// each group takes the position where it first appeared.
+CollapsedAssets collapseAssetVersions(List<AssetItem> ordered) {
+  if (ordered.isEmpty) return CollapsedAssets.empty;
+
+  // Insertion-ordered, which is what keeps the result in display order.
+  final groups = <String, List<AssetItem>>{};
+  final loners = <AssetItem>[];
+  // The slot each group takes in the output, so a group's position is where
+  // its first member was rather than where the map happens to put it.
+  final order = <Object>[];
+
+  for (final asset in ordered) {
+    final key = asset.twinKey;
+    if (key.isEmpty) {
+      loners.add(asset);
+      order.add(asset);
+      continue;
+    }
+    final existing = groups[key];
+    if (existing == null) {
+      groups[key] = <AssetItem>[asset];
+      order.add(key);
+    } else {
+      existing.add(asset);
+    }
+  }
+
+  final rows = <AssetItem>[];
+  final membersById = <String, List<AssetItem>>{};
+  for (final slot in order) {
+    if (slot is AssetItem) {
+      rows.add(slot);
+      continue;
+    }
+    final members = groups[slot as String]!;
+    if (members.length == 1) {
+      rows.add(members.first);
+      continue;
+    }
+    var best = members.first;
+    for (final member in members.skip(1)) {
+      if (_representativeRank(member) < _representativeRank(best)) {
+        best = member;
+      }
+    }
+    rows.add(best);
+    membersById[best.id] = List<AssetItem>.unmodifiable(members);
+  }
+
+  return CollapsedAssets(
+    rows: List<AssetItem>.unmodifiable(rows),
+    membersById: Map<String, List<AssetItem>>.unmodifiable(membersById),
+  );
 }
 
 /// One model's other copies, in both strengths.
@@ -11991,6 +12287,21 @@ String normalizePathKey(String value) {
   return value.trim().toLowerCase().replaceAll('/', '\\');
 }
 
+/// The last `/` or `\` in a path, or -1.
+///
+/// Not `lastIndexOf(RegExp(...))`: a `Pattern` search walks the string from
+/// the front for every position it tries, and these paths are long. Over the
+/// catalog that one call was 2.6 s of the 4.3 s the two index builds spent,
+/// which is 2.6 s of frozen window. A scan backwards over code units is the
+/// same answer in 0.1 s.
+int lastPathSeparator(String value) {
+  for (var index = value.length - 1; index >= 0; index -= 1) {
+    final unit = value.codeUnitAt(index);
+    if (unit == 0x2F || unit == 0x5C) return index;
+  }
+  return -1;
+}
+
 // Shared by the texture scoring paths, which run per candidate per material.
 // Rebuilding these inside the scorers dominated relink cost.
 final _extensionPattern = RegExp(r'\.[^.]+$');
@@ -12334,7 +12645,11 @@ _TextureIndex _textureIndexOf(List<AssetItem> allAssets) {
   for (var index = 0; index < allAssets.length; index += 1) {
     final asset = allAssets[index];
     if (!textureExts.contains(asset.ext)) continue;
-    final base = asset.name.toLowerCase().replaceAll(_extensionPattern, '');
+    // twinStem, not a regex replace: the same answer for every name with an
+    // extension, without a pattern walk per texture, and the lookup side in
+    // `_textureAssetFor` keys on twinStem -- so the two now agree by
+    // construction rather than by both happening to strip the same thing.
+    final base = twinStem(asset.name);
     (byBaseName[base] ??= <AssetItem>[]).add(asset);
     final key = _textureContainerKey(asset);
     if (key == null) continue;
@@ -18600,6 +18915,23 @@ class AssetItem {
   /// Set once some model has been read and found to use this image. Persisted,
   /// because it is only learned by importing a model.
   bool referencedByModel;
+
+  /// Which model this file is a copy of: [twinKeyFor], computed once.
+  ///
+  /// Held per asset because collapsing versions asks it of every row in the
+  /// list, twice per rebuild, and nothing it reads -- the path, the name, the
+  /// type -- changes while Atlas is open.
+  String get twinKey => _twinKey ??= twinKeyFor(this);
+  String? _twinKey;
+
+  /// This asset's folder path, lower-cased, computed once.
+  ///
+  /// Every sort in the app ties on it, and sorting the catalog is 9.1 million
+  /// comparisons: building the string inside the comparator allocated some 18
+  /// million of them. Held per asset rather than per sort so that changing
+  /// the sort mode does not pay for it again.
+  String get sortPathKey => _sortPathKey ??= relativePath.toLowerCase();
+  String? _sortPathKey;
 
   /// The type to show and filter by. An FBX holding only a skeleton and curves
   /// is an animation, not a model, but only a parse can tell you that.
