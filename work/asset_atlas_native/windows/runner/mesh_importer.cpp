@@ -12,6 +12,8 @@
 
 #include "third_party/ufbx/ufbx.h"
 
+#include "gltf_reader.h"
+
 struct Vec3 {
   double x;
   double y;
@@ -545,8 +547,19 @@ int main(int argc, char** argv) {
       fprintf(stderr, "No FBX bytes received on stdin.\n");
       return 1;
     }
+    // GLB and glTF go to cgltf. The label is what says which: bytes on
+    // stdin are an entry out of a zip, and the entry name came with them.
+    if (gltf_path_looks_like_gltf(input_label)) {
+      return gltf_print_model(input_label, input_bytes, nullptr, probe_only,
+                              summary_only);
+    }
     scene = ufbx_load_memory(input_bytes.data(), input_bytes.size(), &opts, &error);
   } else {
+    if (gltf_path_looks_like_gltf(input_label)) {
+      // From a path, so a .gltf can load the .bin beside it.
+      return gltf_print_model(input_label, {}, file_argument, probe_only,
+                              summary_only);
+    }
     scene = ufbx_load_file(file_argument, &opts, &error);
   }
   if (!scene) {

@@ -43,6 +43,30 @@ class VisualTagQueue {
   final RenderAsset renderAsset;
 
   final void Function(TagProgress)? onProgress;
+
+  /// How long the lanes have spent waiting for a render and for the
+  /// embedder, summed across lanes, and when each asset finished.
+  ///
+  /// The point of measuring: this repo has six recorded hypotheses about
+  /// what makes tagging slow and five of them were wrong. A run now says
+  /// which of its two stages it is spending its time in, rather than
+  /// inviting a seventh guess.
+  int renderWaitMs = 0;
+  int workerWaitMs = 0;
+  final List<DateTime> _finishedAt = [];
+
+  /// Assets finished in the last minute, as a rate.
+  double get assetsPerMinute {
+    final cutoff = DateTime.now().subtract(const Duration(minutes: 1));
+    _finishedAt.removeWhere((at) => at.isBefore(cutoff));
+    return _finishedAt.length.toDouble();
+  }
+
+  TagProgress _withTimings(TagProgress progress) => progress.copyWith(
+    assetsPerMinute: assetsPerMinute,
+    renderWaitMs: renderWaitMs,
+    workerWaitMs: workerWaitMs,
+  );
   final int threads;
   final int batchSize;
 
@@ -124,7 +148,7 @@ class VisualTagQueue {
 
   void _emit(TagProgress next) {
     _progress = next;
-    onProgress?.call(next);
+    onProgress?.call(_withTimings(next));
   }
 
   /// Start, or return the run already in progress.
@@ -246,9 +270,15 @@ class VisualTagQueue {
             _emit(_progress.copyWith(current: asset['name'] as String?));
 
             final Uint8List png;
+            final renderStarted = DateTime.now();
             try {
               png = await renderAsset(asset['path'] as String, renderSize);
+              renderWaitMs +=
+                  DateTime.now().difference(renderStarted).inMilliseconds;
+              _finishedAt.add(DateTime.now());
             } catch (error) {
+              renderWaitMs +=
+                  DateTime.now().difference(renderStarted).inMilliseconds;
               // Charging the asset is only right when the asset is at fault.
               // If the renderer has gone, every remaining file would be
               // charged an attempt for something that is not about it, and
@@ -353,8 +383,13 @@ class VisualTagQueue {
     TagWorker worker,
     List<Map<String, Object?>> batch,
   ) async {
-    final reply = await _ask(worker, 'images', {'entries': batch});
-    return _asInt(reply['stored']);
+    final started = DateTime.now();
+    try {
+      final reply = await _ask(worker, 'images', {'entries': batch});
+      return _asInt(reply['stored']);
+    } finally {
+      workerWaitMs += DateTime.now().difference(started).inMilliseconds;
+    }
   }
 
   TagProgress _finalProgress(

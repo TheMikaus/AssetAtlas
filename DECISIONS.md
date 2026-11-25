@@ -360,3 +360,103 @@ Record significant **approved** decisions; do not confuse proposals with impleme
   WP5 stores a bone signature per rig: `other`'s container test and the
   `unreal`/`sidekick` special case both become consequences of the bones
   instead of rules of their own.
+
+## FMT-001 — cgltf for GLB and glTF, and no COLLADA reader at all
+
+- **ID / date:** FMT-001 / 2026-11-24
+- **Status:** Accepted (user approval, 2026-11-24: "vendor cgltf — yes", "DAE —
+  skip")
+- **Context and verified evidence:** Atlas drew FBX, OBJ and STL. The library
+  also holds 3,035 GLB, 3,045 DAE and 316 glTF. Measured against the catalog:
+  every DAE and every glTF has a same-name FBX or OBJ in its own pack, and so
+  do 2,843 of the GLB. The files with no other copy are **192 GLB**, all in
+  `KayKit Dungeon Pack 1.0`. So reading GLB adds 192 models nobody can see
+  today, and reading DAE adds none.
+- **Options considered:**
+  - A. `cgltf` — one MIT header, no dependencies, vendored in-tree. **Chosen**
+    for GLB and glTF.
+  - B. Assimp — reads DAE and much else, and would several-fold the importer's
+    size and build time. Rejected.
+  - C. A hand-written COLLADA subset reader over an XML library. Rejected: it
+    would add no model that cannot already be drawn through a twin.
+  - D. Nothing. Rejected for GLB because of the 192, accepted for DAE.
+- **Decision and rationale:** vendor cgltf 1.15 at
+  `windows/runner/third_party/cgltf/cgltf.h`, beside ufbx, and read GLB and
+  glTF in `windows/runner/gltf_reader.cpp`, printing the JSON the FBX path
+  already prints so the Dart decoder is unchanged. Do not write or vendor a
+  COLLADA reader.
+- **Tradeoffs / risks:**
+  - Version 1 reads node transforms, positions, indices, the first UV set and
+    each material's base colour factor and texture. It does not read skins,
+    animations, morph targets, cameras or lights, so a GLB reports no rig
+    rather than a wrong one.
+  - Draco and meshopt compression are refused with a message rather than
+    drawn wrong.
+  - A `.gltf` keeps its geometry in a separate `.bin`. A loose one on disk
+    reads; one inside a zip cannot, because the reader is handed bytes and no
+    folder. Those fall back to the twin, which all 316 have.
+  - cgltf uses `fopen`, `strcpy` and `strncpy`, which MSVC deprecates and this
+    build treats as errors. Suppressed around the vendored header only.
+- **Affected components and source references:**
+  `windows/runner/gltf_reader.cpp`, `windows/runner/gltf_reader.h`,
+  `windows/runner/third_party/cgltf/cgltf.h`, `windows/runner/CMakeLists.txt`,
+  `windows/runner/mesh_importer.cpp` (the dispatch), and in `lib/main.dart`
+  `previewableModelExts`, `inArchiveModelExts`, `previewKindFor` and `loadMesh`.
+- **Validation and revisit trigger:** `test/gltf_reader_test.dart` reads a real
+  KayKit GLB through the importer, decodes it, and rasterises it, asserting the
+  model covers a visible part of the frame. Revisit DAE only if a DAE arrives
+  with no FBX or OBJ twin, which WP7's twin index makes visible.
+
+## TEX-001 — The texture a model gets when it names none comes from the pack's own Unity build
+
+- **ID / date:** TEX-001 / 2026-11-24
+- **Status:** Accepted (user approval, 2026-11-24, after he doubted the pack
+  shipped the War Robot with no colouring in mind — he was right)
+- **Context and verified evidence:** 14% of FBX meshes here name no texture at
+  all. `SK_Chr_BR_War_Robot_01.fbx` has one material, `SciFiSpaceBase4`, and
+  zero texture references; the material name does not encode the atlas either.
+  The pack's Unity build does: prefab → material GUID → `.mat` → `_MainTex`
+  GUID → `PolygonSciFiSpace_Texture_01_A.png`, which 42 of the pack's 43
+  character prefabs resolve to and 544 of its 662 prefabs overall.
+- **Options considered:**
+  - A. Rank file names in a textures folder. This was the first draft.
+    Rejected as the primary rule: validated against the authored answer over
+    seven packs it agreed on five, and one of its misses
+    (`PolygonNature_01.png`) was caused by its own "must contain the word
+    texture" filter.
+  - B. Read the authored chain where it exists, and keep the filename rule as
+    a last tier with a dominance guard. **Chosen.**
+  - C. Read inside the FBX for a material-name convention. Rejected on
+    evidence: the robot's material is `SciFiSpaceBase4` and its atlas is
+    `Material_01_A`.
+- **Decision and rationale:** four tiers, first answer wins — the model's own
+  prefab, the pack's dominant assignment, a filename rule, nothing — and the
+  UI says which tier answered, because a guess and an authored answer look
+  identical once applied. Both container formats are read: the 10 Unity zips
+  through their `.meta` files, and the 83 `.unitypackage` files as sidecars on
+  disk, where the GUID is the directory name and `pathname` is the path.
+- **Tradeoffs / risks:**
+  - A wrong texture is worse than none, because the tagging queue embeds the
+    picture Atlas draws. Hence the four preconditions (UVs, no texture named,
+    none embedded, none hand-picked), the dominance guards, and "None (flat
+    colour)" in the picker.
+  - Two guards came out of looking at real packs rather than reasoning: a pack
+    default needs half the prefabs that resolve anything **and** a fifth of all
+    prefabs **and** at least eight of them. Without the second, Dungeon Realms
+    2022 called an FX circle its atlas on the strength of 17 prefabs of 1,529.
+  - The newer Synty packs do not use `_MainTex`: the 2022 builds fill
+    `_Albedo_Map`, and 56 of that pack's 73 materials reference a texture while
+    only 5 do it through `_MainTex`. Five slot names are read in order.
+  - Models that drew flat grey and now draw textured have stale embeddings.
+    Re-embedding needs a `--force` flag that does not exist, and a run that is
+    held.
+- **Affected components and source references:** `lib/main.dart` --
+  `findInferredTexture`, `readUnityTextureChain`, `guessTextureByName`,
+  `meshWantsInferredTexture`, `unityPackageSidecarsFor`, `loadMesh`,
+  `TexturePickerButton`, `materialSummaryLine`; the dead
+  `findModelFallbackTexture` was deleted with it.
+- **Validation and revisit trigger:** `test/inferred_texture_test.dart`, with a
+  hand-built Unity zip fixture and corpus-gated tests that resolve the real War
+  Robot through tier 1 and a PolygonTown model through the `.unitypackage`
+  sidecar. Revisit when a pack is found whose authored answer the reader gets
+  wrong -- the survey script in the plan's appendix prints the list.

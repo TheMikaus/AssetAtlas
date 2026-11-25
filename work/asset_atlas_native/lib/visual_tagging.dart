@@ -41,12 +41,31 @@ class TagProgress {
     this.embeddedThisRun = 0,
     this.current,
     this.message,
+    this.assetsPerMinute = 0,
+    this.renderWaitMs = 0,
+    this.workerWaitMs = 0,
   });
 
   final TagState state;
 
   /// Distinct models in scope, after duplicates and clips are removed.
   final int selected;
+
+  /// Assets finished in the last minute, as a rate.
+  ///
+  /// Over a window rather than over the whole run: the first assets are
+  /// warm-up -- the worker loads a model, the zip caches fill -- and an
+  /// average that includes them never catches up with what the run is
+  /// actually doing now.
+  final double assetsPerMinute;
+
+  /// Milliseconds the lanes have spent waiting for a render, summed across
+  /// them, and the same for the embedder's reply.
+  ///
+  /// The two stages the run is made of. Whichever total is larger is where
+  /// the time is going, and a mode that raises lanes helps only the first.
+  final int renderWaitMs;
+  final int workerWaitMs;
 
   /// How many of those already have a vector, from any run.
   final int done;
@@ -92,9 +111,15 @@ class TagProgress {
     int? embeddedThisRun,
     String? current,
     String? message,
+    double? assetsPerMinute,
+    int? renderWaitMs,
+    int? workerWaitMs,
     bool clearCurrent = false,
   }) => TagProgress(
     state: state ?? this.state,
+    assetsPerMinute: assetsPerMinute ?? this.assetsPerMinute,
+    renderWaitMs: renderWaitMs ?? this.renderWaitMs,
+    workerWaitMs: workerWaitMs ?? this.workerWaitMs,
     selected: selected ?? this.selected,
     done: done ?? this.done,
     remaining: remaining ?? this.remaining,
@@ -107,6 +132,79 @@ class TagProgress {
 }
 
 enum TagState { idle, starting, running, paused, finished, failed }
+
+/// How hard a tagging run is allowed to push the machine.
+///
+/// One setting rather than three dials. The shape of the job is a render
+/// stage that spreads across lanes and an embedding stage that does not, so
+/// the useful knobs are how many renders are in flight, how many threads the
+/// model gets, and whether to pause between renders at all.
+enum TaggingMode {
+  /// For working in Atlas while it tags: one lane, one model thread, and a
+  /// pause between renders.
+  quiet,
+
+  /// What every run before this used.
+  balanced,
+
+  /// For a machine nobody else is using.
+  fast,
+
+  /// For nobody at the keyboard.
+  overnight,
+}
+
+extension TaggingModeSettings on TaggingMode {
+  String get label => switch (this) {
+    TaggingMode.quiet => 'Quiet',
+    TaggingMode.balanced => 'Balanced',
+    TaggingMode.fast => 'Fast',
+    TaggingMode.overnight => 'Overnight',
+  };
+
+  String get describe => switch (this) {
+    TaggingMode.quiet => 'one at a time, leaves the machine to you',
+    TaggingMode.balanced => 'four at a time',
+    TaggingMode.fast => 'eight at a time, the window may stutter',
+    TaggingMode.overnight => 'as hard as it goes',
+  };
+
+  int get lanes => switch (this) {
+    TaggingMode.quiet => 1,
+    TaggingMode.balanced => 4,
+    TaggingMode.fast => 8,
+    TaggingMode.overnight => 12,
+  };
+
+  /// Threads the embedding model may use, capped at the physical cores.
+  ///
+  /// `numberOfProcessors` counts hardware threads, and onnxruntime on twice
+  /// the physical cores spends its gain on contention.
+  int threadsOn(int processors) {
+    final cores = processors < 2 ? 1 : processors ~/ 2;
+    final wanted = switch (this) {
+      TaggingMode.quiet => 1,
+      TaggingMode.balanced => 2,
+      TaggingMode.fast => 6,
+      TaggingMode.overnight => 10,
+    };
+    return wanted < cores ? wanted : cores;
+  }
+
+  int get paceMs => this == TaggingMode.quiet ? 100 : 0;
+}
+
+/// Reads a mode back from a setting or a command line. Anything unknown is
+/// the default, the same way the existing flags behave.
+TaggingMode taggingModeByName(String? name) {
+  for (final mode in TaggingMode.values) {
+    if (mode.name == name) return mode;
+  }
+  return TaggingMode.balanced;
+}
+
+/// Where the chosen mode is remembered.
+const taggingModeKey = 'tagging.mode';
 
 /// Where the pass is allowed to look. Null everywhere means the library.
 class TagScope {

@@ -41,6 +41,7 @@ add_dependencies(${BINARY_NAME} flutter_assemble)
 
 add_executable(asset_atlas_mesh_importer
   "mesh_importer.cpp"
+  "gltf_reader.cpp"
   "third_party/ufbx/ufbx.c"
 )
 

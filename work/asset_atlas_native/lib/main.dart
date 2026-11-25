@@ -28,13 +28,17 @@ import 'visual_tagging.dart';
 /// over one newly scanned folder and no use for the whole library: that is
 /// an 18-hour job that wants to run with nobody watching.
 class StartupOptions {
-  const StartupOptions({this.tagAll = false, this.renderLanes});
+  const StartupOptions({this.tagAll = false, this.renderLanes, this.tagMode});
 
   /// Start tagging the whole library as soon as the catalog is restored.
   final bool tagAll;
 
   /// Renders in flight at once, or null to leave the queue's own default.
   final int? renderLanes;
+
+  /// How hard a tagging run may push the machine, or null for the saved
+  /// setting. An explicit `--tag-lanes` still wins over the mode's lanes.
+  final TaggingMode? tagMode;
 }
 
 /// Reads `--tag-all` and `--tag-lanes=N`.
@@ -44,8 +48,10 @@ class StartupOptions {
 /// convenience: anything it cannot understand leaves the default in place.
 StartupOptions parseStartupOptions(List<String> arguments) {
   const lanesFlag = '--tag-lanes=';
+  const modeFlag = '--tag-mode=';
   var tagAll = false;
   int? lanes;
+  TaggingMode? mode;
   for (final argument in arguments) {
     if (argument == '--tag-all') {
       tagAll = true;
@@ -56,9 +62,18 @@ StartupOptions parseStartupOptions(List<String> arguments) {
       // Capped rather than trusted. Each lane is a subprocess and an
       // isolate, and a mistyped 400 would ask the machine for 400 of each.
       if (value != null && value >= 1 && value <= 32) lanes = value;
+      continue;
+    }
+    if (argument.startsWith(modeFlag)) {
+      final name = argument.substring(modeFlag.length).trim().toLowerCase();
+      // Only a name this knows. An unknown one leaves the saved setting
+      // alone rather than silently choosing for the user.
+      for (final candidate in TaggingMode.values) {
+        if (candidate.name == name) mode = candidate;
+      }
     }
   }
-  return StartupOptions(tagAll: tagAll, renderLanes: lanes);
+  return StartupOptions(tagAll: tagAll, renderLanes: lanes, tagMode: mode);
 }
 
 Future<void> main(List<String> arguments) async {
@@ -150,7 +165,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.49';
+const appVersion = '1.10.50';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -276,6 +291,30 @@ class _CatalogScreenState extends State<CatalogScreen> {
   /// The bone names behind each rig signature in the catalog, read once when
   /// it opens. A few dozen entries: rigs repeat across thousands of files.
   final rigBonesBySignature = <String, List<String>>{};
+
+  /// How hard a tagging run may push this machine. Saved between runs.
+  TaggingMode _taggingMode = TaggingMode.balanced;
+
+  Future<void> _loadTaggingMode() async {
+    try {
+      final saved = await db.readSetting(taggingModeKey);
+      if (!mounted) return;
+      setState(() {
+        _taggingMode = widget.options.tagMode ?? taggingModeByName(saved);
+      });
+    } catch (error) {
+      fbxLog('Could not read the tagging mode: $error');
+    }
+  }
+
+  Future<void> _setTaggingMode(TaggingMode mode) async {
+    setState(() => _taggingMode = mode);
+    try {
+      await db.writeSetting(taggingModeKey, mode.name);
+    } catch (error) {
+      fbxLog('Could not save the tagging mode: $error');
+    }
+  }
   final selectedIds = <String>{};
   final sourceRoots = <String>{};
 
@@ -352,8 +391,11 @@ class _CatalogScreenState extends State<CatalogScreen> {
       // There is no bridge in the way here -- the renderer is in this
       // process -- so the only way it "stops" is the app shutting down.
       isRendererAlive: () async => mounted,
-      renderConcurrency:
-          widget.options.renderLanes ?? VisualTagQueue.defaultRenderLanes,
+      // The mode sets all three; an explicit --tag-lanes still wins, which
+      // is what that flag was for before modes existed.
+      renderConcurrency: widget.options.renderLanes ?? _taggingMode.lanes,
+      threads: _taggingMode.threadsOn(Platform.numberOfProcessors),
+      paceMs: _taggingMode.paceMs,
       onProgress: (progress) {
         if (!mounted) return;
         setState(() => _tagProgress = progress);
@@ -442,6 +484,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         'Restoring catalog in the background...',
       );
       _restorePersistedCatalog();
+      unawaited(_loadTaggingMode());
       // The MCP's model tools ask the running app rather than restating its
       // texture and rig logic, so the bridge is up for as long as the window
       // is. Not in tests: binding a port is not a widget test's business.
@@ -1842,6 +1885,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
               VisualTaggingStrip(
                 progress: _tagProgress,
                 unavailable: _tagUnavailable,
+                mode: _taggingMode,
+                onModeChanged: (mode) => unawaited(_setTaggingMode(mode)),
                 onPause: () => _tagQueue?.pause(),
                 onResume: () => _tagQueue?.resumeRun(),
                 onStop: () => _tagQueue?.stop(),
@@ -3468,10 +3513,11 @@ enum PreviewKind {
 PreviewKind previewKindFor(AssetItem item) {
   if (item.type == 'image') return PreviewKind.image;
   if (item.type == 'model') {
+    if (!previewableModelExts.contains(item.ext)) {
+      return PreviewKind.zipModelUnsupported;
+    }
     if (isZipVirtualPath(item.path) &&
-        item.ext != 'obj' &&
-        item.ext != 'stl' &&
-        item.ext != 'fbx') {
+        !inArchiveModelExts.contains(item.ext)) {
       return PreviewKind.zipModelUnsupported;
     }
     return PreviewKind.model;
@@ -4266,9 +4312,19 @@ class _ModelPreviewState extends State<ModelPreview> {
     final chosen = chosenTexturePath;
     // Not cached: the cache is keyed on the file, and this is the user's
     // choice rather than anything the file said.
-    final textured = chosen == null
-        ? mesh
-        : await applyChosenTexture(mesh, chosen);
+    final MeshModel textured;
+    if (chosen == null) {
+      textured = mesh;
+    } else if (chosen == noTextureChoice) {
+      // "None" is a decision, and it has to beat the inferred texture the
+      // load applied -- otherwise there would be no way to turn a wrong
+      // guess off.
+      textured = mesh.withMaterials([
+        for (final material in mesh.materials) material.withoutBaseTexture(),
+      ]);
+    } else {
+      textured = await applyChosenTexture(mesh, chosen);
+    }
     return _dress(textured);
   }
 
@@ -4590,6 +4646,13 @@ class _ModelPreviewState extends State<ModelPreview> {
                           widget.allAssets,
                         ),
                         chosenPath: chosenTexturePath,
+                        inferred: inferredTextureSourceOf(mesh),
+                        inferredName: mesh.materials
+                            .map((m) => m.textureName)
+                            .firstWhere(
+                              (name) => name.isNotEmpty,
+                              orElse: () => '',
+                            ),
                         onChosen: (path) => setState(() {
                           chosenTexturePath = path;
                           meshFuture = _loadCurrentMesh();
@@ -8830,6 +8893,719 @@ RigFamily rigFamilyOfSkeleton(SkeletonAnimation skeleton) =>
       bones: skeleton.bones.length,
     );
 
+// --- The texture the pack's author assigned ------------------------------
+//
+// 14% of the FBX meshes in this library name no texture at all. The War
+// Robot is one: one material called `SciFiSpaceBase4`, zero texture
+// references, and the material name does not encode the atlas either -- the
+// atlas it is actually assigned is `Material_01_A`.
+//
+// The pack carries the answer somewhere else. Unity stores an authored
+// chain: a .prefab names a material by GUID, the .mat names its `_MainTex`
+// by GUID, and every .meta maps a GUID to a path. For the robot that chain
+// resolves to PolygonSciFiSpace_Texture_01_A.png, which 42 of the pack's 43
+// character prefabs are assigned, and 544 of its 662 prefabs overall.
+//
+// So this reads the answer where there is one, and guesses only where there
+// is not -- and says on screen which of the two happened, because a wrong
+// texture is worse than no texture: the tagging queue embeds the picture
+// Atlas draws.
+
+/// Where an inferred texture came from, worst to best.
+enum TextureSource {
+  /// Nothing was inferred. Flat colour.
+  none,
+
+  /// A filename rule. A guess, and labelled as one.
+  guessed,
+
+  /// The texture most of this pack's prefabs are assigned.
+  packDefault,
+
+  /// The texture this model's own prefab is assigned.
+  prefab,
+}
+
+extension TextureSourceLabel on TextureSource {
+  /// What the picker says in place of `Texture: auto`.
+  String get label => switch (this) {
+    TextureSource.prefab => "from the pack's prefab",
+    TextureSource.packDefault => 'pack default',
+    TextureSource.guessed => 'guessed',
+    TextureSource.none => '',
+  };
+}
+
+class InferredTexture {
+  const InferredTexture({required this.path, required this.source});
+
+  final String path;
+  final TextureSource source;
+}
+
+/// Where a loaded mesh's texture came from, when it came from inference.
+///
+/// On the object rather than in it: [MeshModel] is copied by several
+/// `with*` helpers, and a field would have to be threaded through every one
+/// of them to survive. The copy that matters is the one `applyChosenTexture`
+/// returns, and this is set on that.
+final Expando<TextureSource> _inferredTextureSource =
+    Expando<TextureSource>('inferred texture source');
+
+TextureSource inferredTextureSourceOf(MeshModel mesh) =>
+    _inferredTextureSource[mesh] ?? TextureSource.none;
+
+void setInferredTextureSource(MeshModel mesh, TextureSource source) {
+  _inferredTextureSource[mesh] = source;
+}
+
+/// What a Unity build says about its own materials.
+class UnityTextureChain {
+  const UnityTextureChain({
+    required this.byModelStem,
+    required this.dominant,
+    required this.prefabsResolved,
+    required this.prefabsTotal,
+  });
+
+  static const empty = UnityTextureChain(
+    byModelStem: {},
+    dominant: null,
+    prefabsResolved: 0,
+    prefabsTotal: 0,
+  );
+
+  /// Prefab stem (lower-cased, `sm_`/`sk_` stripped) to the project path of
+  /// the texture its material assigns.
+  final Map<String, String> byModelStem;
+
+  /// The texture the most prefabs are assigned, where one is dominant
+  /// enough to stand for the pack.
+  final String? dominant;
+
+  final int prefabsResolved;
+  final int prefabsTotal;
+
+  bool get isEmpty => byModelStem.isEmpty && dominant == null;
+}
+
+final _unityGuidPattern = RegExp(r'guid: ([0-9a-f]{32})');
+
+/// The material slots that hold a model's base colour, best first.
+///
+/// `_MainTex` is Unity's built-in name and what the older packs use.
+/// `_BaseMap` is URP's. `_Albedo_Map` is Synty's own shader, which the 2022
+/// and later builds ship: of the 73 materials in Dungeon Realms 2022, 56
+/// reference a texture and only 5 do it through `_MainTex`, so a reader
+/// that knew only that name saw 17 of 1,529 prefabs and called an FX circle
+/// the pack's atlas.
+const _unityBaseTextureSlots = [
+  '_MainTex',
+  '_BaseMap',
+  '_Albedo_Map',
+  '_AlbedoMap',
+  '_BaseColorMap',
+];
+
+final _unityBaseTexturePatterns = [
+  for (final slot in _unityBaseTextureSlots)
+    RegExp(
+      '- $slot:' r'\s*\n\s*m_Texture: \{fileID: \d+(?:, guid: ([0-9a-f]{32}))?',
+    ),
+];
+const _unityImageExtensions = {'png', 'tga', 'psd', 'jpg', 'jpeg'};
+
+/// A prefab or FBX stem with Synty's mesh prefix removed.
+///
+/// The prefabs are named `SM_`, the skinned FBX `SK_`, and the same model
+/// has both. Stripping the prefix matched 614 of 667 FBX in the SciFiSpace
+/// source zip to a prefab.
+String unityModelStem(String fileName) {
+  var stem = twinStem(fileName);
+  for (final prefix in const ['sm_', 'sk_']) {
+    if (stem.startsWith(prefix)) {
+      stem = stem.substring(prefix.length);
+      break;
+    }
+  }
+  return stem;
+}
+
+/// Reads a Unity build's prefab -> material -> `_MainTex` chain.
+///
+/// Plain YAML text inside an archive Atlas already opens. The files are not
+/// in the catalog -- a `.meta` is type `other` and the scanner skips those --
+/// so the archive is read directly.
+UnityTextureChain readUnityTextureChain(String archivePath) {
+  final cached = _unityChainCache[normalizePathKey(archivePath)];
+  if (cached != null) return cached;
+  final chain = _readUnityTextureChain(archivePath);
+  if (_unityChainCache.length >= _maxUnityChainCacheEntries) {
+    _unityChainCache.remove(_unityChainCache.keys.first);
+  }
+  _unityChainCache[normalizePathKey(archivePath)] = chain;
+  return chain;
+}
+
+final _unityChainCache = <String, UnityTextureChain>{};
+const _maxUnityChainCacheEntries = 24;
+
+void resetUnityChainCache() {
+  _unityChainCache.clear();
+  resetUnitySidecarCache();
+}
+
+UnityTextureChain _readUnityTextureChain(String archivePath) {
+  if (extensionOf(archivePath) == 'unitypackage') {
+    return _readUnityPackageChain(archivePath);
+  }
+  final archive = _loadCachedArchive(archivePath);
+  if (archive == null) return UnityTextureChain.empty;
+
+  final guidToPath = <String, String>{};
+  final materialEntries = <String, ArchiveFile>{};
+  final prefabEntries = <ArchiveFile>[];
+  for (final entry in archive.files) {
+    if (!entry.isFile) continue;
+    final name = entry.name.replaceAll('\\', '/');
+    if (name.endsWith('.meta')) {
+      final text = _unityEntryText(entry, 4096);
+      if (text == null) continue;
+      final guid = _unityGuidPattern.firstMatch(text)?.group(1);
+      if (guid != null) {
+        guidToPath[guid] = name.substring(0, name.length - 5);
+      }
+    } else if (name.endsWith('.mat')) {
+      materialEntries[name] = entry;
+    } else if (name.endsWith('.prefab')) {
+      prefabEntries.add(entry);
+    }
+  }
+  if (prefabEntries.isEmpty || materialEntries.isEmpty) {
+    return UnityTextureChain.empty;
+  }
+
+  return _unityChainFrom(
+    guidToPath: guidToPath,
+    materials: materialEntries,
+    prefabs: {
+      for (final entry in prefabEntries) entry.name: entry,
+    },
+  );
+}
+
+/// The half both readers share: resolve every prefab through its materials,
+/// count what the pack uses, and decide whether it has one default.
+///
+/// [materials] and [prefabs] are keyed by the path inside the pack -- the
+/// entry name in a zip, the `pathname` line in a `.unitypackage`.
+UnityTextureChain _unityChainFrom({
+  required Map<String, String> guidToPath,
+  required Map<String, ArchiveFile> materials,
+  required Map<String, ArchiveFile> prefabs,
+}) {
+  final materialTexture = <String, String?>{};
+  String? textureOf(String materialPath) {
+    if (materialTexture.containsKey(materialPath)) {
+      return materialTexture[materialPath];
+    }
+    final entry = materials[materialPath];
+    final text = entry == null ? null : _unityEntryText(entry, 65536);
+    String? answer;
+    if (text != null) {
+      for (final pattern in _unityBaseTexturePatterns) {
+        final guid = pattern.firstMatch(text)?.group(1);
+        final path = guid == null ? null : guidToPath[guid];
+        if (path != null && _unityImageExtensions.contains(extensionOf(path))) {
+          answer = path;
+          break;
+        }
+      }
+    }
+    materialTexture[materialPath] = answer;
+    return answer;
+  }
+
+  final usedByPrefabs = <String, int>{};
+  final perPrefab = <String, Set<String>>{};
+  var resolved = 0;
+  for (final prefab in prefabs.entries) {
+    final text = _unityEntryText(prefab.value, 1 << 20);
+    if (text == null) continue;
+    final textures = <String>{};
+    for (final match in _unityGuidPattern.allMatches(text)) {
+      final path = guidToPath[match.group(1)];
+      if (path == null || !path.endsWith('.mat')) continue;
+      final texture = textureOf(path);
+      if (texture != null) textures.add(texture);
+    }
+    if (textures.isEmpty) continue;
+    resolved += 1;
+    for (final texture in textures) {
+      usedByPrefabs[texture] = (usedByPrefabs[texture] ?? 0) + 1;
+    }
+    perPrefab[unityModelStem(prefab.key.split('/').last)] = textures;
+  }
+  if (resolved == 0) return UnityTextureChain.empty;
+
+  String? dominant;
+  var best = 0;
+  for (final entry in usedByPrefabs.entries) {
+    if (entry.value > best ||
+        (entry.value == best && dominant != null && entry.key.compareTo(dominant) < 0)) {
+      best = entry.value;
+      dominant = entry.key;
+    }
+  }
+  // Half the prefabs that resolve anything, or the pack has no one default.
+  // SciFiCity's most-used texture covers 31 of 647 prefabs and the pack
+  // really does spread across Signs, NeonSigns, Billboards and Road;
+  // answering nothing there is the right answer, not a failure.
+  if (dominant != null && best * 2 < resolved) dominant = null;
+  // And the prefabs that resolved have to be a real share of the pack.
+  // Otherwise a build whose materials this reader does not understand
+  // answers confidently from the handful it did read -- which is how an FX
+  // circle became Dungeon Realms' atlas on the strength of 17 prefabs out
+  // of 1,529.
+  if (dominant != null && resolved * 5 < prefabs.length) dominant = null;
+  // And on more than a handful: the locomotion pack holds three
+  // prefabs, and one of them agreeing with itself is not a default.
+  if (dominant != null && resolved < 8) dominant = null;
+
+  final byStem = <String, String>{};
+  for (final entry in perPrefab.entries) {
+    if (entry.value.length == 1) {
+      byStem[entry.key] = entry.value.single;
+      continue;
+    }
+    // A prefab can name several materials and so resolve several textures --
+    // 14% of them in PolygonAncientEmpire. Atlas draws one texture, and
+    // counting material references cannot break the tie, so the pack's own
+    // default decides; where it is not among them, this prefab says nothing
+    // and tier 2 answers.
+    if (dominant != null && entry.value.contains(dominant)) {
+      byStem[entry.key] = dominant;
+    }
+  }
+
+  return UnityTextureChain(
+    byModelStem: byStem,
+    dominant: dominant,
+    prefabsResolved: resolved,
+    prefabsTotal: prefabs.length,
+  );
+}
+
+/// The same chain out of a `.unitypackage`.
+///
+/// 83 of the 93 Unity builds here are this format and only 10 are zips, so
+/// without this the authored answer covers 7 packs instead of about 90.
+///
+/// A `.unitypackage` is a gzipped tar: one directory per asset, *named by
+/// the GUID*, holding `asset` (the bytes), `asset.meta` and `pathname` (one
+/// line, the path the file had in the project). Two consequences. The
+/// GUID-to-path map comes free -- no `.meta` parsing at all in this format.
+/// And no entry name says what the file is, so the tar is walked once for
+/// the pathnames and once for the bytes of the few that turn out to be
+/// materials and prefabs.
+///
+/// Decompressed to a temporary file rather than to memory: the largest of
+/// these is 364 MB compressed, and holding the whole tar would be worse
+/// than writing it down once and reading it back.
+UnityTextureChain _readUnityPackageChain(String packagePath) {
+  final source = File(packagePath);
+  if (!source.existsSync()) return UnityTextureChain.empty;
+  final scratch = File(
+    '${Directory.systemTemp.path}${Platform.pathSeparator}'
+    'atlas_unitypackage_${source.statSync().modified.millisecondsSinceEpoch}_'
+    '${packagePath.hashCode.toUnsigned(32).toRadixString(16)}.tar',
+  );
+  InputFileStream? packed;
+  try {
+    if (!scratch.existsSync()) {
+      packed = InputFileStream(packagePath);
+      final out = OutputFileStream(scratch.path);
+      GZipDecoder().decodeStream(packed, out);
+      out.closeSync();
+      packed.closeSync();
+      packed = null;
+    }
+  } catch (error) {
+    fbxLog('Unpacking $packagePath failed: $error');
+    try {
+      packed?.closeSync();
+    } catch (_) {}
+    return UnityTextureChain.empty;
+  }
+
+  InputFileStream? tarStream;
+  try {
+    tarStream = InputFileStream(scratch.path);
+    final tar = TarDecoder().decodeStream(tarStream);
+    final guidToPath = <String, String>{};
+    for (final entry in tar.files) {
+      final name = entry.name.replaceAll('\\', '/');
+      if (!name.endsWith('/pathname')) continue;
+      final guid = name.substring(0, name.length - '/pathname'.length);
+      final text = _unityEntryText(entry, 8192);
+      if (text == null) continue;
+      final line = const LineSplitter().convert(text).firstOrNull?.trim();
+      if (line != null && line.isNotEmpty) guidToPath[guid] = line;
+    }
+    if (guidToPath.isEmpty) return UnityTextureChain.empty;
+
+    final materialBytes = <String, ArchiveFile>{};
+    final prefabEntries = <String, ArchiveFile>{};
+    for (final entry in tar.files) {
+      final name = entry.name.replaceAll('\\', '/');
+      if (!name.endsWith('/asset')) continue;
+      final guid = name.substring(0, name.length - '/asset'.length);
+      final path = guidToPath[guid];
+      if (path == null) continue;
+      if (path.endsWith('.mat')) {
+        materialBytes[path] = entry;
+      } else if (path.endsWith('.prefab')) {
+        prefabEntries[path] = entry;
+      }
+    }
+    if (prefabEntries.isEmpty || materialBytes.isEmpty) {
+      return UnityTextureChain.empty;
+    }
+    return _unityChainFrom(
+      guidToPath: guidToPath,
+      materials: materialBytes,
+      prefabs: prefabEntries,
+    );
+  } catch (error) {
+    fbxLog('Reading $packagePath failed: $error');
+    return UnityTextureChain.empty;
+  } finally {
+    try {
+      tarStream?.closeSync();
+    } catch (_) {}
+  }
+}
+
+String? _unityEntryText(ArchiveFile entry, int limit) {
+  if (entry.size > limit) return null;
+  try {
+    return utf8.decode(archiveEntryBytes(entry), allowMalformed: true);
+  } catch (error) {
+    return null;
+  }
+}
+
+/// The folders already searched for Unity sidecars, and what they hold.
+final _unitySidecarsByFolder = <String, List<String>>{};
+
+void resetUnitySidecarCache() => _unitySidecarsByFolder.clear();
+
+/// Unity builds of [asset]'s product that are files on disk rather than
+/// catalog entries.
+///
+/// 83 of the 93 Unity builds in this library are `.unitypackage`, and Atlas
+/// does not index those: every entry inside one is named by a GUID, so the
+/// rows would be thousands of unreadable names per pack. They sit beside the
+/// source zip, so they are found by looking there.
+List<String> unityPackageSidecarsFor(AssetItem asset) {
+  final zip = parseZipVirtualPath(asset.path);
+  final container = zip?.zipPath ?? asset.path;
+  final cut = container.lastIndexOf(RegExp(r'[\\/]'));
+  if (cut <= 0) return const [];
+  final folder = container.substring(0, cut);
+  final product = twinProductKey(containerDisplayName(asset));
+  if (product.isEmpty) return const [];
+
+  final known = _unitySidecarsByFolder[normalizePathKey(folder)];
+  final List<String> packages;
+  if (known != null) {
+    packages = known;
+  } else {
+    final found = <String>[];
+    try {
+      for (final entity in Directory(folder).listSync(followLinks: false)) {
+        if (entity is! File) continue;
+        if (extensionOf(entity.path) != 'unitypackage') continue;
+        found.add(entity.path);
+      }
+    } catch (error) {
+      fbxLog('Listing $folder for Unity packages failed: $error');
+    }
+    found.sort();
+    _unitySidecarsByFolder[normalizePathKey(folder)] = found;
+    packages = found;
+  }
+
+  return [
+    for (final path in packages)
+      if (twinProductKey(path.substring(path.lastIndexOf(RegExp(r'[\\/]')) + 1)) ==
+          product)
+        path,
+  ];
+}
+
+/// The Unity builds of the same product as [asset], nearest first.
+List<AssetItem> unityBuildsFor(AssetItem asset, List<AssetItem> allAssets) {
+  final product = twinProductKey(containerDisplayName(asset));
+  if (product.isEmpty) return const [];
+  final seen = <String>{};
+  final found = <AssetItem>[];
+  for (final other in allAssets) {
+    final zip = parseZipVirtualPath(other.path);
+    if (zip == null) continue;
+    final container = containerDisplayName(other);
+    if (!container.toLowerCase().contains('unity')) continue;
+    if (twinProductKey(container) != product) continue;
+    if (!seen.add(normalizePathKey(zip.zipPath))) continue;
+    found.add(other);
+  }
+  return found;
+}
+
+/// The image in [allAssets] whose path ends with this Unity project path.
+///
+/// The chain gives `PolygonSciFiSpace/Textures/X.png` inside the Unity zip;
+/// what Atlas can draw is the copy in the source zip, or that same entry.
+AssetItem? _textureAssetFor(
+  String unityPath,
+  AssetItem model,
+  List<AssetItem> allAssets,
+) {
+  final wanted = unityPath.split('/').last.toLowerCase();
+  final container = assetContainerKey(model);
+  AssetItem? elsewhere;
+  for (final asset in allAssets) {
+    if (!imageExts.contains(asset.ext)) continue;
+    if (asset.name.toLowerCase() != wanted) continue;
+    if (assetContainerKey(asset) == container) return asset;
+    elsewhere ??= asset;
+  }
+  return elsewhere;
+}
+
+/// The texture to draw a model with when the file itself names none.
+///
+/// Four tiers, first answer wins: the model's own prefab, the pack's
+/// dominant assignment, a filename rule, nothing.
+InferredTexture? findInferredTexture(
+  AssetItem model,
+  List<AssetItem> allAssets,
+) {
+  for (final build in unityBuildsFor(model, allAssets)) {
+    final zip = parseZipVirtualPath(build.path);
+    if (zip == null) continue;
+    final chain = readUnityTextureChain(zip.zipPath);
+    if (chain.isEmpty) continue;
+
+    final own = chain.byModelStem[unityModelStem(model.name)];
+    if (own != null) {
+      final asset = _textureAssetFor(own, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(path: asset.path, source: TextureSource.prefab);
+      }
+    }
+    final dominant = chain.dominant;
+    if (dominant != null) {
+      final asset = _textureAssetFor(dominant, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(
+          path: asset.path,
+          source: TextureSource.packDefault,
+        );
+      }
+    }
+  }
+
+  // Then the Unity builds that are not catalog entries: the .unitypackage
+  // files beside the source zip, which is 83 of the 93 Unity builds here.
+  for (final package in unityPackageSidecarsFor(model)) {
+    final chain = readUnityTextureChain(package);
+    if (chain.isEmpty) continue;
+    final own = chain.byModelStem[unityModelStem(model.name)];
+    if (own != null) {
+      final asset = _textureAssetFor(own, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(path: asset.path, source: TextureSource.prefab);
+      }
+    }
+    final dominant = chain.dominant;
+    if (dominant != null) {
+      final asset = _textureAssetFor(dominant, model, allAssets);
+      if (asset != null) {
+        return InferredTexture(
+          path: asset.path,
+          source: TextureSource.packDefault,
+        );
+      }
+    }
+  }
+
+  final guessed = guessTextureByName(model, allAssets);
+  return guessed == null
+      ? null
+      : InferredTexture(path: guessed.path, source: TextureSource.guessed);
+}
+
+/// The words in a container's name that say which pack it is.
+///
+/// The build words and the version runs are what differ between two builds
+/// of one pack, so they say nothing about which pack it is; anything under
+/// four letters is too short to be evidence.
+Set<String> _packNameWords(String containerName) {
+  var name = containerName.toLowerCase();
+  final dot = name.lastIndexOf('.');
+  if (dot > 0 && name.length - dot <= 15) name = name.substring(0, dot);
+  return {
+    for (final word in name.split(RegExp(r'[^a-z0-9]+')))
+      if (word.length >= 4 &&
+          !_twinBuildWords.contains(word) &&
+          !RegExp(r'^v?[0-9]+$').hasMatch(word))
+        word,
+  };
+}
+
+const _textureFolderNames = {'textures', '_textures'};
+const _textureVariantFolders = {
+  'alts',
+  'alt',
+  'fx',
+  'fx_textures',
+  'emissive',
+  'normals',
+  'masks',
+  'skybox',
+  'ui',
+  'particles',
+};
+const _nonBaseTextureWords = [
+  'mask',
+  'emissive',
+  'skybox',
+  'flare',
+  'dirt',
+  'gradient',
+  'glow',
+  'trail',
+  'normal',
+  'roughness',
+  'metallic',
+  'specular',
+];
+
+/// The pack's base atlas, guessed from file names.
+///
+/// Only reached when no Unity build says otherwise. Validated against the
+/// authored answer over the seven packs that have both: it agrees on five,
+/// and the two it missed are why the rule reads as it does -- the word
+/// `texture` is not required (PolygonNature's atlas is `PolygonNature_01.png`)
+/// and a pack with no single base atlas gets no answer at all.
+AssetItem? guessTextureByName(AssetItem model, List<AssetItem> allAssets) {
+  final container = assetContainerKey(model);
+  final productTokens = _packNameWords(containerDisplayName(model));
+  final candidates = <AssetItem>[];
+  final depths = <String, int>{};
+  for (final asset in allAssets) {
+    if (!imageExts.contains(asset.ext)) continue;
+    if (assetContainerKey(asset) != container) continue;
+    final parts = asset.path.replaceAll('\\', '/').toLowerCase().split('/');
+    var anchor = -1;
+    for (var i = 0; i < parts.length - 1; i += 1) {
+      if (_textureFolderNames.contains(parts[i])) anchor = i;
+    }
+    if (anchor < 0) continue;
+    final below = parts.sublist(anchor + 1, parts.length - 1);
+    if (below.any(_textureVariantFolders.contains)) continue;
+    final name = parts.last;
+    if (textureChannelWord(name).isNotEmpty) continue;
+    if (_nonBaseTextureWords.any(name.contains)) continue;
+    candidates.add(asset);
+    depths[asset.id] = below.length;
+  }
+  if (candidates.isEmpty) return null;
+
+  // Does this file name say which pack it belongs to? Either spelling
+  // counts: `Pack_Texture_01_A.png` in POLYGON_Pack names it in a word of
+  // its own, and `PolygonSciFiSpace_Texture_01_A.png` glues the pack's two
+  // words into one. Substring, both directions, over words long enough that
+  // a coincidence is unlikely.
+  int shared(AssetItem asset) {
+    final stem = twinStem(asset.name).replaceAll(RegExp(r'[^a-z0-9]'), '');
+    var count = 0;
+    for (final word in productTokens) {
+      if (stem.contains(word) || word.contains(stem)) count += 1;
+    }
+    return count;
+  }
+
+  // A name has to say which pack it belongs to, unless it is the only
+  // candidate: a pack of Signs, NeonSigns and Billboards and nothing else
+  // has no base atlas, and must answer nothing rather than pick one.
+  final named = candidates.where((asset) => shared(asset) > 0).toList();
+  final pool = candidates.length == 1 ? candidates : named;
+  if (pool.isEmpty) return null;
+
+  int endingRank(AssetItem asset) {
+    final stem = twinStem(asset.name);
+    if (stem.endsWith('_01_a')) return 3;
+    if (stem.endsWith('_01')) return 2;
+    if (stem.endsWith('_a')) return 1;
+    return 0;
+  }
+
+  int compare(AssetItem a, AssetItem b) {
+    final byDepth = (depths[a.id] ?? 0).compareTo(depths[b.id] ?? 0);
+    if (byDepth != 0) return byDepth;
+    final bySharing = shared(b).compareTo(shared(a));
+    if (bySharing != 0) return bySharing;
+    final byTokens = textureNameTokens(
+      a.name,
+    ).length.compareTo(textureNameTokens(b.name).length);
+    if (byTokens != 0) return byTokens;
+    final byEnding = endingRank(b).compareTo(endingRank(a));
+    if (byEnding != 0) return byEnding;
+    // Never scan order: a tie broken by chance is a different picture on
+    // two machines with the same library.
+    return normalizePathKey(a.path).compareTo(normalizePathKey(b.path));
+  }
+
+  final ranked = [...pool]..sort(compare);
+  if (ranked.length > 1) {
+    final first = ranked[0];
+    final second = ranked[1];
+    final tied = (depths[first.id] ?? 0) == (depths[second.id] ?? 0) &&
+        shared(first) == shared(second) &&
+        textureNameTokens(first.name).length ==
+            textureNameTokens(second.name).length;
+    // Two equally good base atlases means the pack has no default, and
+    // picking by alphabet would be a coin toss baked into every render.
+    if (tied) return null;
+  }
+  return ranked.first;
+}
+
+/// Whether a mesh is in the state an inferred texture is for: UVs to put one
+/// on, and no texture of its own named, embedded or already applied.
+bool meshWantsInferredTexture(MeshModel mesh) {
+  if (mesh.faces.isEmpty) return false;
+  var hasUvs = false;
+  for (final face in mesh.faces) {
+    if (face.uvs.isNotEmpty) {
+      hasUvs = true;
+      break;
+    }
+  }
+  if (!hasUvs) return false;
+  for (final material in mesh.materials) {
+    // A model that names a texture which then fails to resolve is missing
+    // one, not unnamed: the diagnostics report that, and covering it with a
+    // guess would hide a real problem.
+    if (material.textures.isNotEmpty) return false;
+    if (material.resolvedTextures.isNotEmpty) return false;
+    if (material.textureImage != null) return false;
+  }
+  return true;
+}
+
 // --- Twins: the same model in another format or another build ------------
 //
 // Half this library is the same models twice. 120,481 .uasset files carry
@@ -9551,7 +10327,20 @@ bool looksLikeAnimation(String relativePath) {
 /// OBJ is here because the parser now keeps `vt` and `usemtl`; before that it
 /// produced geometry with no texture information, so there was nothing for the
 /// discovery panel to say about one.
-const previewableModelExts = {'fbx', 'obj', 'stl'};
+/// The model formats Atlas can draw.
+///
+/// GLB and glTF read through cgltf in the same importer. DAE is not here on
+/// purpose: all 3,045 of them have a same-name FBX or OBJ in their own pack,
+/// so a COLLADA reader would add no model that cannot already be seen.
+const previewableModelExts = {'fbx', 'obj', 'stl', 'glb', 'gltf'};
+
+/// The model formats that can be read from inside an archive.
+///
+/// A `.gltf` keeps its geometry in a separate `.bin` beside it. An entry in
+/// a zip arrives as bytes with no folder to look in, so a loose `.gltf` on
+/// disk reads and one inside an archive does not -- it falls back to its
+/// twin, which every glTF in this library has.
+const inArchiveModelExts = {'fbx', 'obj', 'stl', 'glb'};
 
 /// One material, with its resolved texture shown rather than described.
 ///
@@ -9571,10 +10360,16 @@ class VisualTaggingStrip extends StatelessWidget {
     required this.onResume,
     required this.onStop,
     required this.onStart,
+    this.mode = TaggingMode.balanced,
+    this.onModeChanged,
     super.key,
   });
 
   final TagProgress progress;
+
+  /// How hard a run may push the machine, and how to change it.
+  final TaggingMode mode;
+  final ValueChanged<TaggingMode>? onModeChanged;
 
   /// Why tagging cannot run -- no Python, no script -- or null.
   final String? unavailable;
@@ -9583,6 +10378,44 @@ class VisualTaggingStrip extends StatelessWidget {
   final VoidCallback onResume;
   final VoidCallback onStop;
   final VoidCallback onStart;
+
+  /// The four modes, as a menu rather than a row of buttons.
+  ///
+  /// A changed mode takes effect on the next run: the worker is started
+  /// with its thread count and restarting it mid-batch would throw away
+  /// renders already paid for.
+  Widget _modePicker() {
+    final change = onModeChanged;
+    if (change == null) return const SizedBox.shrink();
+    return PopupMenuButton<TaggingMode>(
+      tooltip: 'How hard tagging may push this machine',
+      initialValue: mode,
+      onSelected: change,
+      itemBuilder: (context) => [
+        for (final candidate in TaggingMode.values)
+          PopupMenuItem<TaggingMode>(
+            value: candidate,
+            child: Text(
+              '${candidate.label} - ${candidate.describe}',
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              mode.label,
+              style: const TextStyle(fontSize: 11, color: Color(0xff55606e)),
+            ),
+            const Icon(Icons.arrow_drop_down, size: 16),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -9623,6 +10456,7 @@ class VisualTaggingStrip extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+            _modePicker(),
             TextButton(
               onPressed: onStart,
               child: const Text(
@@ -9656,6 +10490,39 @@ class VisualTaggingStrip extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
             ),
           ),
+          if (progress.assetsPerMinute > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Text(
+                '${progress.assetsPerMinute.toStringAsFixed(0)}/min',
+                style: const TextStyle(fontSize: 11, color: Color(0xff55606e)),
+              ),
+            ),
+          // Which stage the run is waiting in. The two totals are what say
+          // whether more lanes would help, and the answer has been guessed
+          // wrong here five times out of six.
+          if (progress.renderWaitMs + progress.workerWaitMs > 0)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Tooltip(
+                message:
+                    'Time the lanes spent waiting: '
+                    '${(progress.renderWaitMs / 1000).toStringAsFixed(0)}s '
+                    'rendering, '
+                    '${(progress.workerWaitMs / 1000).toStringAsFixed(0)}s '
+                    'embedding. The larger one is the limit.',
+                child: Text(
+                  progress.renderWaitMs >= progress.workerWaitMs
+                      ? 'render-bound'
+                      : 'embed-bound',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xff55606e),
+                  ),
+                ),
+              ),
+            ),
+          _modePicker(),
           if (progress.failed > 0 || progress.givenUp > 0)
             Padding(
               padding: const EdgeInsets.only(right: 8),
@@ -9719,7 +10586,12 @@ class VisualTaggingStrip extends StatelessWidget {
 /// "flat colour" and "asked for a texture and did not get one" look identical
 /// on screen but mean opposite things: the first is how a collision hull is
 /// supposed to look, the second is a broken link worth chasing.
-String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
+String materialSummaryLine(
+  MeshMaterial material, {
+  int? width,
+  int? height,
+  TextureSource inferred = TextureSource.none,
+}) {
   final extras = <String>[
     if (material.hasNormalMap) 'normal map',
     if (material.hasEmissiveMap) 'emissive map',
@@ -9728,7 +10600,10 @@ String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
 
   if (width != null && height != null) {
     final embedded = material.hasEmbeddedTexture ? ' (embedded)' : '';
-    return 'textured ${width}x$height$embedded$suffix';
+    final source = inferred == TextureSource.none
+        ? ''
+        : ' (${inferred.label})';
+    return 'textured ${width}x$height$embedded$source$suffix';
   }
   if (material.texturesMissing) {
     final count = material.textures.length;
@@ -9737,6 +10612,12 @@ String materialSummaryLine(MeshMaterial material, {int? width, int? height}) {
   }
   return 'flat colour, no texture$suffix';
 }
+
+/// The hand-picked value that means "draw this one flat".
+///
+/// A path nothing can resolve, chosen so it survives being stored beside
+/// real paths in the same setting.
+const noTextureChoice = 'none:flat-colour';
 
 /// Picks a texture for a model by hand, from what was scanned beside it.
 ///
@@ -9749,6 +10630,8 @@ class TexturePickerButton extends StatelessWidget {
     required this.candidates,
     required this.chosenPath,
     required this.onChosen,
+    this.inferred = TextureSource.none,
+    this.inferredName,
     super.key,
   });
 
@@ -9757,6 +10640,14 @@ class TexturePickerButton extends StatelessWidget {
 
   /// Null clears the choice and goes back to whatever resolved on its own.
   final ValueChanged<String?> onChosen;
+
+  /// Which tier answered, when the texture on screen was inferred rather
+  /// than named by the file. Said out loud: a guess and an authored answer
+  /// look identical once applied, and only one of them is evidence.
+  final TextureSource inferred;
+
+  /// The inferred texture's file name, for the same line.
+  final String? inferredName;
 
   @override
   Widget build(BuildContext context) {
@@ -9782,7 +10673,12 @@ class TexturePickerButton extends StatelessWidget {
         children: [
           Flexible(
             child: Text(
-              chosenName == null ? 'Texture: auto' : 'Texture: $chosenName',
+              chosenName != null
+                  ? 'Texture: $chosenName'
+                  : inferred == TextureSource.none
+                  ? 'Texture: auto'
+                  : 'Texture: ${inferred.label}'
+                        '${inferredName == null ? '' : ' - $inferredName'}',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -9799,6 +10695,12 @@ class TexturePickerButton extends StatelessWidget {
               const PopupMenuItem<String?>(
                 value: null,
                 child: Text('Auto (whatever the model asks for)'),
+              ),
+              // So a wrong inference can be turned off for one model
+              // without turning the feature off for the library.
+              const PopupMenuItem<String?>(
+                value: noTextureChoice,
+                child: Text('None (flat colour)'),
               ),
               const PopupMenuDivider(),
               for (final asset in candidates.take(40))
@@ -14423,7 +15325,11 @@ Future<MeshModel> loadMesh(
       asset.name,
       materialLibrary: await loadObjMaterialLibrary(asset, objText),
     );
-    return withResolvedObjTextures(mesh, asset.path, allAssets);
+    return _withInferredTexture(
+      await withResolvedObjTextures(mesh, asset.path, allAssets),
+      asset,
+      allAssets,
+    );
   }
   if (asset.ext == 'stl') {
     // Bytes, not text: a binary STL is the common case and decoding it as
@@ -14436,6 +15342,36 @@ Future<MeshModel> loadMesh(
     }
     return parseStlMesh(bytes, asset.name);
   }
+  if (asset.ext == 'glb' || asset.ext == 'gltf') {
+    if (asset.ext == 'gltf' && isZipVirtualPath(asset.path)) {
+      // Its geometry is in a .bin beside it in the archive, and the reader
+      // is handed bytes rather than a folder. Say so rather than drawing an
+      // empty mesh; every glTF here has an FBX or OBJ twin.
+      throw const FormatException(
+        'A .gltf inside an archive keeps its geometry in a separate file. '
+        'Open the FBX or OBJ twin instead.',
+      );
+    }
+    final bytes = isZipVirtualPath(asset.path)
+        ? await readZipVirtualAssetBytesByPath(asset.path)
+        : null;
+    if (isZipVirtualPath(asset.path) && (bytes == null || bytes.isEmpty)) {
+      throw const FormatException('Could not read GLB bytes from ZIP entry.');
+    }
+    // The same helper: it reads the extension off the label and hands the
+    // file to cgltf, printing the JSON this decoder already reads.
+    return _withInferredTexture(
+      await importFbxWithUfbx(
+        asset.path,
+        asset.name,
+        inputBytes: bytes,
+        allAssets: allAssets,
+        fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+      ),
+      asset,
+      allAssets,
+    );
+  }
   if (asset.ext == 'fbx') {
     fbxLog('Loading FBX mesh: ${asset.path}');
     final zipBytes = isZipVirtualPath(asset.path)
@@ -14445,17 +15381,48 @@ Future<MeshModel> loadMesh(
         (zipBytes == null || zipBytes.isEmpty)) {
       throw const FormatException('Could not read FBX bytes from ZIP entry.');
     }
-    return importFbxWithUfbx(
-      asset.path,
-      asset.name,
-      inputBytes: zipBytes,
-      allAssets: allAssets,
-      fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+    return _withInferredTexture(
+      await importFbxWithUfbx(
+        asset.path,
+        asset.name,
+        inputBytes: zipBytes,
+        allAssets: allAssets,
+        fallbackCheckerSquareSize: fallbackCheckerSquareSize,
+      ),
+      asset,
+      allAssets,
     );
   }
   throw FormatException(
     '${asset.ext.toUpperCase()} rendering is not implemented yet.',
   );
+}
+
+/// Puts the pack's own texture on a model that names none.
+///
+/// Here rather than inside the FBX and OBJ importers: both arrive at the
+/// same question, the conditions are about the finished mesh, and
+/// [renderAsset] and the tagging queue come through here too, so the
+/// picture they embed is the picture the viewer draws.
+Future<MeshModel> _withInferredTexture(
+  MeshModel mesh,
+  AssetItem asset,
+  List<AssetItem> allAssets,
+) async {
+  if (allAssets.isEmpty) return mesh;
+  if (!meshWantsInferredTexture(mesh)) return mesh;
+  final inferred = findInferredTexture(asset, allAssets);
+  if (inferred == null) return mesh;
+  final applied = await applyChosenTexture(mesh, inferred.path);
+  // applyChosenTexture hands back the same mesh when the image could not be
+  // read; claiming a texture that did not load would be worse than grey.
+  if (identical(applied, mesh)) return mesh;
+  setInferredTextureSource(applied, inferred.source);
+  fbxLog(
+    'Inferred texture for ${asset.name}: ${inferred.path} '
+    '(${inferred.source.name})',
+  );
+  return applied;
 }
 
 Future<MeshModel> importFbxWithUfbx(
@@ -15122,148 +16089,6 @@ String meshImporterPath() {
   if (File(developmentBuild).existsSync()) return developmentBuild;
   return packaged;
 }
-
-String? findModelFallbackTexture(String modelPath, List<AssetItem> allAssets) {
-  final modelDir = parentPath(modelPath).toLowerCase();
-  final modelPathLower = modelPath.toLowerCase().replaceAll('\\', '/');
-  final genericTokens = {
-    'sm',
-    'fbx',
-    'obj',
-    'stl',
-    'mesh',
-    'meshes',
-    'model',
-    'models',
-    'asset',
-    'assets',
-    'content',
-    'sourceart',
-    'source',
-    'marketplace',
-    'material',
-    'materials',
-    'levelprototyping',
-    'interactable',
-    'texture',
-    'textures',
-  };
-
-  Set<String> semanticTokens(String value) {
-    return tokenSet(
-      value,
-    ).where((token) => !genericTokens.contains(token)).toSet();
-  }
-
-  String relativeFromRoot(String fullPath, String rootPath) {
-    final full = fullPath.toLowerCase().replaceAll('\\', '/');
-    final root = rootPath.toLowerCase().replaceAll('\\', '/');
-    if (full == root) return '';
-    if (full.startsWith('$root/')) {
-      return full.substring(root.length + 1);
-    }
-    return full;
-  }
-
-  final modelNameTokens = semanticTokens(
-    modelPath.split(RegExp(r'[\\/]')).last,
-  );
-  final baseCandidates = allAssets.where((asset) {
-    if (!imageExts.contains(asset.ext)) return false;
-    final dir = parentPath(asset.path).toLowerCase();
-    if (dir == modelDir) return true;
-    final lowerPath = asset.path.toLowerCase().replaceAll('\\', '/');
-    return lowerPath.contains('/textures/');
-  }).toList();
-
-  if (baseCandidates.isEmpty) return null;
-
-  final sameSourceCandidates = baseCandidates.where((asset) {
-    final sourceLower = asset.sourceRoot.toLowerCase().replaceAll('\\', '/');
-    return modelPathLower.startsWith(sourceLower);
-  }).toList();
-  final candidates = sameSourceCandidates.isNotEmpty
-      ? sameSourceCandidates
-      : baseCandidates;
-
-  String? modelSourceRoot;
-  for (final candidate in candidates) {
-    final root = candidate.sourceRoot.toLowerCase().replaceAll('\\', '/');
-    if (modelPathLower.startsWith(root)) {
-      modelSourceRoot = root;
-      break;
-    }
-  }
-  final modelRelativePath = modelSourceRoot == null
-      ? modelPathLower
-      : relativeFromRoot(modelPathLower, modelSourceRoot);
-  final modelRelativeSegments = modelRelativePath.split('/');
-  final modelTokens = semanticTokens(modelRelativePath);
-
-  int score(AssetItem asset) {
-    final assetPathLower = asset.path.toLowerCase().replaceAll('\\', '/');
-    final assetRelativePath = modelSourceRoot == null
-        ? assetPathLower
-        : relativeFromRoot(assetPathLower, modelSourceRoot);
-    final assetRelativeSegments = assetRelativePath.split('/');
-    final assetNameTokens = semanticTokens(asset.name);
-    final assetPathTokens = semanticTokens(assetRelativePath);
-    final nameOverlap = modelNameTokens.intersection(assetNameTokens).length;
-    final pathOverlap = modelTokens.intersection(assetPathTokens).length;
-
-    var value = nameOverlap * 24 + pathOverlap * 14;
-
-    // If there is no semantic overlap at all, do not allow weak path bonuses
-    // to force an unrelated texture.
-    if (nameOverlap == 0 && pathOverlap == 0) {
-      return 0;
-    }
-
-    if (parentPath(asset.path).toLowerCase() == modelDir) value += 6;
-    if (assetPathLower.contains('/textures/')) {
-      value += 4;
-    }
-
-    // Prefer textures that are path-wise close under the same source root.
-    var sharedPrefix = 0;
-    final maxPrefix = math.min(
-      modelRelativeSegments.length,
-      assetRelativeSegments.length,
-    );
-    while (sharedPrefix < maxPrefix &&
-        modelRelativeSegments[sharedPrefix] ==
-            assetRelativeSegments[sharedPrefix]) {
-      sharedPrefix += 1;
-    }
-    value += math.min(sharedPrefix * 2, 12);
-
-    return value;
-  }
-
-  final scored = <({AssetItem asset, int score})>[];
-  for (final candidate in candidates) {
-    scored.add((asset: candidate, score: score(candidate)));
-  }
-  scored.sort((a, b) => b.score.compareTo(a.score));
-  final top = scored.take(5).toList();
-  for (final entry in top) {
-    fbxLog('Fallback candidate score=${entry.score} path=${entry.asset.path}');
-  }
-
-  final bestScore = top.isEmpty ? 0 : top.first.score;
-  final secondBest = top.length > 1 ? top[1].score : 0;
-  if (top.isEmpty || bestScore < 18 || (bestScore - secondBest) < 6) {
-    fbxLog(
-      'Fallback rejected due to low confidence or ambiguity (bestScore=$bestScore, secondBest=$secondBest) for model=$modelPath',
-    );
-    return null;
-  }
-
-  final selected = top.first.asset.path;
-  fbxLog('Fallback selected texture: $selected');
-  return selected;
-}
-
 /// One material as an `.mtl` sidecar describes it.
 ///
 /// Only the two fields that change a picture. `Ks`, `Ns`, `Ni` and `illum`
@@ -17409,6 +18234,52 @@ class MeshMaterial {
   /// Used when the user picks a texture by hand: a model whose materials name
   /// nothing (an OBJ with no `mtllib`) or name a file that is not in the
   /// library still has UVs, so a chosen atlas maps onto it correctly.
+  /// The base texture this material is drawing, by file name, or empty.
+  String get textureName {
+    final path = resolvedTextures.isNotEmpty
+        ? resolvedTextures.first
+        : (textures.isNotEmpty ? textures.first : '');
+    if (path.isEmpty) return '';
+    final cut = path.lastIndexOf(RegExp(r'[\\/]'));
+    return cut < 0 ? path : path.substring(cut + 1);
+  }
+
+  /// The same material with no base texture: flat colour, as it loaded.
+  ///
+  /// What "None" in the picker means. An inferred texture is applied during
+  /// the load, so turning it off cannot be done by simply not applying one.
+  MeshMaterial withoutBaseTexture() {
+    return MeshMaterial(
+      name: name,
+      color: color,
+      textures: textures,
+      resolvedTextures: const [],
+      textureColor: textureColor,
+      textureImage: null,
+      texturePixels: null,
+      textureWidth: 0,
+      textureHeight: 0,
+      normalTexture: normalTexture,
+      normalPixels: normalPixels,
+      normalWidth: normalWidth,
+      normalHeight: normalHeight,
+      emissiveTexture: emissiveTexture,
+      emissivePixels: emissivePixels,
+      emissiveWidth: emissiveWidth,
+      emissiveHeight: emissiveHeight,
+      opacity: opacity,
+      roughness: roughness,
+      metalness: metalness,
+      specularFactor: specularFactor,
+      emissiveFactor: emissiveFactor,
+      emissiveColor: emissiveColor,
+      shaderType: shaderType,
+      shadingModel: shadingModel,
+      uvSet: uvSet,
+      hasEmbeddedTexture: false,
+    );
+  }
+
   MeshMaterial withBaseTexture({
     required String path,
     required ui.Image image,
