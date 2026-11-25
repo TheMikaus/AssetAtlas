@@ -67,7 +67,22 @@ Kept separate from the above on purpose. Nothing below exists in source.
   folder is embedded on a worker isolate with throttling and cancel.
 
 ## Data and control flow
-- Pending source inspection, except the embedding store writes described above.
+- Pending source inspection, except the embedding store writes described above
+  and the list pipeline below.
+- Verified — how a row reaches the list (`lib/main.dart`): `assets` (the whole
+  catalog) → `sortedAssets`, memoised per (catalog revision, sort mode) and
+  per `_listEpoch` only in `type` mode → `_assetsMatching`, one pass per
+  predicate with every filter and the query, memoised on a key naming every
+  input → `collapseAssetVersions`, one row per model per pack → the rows the
+  `AssetList` or `AssetGrid` builds. Two passes run per rebuild: the list and
+  the count's denominator, each with its own cache.
+- Verified — the catalog-wide indexes (`rigIndexFor`, `twinIndexFor`,
+  `_textureIndexOf`, `_unityBuildIndex`, `findNearbyTextures`) are each built
+  once per catalog on first use, keyed on
+  `identityHashCode(allAssets) ^ allAssets.length`, and are built on the UI
+  thread by whichever interaction asks first. Nothing that runs per asset may
+  construct a `RegExp` or search a path with one — see DECISIONS.md PERF-001,
+  and `test/select_and_switch_cost_test.dart` for what each stage costs.
 
 ## Interfaces and dependencies
 - Verified: `embedding_store.py` uses the standard library only (`array`,

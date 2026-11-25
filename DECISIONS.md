@@ -460,3 +460,70 @@ Record significant **approved** decisions; do not confuse proposals with impleme
   Robot through tier 1 and a PolygonTown model through the `.unitypackage`
   sidecar. Revisit when a pack is found whose authored answer the reader gets
   wrong -- the survey script in the plan's appendix prints the list.
+
+## LIST-001 — One row per model, not one per file (Accepted, 2026-11-25)
+
+- **Context:** `war_robot_01` is seven files in this library: the source FBX in
+  `POLYGON_SciFiSpace_SourceFiles.zip` and six `.uasset` builds for Unreal 4.19
+  through 5.4. Searching for it gave seven rows of the same robot, and the
+  count beside the list counted files.
+- **Decision and rationale:** collapse by [twinKeyFor] -- the product key of
+  the container plus the file stem -- which is the key WP7 already uses for
+  "same model", so one rule serves pairing and the list. Mike chose the
+  strongest of the three groupings offered (same pack and same name, across
+  formats and engine versions) and chose it on by default. The row shown is
+  the one that can be drawn, so the row with a picture represents the group.
+- **Tradeoffs / risks:**
+  - Collapsing happens after filtering, never before: a filter still sees every
+    file, so "characters with no texture" still means the files.
+  - The badge counts the rows the list would have shown without collapsing,
+    not every copy in the catalog, so turning the switch off accounts for
+    exactly what the badge claimed.
+  - With the collapse on, ticking a row and copying copies the one file shown
+    rather than all seven. The switch is the way to the other behaviour.
+  - The key never reaches across packs, so two `pipe_end` files in different
+    kits stay two rows -- the weaker "possibly the same model" tier in
+    `TwinIndex` is deliberately not used here.
+- **Affected components and source references:** `lib/main.dart` --
+  `collapseAssetVersions`, `CollapsedAssets`, `VersionCountBadge`,
+  `AssetItem.twinKey`, `_assetsMatching`, `collapseVersionsKey`, `AssetList`,
+  `AssetGrid`.
+- **Validation and revisit trigger:** `test/collapse_versions_test.dart`, nine
+  tests over the real war-robot shape. Over the whole catalog: 480,826 files in
+  360,814 rows, 29,930 standing for more than one. Revisit if a pack is found
+  whose builds differ in content rather than only in engine version, where one
+  row would hide a real difference.
+
+## PERF-001 — No per-asset pattern construction, and the sort keys computed once (Accepted, 2026-11-25)
+
+- **Context:** the window froze for 30-60 s on selecting a `.uasset` and then
+  switching the type filter. Measured against the real catalog:
+  `twinIndexFor` 4,706 ms, `findInferredTexture` 4,204 ms, `sortAssets`
+  6,726 ms, a filter pass 627 ms -- all on the UI thread.
+- **Decision and rationale:** three rules, each from a measurement.
+  1. A `RegExp` is never constructed inside a function that runs per asset.
+     `twinProductKey`, `_packNameWords` and `containerDisplayName` each did,
+     and the last also searched for a path separator with
+     `lastIndexOf(RegExp)`, which walks the string from the front for every
+     position it tries: 2.6 s of the 4.3 s those two index builds spent. The
+     patterns are hoisted and the separator search is a backwards scan over
+     code units (`lastPathSeparator`).
+  2. A key derived from a container name is memoised per container name:
+     a few hundred names against 480,826 assets.
+  3. Sort keys are computed before the sort, not inside the comparator, and
+     the lower-cased path is held on the asset.
+- **Tradeoffs / risks:**
+  - `_twinProductKeyCache` and `AssetItem.sortPathKey`/`twinKey` are caches
+    with no invalidation, which is correct only because nothing they read
+    changes while Atlas is open. A rescan replaces the `AssetItem`s.
+  - The sorted list no longer carries `_listEpoch` except in `type` mode. If a
+    future sort mode reads something a classification fills in, it must be
+    added to that condition or the order will go stale.
+- **Affected components and source references:** `lib/main.dart` --
+  `sortAssets`, `_SortKey`, `sortedAssets`, `lastPathSeparator`,
+  `twinProductKey`, `_versionRunPattern`, `_twinProductKeyCache`,
+  `containerDisplayName`, `_textureIndexOf`.
+- **Validation and revisit trigger:**
+  `test/select_and_switch_cost_test.dart` (benchmark, needs `ATLAS_BENCH=1`
+  and a catalog copy) measures each stage; after this, 728 / 1,562 / 1,734 /
+  423 ms. Revisit when any single stage there passes a second again.

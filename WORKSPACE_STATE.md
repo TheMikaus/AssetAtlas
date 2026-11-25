@@ -99,20 +99,42 @@ Playdate framework: N/A
   failed**. The 813 ids it did not take are duplicate-group siblings that
   `candidates()` never offers -- it returns `min(id)` per `(lower(name),
   size)` group -- and 795 of the 796 without a vector have a sibling that
-  carries one. The one real gap is `glass.fbx` (Kenney Food Kit), a
-  pre-existing failure.
+  carries one. The one real gap was `glass.fbx` (Kenney Food Kit), now fixed
+  and embedded -- see below.
+- 2026-11-25, v1.10.51 on `fix/stage-1-correctness`, three things:
+  - `88f13df` the importer no longer prints bare `nan` into its JSON. JSON has
+    no NaN, so a model carrying one was unreadable rather than slightly wrong.
+    Every float in both readers goes through `json_double` (shared header
+    `windows/runner/json_number.h`). glass.fbx reads now; its three recorded
+    failures were cleared and it embedded, so **48,131 models have a vector**
+    and six given-up models remain, all genuinely unreadable.
+  - `b5b5a65` the 30-to-60 second stall Mike hit (All + `war_robot_01`,
+    select, switch to Character). Measured, not guessed, against the real
+    catalog: `twinIndexFor` 4,706 ms, `findInferredTexture` 4,204 ms,
+    `sortAssets` 6,726 ms, a filter pass 627 ms -- now 728 / 1,562 / 1,734 /
+    423 ms. Causes: a `RegExp` constructed per asset in three functions, a
+    `lastIndexOf(RegExp)` separator search worth 2.6 s on its own, sort keys
+    built inside the comparator, and a sorted list keyed on an epoch that
+    three unrelated things bump. See DECISIONS.md PERF-001.
+  - `b5b5a65` also collapses a model's versions into one row: 480,826 files
+    in 360,814 rows, 29,930 of them standing for more than one. Mike chose
+    the grouping (same pack and same name, across formats and engine
+    versions) and chose it on by default. See DECISIONS.md LIST-001.
+  - **The Windows binary is not rebuilt**: Atlas 1.10.50 was running and
+    holds `asset_atlas_native.exe`, so `flutter build windows` fails to link.
+    The importer exe *is* rebuilt. Mike has to close Atlas for the app build.
 - WP3's by-eye acceptance was done offline rather than in the app: the robot
   posed by a Sidekick idle and a forward walk, rendered through Atlas's own
   pose-and-rasterise path, with the controls unchanged. Watching it in the
   window itself is the one check nobody has run.
 
 ## Problems
-- The importer prints bare `nan` into its JSON when a vertex attribute is
-  not finite, which no JSON parser accepts, so the model is unreadable:
-  `glass.fbx` in the Kenney Food Kit fails with "Unexpected character (at
-  character 5742)" on `[0,1,2,0,0,1,0,1,nan,1]`. One model of 43,662 in this
-  library. Fix is to print non-finite floats as 0 in `mesh_importer.cpp`;
-  not done, outside the approved plan.
+- The stall fix leaves three stages still above a second on the UI thread:
+  `sortAssets` 1,734 ms (once per catalog and sort mode), the Unity and
+  texture index builds behind `findInferredTexture` 1,562 ms (once per
+  catalog, paid by whoever clicks first), and `collapseAssetVersions` 222 ms
+  per filter pass once its keys are cached. Nothing here is a freeze any
+  more, but none of it is off the UI thread either.
 - `embeddings.f32` is append-only, so a forced re-embed leaves the old rows
   behind: 145,442 rows in the file against 138,746 in the index, about 20 MB
   of 447 MB now dead. Harmless but it will only grow with each forced pass;
@@ -128,6 +150,9 @@ Playdate framework: N/A
   100–400 MB, unmeasured.
 
 ## User Directives
+- 2026-11-25: collapse the versions of one asset into one row in the list.
+  Mike chose the grouping -- same pack and same name, across formats and
+  engine versions -- and chose it on by default, with a toggle.
 - 2026-11-25: "the machine is free, run the tagging" -- lifts the 11-24 hold
   for that run only. The hold stands again by default.
 - 2026-11-24: no full tagging or embedding run while the user is working on
