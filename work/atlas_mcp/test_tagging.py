@@ -472,6 +472,81 @@ class FailureRecordTest(unittest.TestCase):
             vectors_path, index_path, expect_model_id="test-model")
 
 
+class ForceTest(unittest.TestCase):
+    """Redoing what is already embedded.
+
+    A vector is a picture of a model as Atlas drew it on the day. When the
+    way Atlas draws changes -- the pack's own texture, found where the file
+    named none -- the old vectors are pictures of something else, and
+    nothing in the store can say which. Without this the queue reports
+    "nothing to do" for a library that is entirely out of date, which is
+    exactly what it did report.
+    """
+
+    SCHEMA = (
+        "CREATE TABLE catalog_assets ("
+        " id TEXT PRIMARY KEY, name TEXT, path TEXT, relative_path TEXT,"
+        " ext TEXT, type TEXT, size INTEGER, ignored INTEGER DEFAULT 0,"
+        " model_kind TEXT, rig_family TEXT, referenced_by_model INTEGER"
+        " DEFAULT 0, tags_json TEXT)")
+
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute(self.SCHEMA)
+        for index, name in enumerate(["SM_Crate_01.fbx", "SM_Barrel_01.fbx",
+                                      "SM_Crate_02.fbx"]):
+            self.connection.execute(
+                "INSERT INTO catalog_assets (id, name, path, relative_path,"
+                " ext, type, size, ignored, tags_json)"
+                " VALUES (?,?,?,?,'fbx','model',?,0,'[]')",
+                ("a%d" % index, name, "zip:p.zip::%s" % name,
+                 "p/%s" % name, 100 + index))
+        self.directory = tempfile.mkdtemp(prefix="atlas-force-")
+        self.store = embedding_store.EmbeddingStore.create(
+            os.path.join(self.directory, "v.f32"),
+            os.path.join(self.directory, "i.sqlite"),
+            dims=4, model_id="test-model")
+
+    def tearDown(self):
+        self.store.close()
+        self.connection.close()
+
+    def work(self, **kwargs):
+        return tagging.work_list(self.store, self.connection, **kwargs)
+
+    def embed_everything(self):
+        self.store.append([
+            (row["id"], [0.1, 0.2, 0.3, 0.4], "render", 1)
+            for row in tagging.candidates(self.connection)
+        ])
+
+    def test_an_embedded_library_has_nothing_to_do(self):
+        self.embed_everything()
+        work = self.work()
+        self.assertEqual(work.as_dict()["remaining"], 0)
+        self.assertEqual(work.as_dict()["done"], work.as_dict()["selected"])
+
+    def test_force_takes_them_all_again(self):
+        self.embed_everything()
+        work = self.work(force=True).as_dict()
+        self.assertEqual(work["remaining"], work["selected"])
+        self.assertGreater(work["remaining"], 0)
+
+    def test_force_still_respects_the_limit(self):
+        self.embed_everything()
+        self.assertEqual(self.work(force=True, limit=2)
+                         .as_dict()["remaining"], 2)
+
+    def test_force_is_not_the_default(self):
+        self.embed_everything()
+        self.assertEqual(self.work().as_dict()["remaining"], 0)
+
+    def test_force_on_an_empty_store_changes_nothing(self):
+        before = self.work().as_dict()["remaining"]
+        self.assertEqual(self.work(force=True).as_dict()["remaining"], before)
+
+
 class InterruptedRunTest(unittest.TestCase):
     """What survives stopping the pass part way through.
 
@@ -499,6 +574,7 @@ class InterruptedRunTest(unittest.TestCase):
         dry_run = False
         max_attempts = 3
         retry_failed = False
+        force = False
 
     class FakeWorker:
         """Stands in for the child process, not for the queue.

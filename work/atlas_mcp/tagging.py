@@ -284,7 +284,8 @@ class WorkList:
 
 
 def work_list(store, connection, folder=None, pack=None, ext=None,
-              max_attempts=DEFAULT_MAX_ATTEMPTS, limit=None, kind="model"):
+              max_attempts=DEFAULT_MAX_ATTEMPTS, limit=None, kind="model",
+              force=False):
     """The outstanding work, derived from the store rather than remembered.
 
     Nothing records what is left: whatever has no vector is the job. That is
@@ -294,12 +295,19 @@ def work_list(store, connection, folder=None, pack=None, ext=None,
     Models and images share one store and one failure table, and they do not
     collide: the queue is derived per asset id, so a model with a vector says
     nothing about the texture beside it.
+
+    `force` takes everything the slice selects, vector or no vector. A vector
+    is a picture of a model as Atlas drew it on the day, so a change to how
+    Atlas draws makes the old ones wrong rather than stale-but-fine -- and
+    nothing else in the store can tell you which those are. It is deliberately
+    not the default: redoing the whole library is hours.
     """
     rows = candidates(connection, folder=folder, pack=pack, ext=ext,
                       kind=kind)
     failure_counts = store.failure_counts()
 
-    outstanding = [row for row in rows if not group_is_done(store, row)]
+    outstanding = (list(rows) if force
+                   else [row for row in rows if not group_is_done(store, row)])
     worth_trying = [row for row in outstanding
                     if not group_is_hopeless(row, failure_counts,
                                              max_attempts)]

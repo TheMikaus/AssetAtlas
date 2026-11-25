@@ -28,6 +28,7 @@ class VisualTagQueue {
     this.renderConcurrency = defaultRenderLanes,
     this.renderSize = 224,
     this.maxAttempts = 3,
+    this.force = false,
     this.isRendererAlive,
     this.startWorker = TagWorker.start,
   });
@@ -69,6 +70,13 @@ class VisualTagQueue {
   );
   final int threads;
   final int batchSize;
+
+  /// Embed again even where a vector exists.
+  ///
+  /// A vector is a picture of a model as Atlas drew it that day, so a change
+  /// to how Atlas draws makes the old ones wrong -- and nothing in the store
+  /// can say which. Off by default: redoing the library is hours.
+  final bool force;
 
   /// A gap between renders, off by default.
   ///
@@ -229,6 +237,7 @@ class VisualTagQueue {
         final work = await _ask(worker, 'next', {
           'limit': batchSize * 8,
           'max_attempts': maxAttempts,
+          if (force) 'force': true,
           ...scope.asRequest,
         });
         _emit(

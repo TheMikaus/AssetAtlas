@@ -86,6 +86,16 @@ void main() {
       final options = parseStartupOptions(['--tag-all', '--tag-mode=fast']);
       expect(options.tagAll, isTrue);
       expect(options.tagMode, TaggingMode.fast);
+      expect(options.tagForce, isFalse);
+    });
+
+    test('--tag-force asks for the embedded ones again', () {
+      // A vector is a picture of a model as Atlas drew it that day. When
+      // the way Atlas draws changes -- a texture it now finds, say -- the
+      // old vectors are wrong, and nothing in the store can say which.
+      final options = parseStartupOptions(['--tag-all', '--tag-force']);
+      expect(options.tagForce, isTrue);
+      expect(parseStartupOptions(['--tag-all']).tagForce, isFalse);
     });
   });
 

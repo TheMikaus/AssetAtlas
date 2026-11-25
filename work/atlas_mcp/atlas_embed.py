@@ -554,6 +554,8 @@ def run_text(embedder, phrase, out):
 #   {"op": "ping"}
 #       -> {"ok": true, "model_id": "...", "dims": 768, "store": true}
 #   {"op": "next", "limit": 8, "pack": "POLYGON_Town", "kind": "model"}
+#       "force": true takes assets that already have a vector too, for when
+#       the way Atlas draws has changed and the old pictures are wrong.
 #       -> {"ok": true, "selected": 31495, "done": 264, "given_up": 0,
 #           "remaining": 8, "assets": [{"asset_id": .., "path": ..}, ..]}
 #       kind is "model" (the default: things to render) or "image" (things
@@ -672,7 +674,8 @@ def _serve_next(session, message):
             max_attempts=int(message.get("max_attempts")
                              or tagging.DEFAULT_MAX_ATTEMPTS),
             limit=limit,
-            kind=message.get("kind") or "model")
+            kind=message.get("kind") or "model",
+            force=bool(message.get("force")))
     reply = {"ok": True}
     reply.update(work.as_dict())
     return reply

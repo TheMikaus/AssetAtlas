@@ -192,12 +192,15 @@ def run(arguments, out):
 
         selection = {"folder": arguments.folder, "pack": arguments.pack,
                      "ext": arguments.ext,
-                     "max_attempts": arguments.max_attempts}
+                     "max_attempts": arguments.max_attempts,
+                     "force": arguments.force}
         work = worker.ask(op="next", limit=arguments.limit, **selection)
 
         out.write("%d distinct models selected, %d already embedded, "
-                  "%d to do\n"
-                  % (work["selected"], work["done"], work["remaining"]))
+                  "%d to do%s\n"
+                  % (work["selected"], work["done"], work["remaining"],
+                     " (--force: the embedded ones are being redone)"
+                     if arguments.force else ""))
         out.write("store         %s\n" % vectors_path)
         out.write("priority      %s, %d worker threads, %d ms pace\n"
                   % (priority, arguments.threads, arguments.pace_ms))
@@ -357,6 +360,9 @@ def main(argv=None):
                         help="give up on an asset after this many failed "
                              "renders (default %d; 0 means never give up)"
                              % tagging.DEFAULT_MAX_ATTEMPTS)
+    parser.add_argument("--force", action="store_true",
+                        help="embed again even where a vector exists, for "
+                             "when the way Atlas draws a model has changed")
     parser.add_argument("--retry-failed", action="store_true",
                         help="forget every recorded failure and try them "
                              "all again")

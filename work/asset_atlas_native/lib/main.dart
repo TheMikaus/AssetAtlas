@@ -28,7 +28,12 @@ import 'visual_tagging.dart';
 /// over one newly scanned folder and no use for the whole library: that is
 /// an 18-hour job that wants to run with nobody watching.
 class StartupOptions {
-  const StartupOptions({this.tagAll = false, this.renderLanes, this.tagMode});
+  const StartupOptions({
+    this.tagAll = false,
+    this.renderLanes,
+    this.tagMode,
+    this.tagForce = false,
+  });
 
   /// Start tagging the whole library as soon as the catalog is restored.
   final bool tagAll;
@@ -39,6 +44,9 @@ class StartupOptions {
   /// How hard a tagging run may push the machine, or null for the saved
   /// setting. An explicit `--tag-lanes` still wins over the mode's lanes.
   final TaggingMode? tagMode;
+
+  /// Embed again even where a vector exists -- `--tag-force`.
+  final bool tagForce;
 }
 
 /// Reads `--tag-all` and `--tag-lanes=N`.
@@ -50,11 +58,16 @@ StartupOptions parseStartupOptions(List<String> arguments) {
   const lanesFlag = '--tag-lanes=';
   const modeFlag = '--tag-mode=';
   var tagAll = false;
+  var force = false;
   int? lanes;
   TaggingMode? mode;
   for (final argument in arguments) {
     if (argument == '--tag-all') {
       tagAll = true;
+      continue;
+    }
+    if (argument == '--tag-force') {
+      force = true;
       continue;
     }
     if (argument.startsWith(lanesFlag)) {
@@ -73,7 +86,12 @@ StartupOptions parseStartupOptions(List<String> arguments) {
       }
     }
   }
-  return StartupOptions(tagAll: tagAll, renderLanes: lanes, tagMode: mode);
+  return StartupOptions(
+    tagAll: tagAll,
+    renderLanes: lanes,
+    tagMode: mode,
+    tagForce: force,
+  );
 }
 
 Future<void> main(List<String> arguments) async {
@@ -396,6 +414,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       renderConcurrency: widget.options.renderLanes ?? _taggingMode.lanes,
       threads: _taggingMode.threadsOn(Platform.numberOfProcessors),
       paceMs: _taggingMode.paceMs,
+      force: widget.options.tagForce,
       onProgress: (progress) {
         if (!mounted) return;
         setState(() => _tagProgress = progress);
