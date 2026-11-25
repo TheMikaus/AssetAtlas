@@ -150,7 +150,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.45';
+const appVersion = '1.10.46';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -1657,14 +1657,14 @@ class _CatalogScreenState extends State<CatalogScreen> {
                           }
                         });
                       },
-                      onTypeChanged: (value) => setState(() {
-                        typeFilter = value;
-                        // A query typed against one type almost never means
-                        // anything against the next, and leaving it set makes
-                        // the new type look empty.
-                        searchController.clear();
-                        _onSearchChanged('');
-                      }),
+                      // Changing the type changes the type and nothing
+                      // else. This used to clear the search as well, on the
+                      // theory that a query typed against one type means
+                      // nothing against the next; the empty-list line in
+                      // SearchAndSummary answers that worry without throwing
+                      // away what the user typed.
+                      onTypeChanged: (value) =>
+                          setState(() => typeFilter = value),
                       onModelTextureFilterChanged: (value) {
                         setState(() {
                           modelTextureFilter = value;
@@ -2777,6 +2777,35 @@ class SearchAndSummary extends StatelessWidget {
                 ),
             ],
           ),
+          // An empty list after a filter change used to be explained by
+          // clearing the search. The search now survives, so the list explains
+          // itself instead -- otherwise the view looks broken rather than
+          // filtered.
+          if (visibleCount == 0 && controller.text.trim().isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Still searching for "${controller.text.trim()}". '
+                      'Nothing in this view matches.',
+                      style: const TextStyle(color: Colors.black54),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      controller.clear();
+                      onChanged('');
+                    },
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    child: const Text('Clear search'),
+                  ),
+                ],
+              ),
+            ),
         ],
       ),
     );
