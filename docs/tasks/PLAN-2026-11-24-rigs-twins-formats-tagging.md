@@ -107,10 +107,27 @@ rule better (one filter dropped, one guard added).
 | Read `.unitypackage`, to widen the authored texture chain from 7 packs to ~90? | **Yes** | WP6 **Phase B**, approved work, not a follow-on. |
 | Vendor `cgltf` for GLB/glTF? | **Yes** | WP8 Phase A is unblocked; no further dependency approval needed for `cgltf` specifically. |
 | DAE? | **Skip** | WP8 Phase B is closed, not deferred. Do not write a COLLADA reader. Revisit only if a DAE with no twin enters the library. |
+| Who runs the catalog rewrites? | **Claude runs them once the code is right — tell Mike** | No approval needed per run; a backup first, and say so afterwards. |
 
-Still open and **not** answered: who runs the `backfill_rigs.py --all` catalog
-rewrites that WP4 and WP5 need (Mike, or Claude with Atlas closed). Ask before
-the first one. It is a write over ~480,000 rows and Atlas must not be running.
+**The catalog rewrites, now authorised.** WP4 and WP5 each finish with a
+`backfill_rigs.py --all` pass over the FBX rows. Mike's instruction, 2026-11-24:
+*once you have fixed the code to do what is necessary you can run the backfill,
+just let me know.* So run it, under these conditions, each of which exists
+because of something that has gone wrong before:
+
+1. **The code first.** The rule it writes has to be the final one, with its tests
+   passing. A backfill run on a half-right rule has to be run again.
+2. **Atlas must not be running** — the script's own docstring says so, and the
+   Python suite's `database is locked` failures come from exactly this. Mike's app
+   is his; ask him to close it rather than killing the process.
+3. **Back up first**, to `asset_atlas_native.db.before-<change>`, beside the two
+   earlier backups. This is a write over the whole catalog.
+4. **`--dry-run` first**, read the counts, and only then the real pass.
+5. **Say what it did afterwards**: rows changed, the family histogram before and
+   after, and how long it took.
+6. **Not a licence for the tagging run.** §0.6 still holds: the backfill is about
+   a minute of twelve workers, the tagging run is hours of GPU-less inference.
+   They are different asks and only the first is authorised.
 
 ### 0.4 Rules of the repo (they have each caused real damage when ignored)
 
@@ -494,8 +511,9 @@ Compatibility, in `rigFamiliesCompatible`:
    `main.dart:4150`). After a backfill that copy is stale. Wherever the catalog
    finishes loading, if the chosen character's path matches an asset, overwrite
    `AnimationCharacter.instance.rigFamily` with that asset's current `rigFamily`.
-8. **Re-fill the column** (Mike runs this, or approves it — it writes his catalog):
-   1. Close Atlas.
+8. **Re-fill the column** (authorised 2026-11-24 — Claude runs it and reports;
+   the conditions are in §0.3):
+   1. Ask Mike to close Atlas, and confirm it is closed.
    2. Copy `%APPDATA%\com.example\asset_atlas_native\asset_atlas_native.db` to
       `asset_atlas_native.db.before-rig-rules-2` (two earlier backups beside it
       follow this naming).
@@ -1520,9 +1538,8 @@ Notes that cost time to find out:
   then a run, which is held.
 - **14,836 models are still untagged.** Unblocked by none of this, sped up by WP9,
   held by §0.6.
-- **Who runs the catalog rewrites.** WP4 and WP5 both need
-  `backfill_rigs.py --all` over ~480,000 rows with Atlas closed. Not answered yet;
-  ask before the first run.
+- ~~Who runs the catalog rewrites.~~ Answered 2026-11-24: Claude runs them once
+  the code is right, and tells Mike. Conditions in §0.3.
 - **Browsing the Unity builds as assets.** WP6 Phase B reads `.unitypackage` as a
   sidecar, on demand. Indexing their contents as catalog rows is a different,
   larger decision (each row's name would have to come from `pathname`, not from
