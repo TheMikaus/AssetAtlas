@@ -30,6 +30,10 @@ source in this workspace; the rest is still pending inspection.
     source, computed_ms)`.
 - `source` distinguishes a vector derived from a **render** of the model's
   geometry from one derived from a **texture** the model references.
+- Verified — the values written are `render` (48,148 rows) and `image`
+  (90,599 rows) as of 2026-11-25. Atlas reads that split for the tagging
+  strip (`readTaggedCounts`) and writes nothing here; see DECISIONS.md
+  TAG-002.
 - Deliberately **not** in `catalog_assets`; see DECISIONS.md EMB-001. The
   catalog schema stays at v7 and Atlas keeps sole ownership of it.
 - Crash safety is an ordering property, enforced inside the module because it
@@ -83,6 +87,31 @@ Kept separate from the above on purpose. Nothing below exists in source.
   thread by whichever interaction asks first. Nothing that runs per asset may
   construct a `RegExp` or search a path with one — see DECISIONS.md PERF-001,
   and `test/select_and_switch_cost_test.dart` for what each stage costs.
+- Verified — how a model reaches the viewer (`lib/main.dart`): `loadMeshModel`
+  → `importFbxWithUfbx` → `runMeshImporterOffThread`, which runs
+  `asset_atlas_mesh_importer.exe` and drains its stdout **on a worker
+  isolate**, then `jsonDecode` and `meshModelFromImporterJson` on the UI
+  isolate (the mesh holds `ui.Image` textures, which cannot cross an isolate
+  boundary). The drain is off the UI isolate because a Windows pipe holds
+  about 64 KB and a 705 KB model prints 5.3 MB: draining it on the UI isolate
+  needed more than 60 turns of the event loop, which is minutes when the
+  window is busy. See DECISIONS.md PERF-002. Probes (`--probe`, tens of
+  bytes) still drain on the caller's isolate.
+- Verified — the UI isolate also rasterises **animated** frames inline
+  (`RasterModelView._render` takes the `rasterizeScene` branch whenever a
+  `sceneOverride` is given) and skins the character once per clip frame in
+  `build`. Every other frame goes to `RenderWorker.shared`. Thumbnails
+  (`ModelThumbnailCache`, two at a time, queue capped at 48) flatten and
+  rasterise on the UI isolate as well.
+- Verified — the texture filter validates models lazily: the filter pass
+  queues every model with no verdict, the queue imports three at a time, and
+  the verdicts are folded into the list once per 1,500 ms burst
+  (`ListRefreshCoalescer`) rather than once per file. See DECISIONS.md
+  PERF-004.
+- Verified — `UiStallWatchdog` (started beside the bridge, stopped in
+  `dispose`) logs any gap over 750 ms between its own 250 ms ticks, with a
+  tally of the stages that ran. It is the only thing in the app that can say
+  what froze the window; see DECISIONS.md OBS-001.
 
 ## Interfaces and dependencies
 - Verified: `embedding_store.py` uses the standard library only (`array`,

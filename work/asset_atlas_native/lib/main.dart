@@ -183,7 +183,7 @@ const zipArchiveIdleTimeout = Duration(seconds: 5);
 /// Not const only so tests can shrink it and watch eviction happen without
 /// writing half a gigabyte of fixtures. Nothing in the app assigns to it.
 var maxTextureBitmapCacheBytes = 512 * 1024 * 1024;
-const appVersion = '1.10.51';
+const appVersion = '1.10.52';
 const _maxConcurrentModelValidations = 3;
 
 /// How many chunks are classified at once.
@@ -225,6 +225,79 @@ void fbxLog(String message) {
     ).writeAsStringSync(line, mode: FileMode.append, flush: false);
   } catch (_) {
     // Console logs still provide diagnostics if file logging is unavailable.
+  }
+}
+
+/// What the UI isolate has been doing, for [UiStallWatchdog].
+///
+/// One count per call of a stage that can take hundreds of milliseconds, not
+/// one per asset: the point is to name the work, not to measure it. Globals
+/// are per isolate, so a worker isolate rasterising a frame never lands in
+/// the window's tally.
+final uiStageCounts = <String, int>{};
+
+void countUiStage(String stage) {
+  uiStageCounts[stage] = (uiStageCounts[stage] ?? 0) + 1;
+}
+
+/// The stages in [counts], busiest first: `sort x2, filter x4`.
+String describeUiStages(Map<String, int> counts) {
+  if (counts.isEmpty) return 'nothing instrumented ran';
+  final stages = counts.keys.toList()
+    ..sort((a, b) {
+      final byCount = counts[b]!.compareTo(counts[a]!);
+      return byCount != 0 ? byCount : a.compareTo(b);
+    });
+  return [for (final stage in stages) '$stage x${counts[stage]}'].join(', ');
+}
+
+/// A gap this long between timer ticks means the event loop stopped turning.
+///
+/// 750 ms is well past a slow frame and well short of the seconds that ruin
+/// a window.
+const uiStallThresholdMs = 750;
+
+/// The line to log for a [gapMs] gap between ticks, or null if it was
+/// ordinary.
+///
+/// A blocked UI isolate cannot drain a subprocess pipe, answer the bridge or
+/// draw: a model load behind one takes as long as the block, because the
+/// importer fills its 64 KB stdout pipe and then waits for a reader that is
+/// not running. Which stage froze the window cost a whole session to guess
+/// at, so it is measured here instead.
+String? uiStallReport(int gapMs, Map<String, int> counts) {
+  if (gapMs < uiStallThresholdMs) return null;
+  return 'UI thread blocked for $gapMs ms; ${describeUiStages(counts)}';
+}
+
+/// Logs what ran whenever the event loop stops turning.
+///
+/// The lateness of this timer's own tick is the measurement: nothing else on
+/// the UI isolate can report a block, because a blocked isolate cannot run
+/// the reporter either.
+class UiStallWatchdog {
+  UiStallWatchdog._();
+
+  static Timer? _timer;
+  static var _last = DateTime.now();
+
+  static void start() {
+    if (_timer != null) return;
+    _last = DateTime.now();
+    uiStageCounts.clear();
+    _timer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      final now = DateTime.now();
+      final gapMs = now.difference(_last).inMilliseconds;
+      _last = now;
+      final report = uiStallReport(gapMs, uiStageCounts);
+      if (report != null) fbxLog(report);
+      uiStageCounts.clear();
+    });
+  }
+
+  static void stop() {
+    _timer?.cancel();
+    _timer = null;
   }
 }
 
@@ -448,6 +521,13 @@ class _CatalogScreenState extends State<CatalogScreen> {
     );
     _tagQueue = queue;
     await queue.start(scope);
+    if (mounted) unawaited(_loadTaggedCounts());
+  }
+
+  Future<void> _loadTaggedCounts() async {
+    final counts = await readTaggedCounts(db.catalogDirectory);
+    if (!mounted || counts == null) return;
+    setState(() => _taggedCounts = counts);
   }
 
   Future<void> _rescanAllSources({bool force = false}) async {
@@ -487,6 +567,18 @@ class _CatalogScreenState extends State<CatalogScreen> {
   VisualTagQueue? _tagQueue;
   TagProgress _tagProgress = const TagProgress(state: TagState.idle);
   String? _tagUnavailable;
+
+  /// What earlier runs left in the store, read once at startup and again
+  /// when a run ends.
+  TaggedCounts? _taggedCounts;
+
+  /// Redraws the list for a burst of background verdicts once.
+  late final ListRefreshCoalescer _listRefresh = ListRefreshCoalescer(
+    onRefresh: () {
+      if (!mounted) return;
+      setState(_invalidateAssetViews);
+    },
+  );
 
   /// Bumped whenever something that affects filtering changes without the
   /// catalog itself changing: an ignore toggle, a texture validation result, an
@@ -536,6 +628,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
       // is. Not in tests: binding a port is not a widget test's business.
       AtlasBridge.instance.bindCatalog(() => assets);
       unawaited(AtlasBridge.instance.start());
+      UiStallWatchdog.start();
+      unawaited(_loadTaggedCounts());
     } else {
       loadingPersisted = false;
     }
@@ -737,6 +831,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
       _listEpoch,
     ].join('|');
     if (cache != null && cachedKey == cacheKey) return cache;
+    countUiStage('filter');
 
     // Bones beat family names wherever both rigs are known. The index is
     // built once per catalog, not once per pass.
@@ -1010,6 +1105,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
         batch.add(_modelValidationQueue.removeFirst());
       }
       await Future.wait(batch.map(_validateModelTexture));
+      if (!mounted) break;
     }
     _processingModelValidationQueue = false;
   }
@@ -1034,10 +1130,12 @@ class _CatalogScreenState extends State<CatalogScreen> {
     }
 
     if (mounted) {
-      setState(() {
-        modelHasValidTextures[asset.id] = hasValidTexture;
-        _invalidateAssetViews();
-      });
+      // The verdict lands at once; the redraw it implies is collected with
+      // the rest of the sweep's. One refresh per verdict meant a filter pass
+      // and a collapse over the whole catalog per file, which is what pinned
+      // the UI thread for 46 minutes with the texture filter on.
+      modelHasValidTextures[asset.id] = hasValidTexture;
+      _listRefresh.request();
     }
     _modelValidationInFlight.remove(asset.id);
   }
@@ -1049,6 +1147,8 @@ class _CatalogScreenState extends State<CatalogScreen> {
     searchController.dispose();
     folderFilterController.dispose();
     unawaited(AtlasBridge.instance.stop());
+    UiStallWatchdog.stop();
+    _listRefresh.cancel();
     super.dispose();
   }
 
@@ -1961,6 +2061,7 @@ class _CatalogScreenState extends State<CatalogScreen> {
               VisualTaggingStrip(
                 progress: _tagProgress,
                 unavailable: _tagUnavailable,
+                tagged: _taggedCounts,
                 mode: _taggingMode,
                 onModeChanged: (mode) => unawaited(_setTaggingMode(mode)),
                 onPause: () => _tagQueue?.pause(),
@@ -3510,6 +3611,7 @@ Future<ui.Image?> renderModelThumbnail(
   List<AssetItem> allAssets = const [],
   int size = ModelThumbnailCache.size,
 }) async {
+  countUiStage('thumbnail');
   final mesh = await MeshLoadCache.load(asset, allAssets: allAssets);
   if (mesh.isAnimationOnly || mesh.faces.isEmpty) return null;
 
@@ -5199,6 +5301,21 @@ class SkeletonPlayer extends StatefulWidget {
   State<SkeletonPlayer> createState() => _SkeletonPlayerState();
 }
 
+/// Which frame of a [frameCount]-frame clip at [frameRate] is showing
+/// after [elapsed] of playback.
+///
+/// Top level and pure so the playback rate can be tested without a window.
+int animationFrameAt(
+  Duration elapsed, {
+  required int frameCount,
+  required double frameRate,
+}) {
+  if (frameCount <= 1) return 0;
+  final rate = frameRate <= 0 ? 30.0 : frameRate;
+  // Loop: a locomotion clip is meant to be watched repeatedly.
+  return ((elapsed.inMicroseconds / 1e6) * rate).floor() % frameCount;
+}
+
 class _SkeletonPlayerState extends State<SkeletonPlayer>
     with SingleTickerProviderStateMixin {
   late final Ticker _ticker;
@@ -5243,6 +5360,14 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     super.initState();
     _ticker = createTicker((elapsed) {
       if (!_playing) return;
+      // A 30 fps clip on a 60 Hz display puts every second tick on the frame
+      // already drawn, and redrawing it is not free: the build skins every
+      // vertex of the character and then rasterises the whole pane, both on
+      // this isolate. Let the clock run on without a rebuild instead.
+      if (_frameAt(elapsed) == _frame) {
+        _elapsed = elapsed;
+        return;
+      }
       setState(() => _elapsed = elapsed);
     })..start();
     // The outfit can change while a clip is open -- a helmet put on in the
@@ -5423,15 +5548,13 @@ class _SkeletonPlayerState extends State<SkeletonPlayer>
     super.dispose();
   }
 
-  int get _frame {
-    final count = widget.skeleton.frameCount;
-    if (count <= 1) return 0;
-    final rate = widget.skeleton.frameRate <= 0
-        ? 30.0
-        : widget.skeleton.frameRate;
-    // Loop: a locomotion clip is meant to be watched repeatedly.
-    return ((_elapsed.inMicroseconds / 1e6) * rate).floor() % count;
-  }
+  int get _frame => _frameAt(_elapsed);
+
+  int _frameAt(Duration elapsed) => animationFrameAt(
+    elapsed,
+    frameCount: widget.skeleton.frameCount,
+    frameRate: widget.skeleton.frameRate,
+  );
 
   /// Parks playback on one frame. Scrubbing implies pausing.
   void _seek(int frame) {
@@ -6017,6 +6140,7 @@ class RasterScene {
   );
 
   static RasterScene fromMesh(MeshModel mesh, {String? uvSetOverride}) {
+    countUiStage('scene flatten');
     final triangles = <int>[];
     final triMaterial = <int>[];
     final triObject = <int>[];
@@ -6437,6 +6561,7 @@ class RasterRequest {
 /// Renders a frame. Pure, and free of `dart:ui`, so it runs equally well on a
 /// worker isolate; see [rasterizeSceneInIsolate].
 RasterResult rasterizeScene(RasterRequest request) {
+  countUiStage('raster');
   final scene = request.scene;
   final width = request.width;
   final height = request.height;
@@ -7831,6 +7956,7 @@ extension AssetSortModeLabel on AssetSortMode {
 /// path is why the string was built even for the three modes that do not
 /// otherwise look at it.
 List<AssetItem> sortAssets(List<AssetItem> assets, AssetSortMode mode) {
+  countUiStage('sort');
   final keyed = List<_SortKey>.generate(assets.length, (index) {
     final asset = assets[index];
     return _SortKey(
@@ -10000,6 +10126,7 @@ int _representativeRank(AssetItem asset) =>
 /// [ordered] is expected to be in display order and the result keeps it:
 /// each group takes the position where it first appeared.
 CollapsedAssets collapseAssetVersions(List<AssetItem> ordered) {
+  countUiStage('collapse');
   if (ordered.isEmpty) return CollapsedAssets.empty;
 
   // Insertion-ordered, which is what keeps the result in display order.
@@ -10152,6 +10279,7 @@ TwinIndex twinIndexFor(List<AssetItem> allAssets) {
   final identity = identityHashCode(allAssets) ^ allAssets.length;
   final known = _twinIndex;
   if (known != null && _twinIndexIdentity == identity) return known;
+  countUiStage('twin index build');
   final index = TwinIndex.of(allAssets);
   _twinIndex = index;
   _twinIndexIdentity = identity;
@@ -10283,6 +10411,7 @@ RigIndex rigIndexFor(
       identityHashCode(allAssets) ^ allAssets.length ^ bonesBySignature.length;
   final known = _rigIndex;
   if (known != null && _rigIndexIdentity == identity) return known;
+  countUiStage('rig index build');
   final index = RigIndex(bonesBySignature: bonesBySignature);
   for (final asset in allAssets) {
     index.add(asset);
@@ -10689,6 +10818,108 @@ const inArchiveModelExts = {'fbx', 'obj', 'stl', 'glb'};
 /// "Is this model textured?" is a question a swatch answers instantly, and a
 /// list of paths does not: a model can resolve its atlas correctly and still
 /// look grey, because that is the part of the atlas it uses.
+/// How long a sweep of background verdicts may hold back a list refresh.
+///
+/// Longer than a refresh costs (two filter passes and two collapses over the
+/// whole catalog, about 1.3 s on this library) so a sweep of tens of
+/// thousands of files cannot spend more of the thread on redrawing the list
+/// than on the work itself.
+const listRefreshWindowMs = 1500;
+
+/// Collects list invalidations that arrive in a burst into one.
+///
+/// The texture filter validates models lazily: the filter pass queues every
+/// model it has no verdict for, and each verdict changes what the list shows.
+/// Applying them one at a time meant a whole-catalog refresh per file --
+/// 48,000 of them, each about 1.3 s, on the UI thread. The window burned a
+/// core for 46 minutes doing that, and a model load waiting behind it took
+/// 13 minutes 57 seconds.
+///
+/// The verdicts themselves are never delayed or dropped; only the redraw is.
+class ListRefreshCoalescer {
+  ListRefreshCoalescer({
+    required this.onRefresh,
+    this.window = const Duration(milliseconds: listRefreshWindowMs),
+  });
+
+  final VoidCallback onRefresh;
+  final Duration window;
+  Timer? _pending;
+
+  /// Refreshes once, [window] from the first request in a burst.
+  void request() {
+    if (_pending != null) return;
+    _pending = Timer(window, () {
+      _pending = null;
+      onRefresh();
+    });
+  }
+
+  bool get hasPending => _pending != null;
+
+  void cancel() {
+    _pending?.cancel();
+    _pending = null;
+  }
+}
+
+/// What the embedding store already holds, for the tagging strip.
+class TaggedCounts {
+  const TaggedCounts({required this.models, required this.textures});
+
+  /// Vectors made from a render of a model, and from a texture image.
+  final int models;
+  final int textures;
+
+  bool get any => models + textures > 0;
+}
+
+/// Counts the vectors beside the catalog, by what they were made from.
+///
+/// One read of one index table, not a tagging run: starting the embedder to
+/// answer this would load 325 MB of model to print a number.
+///
+/// The strip used to say "visual tagging has not been started" whenever no
+/// run had happened *in this process*, which is every ordinary launch. It
+/// said that over a store holding 138,747 vectors, and was believed. Atlas
+/// still never writes here -- `tagging.py` owns the store, DECISIONS.md
+/// EMB-001 -- and deliberately does not recompute what counts as outstanding:
+/// that lives in one place, in Python, and this reports only what is there.
+Future<TaggedCounts?> readTaggedCounts(String? catalogDirectory) async {
+  if (catalogDirectory == null) return null;
+  final path =
+      '$catalogDirectory${Platform.pathSeparator}embeddings_index.sqlite';
+  if (!File(path).existsSync()) return null;
+  Database? database;
+  try {
+    database = await databaseFactory.openDatabase(
+      path,
+      options: OpenDatabaseOptions(readOnly: true, singleInstance: false),
+    );
+    final rows = await database.rawQuery(
+      'select source, count(*) as tally from embedding_index group by source',
+    );
+    var models = 0;
+    var textures = 0;
+    for (final row in rows) {
+      final count = (row['tally'] as int?) ?? 0;
+      if (row['source'] == 'image') {
+        textures += count;
+      } else {
+        models += count;
+      }
+    }
+    return TaggedCounts(models: models, textures: textures);
+  } catch (error) {
+    // A missing table, a store from a newer writer, no ffi factory in a test:
+    // none of them are worth a dialog. The strip falls back to its own state.
+    fbxLog('Could not read the embedding index: $error');
+    return null;
+  } finally {
+    await database?.close();
+  }
+}
+
 /// The tagging strip: one line, and only when there is something to say.
 ///
 /// Visual tagging runs for hours and is meant to be forgotten about, so this
@@ -10704,6 +10935,7 @@ class VisualTaggingStrip extends StatelessWidget {
     required this.onStart,
     this.mode = TaggingMode.balanced,
     this.onModeChanged,
+    this.tagged,
     super.key,
   });
 
@@ -10716,10 +10948,28 @@ class VisualTaggingStrip extends StatelessWidget {
   /// Why tagging cannot run -- no Python, no script -- or null.
   final String? unavailable;
 
+  /// What the store holds from earlier runs, or null if it could not be read.
+  final TaggedCounts? tagged;
+
   final VoidCallback onPause;
   final VoidCallback onResume;
   final VoidCallback onStop;
   final VoidCallback onStart;
+
+  /// What the strip says when no run is going.
+  ///
+  /// "Not started" is only true of this process, and saying it over a full
+  /// store reads as "none of your library is tagged", which was wrong by
+  /// 138,747 vectors.
+  String get idleMessage {
+    final counts = tagged;
+    if (counts == null || !counts.any) {
+      return 'Visual tagging has not been started. It renders each model '
+          'and learns what it looks like, in the background.';
+    }
+    return '${counts.models} models and ${counts.textures} textures are '
+        'tagged. Start again to pick up anything added since.';
+  }
 
   /// The four modes, as a menu rather than a row of buttons.
   ///
@@ -10790,11 +11040,13 @@ class VisualTaggingStrip extends StatelessWidget {
           children: [
             const Icon(Icons.auto_awesome, size: 14, color: Color(0xff6b7a8d)),
             const SizedBox(width: 8),
-            const Expanded(
+            Expanded(
               child: Text(
-                'Visual tagging has not been started. It renders each model '
-                'and learns what it looks like, in the background.',
-                style: TextStyle(fontSize: 11, color: Color(0xff55606e)),
+                idleMessage,
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: Color(0xff55606e),
+                ),
                 overflow: TextOverflow.ellipsis,
               ),
             ),
@@ -12638,6 +12890,7 @@ _TextureIndex _textureIndexOf(List<AssetItem> allAssets) {
   final identity = identityHashCode(allAssets) ^ allAssets.length;
   final cached = _textureIndexCache;
   if (cached != null && _textureIndexIdentity == identity) return cached;
+  countUiStage('texture index build');
 
   final byContainer = <String, _ContainerTextures>{};
   final byBaseName = <String, List<AssetItem>>{};
@@ -15798,7 +16051,11 @@ Future<MeshModel> importFbxWithUfbx(
     throw FormatException('FBX importer helper was not found at $helper.');
   }
   fbxLog('Launching importer for: $path');
-  final result = await runMeshImporter(helper, path, inputBytes: inputBytes);
+  final result = await runMeshImporterOffThread(
+    helper,
+    path,
+    inputBytes: inputBytes,
+  );
   if (result.exitCode != 0) {
     final error = result.stderr.trim();
     fbxLog('Importer failed (${result.exitCode}): $error');
@@ -15806,6 +16063,7 @@ Future<MeshModel> importFbxWithUfbx(
   }
   fbxLog('Importer completed for: $path');
 
+  countUiStage('importer json');
   final json = jsonDecode(result.stdout) as Map<String, dynamic>;
   fbxLog(
     'Importer JSON counts: vertices=${(json['vertices'] as List<dynamic>?)?.length ?? 0}, vertexColors=${(json['vertexColors'] as List<dynamic>?)?.length ?? 0}, faces=${(json['faces'] as List<dynamic>?)?.length ?? 0}, materials=${(json['materials'] as List<dynamic>?)?.length ?? 0}, textureFiles=${(json['textureFiles'] as List<dynamic>?)?.length ?? 0}, sceneTextures=${(json['sceneTextures'] as List<dynamic>?)?.length ?? 0}',
@@ -15818,6 +16076,26 @@ Future<MeshModel> importFbxWithUfbx(
     fallbackCheckerSquareSize: fallbackCheckerSquareSize,
   );
 }
+
+/// [runMeshImporter] on a worker isolate, for the full import.
+///
+/// The drain above is asynchronous, so the UI isolate's event loop has to turn
+/// once for every pipe buffer the child fills -- and a Windows pipe holds
+/// about 64 KB of the megabytes a model prints. A window that is busy for
+/// seconds at a time therefore turns a 0.3 s import into minutes: measured at
+/// 12 minutes and still unfinished for one 705 KB model, with the child
+/// blocked after 0.25 s of CPU and the window's own thread pegged. On a
+/// worker, nothing the window is doing can stall the pipe.
+///
+/// Probes stay on the caller's isolate: they print tens of bytes, which one
+/// pipe buffer holds, and they already run inside a classify isolate.
+Future<MeshImporterResult> runMeshImporterOffThread(
+  String helper,
+  String sourcePath, {
+  Uint8List? inputBytes,
+}) => Isolate.run(
+  () => runMeshImporter(helper, sourcePath, inputBytes: inputBytes),
+);
 
 class MeshImporterResult {
   const MeshImporterResult({
@@ -15854,8 +16132,14 @@ Future<MeshImporterResult> runMeshImporter(
   // this side waits forever for a stdout that will never arrive. The debug
   // path (ASSET_ATLAS_DEBUG_SPACES) writes a line per mesh, which on a
   // 215-node kit is enough to reach it.
-  final stdoutDone = process.stdout.expand((chunk) => chunk).toList();
-  final stderrDone = process.stderr.expand((chunk) => chunk).toList();
+  // Kept as whole reads rather than as individual bytes: `expand` turned one
+  // 64 KB read into 64 thousand stream events, and a 705 KB model prints
+  // 5.3 MB of JSON. The builder keeps each read intact and hands the decoder
+  // one typed list, which it has a fast path for.
+  final stdoutChunks = BytesBuilder(copy: false);
+  final stderrChunks = BytesBuilder(copy: false);
+  final stdoutDone = process.stdout.forEach(stdoutChunks.add);
+  final stderrDone = process.stderr.forEach(stderrChunks.add);
 
   // A path-based call writes nothing to stdin, so a child that has already
   // exited leaves a closed pipe here. That is not a failure of the import and
@@ -15870,13 +16154,13 @@ Future<MeshImporterResult> runMeshImporter(
     // The child is gone or no longer listening; the exit code decides.
   }
 
-  final stdoutBytes = await stdoutDone;
-  final stderrBytes = await stderrDone;
+  await stdoutDone;
+  await stderrDone;
   final exitCode = await process.exitCode;
   return MeshImporterResult(
     exitCode: exitCode,
-    stdout: utf8.decode(stdoutBytes, allowMalformed: true),
-    stderr: utf8.decode(stderrBytes, allowMalformed: true),
+    stdout: utf8.decode(stdoutChunks.takeBytes(), allowMalformed: true),
+    stderr: utf8.decode(stderrChunks.takeBytes(), allowMalformed: true),
   );
 }
 
@@ -17842,6 +18126,7 @@ Float32List poseSkinnedPositions({
   RetargetPlan? plan,
   Float32List? boneWorld,
 }) {
+  countUiStage('skinning');
   final vertices = character.vertices;
   final skin = character.skin;
   if (skin == null || frame < 0 || frame >= clip.frameCount) {
