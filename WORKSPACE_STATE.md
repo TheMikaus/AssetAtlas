@@ -60,6 +60,26 @@ Playdate framework: N/A
   analyze clean. Version 1.10.29.
 - `a1b37b8` Adopted the new behaviour contract, `.claude/` agents/skills/rules,
   and continuity documents. Previous instructions kept as `CLAUDE.old.md`.
+- 2026-11-25 (late): the "visual tagging has not been started" note and the
+  model that would not load, both investigated against the running app and
+  both fixed. Tagging was in fact complete -- `tag_assets.py --dry-run`:
+  48,137 distinct models selected, 48,131 embedded, 0 to do, 6 given up over
+  a store of 138,747 vectors (48,148 `render`, 90,599 `image`). The strip's
+  idle text only ever meant "no run in this process". The load was starved,
+  not slow: the importer child was alive 12 minutes on 0.25 s of CPU while
+  the window's thread took 557 CPU-seconds, and `/health` on the bridge
+  answered in 3,297-7,480 ms, which is the gap between turns of the event
+  loop. The same file imports in 0.31 s and prints 5.3 MB of JSON; a Windows
+  pipe holds 64 KB, so the drain needed 60+ turns. Four changes, 28 new
+  tests: the full import drains on a worker isolate (PERF-002), the animation
+  player poses once per clip frame rather than once per vsync (PERF-003),
+  `UiStallWatchdog` logs any block over 750 ms with a tally of the stages
+  that ran (OBS-001), the strip reads the store instead of guessing
+  (TAG-002), and the texture filter's lazy validation refreshes the list once
+  per burst rather than once per file (PERF-004) -- which is what the thread
+  was burning on. `flutter analyze` clean, `flutter test` 896 passed /
+  39 skipped.
+  **Not yet built into the running app: 1.10.51 is still the one on screen.**
 - Embedding store implemented: `work/atlas_mcp/embedding_store.py`, 32 tests
   passing. Validated at full scale (13,933 × 768): append 579 ms, `matrix()`
   16 ms cold / 0 ms warm, 44.3 MB on disk. **Uncommitted.**
@@ -136,6 +156,34 @@ Playdate framework: N/A
   window itself is the one check nobody has run.
 
 ## Problems
+- The UI thread burn of 2026-11-25 is **diagnosed and fixed** (PERF-004): the
+  texture filter's lazy validation refreshed the whole list per file. The
+  evidence fits it exactly -- continuous for 50+ minutes, event-loop turns
+  3.3-7.5 s apart (one refresh is about 1.3 s, 3 s in `type` mode), and no
+  subprocess running, because a verdict for a non-FBX model needs none. Mike
+  confirmed a model in the 3D preview and no animation clip open, which rules
+  out the player. Not directly observed in the running process: nothing in
+  1.10.51 could report it, which is what OBS-001 is for. If a block is
+  reported again, read `logs/asset_atlas_fbx.log` for "UI thread blocked for"
+  and the stage tally on that line.
+- A single list refresh still costs about 1.3 s of UI thread (two filter
+  passes and two collapses over 480,826 assets) and PERF-004 only caps how
+  often one happens. Incremental filtering -- updating the rows a changed
+  asset affects rather than re-deriving the list -- is the real answer and is
+  unstarted.
+- Animated frames are still rasterised on the UI isolate, by design: the
+  worker would need the geometry every frame. The real fix is to send it the
+  posed positions instead and is not done.
+- Thumbnail rendering still flattens and rasterises on the UI isolate. Moving
+  it is blocked on the same thing: `MeshModel` holds `ui.Image` textures,
+  which cannot cross an isolate boundary, so the expensive flatten has to
+  happen where the mesh is.
+- The catalog contains Unity's generated `Library/PackageCache` trees as if
+  they were art -- the file in tonight's report is a Cinemachine sample.
+  `ignoredFolderNames` skips `intermediate`, `saved` and `binaries` but not
+  `library` or `packagecache`. Not changed: it would alter what a rescan
+  keeps, which is Mike's call. Row count **Unknown** (the catalog was locked
+  by the wedged app when it was asked).
 - The stall fix leaves three stages still above a second on the UI thread:
   `sortAssets` 1,734 ms (once per catalog and sort mode), the Unity and
   texture index builds behind `findInferredTexture` 1,562 ms (once per
@@ -155,6 +203,10 @@ Playdate framework: N/A
   100–400 MB, unmeasured.
 
 ## User Directives
+- 2026-11-25 (late): "Investigate and fix the issues you find" -- approval for
+  the four fixes above, and for the investigation that found them. Stopping
+  the wedged app was asked for and refused by the sandbox, so the build is
+  waiting on Mike closing Atlas.
 - 2026-11-25: collapse the versions of one asset into one row in the list.
   Mike chose the grouping -- same pack and same name, across formats and
   engine versions -- and chose it on by default, with a toggle.
@@ -181,6 +233,11 @@ Playdate framework: N/A
   rather than reimplementing ranking.
 
 ## Decisions
+- PERF-002 Accepted — the UI isolate never waits on a subprocess pipe.
+- PERF-003 Accepted — one pose per clip frame, not one per display frame.
+- OBS-001 Accepted — the app names the stage that froze it.
+- TAG-002 Accepted — the tagging strip reports the store, not this process.
+- PERF-004 Accepted — one list refresh per sweep of texture verdicts.
 - EMB-001 Accepted — embeddings in a flat file beside the catalog, not in it.
 - EMB-002 Accepted in principle — similarity search in a native helper.
 - EMB-003 Accepted on evidence — the texture-to-model link comes from

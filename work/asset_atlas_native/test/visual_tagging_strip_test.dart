@@ -19,12 +19,14 @@ void main() {
     VoidCallback? onPause,
     VoidCallback? onResume,
     VoidCallback? onStop,
+    TaggedCounts? tagged,
   }) => tester.pumpWidget(
     MaterialApp(
       home: Scaffold(
         body: VisualTaggingStrip(
           progress: progress,
           unavailable: unavailable,
+          tagged: tagged,
           onStart: onStart ?? () {},
           onPause: onPause ?? () {},
           onResume: onResume ?? () {},
@@ -62,6 +64,58 @@ void main() {
         progress: const TagProgress(state: TagState.idle),
       );
       expect(find.textContaining('renders each model'), findsOneWidget);
+    });
+  });
+
+  group('what earlier runs left behind', () {
+    // The bug this group exists for: the strip said tagging had not been
+    // started whenever no run had happened in *this process*, which is every
+    // ordinary launch. It said it over a store holding 138,747 vectors, and
+    // it was believed -- the library had in fact been fully tagged hours
+    // earlier by the other driver.
+    const full = TaggedCounts(models: 48148, textures: 90599);
+
+    testWidgets('idle reports the store rather than claiming nothing is done',
+        (tester) async {
+      await pumpStrip(
+        tester,
+        progress: const TagProgress(state: TagState.idle),
+        tagged: full,
+      );
+      expect(find.textContaining('48148 models'), findsOneWidget);
+      expect(find.textContaining('90599 textures'), findsOneWidget);
+      expect(find.textContaining('has not been started'), findsNothing);
+    });
+
+    testWidgets('and still offers a way to run it again', (tester) async {
+      // Counts must not become a reason to hide the button: a folder added
+      // since the last run is exactly when someone reads this line.
+      await pumpStrip(
+        tester,
+        progress: const TagProgress(state: TagState.idle),
+        tagged: full,
+      );
+      expect(find.text('Start visual tagging'), findsOneWidget);
+    });
+
+    testWidgets('an empty store does read as not started', (tester) async {
+      await pumpStrip(
+        tester,
+        progress: const TagProgress(state: TagState.idle),
+        tagged: const TaggedCounts(models: 0, textures: 0),
+      );
+      expect(find.textContaining('has not been started'), findsOneWidget);
+    });
+
+    testWidgets('a store that could not be read falls back to that too',
+        (tester) async {
+      // Nothing read is not the same claim as nothing tagged, but the strip
+      // has nothing better to say, and it must not invent a number.
+      await pumpStrip(
+        tester,
+        progress: const TagProgress(state: TagState.idle),
+      );
+      expect(find.textContaining('has not been started'), findsOneWidget);
     });
   });
 

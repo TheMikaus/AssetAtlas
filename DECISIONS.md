@@ -527,3 +527,162 @@ Record significant **approved** decisions; do not confuse proposals with impleme
   `test/select_and_switch_cost_test.dart` (benchmark, needs `ATLAS_BENCH=1`
   and a catalog copy) measures each stage; after this, 728 / 1,562 / 1,734 /
   423 ms. Revisit when any single stage there passes a second again.
+
+## PERF-002 — The UI isolate never waits on a subprocess pipe (Accepted, 2026-11-25)
+
+- **Context:** selecting a model left the window pegged on one core and the
+  model never appeared. Measured on the running app (1.10.51, pid 118440):
+  the importer child was alive for 12 minutes having used 0.25 s of CPU --
+  blocked, not working -- while the window's own thread took 557 CPU-seconds.
+  The same file, same binary, with its stdout drained, imports in **0.31 s**
+  and prints **5,306,239 bytes** of JSON. Five `/health` calls on the bridge
+  took 6,637 / 3,967 / 3,297 / 3,705 / 7,480 ms, which is the gap between
+  turns of the event loop.
+- **Decision and rationale:** the drain for a full import runs on a worker
+  isolate (`runMeshImporterOffThread`, `Isolate.run`). A Windows pipe holds
+  about 64 KB, so an asynchronous drain on the UI isolate needs one turn of
+  the event loop per buffer: measured at **more than 60 turns** for this one
+  model. Multiply by a turn that takes seconds and a 0.31 s import becomes
+  minutes. Nothing about how busy the window is can stall a worker's pipe.
+  The bytes are also collected as whole reads (`BytesBuilder`) rather than
+  through `expand`, which turned each 64 KB read into 64 thousand stream
+  events.
+- **Tradeoffs / risks:**
+  - One isolate per import. It is tens of milliseconds against a subprocess
+    and a parse, and the classification queue has done this since it existed.
+  - Probes stay on the caller's isolate: they print tens of bytes, one buffer
+    holds that, and they already run inside a classify isolate.
+  - `jsonDecode` of the result is still synchronous on the UI isolate -- one
+    block of a few hundred milliseconds for a large model, counted as
+    `importer json` by the watchdog (OBS-001). Moving it would mean sending a
+    decoded map between isolates, which is its own copy.
+- **Affected components and source references:** `lib/main.dart` --
+  `runMeshImporter`, `runMeshImporterOffThread`, `importFbxWithUfbx`.
+- **Validation and revisit trigger:**
+  `test/importer_off_thread_test.dart` blocks the calling isolate in 200 ms
+  slices and counts the turns the import needs: 60+ before (the test's cap),
+  under 10 after. Corpus-gated. Revisit if a model load is ever reported slow
+  again while the window is responsive -- that would be a different cause.
+
+## PERF-003 — One pose per clip frame, not one per display frame (Accepted, 2026-11-25)
+
+- **Context:** the animation player's ticker called `setState` on every vsync.
+  Each rebuild skins every vertex of the character (`poseSkinnedPositions`)
+  and rasterises the whole pane, both on the UI isolate -- animated frames
+  deliberately bypass the render worker, because the geometry changes every
+  frame and there is no stable scene for the worker to hold.
+- **Decision and rationale:** the ticker advances its clock always and
+  rebuilds only when the clip's frame index changes. A 30 fps clip on a 60 Hz
+  display was paying for every frame twice; on a 144 Hz display, nearly five
+  times. Redrawing the same frame cannot change a pixel, so nothing is lost.
+- **Tradeoffs / risks:** `_elapsed` is now assigned outside `setState` on the
+  ticks that change nothing. That is only correct while the frame index is the
+  only thing on screen derived from it -- a readout of elapsed seconds would
+  have to move inside the guard.
+- **Affected components and source references:** `lib/main.dart` --
+  `animationFrameAt`, `_SkeletonPlayerState._frameAt`, its ticker.
+- **Validation and revisit trigger:**
+  `test/animation_frame_rate_test.dart`, including the count of ticks in one
+  second of 144 Hz that change the frame (30 of 144). Revisit by moving
+  animated rasterising to the render worker -- send the posed positions, not
+  the geometry -- which is the real fix for playback cost and is not done.
+
+## OBS-001 — The app names the stage that froze it (Accepted, 2026-11-25)
+
+- **Context:** a 30-60 s stall was diagnosed by measuring stages against a
+  copy of the catalog, and a 12-minute one could only be narrowed by
+  elimination from outside the process -- thread CPU, child processes, bridge
+  latency. Nothing in the app could say what was running.
+- **Decision and rationale:** a 250 ms periodic timer on the UI isolate whose
+  own lateness is the measurement: a blocked isolate cannot run the reporter
+  either, so the lateness of a tick is the block. When a gap passes 750 ms it
+  logs the gap and a tally of the stages that ran -- `sort`, `filter`,
+  `collapse`, the three index builds, `raster`, `scene flatten`, `skinning`,
+  `thumbnail`, `importer json` -- busiest first. One count per call, not per
+  asset.
+- **Tradeoffs / risks:**
+  - It names stages, it does not time them. The line says what ran during a
+    block, not which part of it was slow; the benchmark test is still what
+    measures a stage.
+  - A block in code with no counter in it reports "nothing instrumented ran",
+    which is itself the answer: instrument that next.
+  - The counters are plain globals, so a worker isolate's own rasterising
+    lands in that worker's copy and never in the window's tally.
+- **Affected components and source references:** `lib/main.dart` --
+  `UiStallWatchdog`, `uiStallReport`, `describeUiStages`, `countUiStage`,
+  `uiStageCounts`; started beside the bridge, stopped in `dispose`.
+- **Validation and revisit trigger:** `test/ui_stall_watchdog_test.dart` (the
+  decision is a pure function; the timer measures real lateness and cannot be
+  faked). Revisit if a stall is reported and the log names nothing.
+
+## TAG-002 — The strip reports the store, not this process (Accepted, 2026-11-25)
+
+- **Context:** Mike read "Visual tagging has not been started" in the window
+  and concluded the library had never been tagged. It had: 48,137 distinct
+  models selected, 48,131 embedded, 0 to do (`tag_assets.py --dry-run`), over
+  a store of 138,747 vectors. The strip's idle text meant "no run has
+  happened in this process", which is true of every ordinary launch.
+- **Decision and rationale:** the idle strip reads one table beside the
+  catalog -- `select source, count(*) from embedding_index group by source` --
+  and says how many models and textures have vectors. Reading is enough:
+  starting the embedder to answer it would load 325 MB of model to print a
+  number, and recomputing what is *outstanding* would restate in Dart the
+  selection logic that `tagging.py` owns (EMB-001).
+- **Tradeoffs / risks:**
+  - It reports what is there, not completeness. "48,148 models and 90,599
+    textures are tagged" does not claim the library is finished, because
+    Atlas cannot know that without Python's selection rules.
+  - A store it cannot read falls back to the old sentence. Nothing read and
+    nothing tagged are different claims, but the strip has nothing better to
+    say and must not invent a number.
+- **Affected components and source references:** `lib/main.dart` --
+  `TaggedCounts`, `readTaggedCounts`, `VisualTaggingStrip.idleMessage`,
+  `_loadTaggedCounts`.
+- **Validation and revisit trigger:** `test/tagged_counts_test.dart` (the
+  read, including the empty, absent and unreadable cases) and the new group in
+  `test/visual_tagging_strip_test.dart`. Revisit if the store grows a third
+  `source` that is not a model render.
+
+## PERF-004 — One list refresh per sweep of verdicts, not one per file (Accepted, 2026-11-25)
+
+- **Context:** with the texture filter on anything but `all`, the window
+  burned one core continuously -- 557 CPU-seconds when first sampled, 2,754
+  fifty minutes later, with no model import in flight for most of it -- and
+  turns of its event loop were 3,297-7,480 ms apart. The mechanism is in
+  source: the filter pass itself queues every model it has no texture verdict
+  for (`_assetsMatching`, the `hasValid == null` branch), and
+  `_validateModelTexture` then called `setState` with `_invalidateAssetViews()`
+  **per file**. Each of those re-runs both filter passes and both collapses
+  over 480,826 assets, about 1.3 s, and in `type` sort mode a 1,734 ms
+  re-sort as well. There are about 48,000 models to get verdicts for, and a
+  verdict for a non-FBX model is instant -- no subprocess, which is why the
+  thread stayed busy with no importer process to show for it. The classify
+  queue had already learned this lesson: `_applyModelKinds` folds a chunk of
+  400 in at a time, and its comment says why.
+- **Decision and rationale:** the verdict lands in `modelHasValidTextures`
+  immediately; the redraw it implies goes through `ListRefreshCoalescer`,
+  which refreshes once per 1,500 ms burst. The window is deliberately longer
+  than a refresh costs, so a sweep cannot spend more of the thread redrawing
+  the list than validating files. Nothing about the verdicts changes.
+- **Tradeoffs / risks:**
+  - A row can take up to 1.5 s to appear or disappear while a sweep runs.
+    That is a background sweep over tens of thousands of files; the
+    alternative was a window that could not draw at all.
+  - The verdict map is now written outside `setState`. Correct because the
+    pending refresh is what rebuilds, but a future reader of that map must
+    not assume a rebuild has already happened.
+  - It caps the refresh rate, not the cost of one refresh. A refresh is still
+    1.3 s of UI thread; incremental filtering is the real answer and is not
+    done. See the Problems list.
+  - Validating a filter over the whole library still means importing every
+    FBX model in it, three at a time. That is inherent to the filter, and
+    since PERF-002 it is off the UI isolate.
+- **Affected components and source references:** `lib/main.dart` --
+  `ListRefreshCoalescer`, `listRefreshWindowMs`, `_listRefresh`,
+  `_validateModelTexture`, `_processModelValidationQueue`.
+- **Validation and revisit trigger:**
+  `test/list_refresh_coalescer_test.dart` (5 tests, on the fake clock):
+  50 verdicts in a burst cost one refresh, 50 over five seconds cost at most
+  ten, a verdict after a quiet spell still redraws, and cancelling drops the
+  pending one. Revisit when `UiStallWatchdog` reports a block whose tally is
+  dominated by `filter` and `collapse` again.
