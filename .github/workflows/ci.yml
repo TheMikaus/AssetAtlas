@@ -12,7 +12,12 @@ jobs:
       run:
         working-directory: work/asset_atlas_native
     steps:
-      - uses: actions/checkout@v4
+      # v7, not v4: v4 runs on Node 20, which GitHub has deprecated and now
+      # forces onto Node 24 while warning in every run's log. v7 ships on
+      # Node 24. Its one behaviour change that could bite -- refusing to
+      # check out a fork's head -- applies to pull_request_target and
+      # workflow_run, which this workflow does not use.
+      - uses: actions/checkout@v7
 
       - uses: subosito/flutter-action@v2
         with:
