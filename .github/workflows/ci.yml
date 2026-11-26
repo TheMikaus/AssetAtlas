@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Work on a branch with no open pull request gets no build at all
+  # otherwise, which is how a toolchain change can sit unverified. This
+  # puts a "Run workflow" button on the Actions tab for any branch.
+  workflow_dispatch:
 
 jobs:
   windows:
